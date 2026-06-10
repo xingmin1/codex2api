@@ -711,6 +711,8 @@
     "autoPauseThresholdPlaceholder": "留空或 0",
     "autoPauseThresholdHint": "留空或填 0 表示不启用该窗口阈值；达到阈值后只在调度时跳过账号。",
     "autoPauseThresholdRange": "请输入 0 到 100 之间的百分比。",
+    "ignoreUsageLimit429Cooldown": "忽略 usage-limit 429 冷却",
+    "ignoreUsageLimit429CooldownHint": "开启后，上游返回 usage_limit_reached 429 时只按失败请求记录，不把该账号写入冷却或用量耗尽状态。",
     "schedulerCustom": "自定义",
     "schedulerCustomValuePreview": "当前输入将保存为：{{value}}",
     "allowedAPIKeysLabel": "允许调用 Token",

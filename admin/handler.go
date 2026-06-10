@@ -538,66 +538,67 @@ func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 // ==================== Accounts ====================
 
 type accountResponse struct {
-	ID                       int64                      `json:"id"`
-	Name                     string                     `json:"name"`
-	Email                    string                     `json:"email"`
-	EmailDomain              string                     `json:"email_domain,omitempty"`
-	PlanType                 string                     `json:"plan_type"`
-	SubscriptionExpiresAt    string                     `json:"subscription_expires_at,omitempty"`
-	Status                   string                     `json:"status"`
-	ErrorMessage             string                     `json:"error_message,omitempty"`
-	ATOnly                   bool                       `json:"at_only"`
-	CreditEnabled            bool                       `json:"credit_enabled"`
-	CreditSkipUsageWindow    bool                       `json:"credit_skip_usage_window"`
-	SkipWarmTier             bool                       `json:"skip_warm_tier"`
-	AccountType              string                     `json:"account_type,omitempty"`
-	OpenAIResponsesAPI       bool                       `json:"openai_responses_api,omitempty"`
-	BaseURL                  string                     `json:"base_url,omitempty"`
-	Models                   []string                   `json:"models,omitempty"`
-	HealthTier               string                     `json:"health_tier"`
-	SchedulerScore           float64                    `json:"scheduler_score"`
-	DispatchScore            float64                    `json:"dispatch_score"`
-	ScoreBiasOverride        *int64                     `json:"score_bias_override"`
-	ScoreBiasEffective       int64                      `json:"score_bias_effective"`
-	BaseConcurrencyOverride  *int64                     `json:"base_concurrency_override"`
-	BaseConcurrencyEffective int64                      `json:"base_concurrency_effective"`
-	ConcurrencyCap           int64                      `json:"dynamic_concurrency_limit"`
-	ProxyURL                 string                     `json:"proxy_url"`
-	CreatedAt                string                     `json:"created_at"`
-	UpdatedAt                string                     `json:"updated_at"`
-	CodexUsageUpdatedAt      string                     `json:"codex_usage_updated_at,omitempty"`
-	ActiveRequests           int64                      `json:"active_requests"`
-	TotalRequests            int64                      `json:"total_requests"`
-	LastUsedAt               string                     `json:"last_used_at"`
-	SuccessRequests          int64                      `json:"success_requests"`
-	ErrorRequests            int64                      `json:"error_requests"`
-	RetryErrorRequests       int64                      `json:"retry_error_requests"`
-	RateLimitAttempts        int64                      `json:"rate_limit_attempts"`
-	UsagePercent7d           *float64                   `json:"usage_percent_7d"`
-	UsagePercent5h           *float64                   `json:"usage_percent_5h"`
-	AutoPause5hThreshold     *float64                   `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold     *float64                   `json:"auto_pause_7d_threshold"`
-	AutoPause5hDisabled      bool                       `json:"auto_pause_5h_disabled"`
-	AutoPause7dDisabled      bool                       `json:"auto_pause_7d_disabled"`
-	Usage5hDetail            *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
-	Usage7dDetail            *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
-	Reset5hAt                string                     `json:"reset_5h_at,omitempty"`
-	Reset7dAt                string                     `json:"reset_7d_at,omitempty"`
-	Billed5h                 *float64                   `json:"billed_5h"`
-	Billed7d                 *float64                   `json:"billed_7d"`
-	ScoreBreakdown           schedulerBreakdownResponse `json:"scheduler_breakdown"`
-	LastUnauthorizedAt       string                     `json:"last_unauthorized_at,omitempty"`
-	LastRateLimitedAt        string                     `json:"last_rate_limited_at,omitempty"`
-	LastTimeoutAt            string                     `json:"last_timeout_at,omitempty"`
-	LastServerErrorAt        string                     `json:"last_server_error_at,omitempty"`
-	CooldownReason           string                     `json:"cooldown_reason,omitempty"`
-	CooldownUntil            string                     `json:"cooldown_until,omitempty"`
-	ModelCooldowns           []modelCooldownResponse    `json:"model_cooldowns,omitempty"`
-	Enabled                  bool                       `json:"enabled"`
-	Locked                   bool                       `json:"locked"`
-	AllowedAPIKeyIDs         []int64                    `json:"allowed_api_key_ids"`
-	Tags                     []string                   `json:"tags"`
-	GroupIDs                 []int64                    `json:"group_ids"`
+	ID                          int64                      `json:"id"`
+	Name                        string                     `json:"name"`
+	Email                       string                     `json:"email"`
+	EmailDomain                 string                     `json:"email_domain,omitempty"`
+	PlanType                    string                     `json:"plan_type"`
+	SubscriptionExpiresAt       string                     `json:"subscription_expires_at,omitempty"`
+	Status                      string                     `json:"status"`
+	ErrorMessage                string                     `json:"error_message,omitempty"`
+	ATOnly                      bool                       `json:"at_only"`
+	CreditEnabled               bool                       `json:"credit_enabled"`
+	CreditSkipUsageWindow       bool                       `json:"credit_skip_usage_window"`
+	SkipWarmTier                bool                       `json:"skip_warm_tier"`
+	AccountType                 string                     `json:"account_type,omitempty"`
+	OpenAIResponsesAPI          bool                       `json:"openai_responses_api,omitempty"`
+	BaseURL                     string                     `json:"base_url,omitempty"`
+	Models                      []string                   `json:"models,omitempty"`
+	HealthTier                  string                     `json:"health_tier"`
+	SchedulerScore              float64                    `json:"scheduler_score"`
+	DispatchScore               float64                    `json:"dispatch_score"`
+	ScoreBiasOverride           *int64                     `json:"score_bias_override"`
+	ScoreBiasEffective          int64                      `json:"score_bias_effective"`
+	BaseConcurrencyOverride     *int64                     `json:"base_concurrency_override"`
+	BaseConcurrencyEffective    int64                      `json:"base_concurrency_effective"`
+	ConcurrencyCap              int64                      `json:"dynamic_concurrency_limit"`
+	ProxyURL                    string                     `json:"proxy_url"`
+	CreatedAt                   string                     `json:"created_at"`
+	UpdatedAt                   string                     `json:"updated_at"`
+	CodexUsageUpdatedAt         string                     `json:"codex_usage_updated_at,omitempty"`
+	ActiveRequests              int64                      `json:"active_requests"`
+	TotalRequests               int64                      `json:"total_requests"`
+	LastUsedAt                  string                     `json:"last_used_at"`
+	SuccessRequests             int64                      `json:"success_requests"`
+	ErrorRequests               int64                      `json:"error_requests"`
+	RetryErrorRequests          int64                      `json:"retry_error_requests"`
+	RateLimitAttempts           int64                      `json:"rate_limit_attempts"`
+	UsagePercent7d              *float64                   `json:"usage_percent_7d"`
+	UsagePercent5h              *float64                   `json:"usage_percent_5h"`
+	AutoPause5hThreshold        *float64                   `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold        *float64                   `json:"auto_pause_7d_threshold"`
+	AutoPause5hDisabled         bool                       `json:"auto_pause_5h_disabled"`
+	AutoPause7dDisabled         bool                       `json:"auto_pause_7d_disabled"`
+	IgnoreUsageLimit429Cooldown bool                       `json:"ignore_usage_limit_429_cooldown"`
+	Usage5hDetail               *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
+	Usage7dDetail               *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
+	Reset5hAt                   string                     `json:"reset_5h_at,omitempty"`
+	Reset7dAt                   string                     `json:"reset_7d_at,omitempty"`
+	Billed5h                    *float64                   `json:"billed_5h"`
+	Billed7d                    *float64                   `json:"billed_7d"`
+	ScoreBreakdown              schedulerBreakdownResponse `json:"scheduler_breakdown"`
+	LastUnauthorizedAt          string                     `json:"last_unauthorized_at,omitempty"`
+	LastRateLimitedAt           string                     `json:"last_rate_limited_at,omitempty"`
+	LastTimeoutAt               string                     `json:"last_timeout_at,omitempty"`
+	LastServerErrorAt           string                     `json:"last_server_error_at,omitempty"`
+	CooldownReason              string                     `json:"cooldown_reason,omitempty"`
+	CooldownUntil               string                     `json:"cooldown_until,omitempty"`
+	ModelCooldowns              []modelCooldownResponse    `json:"model_cooldowns,omitempty"`
+	Enabled                     bool                       `json:"enabled"`
+	Locked                      bool                       `json:"locked"`
+	AllowedAPIKeyIDs            []int64                    `json:"allowed_api_key_ids"`
+	Tags                        []string                   `json:"tags"`
+	GroupIDs                    []int64                    `json:"group_ids"`
 	// 图片配额信息
 	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
@@ -720,6 +721,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		resp.AutoPause7dThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_7d_threshold")
 		resp.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 		resp.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
+		resp.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
 		if acc, ok := accountMap[row.ID]; ok {
 			acc.Mu().RLock()
 			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
@@ -867,20 +869,20 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 }
 
 type updateAccountSchedulerReq struct {
-	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
-	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
-	SkipWarmTier            json.RawMessage `json:"skip_warm_tier"`
-	AllowedAPIKeyIDs        json.RawMessage `json:"allowed_api_key_ids"`
-	Tags                    json.RawMessage `json:"tags"`
-	GroupIDs                json.RawMessage `json:"group_ids"`
-	AutoPause5hThreshold    json.RawMessage `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold    json.RawMessage `json:"auto_pause_7d_threshold"`
-	AutoPause5hDisabled     json.RawMessage `json:"auto_pause_5h_disabled"`
-	AutoPause7dDisabled     json.RawMessage `json:"auto_pause_7d_disabled"`
-	ProxyURL                *string         `json:"proxy_url"`
+	ScoreBiasOverride           json.RawMessage `json:"score_bias_override"`
+	BaseConcurrencyOverride     json.RawMessage `json:"base_concurrency_override"`
+	SkipWarmTier                json.RawMessage `json:"skip_warm_tier"`
+	AllowedAPIKeyIDs            json.RawMessage `json:"allowed_api_key_ids"`
+	Tags                        json.RawMessage `json:"tags"`
+	GroupIDs                    json.RawMessage `json:"group_ids"`
+	AutoPause5hThreshold        json.RawMessage `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold        json.RawMessage `json:"auto_pause_7d_threshold"`
+	AutoPause5hDisabled         json.RawMessage `json:"auto_pause_5h_disabled"`
+	AutoPause7dDisabled         json.RawMessage `json:"auto_pause_7d_disabled"`
+	IgnoreUsageLimit429Cooldown json.RawMessage `json:"ignore_usage_limit_429_cooldown"`
+	ProxyURL                    *string         `json:"proxy_url"`
 }
 
-// UpdateAccountScheduler 更新账号调度配置。
 // UpdateAccountCredit 更新账号信用设置
 func (h *Handler) UpdateAccountCredit(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -920,6 +922,7 @@ func (h *Handler) UpdateAccountCredit(c *gin.Context) {
 	}
 }
 
+// UpdateAccountScheduler 更新账号调度配置。
 func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -985,6 +988,11 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	ignoreUsageLimit429Cooldown, err := parseOptionalBoolField(req.IgnoreUsageLimit429Cooldown, "ignore_usage_limit_429_cooldown")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -1036,6 +1044,9 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	}
 	if autoPause7dDisabled.Set {
 		credentialUpdates["auto_pause_7d_disabled"] = autoPause7dDisabled.Value
+	}
+	if ignoreUsageLimit429Cooldown.Set {
+		credentialUpdates["ignore_usage_limit_429_cooldown"] = ignoreUsageLimit429Cooldown.Value
 	}
 	if len(credentialUpdates) == 0 {
 		credentialUpdates = nil
@@ -1090,6 +1101,9 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 				optionalBoolPtr(autoPause5hDisabled),
 				optionalBoolPtr(autoPause7dDisabled),
 			)
+		}
+		if ignoreUsageLimit429Cooldown.Set {
+			h.store.ApplyAccountUsageLimit429CooldownConfig(id, ignoreUsageLimit429Cooldown.Value)
 		}
 	}
 	if h.store != nil && tags.Set {

@@ -1756,6 +1756,60 @@ func TestApply429CooldownUsageLimitUpdatesFreePlanMetadata(t *testing.T) {
 	}
 }
 
+func TestApply429CooldownUsageLimitCanBeIgnoredPerAccount(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "usage-limit-ignored", map[string]interface{}{
+		"plan_type":                       "pro",
+		"ignore_usage_limit_429_cooldown": true,
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials 返回错误: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: id, AccessToken: "at", PlanType: "pro", IgnoreUsageLimit429Cooldown: true}
+	body := []byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_in_seconds":3600}}`)
+
+	decision := Apply429Cooldown(store, account, body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if decision != (codex429Decision{}) {
+		t.Fatalf("decision = %#v, want empty ignored decision", decision)
+	}
+	if got := account.GetPlanType(); got != "pro" {
+		t.Fatalf("account plan_type = %q, want pro", got)
+	}
+	if pct, ok := account.GetUsagePercent7d(); ok {
+		t.Fatalf("usage_percent_7d = %v ok=%v, want unset", pct, ok)
+	}
+	if account.HasActiveCooldown() {
+		t.Fatal("HasActiveCooldown() = true, want false")
+	}
+	if !account.IsAvailable() {
+		t.Fatal("IsAvailable() = false, want true")
+	}
+
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAccountByID 返回错误: %v", err)
+	}
+	if got := row.GetCredential("plan_type"); got != "pro" {
+		t.Fatalf("persisted plan_type = %q, want pro", got)
+	}
+	if got := row.GetCredential("codex_7d_used_percent"); got != "" {
+		t.Fatalf("persisted codex_7d_used_percent = %q, want empty", got)
+	}
+	if row.CooldownUntil.Valid || row.CooldownReason != "" {
+		t.Fatalf("persisted cooldown = (%q, %v), want empty", row.CooldownReason, row.CooldownUntil)
+	}
+}
+
 func TestApplyCooldownUsageLimit500UpdatesFreePlanMetadata(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	account := &auth.Account{DBID: 201, AccessToken: "at", PlanType: "free"}
@@ -1806,6 +1860,32 @@ func TestApplyResponseFailedUsageLimitRemovesAccountFromScheduling(t *testing.T)
 	}
 	if next := store.Next(); next != nil {
 		t.Fatalf("store.Next() returned account %d, want nil after usage exhaustion", next.ID())
+	}
+}
+
+func TestApplyResponseFailedUsageLimitCanBeIgnoredPerAccount(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{DBID: 302, AccessToken: "at", PlanType: "pro", Status: auth.StatusReady, IgnoreUsageLimit429Cooldown: true}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	payload := []byte(`{"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","plan_type":"free","resets_in_seconds":3600}}}`)
+
+	decision := handler.applyResponseFailedCooldown(account, payload, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if decision != (codex429Decision{}) {
+		t.Fatalf("decision = %#v, want empty ignored decision", decision)
+	}
+	if got := account.GetPlanType(); got != "pro" {
+		t.Fatalf("account plan_type = %q, want pro", got)
+	}
+	if account.HasActiveCooldown() {
+		t.Fatal("HasActiveCooldown() = true, want false")
+	}
+	if !account.IsAvailable() {
+		t.Fatal("IsAvailable() = false, want true")
+	}
+	if next := store.Next(); next == nil || next.ID() != account.ID() {
+		t.Fatalf("store.Next() = %#v, want account %d", next, account.ID())
 	}
 }
 

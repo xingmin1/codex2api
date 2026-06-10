@@ -65,19 +65,20 @@ type Account struct {
 	ErrorMsg       string
 
 	// 用量进度（从 Codex 响应头被动解析）
-	UsagePercent7d        float64 // 7d 窗口使用率 0-100+
-	UsagePercent7dValid   bool
-	Reset7dAt             time.Time // 7d 窗口重置时间
-	UsagePercent5h        float64   // 5h 窗口使用率 0-100+
-	UsagePercent5hValid   bool
-	Reset5hAt             time.Time // 5h 窗口重置时间
-	UsageUpdatedAt        time.Time
-	usageProbeInFlight    bool
-	recoveryProbeInFlight bool
-	AutoPause5hThreshold  float64 // 0..1, 0 = disabled
-	AutoPause7dThreshold  float64 // 0..1, 0 = disabled
-	AutoPause5hDisabled   bool
-	AutoPause7dDisabled   bool
+	UsagePercent7d              float64 // 7d 窗口使用率 0-100+
+	UsagePercent7dValid         bool
+	Reset7dAt                   time.Time // 7d 窗口重置时间
+	UsagePercent5h              float64   // 5h 窗口使用率 0-100+
+	UsagePercent5hValid         bool
+	Reset5hAt                   time.Time // 5h 窗口重置时间
+	UsageUpdatedAt              time.Time
+	usageProbeInFlight          bool
+	recoveryProbeInFlight       bool
+	AutoPause5hThreshold        float64 // 0..1, 0 = disabled
+	AutoPause7dThreshold        float64 // 0..1, 0 = disabled
+	AutoPause5hDisabled         bool
+	AutoPause7dDisabled         bool
+	IgnoreUsageLimit429Cooldown bool
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -954,6 +955,16 @@ func (a *Account) quotaAutoPausedLocked(now time.Time) bool {
 		return true
 	}
 	return quotaAutoPausedByWindow(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, a.AutoPause7dThreshold, a.AutoPause7dDisabled, now)
+}
+
+// ShouldIgnoreUsageLimit429Cooldown 返回该账号是否把 usage_limit_reached 429 当作普通上游错误。
+func (a *Account) ShouldIgnoreUsageLimit429Cooldown() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.IgnoreUsageLimit429Cooldown
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -2761,6 +2772,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	account.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 	account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
+	account.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
 	for _, cooldown := range modelCooldowns[row.ID] {
 		account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
 	}
@@ -3901,6 +3913,19 @@ func (s *Store) ApplyAccountQuotaAutoPauseConfig(dbID int64, threshold5h, thresh
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	return true
+}
+
+// ApplyAccountUsageLimit429CooldownConfig 更新账号级 usage_limit_reached 429 冷却策略。
+func (s *Store) ApplyAccountUsageLimit429CooldownConfig(dbID int64, ignore bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	acc.IgnoreUsageLimit429Cooldown = ignore
+	acc.mu.Unlock()
 	return true
 }
 

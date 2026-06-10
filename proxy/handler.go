@@ -3519,8 +3519,15 @@ func usageLimitFallbackCooldown(account *auth.Account, body []byte) time.Duratio
 	}
 }
 
+func shouldIgnoreUsageLimit429Cooldown(account *auth.Account, body []byte) bool {
+	return account != nil && account.ShouldIgnoreUsageLimit429Cooldown() && IsUsageLimitReachedError(body)
+}
+
 // Apply429Cooldown 统一处理 429 对账号状态的影响。
 func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, resp *http.Response, model string) codex429Decision {
+	if shouldIgnoreUsageLimit429Cooldown(account, body) {
+		return codex429Decision{}
+	}
 	decision := classify429RateLimit(account, body, resp, time.Now(), model)
 	if store == nil || account == nil {
 		return decision
@@ -3549,6 +3556,10 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
 	if IsUsageLimitReachedError(body) {
+		if shouldIgnoreUsageLimit429Cooldown(account, body) {
+			log.Printf("账号 %d 已配置忽略 usage_limit_reached 429 冷却，本次按普通上游错误处理", account.ID())
+			return codex429Decision{}
+		}
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
 		log.Printf("账号 %d 触发用量上限 (status=%d, plan=%s, reason=%s)，冷却到 %s", account.ID(), statusCode, account.GetPlanType(), decision.Reason, decision.ResetAt.Format(time.RFC3339))
 		return decision

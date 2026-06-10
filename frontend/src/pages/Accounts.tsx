@@ -541,6 +541,10 @@ export default function Accounts() {
     useState(false);
   const [editAutoPause7dDisabled, setEditAutoPause7dDisabled] =
     useState(false);
+  const [
+    editIgnoreUsageLimit429Cooldown,
+    setEditIgnoreUsageLimit429Cooldown,
+  ] = useState(false);
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
     number[]
   >([]);
@@ -2503,6 +2507,9 @@ export default function Accounts() {
     );
     setEditAutoPause5hDisabled(account.auto_pause_5h_disabled ?? false);
     setEditAutoPause7dDisabled(account.auto_pause_7d_disabled ?? false);
+    setEditIgnoreUsageLimit429Cooldown(
+      account.ignore_usage_limit_429_cooldown ?? false,
+    );
     setAllowedAPIKeySelection(
       filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
     );
@@ -2532,6 +2539,7 @@ export default function Accounts() {
     setEditAutoPause7dThresholdInput("");
     setEditAutoPause5hDisabled(false);
     setEditAutoPause7dDisabled(false);
+    setEditIgnoreUsageLimit429Cooldown(false);
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
     setEditTags([]);
@@ -2648,6 +2656,7 @@ export default function Accounts() {
         ),
         auto_pause_5h_disabled: editAutoPause5hDisabled,
         auto_pause_7d_disabled: editAutoPause7dDisabled,
+        ignore_usage_limit_429_cooldown: editIgnoreUsageLimit429Cooldown,
       };
       await api.updateAccountScheduler(editingAccount.id, payload);
       showToast(t("accounts.schedulerSaveSuccess"));
@@ -5165,6 +5174,42 @@ export default function Accounts() {
                             onThresholdChange={setEditAutoPause7dThresholdInput}
                             onDisabledChange={setEditAutoPause7dDisabled}
                           />
+                        </div>
+                        <div className="mt-4 rounded-lg border border-border bg-muted/10 p-3">
+                          <div className="flex items-start justify-between gap-4">
+                            <div>
+                              <div className="text-sm font-semibold text-foreground">
+                                {t(
+                                  "accounts.ignoreUsageLimit429Cooldown",
+                                )}
+                              </div>
+                              <div className="mt-1 text-xs text-muted-foreground">
+                                {t(
+                                  "accounts.ignoreUsageLimit429CooldownHint",
+                                )}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              role="switch"
+                              aria-label={t(
+                                "accounts.ignoreUsageLimit429Cooldown",
+                              )}
+                              aria-checked={
+                                editIgnoreUsageLimit429Cooldown
+                              }
+                              onClick={() =>
+                                setEditIgnoreUsageLimit429Cooldown(
+                                  (current) => !current,
+                                )
+                              }
+                              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 ${editIgnoreUsageLimit429Cooldown ? "bg-primary" : "bg-muted"}`}
+                            >
+                              <span
+                                className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${editIgnoreUsageLimit429Cooldown ? "translate-x-4" : "translate-x-0"}`}
+                              />
+                            </button>
+                          </div>
                         </div>
                       </div>
 
