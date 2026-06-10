@@ -1351,6 +1351,30 @@ func TestPrepareResponsesBody_ConvertsPlaintextCompactionToDeveloperMessage(t *t
 	}
 }
 
+func TestPrepareResponsesBody_PassesThroughCompactV2Items(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.4",
+		"input":[
+			{"type":"compaction","encrypted_content":"opaque-blob"},
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"compaction_trigger"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	input := gjson.GetBytes(got, "input")
+	if gotType := input.Get("0.type").String(); gotType != "compaction" {
+		t.Fatalf("encrypted compaction item type = %q, want compaction (verbatim passthrough); input=%s", gotType, input.Raw)
+	}
+	if gotContent := input.Get("0.encrypted_content").String(); gotContent != "opaque-blob" {
+		t.Fatalf("encrypted compaction content = %q, want opaque-blob; input=%s", gotContent, input.Raw)
+	}
+	if gotType := input.Get("2.type").String(); gotType != "compaction_trigger" {
+		t.Fatalf("compaction_trigger item type = %q, want compaction_trigger (verbatim passthrough); input=%s", gotType, input.Raw)
+	}
+}
+
 func TestPrepareCompactResponsesBody_ConvertsPlaintextCompactionToDeveloperMessage(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

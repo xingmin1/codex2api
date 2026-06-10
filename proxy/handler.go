@@ -619,7 +619,8 @@ func gjsonResultHasCompactionInput(result gjson.Result) bool {
 	if !result.Exists() {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(result.Get("type").String()), "compaction") {
+	switch strings.ToLower(strings.TrimSpace(result.Get("type").String())) {
+	case "compaction", "compaction_trigger", "context_compaction":
 		return true
 	}
 	if !result.IsArray() && !result.IsObject() {

@@ -706,6 +706,10 @@ func normalizeResponsesImageOnlyModel(body map[string]any) bool {
 // are dropped. Codex CLI compresses prior turns into compaction items expecting
 // them to be forwarded as conversation context; the upstream rejects the type
 // with "Invalid input type 'compaction' at index N", so we translate in place.
+//
+// Compact v2 (newer Codex CLI) items are left untouched: compaction items
+// carrying "encrypted_content" originate from the upstream itself and must be
+// forwarded verbatim, or the compacted conversation context is lost.
 func normalizeResponsesCompactionItems(body map[string]any) bool {
 	if len(body) == 0 {
 		return false
@@ -726,6 +730,12 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 			continue
 		}
 		if firstNonEmptyAnyString(itemMap["type"]) != "compaction" {
+			out = append(out, raw)
+			continue
+		}
+
+		// compact v2: 加密压缩项由上游生成并原生支持，必须原样透传
+		if firstNonEmptyAnyString(itemMap["encrypted_content"]) != "" {
 			out = append(out, raw)
 			continue
 		}
