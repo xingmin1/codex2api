@@ -16,10 +16,7 @@
     ];
     forAllSystems = lib.genAttrs systems;
 
-    version =
-      if self ? shortRev
-      then "0.0.0-dev+${self.shortRev}"
-      else "0.0.0-dev";
+    version = lib.strings.trim (builtins.readFile ./VERSION);
   in {
     packages = forAllSystems (
       system: let

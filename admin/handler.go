@@ -580,6 +580,7 @@ type accountResponse struct {
 	AutoPause5hDisabled         bool                       `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled         bool                       `json:"auto_pause_7d_disabled"`
 	IgnoreUsageLimit429Cooldown bool                       `json:"ignore_usage_limit_429_cooldown"`
+	IgnoreUnauthorizedCooldown  bool                       `json:"ignore_unauthorized_cooldown"`
 	Usage5hDetail               *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
 	Usage7dDetail               *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                   string                     `json:"reset_5h_at,omitempty"`
@@ -722,6 +723,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		resp.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 		resp.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 		resp.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
+		resp.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
 		if acc, ok := accountMap[row.ID]; ok {
 			acc.Mu().RLock()
 			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
@@ -880,6 +882,7 @@ type updateAccountSchedulerReq struct {
 	AutoPause5hDisabled         json.RawMessage `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled         json.RawMessage `json:"auto_pause_7d_disabled"`
 	IgnoreUsageLimit429Cooldown json.RawMessage `json:"ignore_usage_limit_429_cooldown"`
+	IgnoreUnauthorizedCooldown  json.RawMessage `json:"ignore_unauthorized_cooldown"`
 	ProxyURL                    *string         `json:"proxy_url"`
 }
 
@@ -993,6 +996,11 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
+	ignoreUnauthorizedCooldown, err := parseOptionalBoolField(req.IgnoreUnauthorizedCooldown, "ignore_unauthorized_cooldown")
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -1047,6 +1055,9 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	}
 	if ignoreUsageLimit429Cooldown.Set {
 		credentialUpdates["ignore_usage_limit_429_cooldown"] = ignoreUsageLimit429Cooldown.Value
+	}
+	if ignoreUnauthorizedCooldown.Set {
+		credentialUpdates["ignore_unauthorized_cooldown"] = ignoreUnauthorizedCooldown.Value
 	}
 	if len(credentialUpdates) == 0 {
 		credentialUpdates = nil
@@ -1104,6 +1115,9 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		}
 		if ignoreUsageLimit429Cooldown.Set {
 			h.store.ApplyAccountUsageLimit429CooldownConfig(id, ignoreUsageLimit429Cooldown.Value)
+		}
+		if ignoreUnauthorizedCooldown.Set {
+			h.store.ApplyAccountUnauthorizedCooldownConfig(id, ignoreUnauthorizedCooldown.Value)
 		}
 	}
 	if h.store != nil && tags.Set {

@@ -1086,7 +1086,7 @@ func TestUpdateAccountSchedulerPersistsQuotaAutoPauseConfig(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"auto_pause_5h_threshold":0.95,"auto_pause_7d_threshold":null,"auto_pause_5h_disabled":true,"auto_pause_7d_disabled":false,"ignore_usage_limit_429_cooldown":true}`))
+	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"auto_pause_5h_threshold":0.95,"auto_pause_7d_threshold":null,"auto_pause_5h_disabled":true,"auto_pause_7d_disabled":false,"ignore_usage_limit_429_cooldown":true,"ignore_unauthorized_cooldown":true}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
 	handler.UpdateAccountScheduler(ctx)
@@ -1115,6 +1115,9 @@ func TestUpdateAccountSchedulerPersistsQuotaAutoPauseConfig(t *testing.T) {
 	}
 	if !rows[0].GetCredentialBool("ignore_usage_limit_429_cooldown") {
 		t.Fatal("ignore_usage_limit_429_cooldown = false, want true")
+	}
+	if !rows[0].GetCredentialBool("ignore_unauthorized_cooldown") {
+		t.Fatal("ignore_unauthorized_cooldown = false, want true")
 	}
 }
 
@@ -1308,7 +1311,7 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"skip_warm_tier":true,"allowed_api_key_ids":[%d,%d],"auto_pause_5h_threshold":0.95,"auto_pause_7d_threshold":0.9,"auto_pause_5h_disabled":true,"auto_pause_7d_disabled":false,"ignore_usage_limit_429_cooldown":true}`, keyID2, keyID1)))
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"skip_warm_tier":true,"allowed_api_key_ids":[%d,%d],"auto_pause_5h_threshold":0.95,"auto_pause_7d_threshold":0.9,"auto_pause_5h_disabled":true,"auto_pause_7d_disabled":false,"ignore_usage_limit_429_cooldown":true,"ignore_unauthorized_cooldown":true}`, keyID2, keyID1)))
 	ginCtx.Request.Header.Set("Content-Type", "application/json")
 
 	handler.UpdateAccountScheduler(ginCtx)
@@ -1347,6 +1350,9 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	}
 	if !runtimeAccount.IgnoreUsageLimit429Cooldown {
 		t.Fatal("runtime ignore_usage_limit_429_cooldown = false, want true")
+	}
+	if !runtimeAccount.IgnoreUnauthorizedCooldown {
+		t.Fatal("runtime ignore_unauthorized_cooldown = false, want true")
 	}
 }
 

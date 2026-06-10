@@ -713,6 +713,8 @@
     "autoPauseThresholdRange": "Enter a percentage from 0 to 100.",
     "ignoreUsageLimit429Cooldown": "Ignore usage-limit 429 cooldown",
     "ignoreUsageLimit429CooldownHint": "When enabled, upstream usage_limit_reached 429 responses are recorded as failed requests without putting this account into cooldown or usage-exhausted state.",
+    "ignoreUnauthorizedCooldown": "Treat 401 as ordinary error",
+    "ignoreUnauthorizedCooldownHint": "When enabled, upstream 401 responses are recorded as ordinary failed requests without marking this account banned, cooled down, or auto-cleaned.",
     "schedulerCustom": "Custom",
     "schedulerCustomValuePreview": "Current input will be saved as: {{value}}",
     "allowedAPIKeysLabel": "Allowed Tokens",

@@ -258,7 +258,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		if resp.StatusCode != http.StatusOK {
 			ttftGuard.Stop()
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
@@ -274,7 +274,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -294,7 +294,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 				IsRetryAttempt:       shouldRetry,
 				AttemptIndex:         attempt + 1,
-				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind:    upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
@@ -480,12 +480,12 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 		ttftGuard.Stop()
 		if len(terminalFailurePayload) > 0 {
-			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+			outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
 			// 流式 response.failed 也要把额度耗尽/限流账号冷却下来，
 			// 否则该账号会保持高分继续被调度（与 /v1/responses 路径保持一致）。
 			responseFailedDecision := h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
 			if responseFailedDecision.Reason != "" {
-				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
+				outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 			}
 		}
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {

@@ -713,6 +713,17 @@ func classifyHTTPFailure(statusCode int) string {
 	}
 }
 
+func shouldTreatUnauthorizedAsClientError(account *auth.Account, statusCode int) bool {
+	return statusCode == http.StatusUnauthorized && account != nil && account.ShouldIgnoreUnauthorizedCooldown()
+}
+
+func classifyHTTPFailureForAccount(account *auth.Account, statusCode int) string {
+	if shouldTreatUnauthorizedAsClientError(account, statusCode) {
+		return "client"
+	}
+	return classifyHTTPFailure(statusCode)
+}
+
 type streamOutcome struct {
 	logStatusCode  int
 	failureKind    string
@@ -763,12 +774,16 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 }
 
 func classifyResponseFailedOutcome(payload []byte) streamOutcome {
+	return classifyResponseFailedOutcomeForAccount(nil, payload)
+}
+
+func classifyResponseFailedOutcomeForAccount(account *auth.Account, payload []byte) streamOutcome {
 	statusCode := responseFailedStatusCode(payload)
 	message := usageLogErrorMessage(statusCode, payload)
 	if strings.TrimSpace(message) == "" || message == fmt.Sprintf("HTTP %d", statusCode) {
 		message = "上游返回 response.failed"
 	}
-	kind := upstreamErrorKind(statusCode, payload, codex429Decision{})
+	kind := upstreamErrorKindForAccount(account, statusCode, payload, codex429Decision{})
 	if kind == "" {
 		if statusCode >= 500 {
 			kind = "server"
@@ -776,11 +791,12 @@ func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 			kind = "client"
 		}
 	}
+	penalizeUnauthorized := statusCode == http.StatusUnauthorized && !shouldTreatUnauthorizedAsClientError(account, statusCode)
 	return streamOutcome{
 		logStatusCode:  statusCode,
 		failureKind:    kind,
 		failureMessage: message,
-		penalize:       statusCode == http.StatusUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500,
+		penalize:       penalizeUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500,
 	}
 }
 
@@ -1221,6 +1237,13 @@ func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries
 	return true
 }
 
+func shouldRetryHTTPStatusForAccount(account *auth.Account, statusCode int, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
+	if shouldTreatUnauthorizedAsClientError(account, statusCode) {
+		return false
+	}
+	return shouldRetryHTTPStatus(statusCode, generalRetries, rateLimitRetries, maxGeneralRetries, maxRateLimitRetries)
+}
+
 func shouldRetryRequestError(err error, generalRetries *int, maxGeneralRetries int) bool {
 	if err == nil || generalRetries == nil || *generalRetries >= maxGeneralRetries {
 		return false
@@ -1290,6 +1313,13 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 		}
 		return ""
 	}
+}
+
+func upstreamErrorKindForAccount(account *auth.Account, statusCode int, body []byte, decision codex429Decision) string {
+	if shouldTreatUnauthorizedAsClientError(account, statusCode) {
+		return "client"
+	}
+	return upstreamErrorKind(statusCode, body, decision)
 }
 
 func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
@@ -1553,7 +1583,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -1564,7 +1594,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -1584,7 +1614,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					BillingServiceTier:   usageTiers.BillingServiceTier,
 					IsRetryAttempt:       shouldRetry,
 					AttemptIndex:         attempt + 1,
-					UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+					UpstreamErrorKind:    upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 					ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 				})
 
@@ -1710,10 +1740,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			ttftGuard.Stop()
 			var responseFailedDecision codex429Decision
 			if len(terminalFailurePayload) > 0 {
-				outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+				outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
 				responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
 				if responseFailedDecision.Reason != "" {
-					outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
+					outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 				}
 			}
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
@@ -1893,7 +1923,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
@@ -1905,7 +1935,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -1925,7 +1955,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 				IsRetryAttempt:       shouldRetry,
 				AttemptIndex:         attempt + 1,
-				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind:    upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
@@ -2110,10 +2140,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		ttftGuard.Stop()
 		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
-			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+			outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
 			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
 			if responseFailedDecision.Reason != "" {
-				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
+				outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 			}
 		}
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
@@ -2394,7 +2424,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -2404,7 +2434,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-				shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -2422,7 +2452,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					BillingServiceTier:   usageTiers.BillingServiceTier,
 					IsRetryAttempt:       shouldRetry,
 					AttemptIndex:         attempt + 1,
-					UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+					UpstreamErrorKind:    upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 					ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 				})
 
@@ -2537,7 +2567,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				}
 			}
 
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
@@ -2548,7 +2578,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -2566,7 +2596,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 				IsRetryAttempt:       shouldRetry,
 				AttemptIndex:         attempt + 1,
-				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind:    upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
@@ -2851,7 +2881,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		if resp.StatusCode != http.StatusOK {
 			ttftGuard.Stop()
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
@@ -2865,7 +2895,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -2885,7 +2915,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				BillingServiceTier:   usageTiers.BillingServiceTier,
 				IsRetryAttempt:       shouldRetry,
 				AttemptIndex:         attempt + 1,
-				UpstreamErrorKind:    upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind:    upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
@@ -3073,10 +3103,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		ttftGuard.Stop()
 		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
-			outcome = classifyResponseFailedOutcome(terminalFailurePayload)
+			outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
 			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
 			if responseFailedDecision.Reason != "" {
-				outcome.failureKind = upstreamErrorKind(outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
+				outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 			}
 		}
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
@@ -3575,6 +3605,11 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 		log.Printf("账号 %d 被限速 (plan=%s, reason=%s)，冷却到 %s", account.ID(), account.GetPlanType(), decision.Reason, decision.ResetAt.Format(time.RFC3339))
 		return decision
 	case http.StatusUnauthorized:
+		if shouldTreatUnauthorizedAsClientError(account, statusCode) {
+			log.Printf("账号 %d 已配置将 401 当作普通上游错误，不进入封禁或冷却", account.ID())
+			return codex429Decision{}
+		}
+
 		// 原子标志瞬间置位，阻止其他并发请求再选到该账号
 		atomic.StoreInt32(&account.Disabled, 1)
 

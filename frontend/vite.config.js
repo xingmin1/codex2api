@@ -1,5 +1,6 @@
 import path from 'path'
 import { execSync } from 'child_process'
+import { readFileSync } from 'fs'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
@@ -9,7 +10,11 @@ function getVersion() {
   try {
     return execSync('git describe --tags --abbrev=0', { encoding: 'utf-8' }).trim()
   } catch {
-    return 'dev'
+    try {
+      return readFileSync(path.resolve(__dirname, '../VERSION'), 'utf-8').trim()
+    } catch {
+      return 'dev'
+    }
   }
 }
 

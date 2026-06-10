@@ -713,6 +713,8 @@
     "autoPauseThresholdRange": "请输入 0 到 100 之间的百分比。",
     "ignoreUsageLimit429Cooldown": "忽略 usage-limit 429 冷却",
     "ignoreUsageLimit429CooldownHint": "开启后，上游返回 usage_limit_reached 429 时只按失败请求记录，不把该账号写入冷却或用量耗尽状态。",
+    "ignoreUnauthorizedCooldown": "将 401 当作普通错误",
+    "ignoreUnauthorizedCooldownHint": "开启后，上游返回 401 时只按普通失败请求记录，不把该账号标记为封禁、冷却或自动清理。",
     "schedulerCustom": "自定义",
     "schedulerCustomValuePreview": "当前输入将保存为：{{value}}",
     "allowedAPIKeysLabel": "允许调用 Token",

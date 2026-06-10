@@ -1484,6 +1484,72 @@ func TestDeactivatedWorkspace402MarksAccountError(t *testing.T) {
 	}
 }
 
+func TestUnauthorizedCanBeTreatedAsClientErrorPerAccount(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{
+		DBID:                       43,
+		AccessToken:                "at",
+		Status:                     auth.StatusReady,
+		HealthTier:                 auth.HealthTierHealthy,
+		IgnoreUnauthorizedCooldown: true,
+	}
+	handler := &Handler{store: store}
+	body := []byte(`{"error":{"message":"Invalid token"}}`)
+
+	if got := classifyHTTPFailureForAccount(account, http.StatusUnauthorized); got != "client" {
+		t.Fatalf("classifyHTTPFailureForAccount = %q, want client", got)
+	}
+	store.ReportRequestFailure(account, classifyHTTPFailureForAccount(account, http.StatusUnauthorized), time.Millisecond)
+	if got := upstreamErrorKindForAccount(account, http.StatusUnauthorized, body, codex429Decision{}); got != "client" {
+		t.Fatalf("upstreamErrorKindForAccount = %q, want client", got)
+	}
+
+	generalRetries := 0
+	if shouldRetryHTTPStatusForAccount(account, http.StatusUnauthorized, &generalRetries, nil, 1, 1) {
+		t.Fatal("ignored 401 should not consume retry budget")
+	}
+	if generalRetries != 0 {
+		t.Fatalf("generalRetries = %d, want 0", generalRetries)
+	}
+
+	decision := handler.applyCooldownForModel(account, http.StatusUnauthorized, body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+	if decision != (codex429Decision{}) {
+		t.Fatalf("decision = %#v, want empty", decision)
+	}
+	if account.HasActiveCooldown() {
+		t.Fatal("HasActiveCooldown() = true, want false")
+	}
+	if !account.IsAvailable() {
+		t.Fatal("IsAvailable() = false, want true")
+	}
+
+	account.Mu().RLock()
+	healthTier := account.HealthTier
+	lastUnauthorizedAt := account.LastUnauthorizedAt
+	account.Mu().RUnlock()
+	if healthTier == auth.HealthTierBanned {
+		t.Fatal("HealthTier = banned, want non-banned")
+	}
+	if !lastUnauthorizedAt.IsZero() {
+		t.Fatalf("LastUnauthorizedAt = %s, want zero", lastUnauthorizedAt)
+	}
+
+	payload := []byte(`{"type":"response.failed","response":{"error":{"type":"invalid_api_key","message":"Invalid token"}}}`)
+	outcome := classifyResponseFailedOutcomeForAccount(account, payload)
+	if outcome.failureKind != "client" {
+		t.Fatalf("response.failed failureKind = %q, want client", outcome.failureKind)
+	}
+	if outcome.penalize {
+		t.Fatal("response.failed penalize = true, want false")
+	}
+	if decision := handler.applyResponseFailedCooldown(account, payload, &http.Response{Header: make(http.Header)}, "gpt-5.4"); decision != (codex429Decision{}) {
+		t.Fatalf("response.failed decision = %#v, want empty", decision)
+	}
+	if account.HasActiveCooldown() {
+		t.Fatal("response.failed HasActiveCooldown() = true, want false")
+	}
+}
+
 func TestSendFinalUpstreamError_UsageLimitRewrites429(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

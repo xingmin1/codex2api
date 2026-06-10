@@ -79,6 +79,7 @@ type Account struct {
 	AutoPause5hDisabled         bool
 	AutoPause7dDisabled         bool
 	IgnoreUsageLimit429Cooldown bool
+	IgnoreUnauthorizedCooldown  bool
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -965,6 +966,16 @@ func (a *Account) ShouldIgnoreUsageLimit429Cooldown() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.IgnoreUsageLimit429Cooldown
+}
+
+// ShouldIgnoreUnauthorizedCooldown 返回该账号是否把 401 当作普通上游错误。
+func (a *Account) ShouldIgnoreUnauthorizedCooldown() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.IgnoreUnauthorizedCooldown
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -2773,6 +2784,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	account.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 	account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 	account.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
+	account.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
 	for _, cooldown := range modelCooldowns[row.ID] {
 		account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
 	}
@@ -3925,6 +3937,19 @@ func (s *Store) ApplyAccountUsageLimit429CooldownConfig(dbID int64, ignore bool)
 
 	acc.mu.Lock()
 	acc.IgnoreUsageLimit429Cooldown = ignore
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountUnauthorizedCooldownConfig 更新账号级 401 冷却策略。
+func (s *Store) ApplyAccountUnauthorizedCooldownConfig(dbID int64, ignore bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	acc.IgnoreUnauthorizedCooldown = ignore
 	acc.mu.Unlock()
 	return true
 }

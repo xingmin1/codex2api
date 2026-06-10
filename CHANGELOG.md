@@ -1,5 +1,15 @@
 # Changelog
 
+## v2.3.0-xmin.3 - 2026-06-11
+
+### Features
+
+- **Per-account 401 handling override.** Added an account-level option to treat upstream HTTP 401 responses as ordinary client errors. When enabled, 401 responses no longer mark the account as banned, set unauthorized cooldowns, trigger unauthorized auto-cleanup, or consume 401 retry budget; streaming `response.failed` frames inferred as 401 follow the same behavior.
+
+### Fixes
+
+- **Release latest ref ordering.** The release workflow now updates the `latest` branch only after GitHub Actions has created the release and uploaded all release assets successfully.
+
 ## v2.3.0 - 2026-06-10
 
 ### Features

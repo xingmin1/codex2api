@@ -47,6 +47,12 @@ jobs:
           set -euo pipefail
 
           version="${VERSION#v}"
+          declared_version="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$declared_version" != "$version" ]]; then
+            echo "Tag ${VERSION} does not match VERSION ${declared_version}" >&2
+            exit 1
+          fi
+
           mkdir -p dist build
 
           build_target() {
@@ -118,3 +124,10 @@ jobs:
               sleep $((attempt * 2))
             done
           done
+
+      - name: Update latest release ref
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin refs/heads/latest:refs/remotes/origin/latest || true
+          git push --force-with-lease=refs/heads/latest origin HEAD:refs/heads/latest

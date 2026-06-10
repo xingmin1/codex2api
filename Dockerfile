@@ -6,14 +6,15 @@
 # ============================================================
 FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
 
-ARG BUILD_VERSION=dev
+ARG BUILD_VERSION
 
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm \
     npm ci --no-audit --no-fund
 COPY frontend/ .
-RUN VITE_APP_VERSION=${BUILD_VERSION} npm run build
+COPY VERSION /VERSION
+RUN resolved_version="${BUILD_VERSION:-$(cat /VERSION)}" && VITE_APP_VERSION="${resolved_version}" npm run build
 
 # ============================================================
 # Stage 2: 构建 Go 后端

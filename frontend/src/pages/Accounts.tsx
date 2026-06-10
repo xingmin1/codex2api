@@ -545,6 +545,10 @@ export default function Accounts() {
     editIgnoreUsageLimit429Cooldown,
     setEditIgnoreUsageLimit429Cooldown,
   ] = useState(false);
+  const [
+    editIgnoreUnauthorizedCooldown,
+    setEditIgnoreUnauthorizedCooldown,
+  ] = useState(false);
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
     number[]
   >([]);
@@ -2510,6 +2514,9 @@ export default function Accounts() {
     setEditIgnoreUsageLimit429Cooldown(
       account.ignore_usage_limit_429_cooldown ?? false,
     );
+    setEditIgnoreUnauthorizedCooldown(
+      account.ignore_unauthorized_cooldown ?? false,
+    );
     setAllowedAPIKeySelection(
       filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
     );
@@ -2540,6 +2547,7 @@ export default function Accounts() {
     setEditAutoPause5hDisabled(false);
     setEditAutoPause7dDisabled(false);
     setEditIgnoreUsageLimit429Cooldown(false);
+    setEditIgnoreUnauthorizedCooldown(false);
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
     setEditTags([]);
@@ -2657,6 +2665,7 @@ export default function Accounts() {
         auto_pause_5h_disabled: editAutoPause5hDisabled,
         auto_pause_7d_disabled: editAutoPause7dDisabled,
         ignore_usage_limit_429_cooldown: editIgnoreUsageLimit429Cooldown,
+        ignore_unauthorized_cooldown: editIgnoreUnauthorizedCooldown,
       };
       await api.updateAccountScheduler(editingAccount.id, payload);
       showToast(t("accounts.schedulerSaveSuccess"));
@@ -5207,6 +5216,36 @@ export default function Accounts() {
                             >
                               <span
                                 className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${editIgnoreUsageLimit429Cooldown ? "translate-x-4" : "translate-x-0"}`}
+                              />
+                            </button>
+                          </div>
+                        </div>
+                        <div className="mt-3 rounded-lg border border-border bg-muted/10 p-3">
+                          <div className="flex items-start justify-between gap-4">
+                            <div>
+                              <div className="text-sm font-semibold text-foreground">
+                                {t("accounts.ignoreUnauthorizedCooldown")}
+                              </div>
+                              <div className="mt-1 text-xs text-muted-foreground">
+                                {t("accounts.ignoreUnauthorizedCooldownHint")}
+                              </div>
+                            </div>
+                            <button
+                              type="button"
+                              role="switch"
+                              aria-label={t(
+                                "accounts.ignoreUnauthorizedCooldown",
+                              )}
+                              aria-checked={editIgnoreUnauthorizedCooldown}
+                              onClick={() =>
+                                setEditIgnoreUnauthorizedCooldown(
+                                  (current) => !current,
+                                )
+                              }
+                              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 ${editIgnoreUnauthorizedCooldown ? "bg-primary" : "bg-muted"}`}
+                            >
+                              <span
+                                className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${editIgnoreUnauthorizedCooldown ? "translate-x-4" : "translate-x-0"}`}
                               />
                             </button>
                           </div>

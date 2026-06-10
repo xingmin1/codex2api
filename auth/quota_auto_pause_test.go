@@ -1,8 +1,12 @@
 package auth
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/codex2api/database"
 )
 
 func newQuotaAutoPauseTestAccount() *Account {
@@ -75,5 +79,39 @@ func TestQuotaAutoPause7dThresholdFencesAccount(t *testing.T) {
 
 	if acc.IsAvailable() {
 		t.Fatal("IsAvailable() = true, want false after 7d auto-pause threshold is reached")
+	}
+}
+
+func TestAccountCooldownIgnoreFlagsRestoreFromCredentials(t *testing.T) {
+	ctx := context.Background()
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	id, err := db.InsertAccountWithCredentials(ctx, "ignore-cooldown-flags", map[string]interface{}{
+		"access_token":                    "at",
+		"ignore_usage_limit_429_cooldown": true,
+		"ignore_unauthorized_cooldown":    true,
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials 返回错误: %v", err)
+	}
+
+	store := NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	if err := store.Init(ctx); err != nil {
+		t.Fatalf("Init 返回错误: %v", err)
+	}
+
+	account := store.FindByID(id)
+	if account == nil {
+		t.Fatal("FindByID 返回 nil")
+	}
+	if !account.ShouldIgnoreUsageLimit429Cooldown() {
+		t.Fatal("ShouldIgnoreUsageLimit429Cooldown() = false, want true")
+	}
+	if !account.ShouldIgnoreUnauthorizedCooldown() {
+		t.Fatal("ShouldIgnoreUnauthorizedCooldown() = false, want true")
 	}
 }

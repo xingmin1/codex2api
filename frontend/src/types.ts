@@ -84,6 +84,7 @@ export interface AccountRow {
   auto_pause_5h_disabled?: boolean
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
+  ignore_unauthorized_cooldown?: boolean
   usage_5h_detail?: AccountUsageWindow
   usage_7d_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
@@ -182,6 +183,7 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_5h_disabled?: boolean
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
+  ignore_unauthorized_cooldown?: boolean
 }
 
 export interface AccountGroup {
