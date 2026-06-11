@@ -891,6 +891,33 @@ func TestPrepareOpenAIResponsesBody_JSONObjectPrefixesStringInputWhenInputOmitsJ
 	}
 }
 
+func TestPrepareOpenAIResponsesBody_DropsRelayUnsupportedFields(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":"hello",
+		"stream":false,
+		"temperature":1,
+		"top_p":0.98,
+		"top_logprobs":0,
+		"truncation":"disabled",
+		"service_tier":"default",
+		"prompt_cache_retention":"24h"
+	}`)
+
+	got := PrepareOpenAIResponsesBody(raw)
+
+	for _, field := range []string{"top_logprobs", "truncation"} {
+		if gjson.GetBytes(got, field).Exists() {
+			t.Fatalf("%s should be removed for OpenAI Responses relay compatibility; body=%s", field, got)
+		}
+	}
+	for _, field := range []string{"temperature", "top_p", "service_tier", "prompt_cache_retention"} {
+		if !gjson.GetBytes(got, field).Exists() {
+			t.Fatalf("%s should be preserved; body=%s", field, got)
+		}
+	}
+}
+
 func TestPrepareResponsesBody_DefaultsIncludeForResponses(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",

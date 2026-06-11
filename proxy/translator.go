@@ -1552,6 +1552,9 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 	}
 	moveTopLevelResponsesImageOptions(body)
 	normalizeResponsesImageGenerationTools(body, extractResponsesPromptText(body))
+	for _, field := range []string{"top_logprobs", "truncation"} {
+		delete(body, field)
+	}
 
 	result, err := json.Marshal(body)
 	if err != nil {
