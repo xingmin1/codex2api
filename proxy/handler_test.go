@@ -900,6 +900,148 @@ func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	}
 }
 
+func TestCloudflareOriginResponseTimeoutDetection(t *testing.T) {
+	body := []byte(`{"error_name":"origin_response_timeout","error_code":524,"retry_after":120}`)
+
+	if !isCloudflareOriginResponseTimeout(cloudflareOriginResponseTimeoutStatus, body) {
+		t.Fatal("expected Cloudflare origin_response_timeout 524 to be detected")
+	}
+	if !shouldFallbackToLongCompactAccount(cloudflareOriginResponseTimeoutStatus, body, &auth.Account{DBID: 1}) {
+		t.Fatal("expected non-long compact account to trigger long compact fallback")
+	}
+	if shouldFallbackToLongCompactAccount(cloudflareOriginResponseTimeoutStatus, body, &auth.Account{DBID: 2, Tags: []string{longCompactAccountTag}}) {
+		t.Fatal("long compact account should not trigger another long compact fallback")
+	}
+	if got := upstreamErrorKind(cloudflareOriginResponseTimeoutStatus, body, codex429Decision{}); got != "timeout" {
+		t.Fatalf("upstreamErrorKind = %q, want timeout", got)
+	}
+}
+
+func TestResponsesCompactFallsBackToLongCompactAccountAfterCloudflare524(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	normalHits := 0
+	normalUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		normalHits++
+		w.WriteHeader(cloudflareOriginResponseTimeoutStatus)
+		_, _ = w.Write([]byte(`{"error_name":"origin_response_timeout","error_code":524,"retry_after":120}`))
+	}))
+	defer normalUpstream.Close()
+
+	longHits := 0
+	longUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		longHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_long_compact",
+			"object":"response",
+			"created_at":1710000000,
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer longUpstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      normalUpstream.URL,
+		APIKey:       "sk-normal",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         2,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      longUpstream.URL,
+		APIKey:       "sk-long",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+		Tags:         []string{longCompactAccountTag},
+	})
+	handler := NewHandler(store, nil, nil, nil)
+	body := []byte(`{"model":"gpt-4.1-direct","input":"hello"}`)
+
+	first := performResponsesCompactRequest(t, handler, body, "compact-session")
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want 200; body=%s", first.Code, first.Body.String())
+	}
+	if id := gjson.GetBytes(first.Body.Bytes(), "id").String(); id != "resp_long_compact" {
+		t.Fatalf("first response id = %q, want resp_long_compact; body=%s", id, first.Body.String())
+	}
+	if normalHits != 1 || longHits != 1 {
+		t.Fatalf("hits after first request = normal %d long %d, want 1/1", normalHits, longHits)
+	}
+	if !handler.shouldPreferLongCompactFallback(longCompactFallbackPreferenceKey(0, "compact-session")) {
+		t.Fatal("expected compact session to remember long compact preference after 524")
+	}
+
+	second := performResponsesCompactRequest(t, handler, body, "compact-session")
+	if second.Code != http.StatusOK {
+		t.Fatalf("second status = %d, want 200; body=%s", second.Code, second.Body.String())
+	}
+	if normalHits != 1 || longHits != 2 {
+		t.Fatalf("hits after second request = normal %d long %d, want 1/2", normalHits, longHits)
+	}
+}
+
+func TestResponsesCompactReturnsOriginalCloudflare524WhenLongCompactPoolUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	normalUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(cloudflareOriginResponseTimeoutStatus)
+		_, _ = w.Write([]byte(`{"error_name":"origin_response_timeout","error_code":524,"retry_after":120}`))
+	}))
+	defer normalUpstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      normalUpstream.URL,
+		APIKey:       "sk-normal",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+	body := []byte(`{"model":"gpt-4.1-direct","input":"hello"}`)
+
+	recorder := performResponsesCompactRequest(t, handler, body, "compact-session")
+
+	if recorder.Code != cloudflareOriginResponseTimeoutStatus {
+		t.Fatalf("status = %d, want 524; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "origin_response_timeout") {
+		t.Fatalf("body should preserve original 524 details: %s", recorder.Body.String())
+	}
+}
+
+func performResponsesCompactRequest(t *testing.T, handler *Handler, body []byte, sessionID string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if sessionID != "" {
+		req.Header.Set("Session_id", sessionID)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ResponsesCompact(ctx)
+	return recorder
+}
+
 // newOpenAIResponsesSSEUpstream 模拟仅支持 OpenAI Responses API 的中转上游，
 // 返回一段最小可用的 Responses SSE 流（issue #181 回归用）。
 func newOpenAIResponsesSSEUpstream(seenPath *string, seenAuth *string, seenBody *[]byte) *httptest.Server {
@@ -1026,6 +1168,79 @@ func TestChatCompletionsUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	}
 	if got := gjson.GetBytes(respBody, "usage.prompt_tokens").Int(); got != 10 {
 		t.Fatalf("usage.prompt_tokens = %d, want 10; body=%s", got, respBody)
+	}
+}
+
+func TestResponsesRetriesOpenAIResponsesBadGatewayOnAnotherAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	failingHits := 0
+	failingUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		failingHits++
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":{"message":"Upstream request failed","type":"upstream_error"}}`))
+	}))
+	defer failingUpstream.Close()
+
+	healthyHits := 0
+	healthyUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		healthyHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_retry_ok",
+			"object":"response",
+			"created_at":1710000000,
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer healthyUpstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+		TestModel:           "gpt-4.1-direct",
+	})
+	failingAccount := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      failingUpstream.URL,
+		APIKey:       "sk-failing",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	}
+	store.AddAccount(failingAccount)
+	store.AddAccount(&auth.Account{
+		DBID:         2,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      healthyUpstream.URL,
+		APIKey:       "sk-healthy",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	store.BindSessionAffinity(sessionAffinityKey("retry-session", 0), failingAccount, "")
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-4.1-direct","input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Session_id", "retry-session")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if id := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); id != "resp_retry_ok" {
+		t.Fatalf("response id = %q, want resp_retry_ok; body=%s", id, recorder.Body.String())
+	}
+	if failingHits != 1 || healthyHits != 1 {
+		t.Fatalf("upstream hits = failing %d healthy %d, want 1/1", failingHits, healthyHits)
 	}
 }
 
@@ -1455,6 +1670,25 @@ func TestShouldRetryHTTPStatusSplitsRateLimitBudget(t *testing.T) {
 	}
 	if generalRetries != 1 || rateLimitRetries != 1 {
 		t.Fatalf("budgets = general %d rate %d, want 1/1", generalRetries, rateLimitRetries)
+	}
+}
+
+func TestShouldRetryHTTPStatusRetriesGateway5xx(t *testing.T) {
+	for _, statusCode := range []int{
+		http.StatusBadGateway,
+		http.StatusGatewayTimeout,
+		cloudflareOriginResponseTimeoutStatus,
+	} {
+		generalRetries := 0
+		if !shouldRetryHTTPStatus(statusCode, &generalRetries, nil, 1, 1) {
+			t.Fatalf("status %d should consume general retry budget", statusCode)
+		}
+		if generalRetries != 1 {
+			t.Fatalf("generalRetries = %d, want 1", generalRetries)
+		}
+		if shouldRetryHTTPStatus(statusCode, &generalRetries, nil, 1, 1) {
+			t.Fatalf("status %d should stop after general retry budget is exhausted", statusCode)
+		}
 	}
 }
 
@@ -1955,6 +2189,100 @@ func TestApplyResponseFailedUsageLimitCanBeIgnoredPerAccount(t *testing.T) {
 	}
 }
 
+func TestApply429CooldownIgnoreFailureCooldownSkipsModelCooldown(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{
+		DBID:                        303,
+		AccessToken:                 "at",
+		PlanType:                    "pro",
+		Status:                      auth.StatusReady,
+		IgnoreUsageLimit429Cooldown: true,
+	}
+	store.AddAccount(account)
+
+	decision := Apply429Cooldown(store, account, []byte(`{"error":{"type":"rate_limit_error","message":"Too many requests"}}`), &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if decision != (codex429Decision{}) {
+		t.Fatalf("decision = %#v, want empty ignored decision", decision)
+	}
+	if account.IsModelRateLimited("gpt-5.4") {
+		t.Fatal("IsModelRateLimited() = true, want false")
+	}
+	if account.HasActiveCooldown() {
+		t.Fatal("HasActiveCooldown() = true, want false")
+	}
+	if next := store.Next(); next == nil || next.ID() != account.ID() {
+		t.Fatalf("store.Next() = %#v, want account %d", next, account.ID())
+	}
+}
+
+func TestApplyCooldownIgnoreFailureCooldownSkipsNon429Cooldowns(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	handler := &Handler{store: store}
+
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		body       []byte
+	}{
+		{
+			name:       "unauthorized",
+			statusCode: http.StatusUnauthorized,
+			body:       []byte(`{"error":{"message":"Invalid token"}}`),
+		},
+		{
+			name:       "payment required",
+			statusCode: http.StatusPaymentRequired,
+			body:       []byte(`{"error":{"message":"payment required"}}`),
+		},
+		{
+			name:       "forbidden",
+			statusCode: http.StatusForbidden,
+			body:       []byte(`{"error":{"message":"forbidden"}}`),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			account := &auth.Account{
+				DBID:                        400 + int64(tc.statusCode),
+				AccessToken:                 "at",
+				PlanType:                    "pro",
+				Status:                      auth.StatusReady,
+				IgnoreUsageLimit429Cooldown: true,
+			}
+			store.AddAccount(account)
+
+			decision := handler.applyCooldownForModel(account, tc.statusCode, tc.body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+			if decision != (codex429Decision{}) {
+				t.Fatalf("decision = %#v, want empty ignored decision", decision)
+			}
+			if account.HasActiveCooldown() {
+				t.Fatal("HasActiveCooldown() = true, want false")
+			}
+			if got := account.RuntimeStatus(); got != "active" {
+				t.Fatalf("RuntimeStatus() = %q, want active", got)
+			}
+			if !account.IsAvailable() {
+				t.Fatal("IsAvailable() = false, want true")
+			}
+			if tc.statusCode == http.StatusUnauthorized {
+				if got := classifyHTTPFailureForAccount(account, http.StatusUnauthorized); got != "client" {
+					t.Fatalf("classifyHTTPFailureForAccount = %q, want client", got)
+				}
+				generalRetries := 0
+				if shouldRetryHTTPStatusForAccount(account, http.StatusUnauthorized, &generalRetries, nil, 1, 1) {
+					t.Fatal("ignored 401 should not consume retry budget")
+				}
+				payload := []byte(`{"type":"response.failed","response":{"error":{"type":"invalid_api_key","message":"Invalid token"}}}`)
+				outcome := classifyResponseFailedOutcomeForAccount(account, payload)
+				if outcome.failureKind != "client" || outcome.penalize {
+					t.Fatalf("response.failed outcome = %#v, want client without penalty", outcome)
+				}
+			}
+		})
+	}
+}
+
 func TestResponseFailedRetryableClassification(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -2132,6 +2460,49 @@ func TestSyncCodexUsageStateMarks7dUsageLimited(t *testing.T) {
 	}
 	if row.CooldownReason != "rate_limited" || !row.CooldownUntil.Valid {
 		t.Fatalf("persisted cooldown = (%q, %v), want active rate_limited", row.CooldownReason, row.CooldownUntil)
+	}
+}
+
+func TestSyncCodexFailureUsageStateCanBeIgnoredPerAccount(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{
+		DBID:                        304,
+		AccessToken:                 "at",
+		PlanType:                    "free",
+		Status:                      auth.StatusReady,
+		IgnoreUsageLimit429Cooldown: true,
+	}
+	store.AddAccount(account)
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "100")
+	resp.Header.Set("x-codex-primary-window-minutes", "300")
+	resp.Header.Set("x-codex-primary-reset-after-seconds", "600")
+	resp.Header.Set("x-codex-secondary-used-percent", "100")
+	resp.Header.Set("x-codex-secondary-window-minutes", "10080")
+	resp.Header.Set("x-codex-secondary-reset-after-seconds", "3600")
+
+	result := SyncCodexFailureUsageState(store, account, resp)
+
+	if result != (CodexUsageSyncResult{}) {
+		t.Fatalf("result = %#v, want empty ignored result", result)
+	}
+	if _, ok := account.GetUsagePercent7d(); ok {
+		t.Fatal("7d usage snapshot should not be written from ignored failure response")
+	}
+	if _, _, ok := account.GetUsageSnapshot5h(); ok {
+		t.Fatal("5h usage snapshot should not be written from ignored failure response")
+	}
+	if account.IsPremium5hRateLimited() {
+		t.Fatal("premium 5h rate limit should not be written from ignored failure response")
+	}
+	if account.HasActiveCooldown() {
+		t.Fatal("HasActiveCooldown() = true, want false")
+	}
+	if got := account.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active", got)
+	}
+	if next := store.Next(); next == nil || next.ID() != account.ID() {
+		t.Fatalf("store.Next() = %#v, want account %d", next, account.ID())
 	}
 }
 

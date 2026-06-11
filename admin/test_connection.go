@@ -108,17 +108,21 @@ func (h *Handler) TestConnection(c *gin.Context) {
 
 	if resp.StatusCode != http.StatusOK {
 		if !isOpenAIResponsesAccount && !isTransient {
-			proxy.SyncCodexUsageState(h.store, account, resp)
+			proxy.SyncCodexFailureUsageState(h.store, account, resp)
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		errMsg := fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))
 		if !isTransient {
 			switch resp.StatusCode {
 			case http.StatusUnauthorized:
-				h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", errMsg)
+				if !proxy.ShouldIgnoreFailureCooldown(account) {
+					h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", errMsg)
+				}
 			case http.StatusTooManyRequests:
 				if isOpenAIResponsesAccount {
-					h.store.MarkCooldown(account, time.Minute, "rate_limited")
+					if !proxy.ShouldIgnoreFailureCooldown(account) {
+						h.store.MarkCooldown(account, time.Minute, "rate_limited")
+					}
 				} else {
 					proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
 				}
@@ -930,9 +934,11 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			return h.handleBatchTestReadError(testCtx, acc, readErr)
 		}
 		if !acc.IsOpenAIResponsesAPI() {
-			proxy.SyncCodexUsageState(h.store, acc, resp)
+			proxy.SyncCodexFailureUsageState(h.store, acc, resp)
 		}
-		h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
+		if !proxy.ShouldIgnoreFailureCooldown(acc) {
+			h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
+		}
 		return "banned", "账号授权失败"
 	case http.StatusTooManyRequests:
 		body, readErr := readBatchTestErrorBody(testCtx, resp.Body)
@@ -940,9 +946,11 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			return h.handleBatchTestReadError(testCtx, acc, readErr)
 		}
 		if acc.IsOpenAIResponsesAPI() {
-			h.store.MarkCooldown(acc, time.Minute, "rate_limited")
+			if !proxy.ShouldIgnoreFailureCooldown(acc) {
+				h.store.MarkCooldown(acc, time.Minute, "rate_limited")
+			}
 		} else {
-			proxy.SyncCodexUsageState(h.store, acc, resp)
+			proxy.SyncCodexFailureUsageState(h.store, acc, resp)
 			proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
 		}
 		return "rate_limited", "账号触发 429 限流"
@@ -1118,7 +1126,9 @@ func (h *Handler) batchTestWhamPreflight(ctx context.Context, acc *auth.Account)
 		switch resp.StatusCode {
 		case http.StatusUnauthorized:
 			msg := fmt.Sprintf("WHAM 用量探针返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
-			h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", msg)
+			if !proxy.ShouldIgnoreFailureCooldown(acc) {
+				h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", msg)
+			}
 			return "banned", msg, true
 		default:
 			if shouldMarkUsageProbeAccountError(resp.StatusCode, body) {

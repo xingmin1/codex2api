@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -35,6 +36,8 @@ type Handler struct {
 	cfg        *config.Config       // 全局配置
 	deviceCfg  *DeviceProfileConfig // 设备指纹配置
 	cache      cache.TokenCache     // Redis/Memory 运行态缓存
+
+	longCompactFallbacks sync.Map // map[string]int64，记录需要优先走长压缩池的 API Key / 会话
 }
 
 const (
@@ -42,6 +45,10 @@ const (
 	apiKeyCountCacheNamespace = "api-key-count"
 	apiKeyCacheTTL            = 5 * time.Minute
 	apiKeyCountCacheTTL       = 30 * time.Second
+
+	cloudflareOriginResponseTimeoutStatus = 524
+	longCompactAccountTag                 = "long-compact"
+	longCompactFallbackTTL                = 6 * time.Hour
 )
 
 type apiKeyRuntimeRecord struct {
@@ -229,6 +236,76 @@ func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.
 		}
 		return codexFilter(account)
 	}
+}
+
+func accountHasTag(account *auth.Account, tag string) bool {
+	if account == nil {
+		return false
+	}
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return false
+	}
+	account.Mu().RLock()
+	defer account.Mu().RUnlock()
+	for _, candidate := range account.Tags {
+		if strings.EqualFold(strings.TrimSpace(candidate), tag) {
+			return true
+		}
+	}
+	return false
+}
+
+func longCompactAccountFilter(base auth.AccountFilter) auth.AccountFilter {
+	return func(account *auth.Account) bool {
+		if base != nil && !base(account) {
+			return false
+		}
+		return accountHasTag(account, longCompactAccountTag)
+	}
+}
+
+func regularCompactAccountFilter(base auth.AccountFilter) auth.AccountFilter {
+	return func(account *auth.Account) bool {
+		if base != nil && !base(account) {
+			return false
+		}
+		return !accountHasTag(account, longCompactAccountTag)
+	}
+}
+
+func longCompactFallbackPreferenceKey(apiKeyID int64, sessionID string) string {
+	if apiKeyID > 0 {
+		return fmt.Sprintf("api-key:%d", apiKeyID)
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID != "" {
+		return "session:" + sessionID
+	}
+	return ""
+}
+
+func (h *Handler) shouldPreferLongCompactFallback(key string) bool {
+	if h == nil || strings.TrimSpace(key) == "" {
+		return false
+	}
+	raw, ok := h.longCompactFallbacks.Load(key)
+	if !ok {
+		return false
+	}
+	expiresAt, ok := raw.(int64)
+	if !ok || time.Now().UnixNano() >= expiresAt {
+		h.longCompactFallbacks.Delete(key)
+		return false
+	}
+	return true
+}
+
+func (h *Handler) rememberLongCompactFallback(key string) {
+	if h == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	h.longCompactFallbacks.Store(key, time.Now().Add(longCompactFallbackTTL).UnixNano())
 }
 
 func modelIDInList(model string, models []string) bool {
@@ -704,6 +781,8 @@ func classifyHTTPFailure(statusCode int) string {
 		return "unauthorized"
 	case statusCode == http.StatusTooManyRequests:
 		return "" // 429 由 applyCooldown 单独处理
+	case statusCode == cloudflareOriginResponseTimeoutStatus:
+		return "timeout"
 	case statusCode >= 500:
 		return "server"
 	case statusCode >= 400:
@@ -714,7 +793,9 @@ func classifyHTTPFailure(statusCode int) string {
 }
 
 func shouldTreatUnauthorizedAsClientError(account *auth.Account, statusCode int) bool {
-	return statusCode == http.StatusUnauthorized && account != nil && account.ShouldIgnoreUnauthorizedCooldown()
+	return statusCode == http.StatusUnauthorized &&
+		account != nil &&
+		(account.ShouldIgnoreUnauthorizedCooldown() || shouldIgnoreAccountFailureCooldown(account))
 }
 
 func classifyHTTPFailureForAccount(account *auth.Account, statusCode int) string {
@@ -722,6 +803,27 @@ func classifyHTTPFailureForAccount(account *auth.Account, statusCode int) string
 		return "client"
 	}
 	return classifyHTTPFailure(statusCode)
+}
+
+func isCloudflareOriginResponseTimeout(statusCode int, body []byte) bool {
+	if statusCode != cloudflareOriginResponseTimeoutStatus {
+		return false
+	}
+	errorName := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error_name").String()))
+	if errorName == "origin_response_timeout" {
+		return true
+	}
+	if gjson.GetBytes(body, "error_code").Int() == cloudflareOriginResponseTimeoutStatus {
+		return true
+	}
+	raw := strings.ToLower(string(body))
+	return strings.Contains(raw, "origin_response_timeout") ||
+		strings.Contains(raw, "cloudflare-5xx-errors/error-524")
+}
+
+func shouldFallbackToLongCompactAccount(statusCode int, body []byte, account *auth.Account) bool {
+	return isCloudflareOriginResponseTimeout(statusCode, body) &&
+		!accountHasTag(account, longCompactAccountTag)
 }
 
 type streamOutcome struct {
@@ -1216,7 +1318,11 @@ const (
 
 // isRetryableStatus 检查是否可重试的上游状态码
 func isRetryableStatus(code int) bool {
-	return code == http.StatusServiceUnavailable || code == http.StatusUnauthorized || code == http.StatusInternalServerError
+	if code == http.StatusUnauthorized {
+		return true
+	}
+	// 设置页承诺“5xx 自动换号重试”，因此所有上游 5xx 都走通用重试预算。
+	return code >= http.StatusInternalServerError && code < 600
 }
 
 func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
@@ -1298,6 +1404,11 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 			return decision.Reason
 		}
 		return "rate_limited"
+	case cloudflareOriginResponseTimeoutStatus:
+		if isCloudflareOriginResponseTimeout(statusCode, body) {
+			return "timeout"
+		}
+		return "server"
 	case http.StatusUnauthorized:
 		return "unauthorized"
 	case http.StatusPaymentRequired, http.StatusForbidden:
@@ -1926,7 +2037,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexUsageState(h.store, account, resp)
+			SyncCodexFailureUsageState(h.store, account, resp)
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			retryExclusions.MarkHard(account.ID())
@@ -2334,6 +2445,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	regularCompactFilter := regularCompactAccountFilter(accountFilter)
+	longCompactFilter := longCompactAccountFilter(accountFilter)
+	longCompactPreferenceKey := longCompactFallbackPreferenceKey(apiKeyID, sessionID)
+	preferLongCompactAccounts := h.shouldPreferLongCompactFallback(longCompactPreferenceKey)
 
 	// compact 走中转账号时需要 OpenAI Responses 形态的请求体
 	openAIResponsesBody := PrepareOpenAIResponsesCompactBody(rawBody)
@@ -2349,11 +2464,27 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	invalidEncryptedContentRetried := false
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
+		activeAccountFilter := regularCompactFilter
+		if preferLongCompactAccounts {
+			activeAccountFilter = longCompactFilter
+		}
+		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, activeAccountFilter)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, activeAccountFilter)
 			if account == nil {
+				if preferLongCompactAccounts {
+					if isCloudflareOriginResponseTimeout(lastStatusCode, lastBody) {
+						h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+						return
+					}
+					preferLongCompactAccounts = false
+					continue
+				}
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
+				if isCloudflareOriginResponseTimeout(lastStatusCode, lastBody) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
@@ -2435,6 +2566,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 				shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				fallbackToLongCompact := shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -2450,11 +2582,20 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					RequestedServiceTier: usageTiers.RequestedServiceTier,
 					ActualServiceTier:    usageTiers.ActualServiceTier,
 					BillingServiceTier:   usageTiers.BillingServiceTier,
-					IsRetryAttempt:       shouldRetry,
+					IsRetryAttempt:       shouldRetry || fallbackToLongCompact,
 					AttemptIndex:         attempt + 1,
 					UpstreamErrorKind:    upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 					ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 				})
+
+				if fallbackToLongCompact {
+					lastStatusCode = resp.StatusCode
+					lastBody = errBody
+					h.rememberLongCompactFallback(longCompactPreferenceKey)
+					preferLongCompactAccounts = true
+					log.Printf("compact 上游返回 Cloudflare 524，切换到带 %q 标签的长压缩账号池重试 (attempt %d, account %d)", longCompactAccountTag, attempt+1, account.ID())
+					continue
+				}
 
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
@@ -2570,7 +2711,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexUsageState(h.store, account, resp)
+			SyncCodexFailureUsageState(h.store, account, resp)
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
@@ -2579,6 +2720,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			fallbackToLongCompact := shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -2594,11 +2736,20 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				RequestedServiceTier: usageTiers.RequestedServiceTier,
 				ActualServiceTier:    usageTiers.ActualServiceTier,
 				BillingServiceTier:   usageTiers.BillingServiceTier,
-				IsRetryAttempt:       shouldRetry,
+				IsRetryAttempt:       shouldRetry || fallbackToLongCompact,
 				AttemptIndex:         attempt + 1,
 				UpstreamErrorKind:    upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 				ErrorMessage:         usageLogErrorMessage(resp.StatusCode, errBody),
 			})
+
+			if fallbackToLongCompact {
+				lastStatusCode = resp.StatusCode
+				lastBody = errBody
+				h.rememberLongCompactFallback(longCompactPreferenceKey)
+				preferLongCompactAccounts = true
+				log.Printf("compact 上游返回 Cloudflare 524，切换到带 %q 标签的长压缩账号池重试 (attempt %d, account %d)", longCompactAccountTag, attempt+1, account.ID())
+				continue
+			}
 
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
@@ -2884,7 +3035,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexUsageState(h.store, account, resp)
+			SyncCodexFailureUsageState(h.store, account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
@@ -3550,13 +3701,18 @@ func usageLimitFallbackCooldown(account *auth.Account, body []byte) time.Duratio
 	}
 }
 
-func shouldIgnoreUsageLimit429Cooldown(account *auth.Account, body []byte) bool {
-	return account != nil && account.ShouldIgnoreUsageLimit429Cooldown() && IsUsageLimitReachedError(body)
+// ShouldIgnoreFailureCooldown 返回账号是否忽略上游失败导致的冷却或用量耗尽写入。
+func ShouldIgnoreFailureCooldown(account *auth.Account) bool {
+	return account != nil && account.ShouldIgnoreUsageLimit429Cooldown()
+}
+
+func shouldIgnoreAccountFailureCooldown(account *auth.Account) bool {
+	return ShouldIgnoreFailureCooldown(account)
 }
 
 // Apply429Cooldown 统一处理 429 对账号状态的影响。
 func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, resp *http.Response, model string) codex429Decision {
-	if shouldIgnoreUsageLimit429Cooldown(account, body) {
+	if shouldIgnoreAccountFailureCooldown(account) {
 		return codex429Decision{}
 	}
 	decision := classify429RateLimit(account, body, resp, time.Now(), model)
@@ -3586,9 +3742,10 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 }
 
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
+	ignoreFailureCooldown := shouldIgnoreAccountFailureCooldown(account)
 	if IsUsageLimitReachedError(body) {
-		if shouldIgnoreUsageLimit429Cooldown(account, body) {
-			log.Printf("账号 %d 已配置忽略 usage_limit_reached 429 冷却，本次按普通上游错误处理", account.ID())
+		if ignoreFailureCooldown {
+			log.Printf("账号 %d 已配置忽略失败冷却，本次 usage_limit_reached 仅按失败请求记录", account.ID())
 			return codex429Decision{}
 		}
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
@@ -3597,6 +3754,10 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 	}
 	switch statusCode {
 	case http.StatusTooManyRequests:
+		if ignoreFailureCooldown {
+			log.Printf("账号 %d 已配置忽略失败冷却，本次 429 仅按失败请求记录", account.ID())
+			return codex429Decision{}
+		}
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
 		if decision.Scope == rateLimitScopeModel {
 			log.Printf("账号 %d 模型 %s 触发短时限流 (reason=%s)，冷却到 %s", account.ID(), decision.Model, decision.Reason, decision.ResetAt.Format(time.RFC3339))
@@ -3606,7 +3767,7 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 		return decision
 	case http.StatusUnauthorized:
 		if shouldTreatUnauthorizedAsClientError(account, statusCode) {
-			log.Printf("账号 %d 已配置将 401 当作普通上游错误，不进入封禁或冷却", account.ID())
+			log.Printf("账号 %d 已配置将 401 或失败冷却当作普通上游错误，不进入封禁、清理或冷却", account.ID())
 			return codex429Decision{}
 		}
 
@@ -3638,6 +3799,10 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 			if h.store != nil {
 				h.store.MarkError(account, upstreamAccountErrorMessage(statusCode, body))
 			}
+			return codex429Decision{}
+		}
+		if ignoreFailureCooldown {
+			log.Printf("账号 %d 已配置忽略失败冷却，本次 %d 不写入 payment_required 冷却", account.ID(), statusCode)
 			return codex429Decision{}
 		}
 		h.store.MarkCooldown(account, 30*time.Minute, "payment_required")
@@ -3761,6 +3926,17 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 	}
 
 	return result
+}
+
+// SyncCodexFailureUsageState 解析失败响应中的 Codex 用量头。
+//
+// 账号开启“忽略所有失败冷却”时，失败响应只记录请求失败，不再根据响应头写入
+// plan / 5h / 7d 用量快照、usage_exhausted 或 premium 5h 冷却状态。
+func SyncCodexFailureUsageState(store *auth.Store, account *auth.Account, resp *http.Response) CodexUsageSyncResult {
+	if ShouldIgnoreFailureCooldown(account) {
+		return CodexUsageSyncResult{}
+	}
+	return SyncCodexUsageState(store, account, resp)
 }
 
 // parseCodexUsageHeaders 从 Codex 响应头解析 5h/7d 用量百分比

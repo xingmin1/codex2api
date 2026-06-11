@@ -958,7 +958,7 @@ func (a *Account) quotaAutoPausedLocked(now time.Time) bool {
 	return quotaAutoPausedByWindow(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, a.AutoPause7dThreshold, a.AutoPause7dDisabled, now)
 }
 
-// ShouldIgnoreUsageLimit429Cooldown 返回该账号是否把 usage_limit_reached 429 当作普通上游错误。
+// ShouldIgnoreUsageLimit429Cooldown 返回该账号是否忽略请求失败导致的冷却与用量耗尽写入。
 func (a *Account) ShouldIgnoreUsageLimit429Cooldown() bool {
 	if a == nil {
 		return false

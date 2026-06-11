@@ -1104,8 +1104,10 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
+			if !ShouldIgnoreFailureCooldown(account) {
+				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
+					h.store.PersistUsageSnapshot(account, usagePct)
+				}
 			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
