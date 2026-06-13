@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +50,15 @@ const (
 	cloudflareOriginResponseTimeoutStatus = 524
 	longCompactAccountTag                 = "long-compact"
 	longCompactFallbackTTL                = 6 * time.Hour
+
+	transientUpstreamRetryDefaultBaseDelay = 500 * time.Millisecond
+	transientUpstreamRetryDefaultMaxDelay  = 15 * time.Second
+)
+
+var (
+	transientUpstreamRetryBaseDelay = transientUpstreamRetryDefaultBaseDelay
+	transientUpstreamRetryMaxDelay  = transientUpstreamRetryDefaultMaxDelay
+	transientUpstreamRetrySleep     = sleepForTransientUpstreamRetry
 )
 
 type apiKeyRuntimeRecord struct {
@@ -1361,6 +1371,175 @@ func shouldRetryRequestError(err error, generalRetries *int, maxGeneralRetries i
 	return false
 }
 
+func shouldPersistTransientUpstreamStatus(statusCode int, body []byte) bool {
+	if IsUsageLimitReachedError(body) {
+		return false
+	}
+	return statusCode >= http.StatusInternalServerError && statusCode < 600
+}
+
+func shouldPersistTransientRequestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if classifyTransportFailure(err) != "" {
+		return true
+	}
+	var proxyErr *Error
+	if errors.As(err, &proxyErr) {
+		return proxyErr.HTTPStatus >= http.StatusInternalServerError && proxyErr.HTTPStatus < 600
+	}
+	return false
+}
+
+type transientUpstreamRetryState struct {
+	active      bool
+	rounds      int
+	statusCode  int
+	message     string
+	retryAfter  time.Duration
+	transport   bool
+	lastAccount int64
+}
+
+func (s *transientUpstreamRetryState) rememberHTTP(accountID int64, statusCode int, body []byte, resp *http.Response) {
+	if s == nil {
+		return
+	}
+	s.active = true
+	s.statusCode = statusCode
+	s.message = usageLogErrorMessage(statusCode, body)
+	s.retryAfter = parseTransientRetryAfter(resp, body)
+	s.transport = false
+	s.lastAccount = accountID
+}
+
+func (s *transientUpstreamRetryState) rememberTransport(accountID int64, err error) {
+	if s == nil {
+		return
+	}
+	s.active = true
+	s.statusCode = 0
+	s.message = strings.TrimSpace(fmt.Sprint(err))
+	s.retryAfter = 0
+	s.transport = true
+	s.lastAccount = accountID
+}
+
+func (s *transientUpstreamRetryState) clear() {
+	if s == nil {
+		return
+	}
+	*s = transientUpstreamRetryState{}
+}
+
+func (s *transientUpstreamRetryState) delay() time.Duration {
+	if s == nil || !s.active {
+		return 0
+	}
+	return transientUpstreamRetryDelay(s.rounds, s.retryAfter)
+}
+
+func (s *transientUpstreamRetryState) nextRound() {
+	if s == nil {
+		return
+	}
+	s.rounds++
+}
+
+func parseTransientRetryAfter(resp *http.Response, body []byte) time.Duration {
+	if resp != nil {
+		if delay := parseRetryAfterHeader(resp.Header.Get("Retry-After")); delay > 0 {
+			return delay
+		}
+	}
+	if len(body) == 0 {
+		return 0
+	}
+	for _, path := range []string{"retry_after", "error.retry_after", "response.error.retry_after", "response.status_details.error.retry_after"} {
+		result := gjson.GetBytes(body, path)
+		if !result.Exists() {
+			continue
+		}
+		if seconds := result.Float(); seconds > 0 {
+			return time.Duration(seconds * float64(time.Second))
+		}
+	}
+	return 0
+}
+
+func parseRetryAfterHeader(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if resetAt, err := http.ParseTime(value); err == nil {
+		delay := time.Until(resetAt)
+		if delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+func transientUpstreamRetryDelay(round int, retryAfter time.Duration) time.Duration {
+	maxDelay := transientUpstreamRetryMaxDelay
+	if maxDelay < 0 {
+		maxDelay = 0
+	}
+	if retryAfter > 0 {
+		if maxDelay > 0 && retryAfter > maxDelay {
+			return maxDelay
+		}
+		return retryAfter
+	}
+
+	delay := transientUpstreamRetryBaseDelay
+	if delay < 0 {
+		delay = 0
+	}
+	for i := 0; i < round && delay > 0; i++ {
+		if maxDelay > 0 && delay >= maxDelay {
+			return maxDelay
+		}
+		delay *= 2
+	}
+	if maxDelay > 0 && delay > maxDelay {
+		return maxDelay
+	}
+	return delay
+}
+
+func sleepForTransientUpstreamRetry(ctx context.Context, delay time.Duration) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if delay <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func sendTransientRetryCanceled(c *gin.Context) {
+	c.JSON(logStatusClientClosed, gin.H{
+		"error": gin.H{
+			"message": "请求已取消，停止瞬时上游错误重试",
+			"type":    ErrorTypeServerError,
+			"code":    "client_closed",
+		},
+	})
+}
+
 func IsDeactivatedWorkspaceError(body []byte) bool {
 	for _, path := range []string{"detail.code", "error.code", "code"} {
 		code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, path).String()))
@@ -1565,6 +1744,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	transientRetry := transientUpstreamRetryState{}
 	forceHTTPAfterWSMessageTooBig := false
 	invalidEncryptedContentRetried := false
 
@@ -1583,6 +1763,18 @@ func (h *Handler) Responses(c *gin.Context) {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
+			}
+			if transientRetry.active {
+				delay := transientRetry.delay()
+				log.Printf("OpenAI Responses 瞬时上游错误账号池本轮已试完，等待 %s 后继续重试 (round %d, last_status=%d, last_account=%d, transport=%t, message=%q)",
+					delay, transientRetry.rounds+1, transientRetry.statusCode, transientRetry.lastAccount, transientRetry.transport, transientRetry.message)
+				if !transientUpstreamRetrySleep(c.Request.Context(), delay) {
+					sendTransientRetryCanceled(c)
+					return
+				}
+				retryExclusions = newRetryAccountExclusions()
+				transientRetry.nextRound()
+				continue
 			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 			return
@@ -1639,6 +1831,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				if retryable {
 					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 				}
+				persistentTransient := shouldPersistTransientRequestError(reqErr)
+				if persistentTransient && !shouldRetry {
+					shouldRetry = true
+					log.Printf("OpenAI Responses 上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr)
+				}
 				if kind != "" && !(timedOut && shouldRetry) {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
@@ -1660,6 +1857,11 @@ func (h *Handler) Responses(c *gin.Context) {
 
 				log.Printf("OpenAI Responses 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 				if shouldRetry {
+					if persistentTransient && !timedOut {
+						transientRetry.rememberTransport(account.ID(), reqErr)
+					} else {
+						transientRetry.clear()
+					}
 					continue
 				}
 				ErrorToGinResponse(c, reqErr)
@@ -1706,6 +1908,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 				shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody)
+				if persistentTransient && !shouldRetry {
+					shouldRetry = true
+					log.Printf("OpenAI Responses 上游 %d 已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d)", resp.StatusCode, attempt+1, account.ID())
+				}
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -1732,6 +1939,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
+					if persistentTransient {
+						transientRetry.rememberHTTP(account.ID(), resp.StatusCode, errBody, resp)
+					} else {
+						transientRetry.clear()
+					}
 					continue
 				}
 
@@ -1981,6 +2193,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			if retryable {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
+			persistentTransient := shouldPersistTransientRequestError(reqErr)
+			if persistentTransient && !shouldRetry {
+				shouldRetry = true
+				log.Printf("上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr)
+			}
 			if kind != "" && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -2003,6 +2220,11 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			if shouldRetry {
+				if persistentTransient && !timedOut {
+					transientRetry.rememberTransport(account.ID(), reqErr)
+				} else {
+					transientRetry.clear()
+				}
 				continue
 			}
 			ErrorToGinResponse(c, reqErr)
@@ -2047,6 +2269,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody)
+			if persistentTransient && !shouldRetry {
+				shouldRetry = true
+				log.Printf("上游 %d 已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d, /v1/responses)", resp.StatusCode, attempt+1, account.ID())
+			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -2073,6 +2300,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				if persistentTransient {
+					transientRetry.rememberHTTP(account.ID(), resp.StatusCode, errBody, resp)
+				} else {
+					transientRetry.clear()
+				}
 				continue
 			}
 

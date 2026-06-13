@@ -1244,6 +1244,144 @@ func TestResponsesRetriesOpenAIResponsesBadGatewayOnAnotherAccount(t *testing.T)
 	}
 }
 
+func withImmediateTransientUpstreamRetry(t *testing.T) {
+	t.Helper()
+	oldSleep := transientUpstreamRetrySleep
+	oldBaseDelay := transientUpstreamRetryBaseDelay
+	oldMaxDelay := transientUpstreamRetryMaxDelay
+	transientUpstreamRetrySleep = func(ctx context.Context, _ time.Duration) bool {
+		return ctx.Err() == nil
+	}
+	transientUpstreamRetryBaseDelay = 0
+	transientUpstreamRetryMaxDelay = 0
+	t.Cleanup(func() {
+		transientUpstreamRetrySleep = oldSleep
+		transientUpstreamRetryBaseDelay = oldBaseDelay
+		transientUpstreamRetryMaxDelay = oldMaxDelay
+	})
+}
+
+func TestResponsesContinuesOpenAIResponsesTransient5xxAfterRetryBudget(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withImmediateTransientUpstreamRetry(t)
+
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits <= 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"Upstream request failed","type":"upstream_error"},"retry_after":60}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_transient_retry_ok",
+			"object":"response",
+			"created_at":1710000000,
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+		TestModel:           "gpt-4.1-direct",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-transient",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-4.1-direct","input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if id := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); id != "resp_transient_retry_ok" {
+		t.Fatalf("response id = %q, want resp_transient_retry_ok; body=%s", id, recorder.Body.String())
+	}
+	if hits != 3 {
+		t.Fatalf("upstream hits = %d, want 3", hits)
+	}
+}
+
+func TestResponsesStopsOpenAIResponsesTransientRetryWhenContextCanceled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	oldSleep := transientUpstreamRetrySleep
+	oldBaseDelay := transientUpstreamRetryBaseDelay
+	oldMaxDelay := transientUpstreamRetryMaxDelay
+	reqCtx, cancel := context.WithCancel(context.Background())
+	transientUpstreamRetrySleep = func(ctx context.Context, _ time.Duration) bool {
+		cancel()
+		return false
+	}
+	transientUpstreamRetryBaseDelay = 0
+	transientUpstreamRetryMaxDelay = 0
+	t.Cleanup(func() {
+		cancel()
+		transientUpstreamRetrySleep = oldSleep
+		transientUpstreamRetryBaseDelay = oldBaseDelay
+		transientUpstreamRetryMaxDelay = oldMaxDelay
+	})
+
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":{"message":"Upstream request failed","type":"upstream_error"}}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+		TestModel:           "gpt-4.1-direct",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-transient",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-4.1-direct","input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)).WithContext(reqCtx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != logStatusClientClosed {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, logStatusClientClosed, recorder.Body.String())
+	}
+	if hits == 0 {
+		t.Fatal("upstream should be called before cancellation stops retrying")
+	}
+}
+
 func TestPopulateCompactUsageMetaFromRequest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
