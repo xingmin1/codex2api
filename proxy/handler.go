@@ -1447,6 +1447,30 @@ func (s *transientUpstreamRetryState) nextRound() {
 	s.rounds++
 }
 
+func shouldStripEncryptedContentAfterPersistentTransientRetry(state transientUpstreamRetryState, alreadyStripped bool) bool {
+	return !alreadyStripped &&
+		state.active &&
+		!state.transport &&
+		state.rounds >= 1 &&
+		state.statusCode >= http.StatusInternalServerError &&
+		state.statusCode < 600
+}
+
+func stripPersistentEncryptedContentRetryBodies(rawBody, codexBody []byte) ([]byte, []byte, bool) {
+	strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
+	strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+	if !rawChanged && !codexChanged {
+		return rawBody, codexBody, false
+	}
+	if rawChanged {
+		rawBody = strippedRawBody
+	}
+	if codexChanged {
+		codexBody = strippedCodexBody
+	}
+	return rawBody, codexBody, true
+}
+
 func parseTransientRetryAfter(resp *http.Response, body []byte) time.Duration {
 	if resp != nil {
 		if delay := parseRetryAfterHeader(resp.Header.Get("Retry-After")); delay > 0 {
@@ -1491,9 +1515,6 @@ func transientUpstreamRetryDelay(round int, retryAfter time.Duration) time.Durat
 		maxDelay = 0
 	}
 	if retryAfter > 0 {
-		if maxDelay > 0 && retryAfter > maxDelay {
-			return maxDelay
-		}
 		return retryAfter
 	}
 
@@ -1538,6 +1559,10 @@ func sendTransientRetryCanceled(c *gin.Context) {
 			"code":    "client_closed",
 		},
 	})
+}
+
+func downstreamRequestCanceled(c *gin.Context) bool {
+	return c != nil && c.Request != nil && c.Request.Context().Err() != nil
 }
 
 func IsDeactivatedWorkspaceError(body []byte) bool {
@@ -1747,6 +1772,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	transientRetry := transientUpstreamRetryState{}
 	forceHTTPAfterWSMessageTooBig := false
 	invalidEncryptedContentRetried := false
+	persistentEncryptedContentStripped := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -1765,6 +1791,22 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 			if transientRetry.active {
+				if shouldStripEncryptedContentAfterPersistentTransientRetry(transientRetry, persistentEncryptedContentStripped) {
+					strippedRawBody, strippedCodexBody, changed := stripPersistentEncryptedContentRetryBodies(rawBody, codexBody)
+					if changed {
+						round := transientRetry.rounds + 1
+						persistentEncryptedContentStripped = true
+						invalidEncryptedContentRetried = true
+						rawBody = strippedRawBody
+						codexBody = strippedCodexBody
+						openAIResponsesBody = PrepareOpenAIResponsesBody(rawBody)
+						expandedInputRaw = responsesInputRaw(codexBody)
+						retryExclusions = newRetryAccountExclusions()
+						transientRetry.clear()
+						log.Printf("OpenAI Responses 连续 5xx 疑似旧会话 encrypted_content 不兼容，已移除加密 reasoning 上下文后重试 (round %d)", round)
+						continue
+					}
+				}
 				delay := transientRetry.delay()
 				log.Printf("OpenAI Responses 瞬时上游错误账号池本轮已试完，等待 %s 后继续重试 (round %d, last_status=%d, last_account=%d, transport=%t, message=%q)",
 					delay, transientRetry.rounds+1, transientRetry.statusCode, transientRetry.lastAccount, transientRetry.transport, transientRetry.message)
@@ -1825,6 +1867,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				if timedOut {
 					reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 				}
+				if downstreamRequestCanceled(c) {
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					sendTransientRetryCanceled(c)
+					return
+				}
 				kind := classifyTransportFailure(reqErr)
 				retryable := IsRetryableError(reqErr) || kind != ""
 				shouldRetry := false
@@ -1875,6 +1923,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				ttftGuard.Stop()
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+
+				if downstreamRequestCanceled(c) {
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					sendTransientRetryCanceled(c)
+					return
+				}
 
 				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
@@ -2180,6 +2235,12 @@ func (h *Handler) Responses(c *gin.Context) {
 			if timedOut {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
+			if downstreamRequestCanceled(c) {
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				sendTransientRetryCanceled(c)
+				return
+			}
 			kind := classifyTransportFailure(reqErr)
 			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
 				log.Printf("上游 WebSocket 请求帧过大，自动降级 HTTP 重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr)
@@ -2235,6 +2296,13 @@ func (h *Handler) Responses(c *gin.Context) {
 			ttftGuard.Stop()
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+
+			if downstreamRequestCanceled(c) {
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				sendTransientRetryCanceled(c)
+				return
+			}
 
 			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)

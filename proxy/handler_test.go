@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1321,6 +1322,97 @@ func TestResponsesContinuesOpenAIResponsesTransient5xxAfterRetryBudget(t *testin
 	}
 }
 
+func TestResponsesStripsEncryptedContentAfterPersistentOpenAIResponses502(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withImmediateTransientUpstreamRetry(t)
+
+	var bodies [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, body)
+		if bytes.Contains(body, []byte("encrypted_content")) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"Upstream request failed","type":"upstream_error"},"retry_after":60}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_stripped_retry_ok",
+			"object":"response",
+			"created_at":1710000000,
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+		TestModel:           "gpt-4.1-direct",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-transient",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"gpt-4.1-direct",
+		"input":[
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
+			{"type":"function_call_output","call_id":"call_123","output":"done"}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if id := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); id != "resp_stripped_retry_ok" {
+		t.Fatalf("response id = %q, want resp_stripped_retry_ok; body=%s", id, recorder.Body.String())
+	}
+	if len(bodies) != 3 {
+		t.Fatalf("upstream hits = %d, want 3", len(bodies))
+	}
+	if !bytes.Contains(bodies[0], []byte("encrypted_content")) || !bytes.Contains(bodies[1], []byte("encrypted_content")) {
+		t.Fatalf("first two requests should preserve original encrypted_content before fallback")
+	}
+	finalBody := bodies[len(bodies)-1]
+	if bytes.Contains(finalBody, []byte("encrypted_content")) {
+		t.Fatalf("final retry body should strip encrypted_content: %s", finalBody)
+	}
+	if items := gjson.GetBytes(finalBody, "input").Array(); len(items) != 2 {
+		t.Fatalf("final retry input item count = %d, want 2; body=%s", len(items), finalBody)
+	}
+}
+
+func TestTransientUpstreamRetryDelayHonorsRetryAfter(t *testing.T) {
+	oldMaxDelay := transientUpstreamRetryMaxDelay
+	transientUpstreamRetryMaxDelay = 15 * time.Second
+	t.Cleanup(func() {
+		transientUpstreamRetryMaxDelay = oldMaxDelay
+	})
+
+	delay := transientUpstreamRetryDelay(8, 60*time.Second)
+	if delay != 60*time.Second {
+		t.Fatalf("delay = %s, want retry-after 60s", delay)
+	}
+}
+
 func TestResponsesStopsOpenAIResponsesTransientRetryWhenContextCanceled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1379,6 +1471,75 @@ func TestResponsesStopsOpenAIResponsesTransientRetryWhenContextCanceled(t *testi
 	}
 	if hits == 0 {
 		t.Fatal("upstream should be called before cancellation stops retrying")
+	}
+}
+
+func TestResponsesStopsOpenAIResponsesRequestErrorWhenClientCanceled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withImmediateTransientUpstreamRetry(t)
+
+	newClosingServer := func(hits *atomic.Int32) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("test response writer does not support hijacking")
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Fatalf("hijack connection: %v", err)
+			}
+			_ = conn.Close()
+		}))
+	}
+
+	var firstHits atomic.Int32
+	var secondHits atomic.Int32
+	firstUpstream := newClosingServer(&firstHits)
+	defer firstUpstream.Close()
+	secondUpstream := newClosingServer(&secondHits)
+	defer secondUpstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          2,
+		MaxRateLimitRetries: 0,
+		TestModel:           "gpt-4.1-direct",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      firstUpstream.URL,
+		APIKey:       "sk-first",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         2,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      secondUpstream.URL,
+		APIKey:       "sk-second",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	body := []byte(`{"model":"gpt-4.1-direct","input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)).WithContext(reqCtx)
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != logStatusClientClosed {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, logStatusClientClosed, recorder.Body.String())
+	}
+	if hits := firstHits.Load() + secondHits.Load(); hits != 1 {
+		t.Fatalf("upstream hits = %d, want 1", hits)
 	}
 }
 

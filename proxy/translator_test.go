@@ -1611,11 +1611,13 @@ func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
 		"input":[
-			{"type":"message","role":"user","content":"hello"},
-			{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
-			{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"}
-		]
-	}`)
+				{"type":"message","role":"user","content":"hello"},
+				{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
+				{"type":"encrypted_content","encrypted_content":"gBBB"},
+				{"type":"compaction","encrypted_content":"gCCC"},
+				{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"}
+			]
+		}`)
 
 	got, changed := stripInvalidEncryptedContentFromResponsesBody(raw)
 	if !changed {
@@ -1623,7 +1625,7 @@ func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 	}
 	items := gjson.GetBytes(got, "input").Array()
 	if len(items) != 2 {
-		t.Fatalf("expected reasoning item to be removed, got %d items: %s", len(items), got)
+		t.Fatalf("expected encrypted-only items to be removed, got %d items: %s", len(items), got)
 	}
 	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
 		t.Fatalf("first input should remain message, got %q; body=%s", typ, got)

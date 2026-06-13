@@ -977,7 +977,8 @@ func stripInvalidEncryptedContentValue(value any, arrayItem bool) (any, bool, bo
 		return out, changed, true
 	case map[string]any:
 		changed := false
-		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" {
+		itemType := strings.TrimSpace(firstNonEmptyAnyString(v["type"]))
+		if isEncryptedOnlyResponsesItemType(itemType) {
 			if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
 				if arrayItem {
 					return nil, true, false
@@ -1003,6 +1004,15 @@ func stripInvalidEncryptedContentValue(value any, arrayItem bool) (any, bool, bo
 		return v, changed, true
 	default:
 		return value, false, true
+	}
+}
+
+func isEncryptedOnlyResponsesItemType(itemType string) bool {
+	switch itemType {
+	case "reasoning", "encrypted_content", "compaction", "context_compaction":
+		return true
+	default:
+		return false
 	}
 }
 
