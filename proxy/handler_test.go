@@ -1027,6 +1027,184 @@ func TestResponsesCompactReturnsOriginalCloudflare524WhenLongCompactPoolUnavaila
 	}
 }
 
+func TestResponsesCompactContinuesTransient5xxAfterRetryBudget(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withImmediateTransientUpstreamRetry(t)
+
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits <= 2 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"Upstream request failed","type":"upstream_error"},"retry_after":60}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_compact_transient_retry_ok",
+			"object":"response",
+			"created_at":1710000000,
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+		TestModel:           "gpt-4.1-direct",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-transient",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	recorder := performResponsesCompactRequest(t, handler, []byte(`{"model":"gpt-4.1-direct","input":"hello"}`), "compact-transient-session")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if id := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); id != "resp_compact_transient_retry_ok" {
+		t.Fatalf("response id = %q, want resp_compact_transient_retry_ok; body=%s", id, recorder.Body.String())
+	}
+	if hits != 3 {
+		t.Fatalf("upstream hits = %d, want 3", hits)
+	}
+}
+
+func TestResponsesCompactStripsEncryptedContentAfterPersistentOpenAIResponses502(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withImmediateTransientUpstreamRetry(t)
+
+	var bodies [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, body)
+		if bytes.Contains(body, []byte("encrypted_content")) {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"error":{"message":"Upstream request failed","type":"upstream_error"},"retry_after":60}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_compact_stripped_retry_ok",
+			"object":"response",
+			"created_at":1710000000,
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+		TestModel:           "gpt-4.1-direct",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-transient",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"gpt-4.1-direct",
+		"input":[
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
+			{"type":"function_call_output","call_id":"call_123","output":"done"}
+		]
+	}`)
+	recorder := performResponsesCompactRequest(t, handler, body, "compact-encrypted-session")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if id := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); id != "resp_compact_stripped_retry_ok" {
+		t.Fatalf("response id = %q, want resp_compact_stripped_retry_ok; body=%s", id, recorder.Body.String())
+	}
+	if len(bodies) != 3 {
+		t.Fatalf("upstream hits = %d, want 3", len(bodies))
+	}
+	if !bytes.Contains(bodies[0], []byte("encrypted_content")) || !bytes.Contains(bodies[1], []byte("encrypted_content")) {
+		t.Fatalf("first two requests should preserve original encrypted_content before fallback")
+	}
+	finalBody := bodies[len(bodies)-1]
+	if bytes.Contains(finalBody, []byte("encrypted_content")) {
+		t.Fatalf("final retry body should strip encrypted_content: %s", finalBody)
+	}
+	if items := gjson.GetBytes(finalBody, "input").Array(); len(items) != 2 {
+		t.Fatalf("final retry input item count = %d, want 2; body=%s", len(items), finalBody)
+	}
+}
+
+func TestResponsesCompactTreatsRelayBadResponseStatusCodeAsTransient(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	withImmediateTransientUpstreamRetry(t)
+
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits <= 2 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"openai_error","type":"bad_response_status_code","param":"","code":"bad_response_status_code"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_compact_bad_response_status_recovered",
+			"object":"response",
+			"created_at":1710000000,
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+		TestModel:           "gpt-4.1-direct",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-transient",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	recorder := performResponsesCompactRequest(t, handler, []byte(`{"model":"gpt-4.1-direct","input":"hello"}`), "compact-bad-response-status-session")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if id := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); id != "resp_compact_bad_response_status_recovered" {
+		t.Fatalf("response id = %q, want resp_compact_bad_response_status_recovered; body=%s", id, recorder.Body.String())
+	}
+	if hits != 3 {
+		t.Fatalf("upstream hits = %d, want 3", hits)
+	}
+}
+
 func performResponsesCompactRequest(t *testing.T, handler *Handler, body []byte, sessionID string) *httptest.ResponseRecorder {
 	t.Helper()
 

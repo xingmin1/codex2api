@@ -1378,6 +1378,19 @@ func shouldPersistTransientUpstreamStatus(statusCode int, body []byte) bool {
 	return statusCode >= http.StatusInternalServerError && statusCode < 600
 }
 
+func isCompactRelayBadResponseStatusCode(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest || len(body) == 0 {
+		return false
+	}
+	code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
+	errType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()))
+	message := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
+	return code == "bad_response_status_code" ||
+		errType == "bad_response_status_code" ||
+		(code == "" && errType == "upstream_error" && strings.Contains(message, "bad_response_status_code")) ||
+		(code == "openai_error" && strings.Contains(message, "bad_response_status_code"))
+}
+
 func shouldPersistTransientRequestError(err error) bool {
 	if err == nil {
 		return false
@@ -2761,7 +2774,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
+	transientRetry := transientUpstreamRetryState{}
 	invalidEncryptedContentRetried := false
+	persistentEncryptedContentStripped := false
 
 	for attempt := 0; ; attempt++ {
 		activeAccountFilter := regularCompactFilter
@@ -2788,6 +2803,33 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
+				if transientRetry.active {
+					if shouldStripEncryptedContentAfterPersistentTransientRetry(transientRetry, persistentEncryptedContentStripped) {
+						strippedRawBody, strippedCodexBody, changed := stripPersistentEncryptedContentRetryBodies(rawBody, codexBody)
+						if changed {
+							round := transientRetry.rounds + 1
+							persistentEncryptedContentStripped = true
+							invalidEncryptedContentRetried = true
+							rawBody = strippedRawBody
+							codexBody = strippedCodexBody
+							openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+							excludeAccounts = make(map[int64]bool)
+							transientRetry.clear()
+							log.Printf("compact 连续 5xx 疑似旧会话 encrypted_content 不兼容，已移除加密 reasoning 上下文后重试 (round %d)", round)
+							continue
+						}
+					}
+					delay := transientRetry.delay()
+					log.Printf("compact 瞬时上游错误账号池本轮已试完，等待 %s 后继续重试 (round %d, last_status=%d, last_account=%d, transport=%t, message=%q)",
+						delay, transientRetry.rounds+1, transientRetry.statusCode, transientRetry.lastAccount, transientRetry.transport, transientRetry.message)
+					if !transientUpstreamRetrySleep(c.Request.Context(), delay) {
+						sendTransientRetryCanceled(c)
+						return
+					}
+					excludeAccounts = make(map[int64]bool)
+					transientRetry.nextRound()
+					continue
+				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
 				return
 			}
@@ -2812,20 +2854,42 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			durationMs := int(time.Since(start).Milliseconds())
 
 			if reqErr != nil {
-				if kind := classifyTransportFailure(reqErr); kind != "" {
+				if downstreamRequestCanceled(c) {
+					h.store.Release(account)
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					sendTransientRetryCanceled(c)
+					return
+				}
+				kind := classifyTransportFailure(reqErr)
+				retryable := IsRetryableError(reqErr) || kind != ""
+				shouldRetry := false
+				if retryable {
+					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+				}
+				persistentTransient := shouldPersistTransientRequestError(reqErr)
+				if persistentTransient && !shouldRetry {
+					shouldRetry = true
+					log.Printf("OpenAI Responses compact 上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr)
+				}
+				if kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				excludeAccounts[account.ID()] = true
 
-				if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+				if !retryable {
 					ErrorToGinResponse(c, reqErr)
 					return
 				}
 
 				log.Printf("OpenAI Responses compact 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
-				if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				if shouldRetry {
+					if persistentTransient {
+						transientRetry.rememberTransport(account.ID(), reqErr)
+					} else {
+						transientRetry.clear()
+					}
 					continue
 				}
 				ErrorToGinResponse(c, reqErr)
@@ -2866,6 +2930,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 				shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody) || isCompactRelayBadResponseStatusCode(resp.StatusCode, errBody)
+				if persistentTransient && !shouldRetry {
+					shouldRetry = true
+					log.Printf("OpenAI Responses compact 上游 %d 已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d)", resp.StatusCode, attempt+1, account.ID())
+				}
 				fallbackToLongCompact := shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
@@ -2900,6 +2969,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
+					if persistentTransient {
+						transientRetry.rememberHTTP(account.ID(), resp.StatusCode, errBody, resp)
+					} else {
+						transientRetry.clear()
+					}
 					continue
 				}
 
@@ -2965,20 +3039,42 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
-			if kind := classifyTransportFailure(reqErr); kind != "" {
+			if downstreamRequestCanceled(c) {
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				sendTransientRetryCanceled(c)
+				return
+			}
+			kind := classifyTransportFailure(reqErr)
+			retryable := IsRetryableError(reqErr) || kind != ""
+			shouldRetry := false
+			if retryable {
+				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+			}
+			persistentTransient := shouldPersistTransientRequestError(reqErr)
+			if persistentTransient && !shouldRetry {
+				shouldRetry = true
+				log.Printf("compact 上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr)
+			}
+			if kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
-			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
+			if !retryable {
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
 
 			log.Printf("compact 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
-			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+			if shouldRetry {
+				if persistentTransient {
+					transientRetry.rememberTransport(account.ID(), reqErr)
+				} else {
+					transientRetry.clear()
+				}
 				continue
 			}
 			ErrorToGinResponse(c, reqErr)
@@ -3020,6 +3116,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody) || isCompactRelayBadResponseStatusCode(resp.StatusCode, errBody)
+			if persistentTransient && !shouldRetry {
+				shouldRetry = true
+				log.Printf("compact 上游 %d 已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d)", resp.StatusCode, attempt+1, account.ID())
+			}
 			fallbackToLongCompact := shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
@@ -3054,6 +3155,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				if persistentTransient {
+					transientRetry.rememberHTTP(account.ID(), resp.StatusCode, errBody, resp)
+				} else {
+					transientRetry.clear()
+				}
 				continue
 			}
 
