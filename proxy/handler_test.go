@@ -1221,6 +1221,109 @@ func performResponsesCompactRequest(t *testing.T, handler *Handler, body []byte,
 	return recorder
 }
 
+func TestResponsesCompactOpenAIReadErrorRetryReturnsBadGateway(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "128")
+		_, _ = w.Write([]byte(`{"id":"truncated"}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+		Status:       auth.StatusReady,
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-4.1-direct","input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ResponsesCompact(ctx)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.code").String(); got != "upstream_502" {
+		t.Fatalf("error.code = %q, want upstream_502; body=%s", got, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(); !strings.Contains(got, "Failed to read upstream response") {
+		t.Fatalf("error.message = %q, want read failure; body=%s", got, recorder.Body.String())
+	}
+}
+
+func TestResponsesCompactCodexReadErrorRetryReturnsBadGatewayAndSyncsUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() {
+		resinCfg.Store(previousResin)
+	})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/backend-api/codex/responses/compact") {
+			t.Fatalf("upstream path = %q, want Resin path ending /backend-api/codex/responses/compact", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "128")
+		w.Header().Set("x-codex-primary-used-percent", "100")
+		w.Header().Set("x-codex-primary-window-minutes", "300")
+		w.Header().Set("x-codex-primary-reset-after-seconds", "900")
+		_, _ = w.Write([]byte(`{"id":"truncated"}`))
+	}))
+	defer upstream.Close()
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "test"})
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      1,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+	})
+	account := &auth.Account{
+		DBID:        1,
+		AccessToken: "at-1",
+		Models:      []string{"gpt-5.4"},
+		PlanType:    "team",
+		Status:      auth.StatusReady,
+	}
+	store.AddAccount(account)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-5.4","input":"hello"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ResponsesCompact(ctx)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadGateway, recorder.Body.String())
+	}
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.code").String(); got != "upstream_502" {
+		t.Fatalf("error.code = %q, want upstream_502; body=%s", got, recorder.Body.String())
+	}
+	if !account.IsPremium5hRateLimited() {
+		t.Fatal("account should sync Codex usage headers and enter premium 5h rate_limited state")
+	}
+}
+
 // newOpenAIResponsesSSEUpstream 模拟仅支持 OpenAI Responses API 的中转上游，
 // 返回一段最小可用的 Responses SSE 流（issue #181 回归用）。
 func newOpenAIResponsesSSEUpstream(seenPath *string, seenAuth *string, seenBody *[]byte) *httptest.Server {
@@ -2894,6 +2997,38 @@ func TestSyncCodexUsageStateTriggersPremium5hLimitWith5hHeadersOnly(t *testing.T
 	}
 	if !account.IsPremium5hRateLimited() {
 		t.Fatal("expected account to be premium 5h rate limited")
+	}
+}
+
+func TestSyncCodexUsageState5hOnlyDoesNotRefreshStale7dProbeFreshness(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{
+		DBID:                104,
+		AccessToken:         "at",
+		PlanType:            "plus",
+		Status:              auth.StatusReady,
+		UsagePercent7d:      40,
+		UsagePercent7dValid: true,
+		UsageUpdatedAt:      time.Now().Add(-20 * time.Minute),
+	}
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("x-codex-primary-used-percent", "83")
+	resp.Header.Set("x-codex-primary-window-minutes", "300")
+	resp.Header.Set("x-codex-primary-reset-after-seconds", "600")
+
+	result := SyncCodexUsageState(store, account, resp)
+
+	if !result.Used5hHeaders || !result.HasUsage5h {
+		t.Fatalf("usage sync result = %#v, want 5h headers to populate a 5h snapshot", result)
+	}
+	if result.HasUsage7d {
+		t.Fatalf("usage sync result = %#v, want no 7d snapshot from 5h-only headers", result)
+	}
+	if !result.Persisted5hOnly {
+		t.Fatalf("usage sync result = %#v, want 5h-only persistence path", result)
+	}
+	if !account.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = false, want true because 5h-only header sync must not refresh stale 7d freshness")
 	}
 }
 

@@ -1,5 +1,18 @@
 # Changelog
 
+## v2.3.4-xmin.1 - 2026-06-16
+
+### Features
+
+- **Long compact account pool fallback.** Compact requests can fall back to accounts tagged `long-compact` after Cloudflare 524 / origin response timeout failures, keeping long-running compact sessions out of the regular account pool once that path is known to be healthier.
+- **Ignore all failure cooldowns.** The existing per-account `ignore_usage_limit_429_cooldown` setting is now exposed as "Ignore all failure cooldowns" and consistently skips failure-induced account cooldown, model cooldown, usage-exhausted state, premium 5h cooldown, 401 cooldown, and unauthorized auto-cleanup writes.
+
+### Fixes
+
+- **Persistent compact transient retry.** Compact 502 / 5xx / relay `bad_response_status_code` failures keep retrying after the ordinary account-switch retry budget is exhausted, with encrypted reasoning content stripped only after repeated transient failures.
+- **Upstream merge reconciliation.** Reconciled the local compact retry and cooldown behavior with upstream reset-credit, 5h usage freshness, account update, read-error retry, and locale changes.
+- **Frontend dependency hash.** Updated the fixed npm dependency hash used by the Nix build after upstream frontend dependency changes.
+
 ## v2.3.0-xmin.3 - 2026-06-11
 
 ### Features
@@ -9,6 +22,54 @@
 ### Fixes
 
 - **Release latest ref ordering.** The release workflow now updates the `latest` branch only after GitHub Actions has created the release and uploaded all release assets successfully.
+
+## v2.3.3 - 2026-06-13
+
+### Features
+
+- **Cloud storage links for image generation (#240).** When S3-compatible cloud storage is configured and a client requests `response_format=url`, `/v1/images/generations` now uploads each generated image to object storage and returns a time-limited (1h) presigned link instead of a base64 data URL, falling back to the data URL on any upload or signing failure so the API never hard-fails on storage misconfig. Uploaded images are registered into the admin gallery via a lazily created synthetic job + asset record, so they appear in gallery/history and are cleaned up (DB row + backing object) on delete.
+- **API key token-limit unit selector (#234).** The API key 5h/7d token limit fields now offer a unit selector (token / K / M / B) so large quotas can be entered and displayed in readable units instead of raw token counts.
+
+### Fixes
+
+- **Request forwarding error handling and success accounting (#246).** Hardened the OpenAI Responses `ttftGuard` call site with explicit nil-safe wrapping, handled OpenAI/Codex compact response-body read failures while preserving the final 502, synced usage headers on Codex compact read failure and reported request success on the happy path, and rebuilt the Anthropic stream error SSE payload via `json.Marshal`.
+- **WebSocket relay stability (#247).** Improved `wsrelay` executor, manager, and session handling to keep upstream WebSocket relay connections stable.
+- **Function `tool_choice` shape normalized.** A `tool_choice` object missing `type` but carrying a `function` object or top-level `name` is now normalized to `type: "function"` with a flattened `name`, matching OpenAI SDK convention so the upstream no longer rejects the request.
+- **Missing encrypted reasoning content (#235).** `missing_required_parameter` errors on a `*.encrypted_content` param are now recognized alongside `invalid_encrypted_content`, so requests with absent encrypted reasoning content are retried instead of failing.
+- **5h usage freshness split from 7d (#241).** The 5h usage snapshot now persists its own `codex_5h_usage_updated_at` timestamp instead of overwriting the shared `codex_usage_updated_at`, so 5h and 7d freshness no longer clobber each other.
+- **Usage logs page size up to 500 (#244).** The usage logs endpoint now accepts a page size of 500.
+- **Read pages sanitizer narrowed (#245).** Tightened the Read pages sanitizer scope.
+
+### Features
+
+- **Group filter: ungrouped and exclude modes (#229).** The account group filter now supports an "ungrouped" quick option and per-group tri-state filtering (only / hide / off), so accounts outside chosen groups can be isolated, selected in bulk, and assigned to a group quickly. The groups column is also shown by default in the table view.
+
+### Fixes
+
+- **`gpt-5.3-codex-spark` no longer receives the default image tool (#230).** The Responses translator auto-injected the hosted `image_generation` tool (plus bridge instructions) into ordinary text requests; spark rejects hosted image tools, so text-only spark requests failed on the HTTP upstream path. The default injection is now skipped for spark while explicitly supplied image tools are still honored.
+- **Tools without a `type` field no longer fail requests (#219).** Tool definitions missing `type` (or with `type: null`) were forwarded verbatim and the upstream rejected the whole request with 400 `Unsupported tool type: None`. Function-shaped tools (a nested `function` object or a top-level `name`) are now treated as `type: "function"` per OpenAI SDK convention on both the Chat Completions and Responses paths; unrecognizable typeless tools are dropped instead of failing the request.
+- **Usage logs are requeued when a flush fails (#233).** Failed usage-log batches are put back at the front of the buffer and retried on the next flush instead of being dropped, and usage-log inserts plus API key quota updates now run in a single transaction on both SQLite and PostgreSQL.
+- **Reduced timer allocations while waiting for Redis token refresh (#231).** `WaitForRefreshComplete` now reuses a single ticker and timeout timer instead of allocating a new timer every 200ms poll (previously up to ~150 timers per 30s wait).
+
+### Performance
+
+- **Request bodies are read once and reused (#232).** `RequestSizeLimiter` caches the body it already reads, and the body-cache middleware plus all JSON proxy handlers reuse it, cutting up to ~2/3 of duplicated request-body buffer allocations on hot paths.
+
+## v2.3.1 - 2026-06-11
+
+### Features
+
+- **Group-level and global auto-pause thresholds (#227).** Usage auto-pause thresholds can now be set globally (Settings) and per account group (group dialog), resolved with account > group > global priority. Account-level settings win when present, otherwise the smallest non-zero group threshold applies, falling back to the global default. Changes take effect immediately without a restart, and out-of-range values are rejected consistently across all three levels.
+- **API key concurrency limits (#226).** Each API key can cap its concurrent in-flight requests via `limits.max_concurrency`. Requests over the cap receive 429 with a descriptive message across all proxy entrances (responses, compact, chat completions, Anthropic messages, images, WebSocket turns). Unset or 0 means unlimited.
+- **Account group multi-select binding (#217, #222).** Account group assignment now uses a searchable multi-select dropdown instead of assigning new groups to all accounts.
+
+### Fixes
+
+- **WebSocket prompt cache restored (#202).** Since v2.2.7, requests without an explicit session identifier got a random per-request `stateless-` ID on the WS upstream path, which leaked into `prompt_cache_key` and the WS handshake session headers — so the upstream prompt cache never hit in WS mode (HTTP was unaffected). WS now injects a deterministic cache key derived from the downstream API key (matching HTTP behavior), restoring cache hits (~86% of input tokens on repeated prefixes in live testing).
+- **WebSocket connection reuse under high RPM.** Sessionless requests previously opened a new WS connection per request; sustained load (~200 RPM) triggered upstream handshake throttling (`bad handshake` → 503). Such requests now reuse warm connections from a per-(account, cache key) slot pool (8 slots, falling back to one-shot connections when all slots are busy). Live testing at 200 RPM went from 128/200 success to 200/200 with zero handshake failures and roughly halved latency.
+- **Codex CLI compact v2 input items (#224).** `/responses` no longer returns 400 `Invalid input type 'compaction_trigger'` for Codex CLI compact v2 payloads.
+- **Usage probed immediately after OAuth account add.** Newly added OAuth accounts get an immediate usage probe instead of waiting for the next cycle.
+- **Account table scrolling.** Adjusted account table scrolling behavior in the admin UI.
 
 ## v2.3.0 - 2026-06-10
 

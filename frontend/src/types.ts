@@ -79,6 +79,7 @@ export interface AccountRow {
   rate_limit_attempts?: number
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
+  rate_limit_reset_credits?: number | null
   auto_pause_5h_threshold?: number | null
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
@@ -111,6 +112,42 @@ export interface AccountRow {
 }
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
+
+// AccountHealthBucket 是「健康状态」条单个时间窗口内的请求成败计数。
+export interface AccountHealthBucket {
+  success: number
+  failed: number
+}
+
+// AccountHealthBarsResponse 是 GET /api/accounts/health-bars 的响应。
+// buckets 按账号 ID（字符串）映射到由旧到新的 block_count 个时间桶。
+export interface AccountHealthBarsResponse {
+  buckets: Record<string, AccountHealthBucket[]>
+  block_count: number
+  block_minutes: number
+}
+
+export interface InviteItem {
+  referral_id?: string
+  email?: string
+  invite_url?: string
+}
+
+export interface InviteResult {
+  ok: boolean
+  status_code: number
+  request_id?: string
+  referral_key: string
+  emails: string[]
+  invites?: InviteItem[]
+  upstream?: unknown
+  upstream_raw?: string
+}
+
+export interface InviteResponse {
+  ok: boolean
+  result: InviteResult
+}
 
 export interface RecycleBinAccountRow {
   id: number
@@ -186,6 +223,12 @@ export interface UpdateAccountSchedulerRequest {
   ignore_unauthorized_cooldown?: boolean
 }
 
+export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
+  ids: number[]
+  enabled?: boolean
+  locked?: boolean
+}
+
 export interface AccountGroup {
   id: number
   name: string
@@ -193,6 +236,8 @@ export interface AccountGroup {
   color: string
   sort_order: number
   member_count: number
+  auto_pause_5h_threshold: number
+  auto_pause_7d_threshold: number
   created_at: ISODateString
   updated_at: ISODateString
 }
@@ -206,6 +251,8 @@ export interface CreateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  auto_pause_5h_threshold?: number
+  auto_pause_7d_threshold?: number
 }
 
 export interface UpdateAccountGroupRequest {
@@ -213,6 +260,8 @@ export interface UpdateAccountGroupRequest {
   description?: string
   color?: string
   sort_order?: number
+  auto_pause_5h_threshold?: number
+  auto_pause_7d_threshold?: number
 }
 
 export interface AccountModelStat {
@@ -628,6 +677,13 @@ export interface SystemSettings {
   prompt_filter_sensitive_words: string
   prompt_filter_custom_patterns: string
   prompt_filter_disabled_patterns: string
+  prompt_filter_review_enabled: boolean
+  prompt_filter_review_api_key?: string
+  prompt_filter_review_api_key_configured?: boolean
+  prompt_filter_review_base_url: string
+  prompt_filter_review_model: string
+  prompt_filter_review_timeout_seconds: number
+  prompt_filter_review_fail_closed: boolean
   client_compat_mode: 'preserve' | 'auto' | 'force' | string
   codex_min_cli_version: string
   usage_log_mode: 'full' | 'errors' | 'off' | string
@@ -648,6 +704,8 @@ export interface SystemSettings {
   image_s3_secret_key_configured?: boolean
   image_s3_prefix: string
   image_s3_force_path_style: boolean
+  auto_pause_5h_threshold: number
+  auto_pause_7d_threshold: number
 }
 
 export interface SetupHintsResponse {
@@ -693,6 +751,10 @@ export interface PromptFilterVerdict {
   text_preview: string
   reason: string
   extracted_chars: number
+  reviewed?: boolean
+  review_flagged?: boolean
+  review_error?: string
+  review_model?: string
 }
 
 export interface PromptFilterLog {
@@ -707,11 +769,15 @@ export interface PromptFilterLog {
   threshold: number
   matched_patterns: string
   text_preview: string
+  full_text: string
   api_key_id: number
   api_key_name: string
   api_key_masked: string
   client_ip: string
   error_code: string
+  review_model: string
+  review_flagged: boolean
+  review_error: string
 }
 
 export interface PromptFilterLogsResponse {
@@ -972,6 +1038,7 @@ export interface APIKeyLimits {
   model_deny?: string[]
   rpm?: number
   rpd?: number
+  max_concurrency?: number
   cost_limit_5h?: number
   cost_limit_7d?: number
   token_limit_5h?: number
@@ -1132,6 +1199,13 @@ export type ApiListResponse<K extends string, T> = {
 export interface OAuthURLResponse {
   auth_url: string
   session_id: string
+}
+
+export interface UpdateOAuthAccountRequest {
+  session_id: string
+  code: string
+  state: string
+  proxy_url?: string
 }
 
 export interface OAuthExchangeResponse {

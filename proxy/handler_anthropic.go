@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -32,7 +33,17 @@ func sendAnthropicError(c *gin.Context, statusCode int, errType, message string)
 
 // sendAnthropicStreamError 在流式模式中发送错误事件
 func sendAnthropicStreamError(c *gin.Context, errType, message string) {
-	fmt.Fprintf(c.Writer, "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"%s\",\"message\":\"%s\"}}\n\n", errType, message)
+	payload, err := json.Marshal(gin.H{
+		"type": "error",
+		"error": gin.H{
+			"type":    errType,
+			"message": message,
+		},
+	})
+	if err != nil {
+		payload = []byte(`{"type":"error","error":{"type":"api_error","message":"failed to encode stream error"}}`)
+	}
+	fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", payload)
 	if flusher, ok := c.Writer.(http.Flusher); ok {
 		flusher.Flush()
 	}
@@ -65,7 +76,7 @@ func mapHTTPStatusToAnthropicError(statusCode int) string {
 // Messages 处理 /v1/messages 请求（Anthropic Messages API → Codex Responses）
 func (h *Handler) Messages(c *gin.Context) {
 	// 1. 读取请求体
-	rawBody, err := io.ReadAll(c.Request.Body)
+	rawBody, err := readRawRequestBody(c)
 	if err != nil {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Failed to read request body")
 		return
@@ -119,6 +130,13 @@ func (h *Handler) Messages(c *gin.Context) {
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, effectiveModel) {
 		return
+	}
+	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
+	if !ok {
+		return
+	}
+	if releaseAPIKeyConcurrency != nil {
+		defer releaseAPIKeyConcurrency()
 	}
 	// /v1/messages 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发，

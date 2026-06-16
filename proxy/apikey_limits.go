@@ -49,6 +49,16 @@ func apiKeyRowFromContext(c *gin.Context) *database.APIKeyRow {
 	return row
 }
 
+// APIKeyRowFromContext returns the API key metadata stored by the /v1 auth middleware.
+func APIKeyRowFromContext(c *gin.Context) *database.APIKeyRow {
+	return apiKeyRowFromContext(c)
+}
+
+// EnforceAPIKeyLimits checks API key scoped model and rate/cost limits.
+func (h *Handler) EnforceAPIKeyLimits(c *gin.Context, model string) (int, string) {
+	return h.enforceAPIKeyLimits(c, model)
+}
+
 // enforceAPIKeyLimits 检查 API Key 的所有限制条件。
 // 命中限制时返回 (status, errorMessage),handler 应立即以该响应短路;
 // 全部通过返回 (0, "")。
@@ -131,13 +141,8 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 	return 0, ""
 }
 
-// enforceAPIKeyLimitsAndReply 在请求转发前调用,命中限制时已向客户端写入响应并返回 true。
-// handler 应在 true 时立即 return,无需再处理。
-func (h *Handler) enforceAPIKeyLimitsAndReply(c *gin.Context, model string) bool {
-	status, msg := h.enforceAPIKeyLimits(c, model)
-	if status == 0 {
-		return false
-	}
+// SendAPIKeyLimitError writes a standard /v1 API key limit error response.
+func SendAPIKeyLimitError(c *gin.Context, status int, msg string) {
 	errType := api.ErrorTypeRateLimit
 	errCode := api.ErrCodeRateLimitReached
 	if status == http.StatusForbidden {
@@ -145,6 +150,16 @@ func (h *Handler) enforceAPIKeyLimitsAndReply(c *gin.Context, model string) bool
 		errCode = api.ErrCodeInvalidRequest
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(errCode, msg, errType), status)
+}
+
+// enforceAPIKeyLimitsAndReply 在请求转发前调用,命中限制时已向客户端写入响应并返回 true。
+// handler 应在 true 时立即 return,无需再处理。
+func (h *Handler) enforceAPIKeyLimitsAndReply(c *gin.Context, model string) bool {
+	status, msg := h.enforceAPIKeyLimits(c, model)
+	if status == 0 {
+		return false
+	}
+	SendAPIKeyLimitError(c, status, msg)
 	return true
 }
 

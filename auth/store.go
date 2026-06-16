@@ -65,13 +65,25 @@ type Account struct {
 	ErrorMsg       string
 
 	// 用量进度（从 Codex 响应头被动解析）
-	UsagePercent7d              float64 // 7d 窗口使用率 0-100+
-	UsagePercent7dValid         bool
-	Reset7dAt                   time.Time // 7d 窗口重置时间
-	UsagePercent5h              float64   // 5h 窗口使用率 0-100+
-	UsagePercent5hValid         bool
-	Reset5hAt                   time.Time // 5h 窗口重置时间
-	UsageUpdatedAt              time.Time
+	UsagePercent7d      float64 // 7d 窗口使用率 0-100+
+	UsagePercent7dValid bool
+	Reset7dAt           time.Time // 7d 窗口重置时间
+	UsagePercent5h      float64   // 5h 窗口使用率 0-100+
+	UsagePercent5hValid bool
+	Reset5hAt           time.Time // 5h 窗口重置时间
+	UsageUpdatedAt      time.Time // 7d 用量快照刷新时间
+	UsageUpdatedAt5h    time.Time // 5h 用量快照刷新时间
+
+	// RateLimitResetCredits 是 OpenAI 官方账号剩余的「主动重置次数」，来自
+	// /backend-api/wham/usage 响应的 rate_limit_reset_credits.available_count。
+	// -1 表示尚未探测过（未知）；>=0 为已知次数。
+	RateLimitResetCredits      int
+	RateLimitResetCreditsValid bool
+	// resetCreditsProbedAt 记录最近一次成功 wham 用量探针的时间。
+	// 「主动重置次数」只能通过 wham 探针刷新（普通 /responses 流量不携带该字段），
+	// 因此用它独立判断重置次数是否过期，避免活跃账号因用量快照一直被流量刷新而长期不探针。
+	resetCreditsProbedAt time.Time
+
 	usageProbeInFlight          bool
 	recoveryProbeInFlight       bool
 	AutoPause5hThreshold        float64 // 0..1, 0 = disabled
@@ -80,6 +92,8 @@ type Account struct {
 	AutoPause7dDisabled         bool
 	IgnoreUsageLimit429Cooldown bool
 	IgnoreUnauthorizedCooldown  bool
+	effectiveAutoPause5h        float64 // resolved: account > group > global
+	effectiveAutoPause7d        float64
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -952,10 +966,44 @@ func quotaAutoPausedByWindow(usage float64, valid bool, resetAt time.Time, thres
 }
 
 func (a *Account) quotaAutoPausedLocked(now time.Time) bool {
-	if quotaAutoPausedByWindow(a.UsagePercent5h, a.UsagePercent5hValid, a.Reset5hAt, a.AutoPause5hThreshold, a.AutoPause5hDisabled, now) {
+	if quotaAutoPausedByWindow(a.UsagePercent5h, a.UsagePercent5hValid, a.Reset5hAt, a.effectiveAutoPause5h, a.AutoPause5hDisabled, now) {
 		return true
 	}
-	return quotaAutoPausedByWindow(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, a.AutoPause7dThreshold, a.AutoPause7dDisabled, now)
+	return quotaAutoPausedByWindow(a.UsagePercent7d, a.UsagePercent7dValid, a.Reset7dAt, a.effectiveAutoPause7d, a.AutoPause7dDisabled, now)
+}
+
+func (a *Account) recomputeEffectiveAutoPause(s *Store) {
+	a.effectiveAutoPause5h = resolveEffectiveThreshold(a.AutoPause5hThreshold, a.GroupIDs, s, true)
+	a.effectiveAutoPause7d = resolveEffectiveThreshold(a.AutoPause7dThreshold, a.GroupIDs, s, false)
+}
+
+func resolveEffectiveThreshold(accountThreshold float64, groupIDs []int64, s *Store, is5h bool) float64 {
+	if accountThreshold > 0 {
+		return accountThreshold
+	}
+	if s == nil {
+		return 0
+	}
+	var best float64
+	for _, gid := range groupIDs {
+		t5h, t7d := s.getGroupAutoPauseThresholds(gid)
+		var t float64
+		if is5h {
+			t = t5h
+		} else {
+			t = t7d
+		}
+		if t > 0 && (best == 0 || t < best) {
+			best = t
+		}
+	}
+	if best > 0 {
+		return best
+	}
+	if is5h {
+		return s.GetGlobalAutoPause5hThreshold()
+	}
+	return s.GetGlobalAutoPause7dThreshold()
 }
 
 // ShouldIgnoreUsageLimit429Cooldown 返回该账号是否忽略请求失败导致的冷却与用量耗尽写入。
@@ -1161,11 +1209,17 @@ func (a *Account) usagePercentForScheduling() float64 {
 
 // SetUsageSnapshot5h 更新 5h 用量快照
 func (a *Account) SetUsageSnapshot5h(pct float64, resetAt time.Time) {
+	a.SetUsageSnapshot5hAt(pct, resetAt, time.Now())
+}
+
+// SetUsageSnapshot5hAt 更新 5h 用量快照及刷新时间
+func (a *Account) SetUsageSnapshot5hAt(pct float64, resetAt time.Time, updatedAt time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.UsagePercent5h = pct
 	a.UsagePercent5hValid = true
 	a.Reset5hAt = resetAt
+	a.UsageUpdatedAt5h = updatedAt
 }
 
 // GetUsagePercent5h 获取 5h 用量百分比
@@ -1173,6 +1227,33 @@ func (a *Account) GetUsagePercent5h() (float64, bool) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.UsagePercent5h, a.UsagePercent5hValid
+}
+
+// SetRateLimitResetCredits 记录账号剩余的「主动重置次数」。
+func (a *Account) SetRateLimitResetCredits(count int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if count < 0 {
+		count = 0
+	}
+	a.RateLimitResetCredits = count
+	a.RateLimitResetCreditsValid = true
+}
+
+// GetRateLimitResetCredits 返回账号剩余的「主动重置次数」及其是否已探测过。
+func (a *Account) GetRateLimitResetCredits() (int, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.RateLimitResetCredits, a.RateLimitResetCreditsValid
+}
+
+// MarkResetCreditsProbed 记录最近一次成功 wham 用量探针的时间。
+// 调用方应在 wham 探针成功（拿到 usage）后调用，无论本次响应是否带 reset_credits 字段，
+// 因为「能成功拉到 wham」本身就代表重置次数已是最新。
+func (a *Account) MarkResetCreditsProbed(t time.Time) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.resetCreditsProbedAt = t
 }
 
 // ClearUsageCache 清除内存中的用量缓存，下次请求时从上游重新获取
@@ -1186,6 +1267,7 @@ func (a *Account) ClearUsageCache() {
 	a.UsagePercent5hValid = false
 	a.Reset5hAt = time.Time{}
 	a.UsageUpdatedAt = time.Time{}
+	a.UsageUpdatedAt5h = time.Time{}
 }
 
 // SetReset7dAt 设置 7d 窗口重置时间
@@ -1207,6 +1289,20 @@ func (a *Account) GetReset7dAt() time.Time {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.Reset7dAt
+}
+
+// GetUsageUpdatedAt 获取 7d 用量快照刷新时间
+func (a *Account) GetUsageUpdatedAt() time.Time {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.UsageUpdatedAt
+}
+
+// GetUsageUpdatedAt5h 获取 5h 用量快照刷新时间
+func (a *Account) GetUsageUpdatedAt5h() time.Time {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.UsageUpdatedAt5h
 }
 
 // GetPlanType 获取账号套餐类型
@@ -1500,18 +1596,56 @@ func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 		return false
 	}
 	if a.Status == StatusCooldown && a.CooldownReason == "unauthorized" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
-		return false
+		return false // token 失效，wham 也会 401，探针无意义
 	}
+
+	// 「主动重置次数」只能由 wham 探针刷新（普通 /responses 流量不携带该字段），
+	// 因此用独立的 resetCreditsProbedAt 判断它是否过期。否则活跃账号的用量快照被
+	// 业务流量持续刷新，会让用量看起来一直"新鲜"，从而长期不触发 wham 探针、
+	// 重置次数迟迟探测不出来。
+	resetCreditsStale := a.resetCreditsProbedAt.IsZero() || now.Sub(a.resetCreditsProbedAt) > maxAge
+
 	if a.premium5hRateLimitedLocked(now) {
-		return false
+		// premium 5h 限流期间不发 /responses 探活，但 wham 零成本，仍允许其刷新重置次数。
+		return resetCreditsStale
 	}
 	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
-		return false // 429 冷却期间不探活，避免加重限流
+		// 429 冷却期间不发 /responses 探活（避免加重限流），但允许 wham-only 探针刷新重置次数——
+		// 这正是用户最需要看到"还剩几次主动重置"的时刻。
+		return resetCreditsStale
 	}
-	if !a.UsagePercent7dValid || a.UsageUpdatedAt.IsZero() {
+	if resetCreditsStale {
 		return true
 	}
-	return time.Since(a.UsageUpdatedAt) > maxAge
+	if !a.UsagePercent7dValid || a.UsageUpdatedAt.IsZero() || now.Sub(a.UsageUpdatedAt) > maxAge {
+		return true
+	}
+	if a.effectiveAutoPause5h > 0 && !a.AutoPause5hDisabled {
+		if !a.UsagePercent5hValid || a.UsageUpdatedAt5h.IsZero() {
+			return true
+		}
+		if a.Reset5hAt.IsZero() || a.Reset5hAt.After(now) {
+			return now.Sub(a.UsageUpdatedAt5h) > maxAge
+		}
+	}
+	return false
+}
+
+// InLimitedState 报告账号是否处于"应避免 /responses 探活"的限流/冷却状态
+// （429 冷却或 premium 5h 限流）。此时用量探针应只走 wham（零成本），
+// 失败也不回退 /responses，避免加重限流或消耗额度。
+// 注意：unauthorized 冷却不在此列——那类账号 NeedsUsageProbe 已直接跳过。
+func (a *Account) InLimitedState() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	now := time.Now()
+	if a.premium5hRateLimitedLocked(now) {
+		return true
+	}
+	if a.Status == StatusCooldown && a.CooldownReason == "rate_limited" && (a.CooldownUtil.IsZero() || now.Before(a.CooldownUtil)) {
+		return true
+	}
+	return false
 }
 
 // TryBeginUsageProbe 尝试开始一次用量探针
@@ -1657,6 +1791,10 @@ type Store struct {
 	promptFilterConfig    atomic.Value // promptfilter.Config
 	sessionMu             sync.RWMutex
 	sessionBindings       map[string]sessionAffinity
+
+	globalAutoPause5hThreshold float64  // protected by mu
+	globalAutoPause7dThreshold float64  // protected by mu
+	groupAutoPauseThresholds   sync.Map // int64 -> [2]float64 {5h, 7d}
 }
 
 // sessionAffinity 记录某个 sessionKey 当前粘附到哪个账号/代理。
@@ -2097,6 +2235,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexWSHideUpstreamErrors.Store(settings.CodexWSHideUpstreamErrors)
 	s.codexWSSilentRetryEnabled.Store(settings.CodexWSSilentRetryEnabled)
 	s.codexWSSilentMaxRetries.Store(normalizeWSSilentMaxRetries(settings.CodexWSSilentMaxRetries))
+
+	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
+	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause7dThreshold)
 
 	// 加载代理池
 	if settings.ProxyPoolEnabled {
@@ -2648,6 +2789,13 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 
 	s.rebuildAccountIndex()
 	log.Printf("从数据库加载了 %d 个账号", len(s.accounts))
+	if groups, err := s.db.ListAccountGroups(ctx); err == nil {
+		for _, g := range groups {
+			if g.AutoPause5hThreshold > 0 || g.AutoPause7dThreshold > 0 {
+				s.groupAutoPauseThresholds.Store(g.ID, [2]float64{g.AutoPause5hThreshold, g.AutoPause7dThreshold})
+			}
+		}
+	}
 	if memberships, err := s.db.ListAccountGroupMemberships(ctx); err == nil {
 		s.ApplyAccountGroupMemberships(memberships)
 	} else {
@@ -2772,7 +2920,15 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 					resetAt = t
 				}
 			}
-			account.SetUsageSnapshot5h(parsed, resetAt)
+			updatedAt := time.Time{}
+			if usageUpdatedAt5h := row.GetCredential("codex_5h_usage_updated_at"); usageUpdatedAt5h != "" {
+				if parsedTime, err := time.Parse(time.RFC3339, usageUpdatedAt5h); err == nil {
+					updatedAt = parsedTime
+				} else {
+					log.Printf("[账号 %d] 解析 codex_5h_usage_updated_at 失败: %v", row.ID, err)
+				}
+			}
+			account.SetUsageSnapshot5hAt(parsed, resetAt, updatedAt)
 		}
 	}
 	if threshold, ok := row.GetCredentialFloat64("auto_pause_5h_threshold"); ok {
@@ -2785,6 +2941,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 	account.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
 	account.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
+	account.recomputeEffectiveAutoPause(s)
 	for _, cooldown := range modelCooldowns[row.ID] {
 		account.RestoreModelCooldown(cooldown.Model, cooldown.Reason, cooldown.ResetAt, cooldown.UpdatedAt)
 	}
@@ -3786,6 +3943,14 @@ func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfil
 	if disabled, err := promptfilter.ParseDisabledPatterns(settings.PromptFilterDisabledPatterns); err == nil {
 		cfg.DisabledPatterns = disabled
 	}
+	cfg.Review = promptfilter.ReviewConfig{
+		Enabled:        settings.PromptFilterReviewEnabled,
+		APIKey:         settings.PromptFilterReviewAPIKey,
+		BaseURL:        settings.PromptFilterReviewBaseURL,
+		Model:          settings.PromptFilterReviewModel,
+		TimeoutSeconds: settings.PromptFilterReviewTimeoutSeconds,
+		FailClosed:     settings.PromptFilterReviewFailClosed,
+	}
 	return promptfilter.NormalizeConfig(cfg)
 }
 
@@ -3798,6 +3963,60 @@ func (s *Store) GetPromptFilterConfig() promptfilter.Config {
 		return promptfilter.NormalizeConfig(v)
 	}
 	return promptfilter.DefaultConfig()
+}
+
+func (s *Store) SetGlobalAutoPauseThresholds(t5h, t7d float64) {
+	s.mu.Lock()
+	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(t5h)
+	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(t7d)
+	s.mu.Unlock()
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) GetGlobalAutoPause5hThreshold() float64 {
+	s.mu.RLock()
+	v := s.globalAutoPause5hThreshold
+	s.mu.RUnlock()
+	return v
+}
+
+func (s *Store) GetGlobalAutoPause7dThreshold() float64 {
+	s.mu.RLock()
+	v := s.globalAutoPause7dThreshold
+	s.mu.RUnlock()
+	return v
+}
+
+func (s *Store) SetGroupAutoPauseThresholds(groupID int64, t5h, t7d float64) {
+	s.groupAutoPauseThresholds.Store(groupID, [2]float64{
+		normalizeQuotaAutoPauseThreshold(t5h),
+		normalizeQuotaAutoPauseThreshold(t7d),
+	})
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) DeleteGroupAutoPauseThresholds(groupID int64) {
+	s.groupAutoPauseThresholds.Delete(groupID)
+}
+
+func (s *Store) GetGroupAutoPauseThresholds(groupID int64) (float64, float64) {
+	return s.getGroupAutoPauseThresholds(groupID)
+}
+
+func (s *Store) getGroupAutoPauseThresholds(groupID int64) (float64, float64) {
+	if v, ok := s.groupAutoPauseThresholds.Load(groupID); ok {
+		t := v.([2]float64)
+		return t[0], t[1]
+	}
+	return 0, 0
+}
+
+func (s *Store) recomputeAllEffectiveAutoPause() {
+	for _, acc := range s.Accounts() {
+		acc.mu.Lock()
+		acc.recomputeEffectiveAutoPause(s)
+		acc.mu.Unlock()
+	}
 }
 
 // AddAccount 热加载新账号到内存池（前端添加后即刻生效）
@@ -3890,6 +4109,28 @@ func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, ba
 	return true
 }
 
+func (s *Store) ApplyAccountSchedulerOverridePatch(dbID int64, scoreBiasSet bool, scoreBiasOverride *int64, baseConcurrencySet bool, baseConcurrencyOverride *int64, skipWarmTier *bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	if scoreBiasSet {
+		acc.ScoreBiasOverride = cloneInt64Ptr(scoreBiasOverride)
+	}
+	if baseConcurrencySet {
+		acc.BaseConcurrencyOverride = cloneInt64Ptr(baseConcurrencyOverride)
+	}
+	if skipWarmTier != nil {
+		acc.SkipWarmTier = *skipWarmTier
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
 func (s *Store) ApplyAccountAllowedAPIKeys(dbID int64, allowedAPIKeyIDs []int64) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
@@ -3922,6 +4163,7 @@ func (s *Store) ApplyAccountQuotaAutoPauseConfig(dbID int64, threshold5h, thresh
 	if disabled7d != nil {
 		acc.AutoPause7dDisabled = *disabled7d
 	}
+	acc.recomputeEffectiveAutoPause(s)
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
@@ -3972,6 +4214,7 @@ func (s *Store) ApplyAccountGroups(dbID int64, groupIDs []int64) bool {
 	}
 	acc.mu.Lock()
 	acc.GroupIDs = cloneInt64Slice(groupIDs)
+	acc.recomputeEffectiveAutoPause(s)
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	return true
@@ -4006,6 +4249,7 @@ func (s *Store) ApplyAccountGroupMemberships(memberships map[int64][]int64) {
 	for _, acc := range s.Accounts() {
 		acc.mu.Lock()
 		acc.GroupIDs = cloneInt64Slice(memberships[acc.DBID])
+		acc.recomputeEffectiveAutoPause(s)
 		acc.mu.Unlock()
 		s.fastSchedulerUpdate(acc)
 	}
@@ -4550,7 +4794,7 @@ func (s *Store) PersistUsageSnapshot(acc *Account, pct7d float64) {
 		reset7dAt := acc.GetReset7dAt()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if err := s.db.UpdateUsageSnapshotFull(ctx, acc.DBID, pct7d, reset7dAt, pct5h, reset5hAt, now); err != nil {
+		if err := s.db.UpdateUsageSnapshotFull(ctx, acc.DBID, pct7d, reset7dAt, pct5h, reset5hAt, now, acc.GetUsageUpdatedAt5h()); err != nil {
 			log.Printf("[账号 %d] 持久化用量快照失败: %v", acc.DBID, err)
 		}
 		return

@@ -255,6 +255,12 @@ func main() {
 	// 6. 启动 HTTP 服务
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// Gin 默认信任所有代理头（X-Forwarded-For/X-Real-IP），会让公网客户端伪造 c.ClientIP()。
+	// 默认禁用可信代理，避免绕过 bootstrap 本机来源限制与 IP 限流；
+	// 反代部署可通过 TRUSTED_PROXIES（逗号分隔的 IP/CIDR）显式声明可信代理以恢复真实客户端 IP。
+	if err := configureTrustedProxies(r, os.Getenv("TRUSTED_PROXIES")); err != nil {
+		log.Fatalf("配置可信代理失败: %v", err)
+	}
 	r.Use(api.RecoveryMiddleware())
 	r.Use(api.RequestContextMiddleware())
 	r.Use(api.VersionMiddleware())
@@ -290,6 +296,7 @@ func main() {
 	log.Printf("单账号并发上限: %d", settings.MaxConcurrency)
 
 	handler.RegisterRoutes(r)
+	adminHandler.RegisterExternalImageRoutes(r, handler)
 	adminHandler.RegisterRoutes(r)
 
 	// 管理后台前端静态文件
@@ -356,7 +363,8 @@ func main() {
 	log.Printf("  API:    POST /v1/chat/completions")
 	log.Printf("  API:    POST /v1/responses")
 	log.Printf("  API:    POST /v1/images/generations")
-	log.Printf("  API:    POST /v1/images/edits")
+	log.Printf("  API:    POST /v1/images/jobs")
+	log.Printf("  API:    GET  /v1/images/jobs/:id")
 	log.Printf("  API:    POST /v1/messages")
 	log.Printf("  API:    GET  /v1/models")
 	log.Println("==========================================")
@@ -391,6 +399,25 @@ func main() {
 	wsrelay.ShutdownExecutor()
 	proxy.CloseErrorLogger()
 	log.Println("已关闭")
+}
+
+// configureTrustedProxies 配置 Gin 的可信代理列表。
+//
+// trustedProxies 为逗号分隔的 IP/CIDR 列表（通常来自 TRUSTED_PROXIES 环境变量）：
+//   - 为空时禁用所有可信代理，c.ClientIP() 直接采用 TCP 连接来源，忽略转发头（默认安全）；
+//   - 非空时仅信任列表内的代理来源，从其转发头解析真实客户端 IP。
+func configureTrustedProxies(r *gin.Engine, trustedProxies string) error {
+	if r == nil {
+		return nil
+	}
+	var proxies []string
+	for _, p := range strings.Split(trustedProxies, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			proxies = append(proxies, p)
+		}
+	}
+	// proxies 为 nil 时等价于禁用全部可信代理。
+	return r.SetTrustedProxies(proxies)
 }
 
 // loggerMiddleware 简单日志中间件（增强版，支持敏感信息脱敏）

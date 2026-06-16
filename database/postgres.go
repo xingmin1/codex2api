@@ -76,6 +76,32 @@ type OptionalNullInt64 struct {
 	Value sql.NullInt64
 }
 
+type BatchAccountMetadataUpdate struct {
+	Enabled                 OptionalBool
+	Locked                  OptionalBool
+	ScoreBiasOverride       OptionalNullInt64
+	BaseConcurrencyOverride OptionalNullInt64
+	SkipWarmTier            OptionalBool
+	AllowedAPIKeyIDs        OptionalInt64Slice
+	Tags                    OptionalStringSlice
+	GroupIDs                OptionalInt64Slice
+	ProxyURL                OptionalString
+	CredentialUpdates       map[string]interface{}
+}
+
+func (u BatchAccountMetadataUpdate) HasChanges() bool {
+	return u.Enabled.Set ||
+		u.Locked.Set ||
+		u.ScoreBiasOverride.Set ||
+		u.BaseConcurrencyOverride.Set ||
+		u.SkipWarmTier.Set ||
+		u.AllowedAPIKeyIDs.Set ||
+		u.Tags.Set ||
+		u.GroupIDs.Set ||
+		u.ProxyURL.Set ||
+		len(u.CredentialUpdates) > 0
+}
+
 // AccountCredentialIndex holds pre-built sets of existing credentials for fast import dedup.
 type AccountCredentialIndex struct {
 	RefreshTokens map[string]bool
@@ -123,6 +149,10 @@ func (a *AccountRow) GetCredentialStringSlice(key string) []string {
 		return []string{}
 	}
 	return stringSliceFromValue(value)
+}
+
+type sqlExecer interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 }
 
 // DB PostgreSQL 数据库操作
@@ -725,6 +755,12 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_sensitive_words TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_custom_patterns TEXT DEFAULT '[]';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_disabled_patterns TEXT DEFAULT '[]';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_api_key TEXT DEFAULT '';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_base_url TEXT DEFAULT 'https://api.openai.com';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_model TEXT DEFAULT 'omni-moderation-latest';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_timeout_seconds INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_fail_closed BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.118.0';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_mode VARCHAR(20) DEFAULT 'full';
@@ -743,6 +779,11 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_hide_upstream_errors BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_silent_retry_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_silent_max_retries INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
+
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
 
 			CREATE TABLE IF NOT EXISTS prompt_filter_logs (
 				id               SERIAL PRIMARY KEY,
@@ -760,8 +801,16 @@ func (db *DB) migrate(ctx context.Context) error {
 				api_key_name     VARCHAR(255) DEFAULT '',
 				api_key_masked   VARCHAR(64) DEFAULT '',
 				client_ip        VARCHAR(64) DEFAULT '',
-				error_code       VARCHAR(100) DEFAULT ''
+				error_code       VARCHAR(100) DEFAULT '',
+				review_model     VARCHAR(100) DEFAULT '',
+				review_flagged   BOOLEAN DEFAULT FALSE,
+				review_error     TEXT DEFAULT '',
+				full_text        TEXT DEFAULT ''
 			);
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_model VARCHAR(100) DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_flagged BOOLEAN DEFAULT FALSE;
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS review_error TEXT DEFAULT '';
+			ALTER TABLE prompt_filter_logs ADD COLUMN IF NOT EXISTS full_text TEXT DEFAULT '';
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_created_at ON prompt_filter_logs(created_at);
 			CREATE INDEX IF NOT EXISTS idx_prompt_filter_logs_action_created_at ON prompt_filter_logs(action, created_at);
 
@@ -890,8 +939,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	`
 	migrateCtx, migrateCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer migrateCancel()
-	_, err = db.conn.ExecContext(migrateCtx, migrateQuery)
-	return err
+	if _, err = db.conn.ExecContext(migrateCtx, migrateQuery); err != nil {
+		return err
+	}
+	return db.runDataMigrationsWithTimeout()
 }
 
 // ==================== API Keys ====================
@@ -915,23 +966,25 @@ type APIKeyRow struct {
 // - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
 // - RPM: 每分钟请求数 (滑动 60s 窗口)。
 // - RPD: 每天请求数 (滑动 24h 窗口)。
+// - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
 // - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
 // - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
 type APIKeyLimits struct {
-	ModelAllow   []string `json:"model_allow,omitempty"`
-	ModelDeny    []string `json:"model_deny,omitempty"`
-	RPM          int      `json:"rpm,omitempty"`
-	RPD          int      `json:"rpd,omitempty"`
-	CostLimit5h  float64  `json:"cost_limit_5h,omitempty"`
-	CostLimit7d  float64  `json:"cost_limit_7d,omitempty"`
-	TokenLimit5h int64    `json:"token_limit_5h,omitempty"`
-	TokenLimit7d int64    `json:"token_limit_7d,omitempty"`
+	ModelAllow     []string `json:"model_allow,omitempty"`
+	ModelDeny      []string `json:"model_deny,omitempty"`
+	RPM            int      `json:"rpm,omitempty"`
+	RPD            int      `json:"rpd,omitempty"`
+	MaxConcurrency int      `json:"max_concurrency,omitempty"`
+	CostLimit5h    float64  `json:"cost_limit_5h,omitempty"`
+	CostLimit7d    float64  `json:"cost_limit_7d,omitempty"`
+	TokenLimit5h   int64    `json:"token_limit_5h,omitempty"`
+	TokenLimit7d   int64    `json:"token_limit_7d,omitempty"`
 }
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
 func (l APIKeyLimits) IsZero() bool {
 	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 &&
-		l.RPM == 0 && l.RPD == 0 &&
+		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 &&
 		l.TokenLimit5h == 0 && l.TokenLimit7d == 0
 }
@@ -1275,6 +1328,12 @@ type SystemSettings struct {
 	PromptFilterSensitiveWords         string
 	PromptFilterCustomPatterns         string
 	PromptFilterDisabledPatterns       string
+	PromptFilterReviewEnabled          bool
+	PromptFilterReviewAPIKey           string
+	PromptFilterReviewBaseURL          string
+	PromptFilterReviewModel            string
+	PromptFilterReviewTimeoutSeconds   int
+	PromptFilterReviewFailClosed       bool
 	ClientCompatMode                   string
 	CodexMinCLIVersion                 string
 	UsageLogMode                       string
@@ -1293,6 +1352,8 @@ type SystemSettings struct {
 	CodexWSHideUpstreamErrors          bool // 隐藏上游 WS 原始错误，默认 true
 	CodexWSSilentRetryEnabled          bool // 首包前 WS 上游错误静默换号重试，默认 true
 	CodexWSSilentMaxRetries            int  // WS 静默换号最大重试次数，默认 2
+	AutoPause5hThreshold               float64
+	AutoPause7dThreshold               float64
 }
 
 func normalizeBillingTierPolicy(policy string) string {
@@ -1348,6 +1409,12 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_sensitive_words, ''),
 		       COALESCE(prompt_filter_custom_patterns, '[]'),
 		       COALESCE(prompt_filter_disabled_patterns, '[]'),
+		       COALESCE(prompt_filter_review_enabled, false),
+		       COALESCE(prompt_filter_review_api_key, ''),
+		       COALESCE(prompt_filter_review_base_url, 'https://api.openai.com'),
+		       COALESCE(prompt_filter_review_model, 'omni-moderation-latest'),
+		       COALESCE(prompt_filter_review_timeout_seconds, 10),
+		       COALESCE(prompt_filter_review_fail_closed, true),
 		       COALESCE(client_compat_mode, 'preserve'),
 		       COALESCE(codex_min_cli_version, '0.118.0'),
 		       COALESCE(usage_log_mode, 'full'),
@@ -1367,7 +1434,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(codex_ws_keepalive_interval_sec, 60),
 			       COALESCE(codex_ws_hide_upstream_errors, true),
 			       COALESCE(codex_ws_silent_retry_enabled, true),
-			       COALESCE(codex_ws_silent_max_retries, 2)
+			       COALESCE(codex_ws_silent_max_retries, 2),
+			       COALESCE(auto_pause_5h_threshold, 0),
+			       COALESCE(auto_pause_7d_threshold, 0)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1382,6 +1451,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.PromptFilterEnabled, &s.PromptFilterMode, &s.PromptFilterThreshold, &s.PromptFilterStrictThreshold,
 		&s.PromptFilterLogMatches, &s.PromptFilterMaxTextLength, &s.PromptFilterSensitiveWords,
 		&s.PromptFilterCustomPatterns, &s.PromptFilterDisabledPatterns,
+		&s.PromptFilterReviewEnabled, &s.PromptFilterReviewAPIKey, &s.PromptFilterReviewBaseURL,
+		&s.PromptFilterReviewModel, &s.PromptFilterReviewTimeoutSeconds, &s.PromptFilterReviewFailClosed,
 		&s.ClientCompatMode, &s.CodexMinCLIVersion, &s.UsageLogMode, &s.UsageLogBatchSize,
 		&s.UsageLogFlushIntervalSeconds, &s.StreamFlushPolicy, &s.StreamFlushIntervalMS,
 		&s.FirstTokenMode,
@@ -1397,6 +1468,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexWSHideUpstreamErrors,
 		&s.CodexWSSilentRetryEnabled,
 		&s.CodexWSSilentMaxRetries,
+		&s.AutoPause5hThreshold,
+		&s.AutoPause7dThreshold,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1429,6 +1502,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				resin_url, resin_platform_name, prompt_filter_enabled, prompt_filter_mode, prompt_filter_threshold,
 				prompt_filter_strict_threshold, prompt_filter_log_matches, prompt_filter_max_text_length,
 				prompt_filter_sensitive_words, prompt_filter_custom_patterns, prompt_filter_disabled_patterns,
+				prompt_filter_review_enabled, prompt_filter_review_api_key, prompt_filter_review_base_url,
+				prompt_filter_review_model, prompt_filter_review_timeout_seconds, prompt_filter_review_fail_closed,
 				client_compat_mode, codex_min_cli_version, usage_log_mode, usage_log_batch_size,
 					usage_log_flush_interval_seconds, stream_flush_policy, stream_flush_interval_ms,
 					first_token_timeout_seconds,
@@ -1445,9 +1520,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_keepalive_interval_sec,
 					codex_ws_hide_upstream_errors,
 					codex_ws_silent_retry_enabled,
-					codex_ws_silent_max_retries
+					codex_ws_silent_max_retries,
+					auto_pause_5h_threshold,
+					auto_pause_7d_threshold
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1488,6 +1565,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_sensitive_words = EXCLUDED.prompt_filter_sensitive_words,
 				prompt_filter_custom_patterns = EXCLUDED.prompt_filter_custom_patterns,
 				prompt_filter_disabled_patterns = EXCLUDED.prompt_filter_disabled_patterns,
+				prompt_filter_review_enabled = EXCLUDED.prompt_filter_review_enabled,
+				prompt_filter_review_api_key = EXCLUDED.prompt_filter_review_api_key,
+				prompt_filter_review_base_url = EXCLUDED.prompt_filter_review_base_url,
+				prompt_filter_review_model = EXCLUDED.prompt_filter_review_model,
+				prompt_filter_review_timeout_seconds = EXCLUDED.prompt_filter_review_timeout_seconds,
+				prompt_filter_review_fail_closed = EXCLUDED.prompt_filter_review_fail_closed,
 				client_compat_mode = EXCLUDED.client_compat_mode,
 				codex_min_cli_version = EXCLUDED.codex_min_cli_version,
 				usage_log_mode = EXCLUDED.usage_log_mode,
@@ -1509,7 +1592,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_keepalive_interval_sec = EXCLUDED.codex_ws_keepalive_interval_sec,
 					codex_ws_hide_upstream_errors = EXCLUDED.codex_ws_hide_upstream_errors,
 					codex_ws_silent_retry_enabled = EXCLUDED.codex_ws_silent_retry_enabled,
-					codex_ws_silent_max_retries = EXCLUDED.codex_ws_silent_max_retries
+					codex_ws_silent_max_retries = EXCLUDED.codex_ws_silent_max_retries,
+					auto_pause_5h_threshold = EXCLUDED.auto_pause_5h_threshold,
+					auto_pause_7d_threshold = EXCLUDED.auto_pause_7d_threshold
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1519,11 +1604,14 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
 		s.PromptFilterStrictThreshold, s.PromptFilterLogMatches, s.PromptFilterMaxTextLength,
 		s.PromptFilterSensitiveWords, s.PromptFilterCustomPatterns, s.PromptFilterDisabledPatterns,
+		s.PromptFilterReviewEnabled, s.PromptFilterReviewAPIKey, s.PromptFilterReviewBaseURL,
+		s.PromptFilterReviewModel, s.PromptFilterReviewTimeoutSeconds, s.PromptFilterReviewFailClosed,
 		s.ClientCompatMode, s.CodexMinCLIVersion, s.UsageLogMode, s.UsageLogBatchSize,
 		s.UsageLogFlushIntervalSeconds, s.StreamFlushPolicy, s.StreamFlushIntervalMS,
 		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.BackgroundConfig, s.ShowFullUsageNumbers, reasoningEffortModels,
 		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec),
-		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries))
+		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries),
+		s.AutoPause5hThreshold, s.AutoPause7dThreshold)
 	return err
 }
 
@@ -2048,21 +2136,55 @@ func (db *DB) flushLogs() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
 
+	var err error
 	// 使用批处理插入优化性能
 	if db.driver == "postgres" {
-		err := db.batchInsertLogs(ctx, batch)
-		if err != nil {
-			log.Printf("批量写入日志失败: %v", err)
-		}
+		err = db.batchInsertLogs(ctx, batch)
+	} else {
+		err = db.insertSQLiteUsageLogBatch(ctx, batch)
+	}
+	if err != nil {
+		log.Printf("批量写入日志失败，已重新放回缓冲区等待重试: %v", err)
+		db.requeueUsageLogBatch(batch)
 		return
+	}
+
+	if len(batch) > 10 {
+		log.Printf("批量写入 %d 条使用日志", len(batch))
+	}
+}
+
+func (db *DB) requeueUsageLogBatch(batch []usageLogEntry) {
+	if len(batch) == 0 {
+		return
+	}
+	db.logMu.Lock()
+	defer db.logMu.Unlock()
+
+	if len(db.logBuf) == 0 {
+		requeued := make([]usageLogEntry, len(batch), len(batch)+db.GetUsageLogBatchSize())
+		copy(requeued, batch)
+		db.logBuf = requeued
+		return
+	}
+
+	requeued := make([]usageLogEntry, 0, len(batch)+len(db.logBuf))
+	requeued = append(requeued, batch...)
+	requeued = append(requeued, db.logBuf...)
+	db.logBuf = requeued
+}
+
+func (db *DB) insertSQLiteUsageLogBatch(ctx context.Context, batch []usageLogEntry) error {
+	if len(batch) == 0 {
+		return nil
 	}
 
 	// SQLite 使用事务插入
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
-		log.Printf("批量写入日志失败（开始事务）: %v", err)
-		return
+		return fmt.Errorf("开始事务: %w", err)
 	}
+	defer tx.Rollback()
 
 	stmt, err := tx.PrepareContext(ctx,
 		`INSERT INTO usage_logs (account_id, client_ip, endpoint, model, effective_model, prompt_tokens, completion_tokens, total_tokens, status_code, duration_ms,
@@ -2072,9 +2194,7 @@ func (db *DB) flushLogs() {
 			  is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)`)
 	if err != nil {
-		tx.Rollback()
-		log.Printf("批量写入日志失败（准备语句）: %v", err)
-		return
+		return fmt.Errorf("准备语句: %w", err)
 	}
 	defer stmt.Close()
 
@@ -2084,23 +2204,17 @@ func (db *DB) flushLogs() {
 			e.RequestedServiceTier, e.ActualServiceTier, e.BillingServiceTier,
 			e.APIKeyID, e.APIKeyName, e.APIKeyMasked, e.ImageCount, e.ImageWidth, e.ImageHeight, e.ImageBytes, e.ImageFormat, e.ImageSize, e.AccountBilled, e.UserBilled,
 			e.IsRetryAttempt, e.AttemptIndex, e.UpstreamErrorKind, e.ErrorMessage, e.ViaWebsocket); err != nil {
-			tx.Rollback()
-			log.Printf("批量写入日志失败（执行）: %v", err)
-			return
+			return fmt.Errorf("执行插入: %w", err)
 		}
 	}
 
+	if err := db.applyAPIKeyQuotaUsageWithExec(ctx, tx, batch); err != nil {
+		return fmt.Errorf("更新 API Key 额度用量: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
-		log.Printf("批量写入日志失败（提交）: %v", err)
-		return
+		return fmt.Errorf("提交事务: %w", err)
 	}
-	if err := db.applyAPIKeyQuotaUsage(ctx, batch); err != nil {
-		log.Printf("更新 API Key 额度用量失败: %v", err)
-	}
-
-	if len(batch) > 10 {
-		log.Printf("批量写入 %d 条使用日志", len(batch))
-	}
+	return nil
 }
 
 // batchInsertLogs 使用 PostgreSQL 的批量插入优化
@@ -2109,6 +2223,12 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 	if len(batch) == 0 {
 		return nil
 	}
+
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开始事务: %w", err)
+	}
+	defer tx.Rollback()
 
 	const maxRowsPerBatch = 1600
 
@@ -2120,18 +2240,21 @@ func (db *DB) batchInsertLogs(ctx context.Context, batch []usageLogEntry) error 
 		}
 		subBatch := batch[start:end]
 
-		if err := db.batchInsertLogsChunk(ctx, subBatch); err != nil {
+		if err := db.batchInsertLogsChunk(ctx, tx, subBatch); err != nil {
 			return err
 		}
-		if err := db.applyAPIKeyQuotaUsage(ctx, subBatch); err != nil {
-			return err
-		}
+	}
+	if err := db.applyAPIKeyQuotaUsageWithExec(ctx, tx, batch); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交事务: %w", err)
 	}
 	return nil
 }
 
 // batchInsertLogsChunk 插入单批日志（内部辅助函数）
-func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) error {
+func (db *DB) batchInsertLogsChunk(ctx context.Context, execer sqlExecer, batch []usageLogEntry) error {
 	if len(batch) == 0 {
 		return nil
 	}
@@ -2162,12 +2285,19 @@ func (db *DB) batchInsertLogsChunk(ctx context.Context, batch []usageLogEntry) e
 		is_retry_attempt, attempt_index, upstream_error_kind, error_message, via_websocket)
 		VALUES %s`, strings.Join(valueStrings, ","))
 
-	_, err := db.conn.ExecContext(ctx, query, valueArgs...)
+	_, err := execer.ExecContext(ctx, query, valueArgs...)
 	return err
 }
 
 func (db *DB) applyAPIKeyQuotaUsage(ctx context.Context, batch []usageLogEntry) error {
-	if db == nil || len(batch) == 0 {
+	if db == nil {
+		return nil
+	}
+	return db.applyAPIKeyQuotaUsageWithExec(ctx, db.conn, batch)
+}
+
+func (db *DB) applyAPIKeyQuotaUsageWithExec(ctx context.Context, execer sqlExecer, batch []usageLogEntry) error {
+	if db == nil || execer == nil || len(batch) == 0 {
 		return nil
 	}
 	usageByKey := make(map[int64]float64)
@@ -2181,7 +2311,7 @@ func (db *DB) applyAPIKeyQuotaUsage(ctx context.Context, batch []usageLogEntry) 
 		if amount <= 0 {
 			continue
 		}
-		if _, err := db.conn.ExecContext(ctx, `UPDATE api_keys SET quota_used = COALESCE(quota_used, 0) + $1 WHERE id = $2`, amount, id); err != nil {
+		if _, err := execer.ExecContext(ctx, `UPDATE api_keys SET quota_used = COALESCE(quota_used, 0) + $1 WHERE id = $2`, amount, id); err != nil {
 			return err
 		}
 	}
@@ -3313,7 +3443,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	if f.Page < 1 {
 		f.Page = 1
 	}
-	if f.PageSize < 1 || f.PageSize > 200 {
+	if f.PageSize < 1 || f.PageSize > 500 {
 		f.PageSize = 20
 	}
 
@@ -4047,6 +4177,227 @@ func (db *DB) UpdateAccountSchedulerMetadata(ctx context.Context, id int64, scor
 	return tx.Commit()
 }
 
+func (db *DB) BatchUpdateAccountMetadata(ctx context.Context, ids []int64, update BatchAccountMetadataUpdate) ([]int64, error) {
+	ids = normalizeIDSlice(ids)
+	if len(ids) == 0 || !update.HasChanges() {
+		return nil, nil
+	}
+
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	credentialUpdates := cloneCredentialUpdates(update.CredentialUpdates)
+	if update.AllowedAPIKeyIDs.Set {
+		if credentialUpdates == nil {
+			credentialUpdates = make(map[string]interface{}, 1)
+		}
+		credentialUpdates["allowed_api_key_ids"] = normalizePositiveInt64Slice(update.AllowedAPIKeyIDs.Values)
+	}
+
+	active, err := db.selectBatchAccounts(ctx, tx, ids, len(credentialUpdates) > 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(active.ids) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	if err := db.batchUpdateAccountColumns(ctx, tx, active.ids, update); err != nil {
+		return nil, err
+	}
+	if len(credentialUpdates) > 0 {
+		if err := db.batchUpdateAccountCredentials(ctx, tx, active.credentials, credentialUpdates); err != nil {
+			return nil, err
+		}
+	}
+	if update.GroupIDs.Set {
+		if err := db.batchReplaceAccountGroups(ctx, tx, active.ids, update.GroupIDs.Values); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return active.ids, nil
+}
+
+type batchAccountCredentials struct {
+	ids         []int64
+	credentials map[int64]map[string]interface{}
+}
+
+func (db *DB) selectBatchAccounts(ctx context.Context, tx *sql.Tx, ids []int64, includeCredentials bool) (batchAccountCredentials, error) {
+	placeholders := dbPlaceholders(db.isSQLite(), 1, len(ids))
+	columns := "id"
+	if includeCredentials {
+		columns = "id, credentials"
+	}
+	query := fmt.Sprintf(`SELECT %s FROM accounts WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted' AND id IN (%s)`, columns, strings.Join(placeholders, ","))
+	if !db.isSQLite() {
+		query += ` FOR UPDATE`
+	}
+	rows, err := tx.QueryContext(ctx, query, argsFromInt64s(ids)...)
+	if err != nil {
+		return batchAccountCredentials{}, err
+	}
+	defer rows.Close()
+
+	out := batchAccountCredentials{
+		ids:         make([]int64, 0, len(ids)),
+		credentials: make(map[int64]map[string]interface{}, len(ids)),
+	}
+	for rows.Next() {
+		var id int64
+		if includeCredentials {
+			var raw interface{}
+			if err := rows.Scan(&id, &raw); err != nil {
+				return batchAccountCredentials{}, err
+			}
+			out.credentials[id] = decodeCredentials(raw)
+		} else if err := rows.Scan(&id); err != nil {
+			return batchAccountCredentials{}, err
+		}
+		out.ids = append(out.ids, id)
+	}
+	return out, rows.Err()
+}
+
+func cloneCredentialUpdates(updates map[string]interface{}) map[string]interface{} {
+	if len(updates) == 0 {
+		return nil
+	}
+	out := make(map[string]interface{}, len(updates))
+	for key, value := range updates {
+		out[key] = value
+	}
+	return out
+}
+
+func (db *DB) batchUpdateAccountColumns(ctx context.Context, tx *sql.Tx, ids []int64, update BatchAccountMetadataUpdate) error {
+	sets := make([]string, 0, 8)
+	args := make([]interface{}, 0, 10+len(ids))
+	touchUpdatedAt := false
+	add := func(column string, value interface{}, touch bool) {
+		args = append(args, value)
+		ph := "?"
+		if !db.isSQLite() {
+			ph = fmt.Sprintf("$%d", len(args))
+		}
+		sets = append(sets, column+" = "+ph)
+		touchUpdatedAt = touchUpdatedAt || touch
+	}
+	if update.Enabled.Set {
+		add("enabled", update.Enabled.Value, true)
+	}
+	if update.Locked.Set {
+		add("locked", update.Locked.Value, false)
+	}
+	if update.ScoreBiasOverride.Set {
+		add("score_bias_override", nullableInt64Value(update.ScoreBiasOverride.Value), true)
+	}
+	if update.BaseConcurrencyOverride.Set {
+		add("base_concurrency_override", nullableInt64Value(update.BaseConcurrencyOverride.Value), true)
+	}
+	if update.SkipWarmTier.Set {
+		add("skip_warm_tier", update.SkipWarmTier.Value, true)
+	}
+	if update.Tags.Set {
+		if db.isSQLite() {
+			add("tags", encodeTagsJSON(update.Tags.Values), true)
+		} else {
+			args = append(args, encodeTagsJSON(update.Tags.Values))
+			sets = append(sets, fmt.Sprintf("tags = $%d::jsonb", len(args)))
+			touchUpdatedAt = true
+		}
+	}
+	if update.ProxyURL.Set {
+		add("proxy_url", strings.TrimSpace(update.ProxyURL.Value), true)
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+
+	if touchUpdatedAt {
+		sets = append(sets, "updated_at = CURRENT_TIMESTAMP")
+	}
+	start := len(args) + 1
+	placeholders := dbPlaceholders(db.isSQLite(), start, len(ids))
+	args = append(args, argsFromInt64s(ids)...)
+	query := fmt.Sprintf("UPDATE accounts SET %s WHERE id IN (%s)", strings.Join(sets, ", "), strings.Join(placeholders, ","))
+	_, err := tx.ExecContext(ctx, query, args...)
+	return err
+}
+
+func (db *DB) batchUpdateAccountCredentials(ctx context.Context, tx *sql.Tx, current map[int64]map[string]interface{}, updates map[string]interface{}) error {
+	query := `UPDATE accounts SET credentials = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+	if !db.isSQLite() {
+		query = `UPDATE accounts SET credentials = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE id = $2`
+	}
+	for id, credentials := range current {
+		merged := mergeCredentialMaps(credentials, updates)
+		credJSON, err := json.Marshal(merged)
+		if err != nil {
+			return fmt.Errorf("序列化 credentials 失败: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, query, credJSON, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (db *DB) batchReplaceAccountGroups(ctx context.Context, tx *sql.Tx, accountIDs []int64, groupIDs []int64) error {
+	placeholders := dbPlaceholders(db.isSQLite(), 1, len(accountIDs))
+	args := argsFromInt64s(accountIDs)
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf("DELETE FROM account_group_members WHERE account_id IN (%s)", strings.Join(placeholders, ",")), args...); err != nil {
+		return err
+	}
+
+	groupIDs = normalizeIDSlice(groupIDs)
+	if len(groupIDs) == 0 {
+		return nil
+	}
+	insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
+	if db.isSQLite() {
+		insertQ = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
+	}
+	for _, accountID := range accountIDs {
+		for _, groupID := range groupIDs {
+			if _, err := tx.ExecContext(ctx, insertQ, accountID, groupID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func dbPlaceholders(sqlite bool, start, n int) []string {
+	placeholders := make([]string, n)
+	for i := 0; i < n; i++ {
+		if sqlite {
+			placeholders[i] = "?"
+		} else {
+			placeholders[i] = fmt.Sprintf("$%d", start+i)
+		}
+	}
+	return placeholders
+}
+
+func argsFromInt64s(ids []int64) []interface{} {
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	return args
+}
+
 func nullableInt64Value(v sql.NullInt64) interface{} {
 	if !v.Valid {
 		return nil
@@ -4275,6 +4626,47 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 	return tx.Commit()
 }
 
+func (db *DB) UpdateOAuthAccountCredentials(ctx context.Context, id int64, credentials map[string]interface{}, proxyURL string) error {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	selectQuery := `SELECT credentials FROM accounts WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
+	if !db.isSQLite() {
+		selectQuery += ` FOR UPDATE`
+	}
+
+	var currentRaw interface{}
+	if err := tx.QueryRowContext(ctx, selectQuery, id).Scan(&currentRaw); err != nil {
+		return err
+	}
+
+	merged := mergeCredentialMaps(decodeCredentials(currentRaw), credentials)
+	credJSON, err := json.Marshal(merged)
+	if err != nil {
+		return fmt.Errorf("序列化 credentials 失败: %w", err)
+	}
+
+	updateQuery := `UPDATE accounts SET credentials = $1, proxy_url = $2, platform = 'openai', type = 'oauth', updated_at = CURRENT_TIMESTAMP WHERE id = $3`
+	if !db.isSQLite() {
+		updateQuery = `UPDATE accounts SET credentials = $1::jsonb, proxy_url = $2, platform = 'openai', type = 'oauth', updated_at = CURRENT_TIMESTAMP WHERE id = $3`
+	}
+	res, err := tx.ExecContext(ctx, updateQuery, credJSON, proxyURL, id)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 // UpdateUsageSnapshot 持久化账号用量快照（7d + 5h）
 func (db *DB) UpdateUsageSnapshot(ctx context.Context, id int64, pct7d float64, updatedAt time.Time) error {
 	return db.UpdateCredentials(ctx, id, map[string]interface{}{
@@ -4284,13 +4676,14 @@ func (db *DB) UpdateUsageSnapshot(ctx context.Context, id int64, pct7d float64, 
 }
 
 // UpdateUsageSnapshotFull 持久化完整用量快照（5h + 7d + 重置时间）
-func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float64, reset7dAt time.Time, pct5h float64, reset5hAt time.Time, updatedAt time.Time) error {
+func (db *DB) UpdateUsageSnapshotFull(ctx context.Context, id int64, pct7d float64, reset7dAt time.Time, pct5h float64, reset5hAt time.Time, updatedAt7d time.Time, updatedAt5h time.Time) error {
 	fields := map[string]interface{}{
-		"codex_7d_used_percent":  pct7d,
-		"codex_7d_reset_at":      reset7dAt.Format(time.RFC3339),
-		"codex_5h_used_percent":  pct5h,
-		"codex_5h_reset_at":      reset5hAt.Format(time.RFC3339),
-		"codex_usage_updated_at": updatedAt.Format(time.RFC3339),
+		"codex_7d_used_percent":     pct7d,
+		"codex_7d_reset_at":         reset7dAt.Format(time.RFC3339),
+		"codex_5h_used_percent":     pct5h,
+		"codex_5h_reset_at":         reset5hAt.Format(time.RFC3339),
+		"codex_usage_updated_at":    updatedAt7d.Format(time.RFC3339),
+		"codex_5h_usage_updated_at": updatedAt5h.Format(time.RFC3339),
 	}
 	return db.UpdateCredentials(ctx, id, fields)
 }
@@ -4740,6 +5133,51 @@ func (db *DB) GetAllChatGPTAccountIDs(ctx context.Context) (map[string]bool, err
 		}
 	}
 	return result, rows.Err()
+}
+
+// FindActiveAccountByOAuthIdentity returns the first non-deleted account with
+// the same email and ChatGPT account id. It accepts both historical credential
+// key names: account_id and chatgpt_account_id.
+func (db *DB) FindActiveAccountByOAuthIdentity(ctx context.Context, email, accountID string, excludeIDs ...int64) (int64, error) {
+	email = strings.ToLower(strings.TrimSpace(email))
+	accountID = strings.TrimSpace(accountID)
+	if email == "" || accountID == "" {
+		return 0, sql.ErrNoRows
+	}
+	excluded := make(map[int64]struct{}, len(excludeIDs))
+	for _, id := range excludeIDs {
+		if id > 0 {
+			excluded[id] = struct{}{}
+		}
+	}
+
+	rows, err := db.conn.QueryContext(ctx, `SELECT id, credentials FROM accounts WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id int64
+		var raw interface{}
+		if err := rows.Scan(&id, &raw); err != nil {
+			return 0, err
+		}
+		if _, ok := excluded[id]; ok {
+			continue
+		}
+		if strings.ToLower(strings.TrimSpace(credentialString(raw, "email"))) != email {
+			continue
+		}
+		if strings.TrimSpace(credentialString(raw, "account_id")) == accountID ||
+			strings.TrimSpace(credentialString(raw, "chatgpt_account_id")) == accountID {
+			return id, nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return 0, sql.ErrNoRows
 }
 
 func (db *DB) GetAllOpenAIAPIKeys(ctx context.Context) (map[string]bool, error) {

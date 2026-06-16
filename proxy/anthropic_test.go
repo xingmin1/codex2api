@@ -2,10 +2,45 @@ package proxy
 
 import (
 	"encoding/json"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
+
+func TestSendAnthropicStreamErrorEscapesJSON(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+
+	sendAnthropicStreamError(c, "api_error", "bad \"quote\"\\slash\nand control \x01")
+
+	body := recorder.Body.String()
+	if !strings.HasPrefix(body, "event: error\ndata: ") || !strings.HasSuffix(body, "\n\n") {
+		t.Fatalf("unexpected SSE frame: %q", body)
+	}
+	data := strings.TrimSuffix(strings.TrimPrefix(body, "event: error\ndata: "), "\n\n")
+
+	var payload struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		t.Fatalf("stream error data is not valid JSON: %v; data=%q", err, data)
+	}
+	if payload.Type != "error" || payload.Error.Type != "api_error" {
+		t.Fatalf("unexpected payload metadata: %+v", payload)
+	}
+	wantMessage := "bad \"quote\"\\slash\nand control \x01"
+	if payload.Error.Message != wantMessage {
+		t.Fatalf("message = %q, want %q", payload.Error.Message, wantMessage)
+	}
+}
 
 func TestTranslateAnthropicToCodex_OutputConfigEffortTakesPrecedence(t *testing.T) {
 	raw := []byte(`{
@@ -207,63 +242,203 @@ func TestTranslateAnthropicToCodexDoesNotCanonicalizeDisabledModelAlias(t *testi
 
 func TestSanitizeToolInputJSON(t *testing.T) {
 	tests := []struct {
-		name string
-		in   string
-		want string
+		name     string
+		toolName string
+		in       string
+		want     string
 	}{
 		{
-			name: "drops empty string optional field",
-			in:   `{"file_path":"/etc/hosts","pages":""}`,
-			want: `{"file_path":"/etc/hosts"}`,
+			name:     "read drops empty pages",
+			toolName: "Read",
+			in:       `{"file_path":"/etc/hosts","pages":""}`,
+			want:     `{"file_path":"/etc/hosts"}`,
 		},
 		{
-			name: "drops null field",
-			in:   `{"file_path":"/etc/hosts","limit":null}`,
-			want: `{"file_path":"/etc/hosts"}`,
+			name:     "read preserves null fields other than pages",
+			toolName: "Read",
+			in:       `{"file_path":"/etc/hosts","limit":null}`,
+			want:     `{"file_path":"/etc/hosts","limit":null}`,
 		},
 		{
-			name: "drops multiple empties",
-			in:   `{"file_path":"/x","pages":"","limit":null,"offset":0}`,
-			want: `{"file_path":"/x","offset":0}`,
+			name:     "read only drops empty pages",
+			toolName: "Read",
+			in:       `{"file_path":"/x","pages":"","limit":null,"offset":0}`,
+			want:     `{"file_path":"/x","limit":null,"offset":0}`,
 		},
 		{
-			name: "preserves empty object",
-			in:   `{"options":{}}`,
-			want: `{"options":{}}`,
+			name:     "write preserves empty content",
+			toolName: "Write",
+			in:       `{"file_path":"/tmp/empty.txt","content":""}`,
+			want:     `{"file_path":"/tmp/empty.txt","content":""}`,
 		},
 		{
-			name: "preserves empty array",
-			in:   `{"items":[]}`,
-			want: `{"items":[]}`,
+			name:     "edit preserves empty replacement",
+			toolName: "Edit",
+			in:       `{"file_path":"/tmp/a.txt","old_string":"abc","new_string":""}`,
+			want:     `{"file_path":"/tmp/a.txt","old_string":"abc","new_string":""}`,
 		},
 		{
-			name: "preserves whitespace strings",
-			in:   `{"sep":" "}`,
-			want: `{"sep":" "}`,
+			name:     "custom tool preserves empty string",
+			toolName: "Search",
+			in:       `{"query":""}`,
+			want:     `{"query":""}`,
 		},
 		{
-			name: "no-op when nothing to drop",
-			in:   `{"file_path":"/etc/hosts"}`,
-			want: `{"file_path":"/etc/hosts"}`,
+			name:     "read preserves empty object",
+			toolName: "Read",
+			in:       `{"options":{}}`,
+			want:     `{"options":{}}`,
 		},
 		{
-			name: "invalid JSON returned as-is",
-			in:   `{"file_path":`,
-			want: `{"file_path":`,
+			name:     "read preserves empty array",
+			toolName: "Read",
+			in:       `{"items":[]}`,
+			want:     `{"items":[]}`,
 		},
 		{
-			name: "empty input returned as-is",
-			in:   ``,
-			want: ``,
+			name:     "read preserves whitespace strings",
+			toolName: "Read",
+			in:       `{"sep":" "}`,
+			want:     `{"sep":" "}`,
+		},
+		{
+			name:     "read no-op when pages absent",
+			toolName: "Read",
+			in:       `{"file_path":"/etc/hosts"}`,
+			want:     `{"file_path":"/etc/hosts"}`,
+		},
+		{
+			name:     "enter worktree drops empty name when path is set",
+			toolName: "EnterWorktree",
+			in:       `{"name":"","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+			want:     `{"path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+		},
+		{
+			name:     "enter worktree drops empty path when name is set",
+			toolName: "EnterWorktree",
+			in:       `{"name":"feature-x","path":""}`,
+			want:     `{"name":"feature-x"}`,
+		},
+		{
+			name:     "enter worktree preserves both non-empty mutually exclusive fields",
+			toolName: "EnterWorktree",
+			in:       `{"name":"feature-x","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+			want:     `{"name":"feature-x","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+		},
+		{
+			name:     "enter worktree preserves both empty fields",
+			toolName: "EnterWorktree",
+			in:       `{"name":"","path":""}`,
+			want:     `{"name":"","path":""}`,
+		},
+		{
+			name:     "invalid JSON returned as-is",
+			toolName: "Read",
+			in:       `{"file_path":`,
+			want:     `{"file_path":`,
+		},
+		{
+			name:     "empty input returned as-is",
+			toolName: "Read",
+			in:       ``,
+			want:     ``,
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := sanitizeToolInputJSON(tc.in)
+			got := sanitizeToolInputJSON(tc.toolName, tc.in)
 			// Compare as JSON to ignore key ordering.
 			if !jsonEqual(t, got, tc.want) {
-				t.Fatalf("sanitizeToolInputJSON(%q) = %q, want equivalent to %q",
-					tc.in, got, tc.want)
+				t.Fatalf("sanitizeToolInputJSON(%q, %q) = %q, want equivalent to %q",
+					tc.toolName, tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTranslateAnthropicToCodexPreservesToolInputByToolName(t *testing.T) {
+	raw := []byte(`{
+		"model":"claude-sonnet-4-5",
+		"messages":[{
+			"role":"assistant",
+			"content":[{
+				"type":"tool_use",
+				"id":"toolu_abc",
+				"name":"Write",
+				"input":{"file_path":"/tmp/empty.txt","content":""}
+			}]
+		}]
+	}`)
+
+	body, _, err := TranslateAnthropicToCodexWithModels(raw, "", []string{"gpt-5.4"})
+	if err != nil {
+		t.Fatalf("TranslateAnthropicToCodexWithModels returned error: %v", err)
+	}
+
+	args := gjson.GetBytes(body, `input.#(type=="function_call").arguments`).String()
+	want := `{"file_path":"/tmp/empty.txt","content":""}`
+	if !jsonEqual(t, args, want) {
+		t.Fatalf("function_call arguments = %q, want equivalent to %q; body=%s", args, want, body)
+	}
+}
+
+func TestBuildAnthropicResponseFromCompletedPreservesToolInputByToolName(t *testing.T) {
+	tests := []struct {
+		name      string
+		toolName  string
+		arguments string
+		wantInput string
+	}{
+		{
+			name:      "read drops empty pages",
+			toolName:  "Read",
+			arguments: `{"file_path":"/etc/hosts","pages":""}`,
+			wantInput: `{"file_path":"/etc/hosts"}`,
+		},
+		{
+			name:      "write preserves empty content",
+			toolName:  "Write",
+			arguments: `{"file_path":"/tmp/empty.txt","content":""}`,
+			wantInput: `{"file_path":"/tmp/empty.txt","content":""}`,
+		},
+		{
+			name:      "enter worktree drops empty name when path is set",
+			toolName:  "EnterWorktree",
+			arguments: `{"name":"","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+			wantInput: `{"path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+		},
+		{
+			name:      "enter worktree preserves both non-empty mutually exclusive fields",
+			toolName:  "EnterWorktree",
+			arguments: `{"name":"feature-x","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+			wantInput: `{"name":"feature-x","path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			completed := []byte(`{
+				"type":"response.completed",
+				"response":{
+					"status":"completed",
+					"output":[{
+						"type":"function_call",
+						"call_id":"call_abc",
+						"name":` + mustJSONString(tc.toolName) + `,
+						"arguments":` + mustJSONString(tc.arguments) + `
+					}]
+				}
+			}`)
+
+			resp := buildAnthropicResponseFromCompleted(completed, "claude-sonnet-4-5")
+			if len(resp.Content) != 1 {
+				t.Fatalf("len(content) = %d, want 1: %+v", len(resp.Content), resp.Content)
+			}
+			if got := resp.Content[0].Name; got != tc.toolName {
+				t.Fatalf("tool name = %q, want %q", got, tc.toolName)
+			}
+			if !jsonEqual(t, string(resp.Content[0].Input), tc.wantInput) {
+				t.Fatalf("tool input = %q, want equivalent to %q", string(resp.Content[0].Input), tc.wantInput)
 			}
 		})
 	}
@@ -290,63 +465,108 @@ func jsonEqual(t *testing.T, a, b string) bool {
 // "pages":"" 拆成多片 SSE 推送：translator 应缓冲到 tool_use 块关闭时再
 // 整段清洗，并以单次 input_json_delta 发出，下游收到的 JSON 不含空 pages。
 func TestAnthropicStreamTranslator_ToolInputBufferedAndCleaned(t *testing.T) {
-	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
-
-	// response.created
-	tr.translateEvent([]byte(`{"type":"response.created"}`))
-	// output_item.added — 启动 tool_use 块
-	tr.translateEvent([]byte(`{
-		"type":"response.output_item.added",
-		"output_index":0,
-		"item":{"type":"function_call","call_id":"call_abc","name":"Read"}
-	}`))
-
-	// 三片 function_call_arguments.delta，分别是开头/中段/结尾
-	deltas := []string{
-		`{"file_path":"/etc/hosts"`,
-		`,"pages":""`,
-		`}`,
+	tests := []struct {
+		name      string
+		toolName  string
+		deltas    []string
+		wantInput string
+	}{
+		{
+			name:     "read drops empty pages",
+			toolName: "Read",
+			deltas: []string{
+				`{"file_path":"/etc/hosts"`,
+				`,"pages":""`,
+				`}`,
+			},
+			wantInput: `{"file_path":"/etc/hosts"}`,
+		},
+		{
+			name:     "write preserves empty content",
+			toolName: "Write",
+			deltas: []string{
+				`{"file_path":"/tmp/empty.txt"`,
+				`,"content":""`,
+				`}`,
+			},
+			wantInput: `{"file_path":"/tmp/empty.txt","content":""}`,
+		},
+		{
+			name:     "enter worktree drops empty name when path is set",
+			toolName: "EnterWorktree",
+			deltas: []string{
+				`{"name":""`,
+				`,"path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"`,
+				`}`,
+			},
+			wantInput: `{"path":"F:\\Github\\codex2api\\.claude\\worktrees\\existing"}`,
+		},
+		{
+			name:     "enter worktree drops empty path when name is set",
+			toolName: "EnterWorktree",
+			deltas: []string{
+				`{"name":"feature-x"`,
+				`,"path":""`,
+				`}`,
+			},
+			wantInput: `{"name":"feature-x"}`,
+		},
 	}
-	var streamed []anthropicStreamEvent
-	for _, d := range deltas {
-		evt := []byte(`{"type":"response.function_call_arguments.delta","delta":` +
-			mustJSONString(d) + `}`)
-		streamed = append(streamed, tr.translateEvent(evt)...)
-	}
 
-	// delta 阶段不应该泄漏任何 input_json_delta
-	for _, evt := range streamed {
-		if evt.Type == "content_block_delta" {
-			t.Fatalf("expected no content_block_delta during streaming, got %+v", evt)
-		}
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
 
-	// output_item.done 触发 closeCurrentBlock，整段清洗
-	closing := tr.translateEvent([]byte(`{"type":"response.output_item.done"}`))
+			// response.created
+			tr.translateEvent([]byte(`{"type":"response.created"}`))
+			// output_item.added — 启动 tool_use 块
+			tr.translateEvent([]byte(`{
+				"type":"response.output_item.added",
+				"output_index":0,
+				"item":{"type":"function_call","call_id":"call_abc","name":` + mustJSONString(tc.toolName) + `}
+			}`))
 
-	var sawDelta bool
-	var sawStop bool
-	for _, evt := range closing {
-		if evt.Type == "content_block_delta" {
-			sawDelta = true
-			if evt.Delta == nil || evt.Delta.Type != "input_json_delta" {
-				t.Fatalf("expected input_json_delta, got %+v", evt.Delta)
+			var streamed []anthropicStreamEvent
+			for _, d := range tc.deltas {
+				evt := []byte(`{"type":"response.function_call_arguments.delta","delta":` +
+					mustJSONString(d) + `}`)
+				streamed = append(streamed, tr.translateEvent(evt)...)
 			}
-			want := `{"file_path":"/etc/hosts"}`
-			if !jsonEqual(t, evt.Delta.PartialJSON, want) {
-				t.Fatalf("cleaned tool input = %q, want equivalent to %q",
-					evt.Delta.PartialJSON, want)
+
+			// delta 阶段不应该泄漏任何 input_json_delta
+			for _, evt := range streamed {
+				if evt.Type == "content_block_delta" {
+					t.Fatalf("expected no content_block_delta during streaming, got %+v", evt)
+				}
 			}
-		}
-		if evt.Type == "content_block_stop" {
-			sawStop = true
-		}
-	}
-	if !sawDelta {
-		t.Fatalf("expected one content_block_delta with cleaned input on close")
-	}
-	if !sawStop {
-		t.Fatalf("expected content_block_stop on close")
+
+			// output_item.done 触发 closeCurrentBlock，整段清洗
+			closing := tr.translateEvent([]byte(`{"type":"response.output_item.done"}`))
+
+			var sawDelta bool
+			var sawStop bool
+			for _, evt := range closing {
+				if evt.Type == "content_block_delta" {
+					sawDelta = true
+					if evt.Delta == nil || evt.Delta.Type != "input_json_delta" {
+						t.Fatalf("expected input_json_delta, got %+v", evt.Delta)
+					}
+					if !jsonEqual(t, evt.Delta.PartialJSON, tc.wantInput) {
+						t.Fatalf("cleaned tool input = %q, want equivalent to %q",
+							evt.Delta.PartialJSON, tc.wantInput)
+					}
+				}
+				if evt.Type == "content_block_stop" {
+					sawStop = true
+				}
+			}
+			if !sawDelta {
+				t.Fatalf("expected one content_block_delta with cleaned input on close")
+			}
+			if !sawStop {
+				t.Fatalf("expected content_block_stop on close")
+			}
+		})
 	}
 }
 
@@ -393,8 +613,43 @@ func TestAnthropicResponseAccumulatorUsesStreamDeltasWhenCompletedOutputIsEmpty(
 	if resp.StopReason != "end_turn" {
 		t.Fatalf("stop_reason = %q, want end_turn", resp.StopReason)
 	}
-	if resp.Usage.InputTokens != 10 || resp.Usage.OutputTokens != 2 || resp.Usage.CacheReadInputTokens != 3 {
-		t.Fatalf("usage = %+v, want input=10 output=2 cache_read=3", resp.Usage)
+	// 上游 input_tokens=10 含 3 个缓存命中；Anthropic 语义下 input_tokens 不含
+	// 缓存，应对外报 input=7（10-3）、cache_read=3，避免缓存 token 被重复计费。
+	if resp.Usage.InputTokens != 7 || resp.Usage.OutputTokens != 2 || resp.Usage.CacheReadInputTokens != 3 {
+		t.Fatalf("usage = %+v, want input=7 output=2 cache_read=3", resp.Usage)
+	}
+}
+
+// TestAnthropicStreamTranslatorUsageExcludesCachedTokens 验证流式 message_delta
+// 的 usage 把缓存命中从 input_tokens 中扣除，避免缓存 token 被重复计费。
+func TestAnthropicStreamTranslatorUsageExcludesCachedTokens(t *testing.T) {
+	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
+	tr.translateEvent([]byte(`{"type":"response.created"}`))
+
+	completed := []byte(`{
+		"type":"response.completed",
+		"response":{
+			"status":"completed",
+			"usage":{
+				"input_tokens":10,
+				"output_tokens":2,
+				"input_tokens_details":{"cached_tokens":3}
+			}
+		}
+	}`)
+
+	var usage *anthropicUsage
+	for _, evt := range tr.translateEvent(completed) {
+		if evt.Type == "message_delta" && evt.Usage != nil {
+			usage = evt.Usage
+		}
+	}
+	if usage == nil {
+		t.Fatal("expected message_delta with usage")
+	}
+	// input_tokens=10 含 3 个缓存 → 对外 input=7、cache_read=3
+	if usage.InputTokens != 7 || usage.OutputTokens != 2 || usage.CacheReadInputTokens != 3 {
+		t.Fatalf("usage = %+v, want input=7 output=2 cache_read=3", *usage)
 	}
 }
 

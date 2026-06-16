@@ -22,6 +22,7 @@ import type {
   ImageJobsResponse,
   ImagePromptTemplatePayload,
   ImagePromptTemplatesResponse,
+  InviteResponse,
   MessageResponse,
   ModelSyncResponse,
   ModelsResponse,
@@ -29,6 +30,7 @@ import type {
   OAuthURLResponse,
   OpsErrorSummary,
   OpsOverviewResponse,
+  PromptFilterLog,
   PromptFilterLogsResponse,
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
@@ -42,12 +44,15 @@ import type {
   SystemSettings,
   UpdateAccountSchedulerRequest,
   UpdateAPIKeyRequest,
+  UpdateOAuthAccountRequest,
   UpdateOpenAIResponsesAccountRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
   UsageStats,
   AccountGroup,
   AccountGroupsResponse,
+  AccountHealthBarsResponse,
+  BatchUpdateAccountsRequest,
   BackgroundUploadResponse,
   CreateAccountGroupRequest,
   UpdateAccountGroupRequest,
@@ -236,8 +241,16 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/enable`, { method: 'POST', body: JSON.stringify({ enabled }) }),
   toggleAccountLock: (id: number, locked: boolean) =>
     request<MessageResponse>(`/accounts/${id}/lock`, { method: 'POST', body: JSON.stringify({ locked }) }),
+  batchUpdateAccounts: (data: BatchUpdateAccountsRequest) =>
+    request<{ message: string; success: number; failed: number }>('/accounts/batch-update', { method: 'POST', body: JSON.stringify(data) }),
   resetAccountStatus: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/reset-status`, { method: 'POST' }),
+  resetCredits: (id: number) =>
+    request<{ message: string; rate_limit_reset_credits?: number }>(`/accounts/${id}/reset-credits`, { method: 'POST' }),
+  getAccountHealthBars: () =>
+    request<AccountHealthBarsResponse>('/accounts/health-bars'),
+  sendInvite: (id: number, data: { emails?: string[]; emails_text?: string; referral_key?: string; proxy_url?: string; max_emails?: number }) =>
+    request<InviteResponse>(`/accounts/${id}/invite`, { method: 'POST', body: JSON.stringify(data) }),
   batchResetStatus: (ids: number[]) =>
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
   getAccountUsage: (id: number, days?: number) => {
@@ -454,6 +467,14 @@ export const api = {
   },
   clearPromptFilterLogs: () =>
     request<MessageResponse>('/prompt-filter/logs', { method: 'DELETE' }),
+  matchPromptFilterLog: (params: { at: string; endpoint?: string; apiKeyId?: number; source?: string }) => {
+    const search = new URLSearchParams()
+    search.set('at', params.at)
+    if (params.endpoint) search.set('endpoint', params.endpoint)
+    if (params.apiKeyId) search.set('api_key_id', String(params.apiKeyId))
+    if (params.source) search.set('source', params.source)
+    return request<{ found: boolean; log: PromptFilterLog | null }>(`/prompt-filter/logs/match?${search.toString()}`)
+  },
   testPromptFilter: (data: { text: string; endpoint?: string; model?: string }) =>
     request<PromptFilterTestResponse>('/prompt-filter/test', { method: 'POST', body: JSON.stringify(data) }),
   getPromptFilterRules: () =>
@@ -499,6 +520,8 @@ export const api = {
     request<OAuthURLResponse>('/oauth/generate-auth-url', { method: 'POST', body: JSON.stringify(data) }),
   exchangeOAuthCode: (data: { session_id: string; code: string; state: string; name?: string; proxy_url?: string }) =>
     request<OAuthExchangeResponse>('/oauth/exchange-code', { method: 'POST', body: JSON.stringify(data) }),
+  updateOAuthAccount: (id: number, data: UpdateOAuthAccountRequest) =>
+    request<OAuthExchangeResponse>(`/accounts/${id}/oauth/exchange-code`, { method: 'POST', body: JSON.stringify(data) }),
 }
 
 export interface ProxyRow {

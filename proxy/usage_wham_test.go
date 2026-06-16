@@ -134,6 +134,38 @@ func TestApplyWhamUsage_PersistsPlanAnd5h7d(t *testing.T) {
 	}
 }
 
+func TestApplyWhamUsage5hOnlyDoesNotRefreshStale7dProbeFreshness(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	account := &auth.Account{
+		DBID:                2,
+		AccessToken:         "at",
+		PlanType:            "plus",
+		Status:              auth.StatusReady,
+		UsagePercent7d:      40,
+		UsagePercent7dValid: true,
+		UsageUpdatedAt:      time.Now().Add(-20 * time.Minute),
+	}
+
+	now := time.Now()
+	usage := &WhamUsage{PlanType: "plus"}
+	usage.RateLimit.PrimaryWindow = &WhamUsageWindow{UsedPercent: 83, LimitWindowSeconds: 18000, ResetAt: now.Add(2 * time.Hour).Unix()}
+
+	result := ApplyWhamUsage(store, account, usage)
+
+	if !result.Used5hHeaders || !result.HasUsage5h {
+		t.Fatalf("ApplyWhamUsage result = %+v, want 5h-only usage snapshot", result)
+	}
+	if result.HasUsage7d {
+		t.Fatalf("ApplyWhamUsage result = %+v, want no 7d snapshot from 5h-only usage", result)
+	}
+	if !result.Persisted5hOnly {
+		t.Fatalf("ApplyWhamUsage result = %+v, want 5h-only persistence path", result)
+	}
+	if !account.NeedsUsageProbe(10 * time.Minute) {
+		t.Fatal("NeedsUsageProbe() = false, want true because 5h-only WHAM sync must not refresh stale 7d freshness")
+	}
+}
+
 // 复现 issue #168：free 账号的 wham 响应里 primary_window 实际承载的是 7d 数据
 // （limit_window_seconds=604800），secondary_window=null。代码必须按
 // limit_window_seconds 而不是字段位置来分类，否则 7d 数据会被错误写入 5h 槽位。
@@ -304,5 +336,109 @@ func TestWhamUsageJSON_RoundTrip(t *testing.T) {
 	}
 	if out.RateLimit.PrimaryWindow == nil || out.RateLimit.PrimaryWindow.UsedPercent != 50 {
 		t.Errorf("roundtrip lost primary window")
+	}
+}
+
+func TestQueryWhamUsage_ParsesRateLimitResetCredits(t *testing.T) {
+	body := `{
+		"plan_type": "plus",
+		"rate_limit": {"allowed": true},
+		"rate_limit_reset_credits": {"available_count": 4}
+	}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	oldURL := whamURLForTest
+	whamURLForTest = server.URL
+	defer func() { whamURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	usage, _, err := queryWhamUsageWithURL(context.Background(), account, "", whamURLForTest)
+	if err != nil {
+		t.Fatalf("QueryWhamUsage error: %v", err)
+	}
+	if usage.RateLimitResetCredits == nil || usage.RateLimitResetCredits.AvailableCount != 4 {
+		t.Fatalf("RateLimitResetCredits = %+v, want available_count=4", usage.RateLimitResetCredits)
+	}
+
+	// ApplyWhamUsage 应把次数写入账号。
+	ApplyWhamUsage(nil, account, usage)
+	if count, ok := account.GetRateLimitResetCredits(); !ok || count != 4 {
+		t.Fatalf("account reset credits = (%d,%v), want (4,true)", count, ok)
+	}
+}
+
+func TestConsumeResetCredit_PostsRedeemRequestID(t *testing.T) {
+	var gotMethod, gotAuth, gotAccountID, gotRedeemID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotAuth = r.Header.Get("Authorization")
+		gotAccountID = r.Header.Get("chatgpt-account-id")
+		var payload struct {
+			RedeemRequestID string `json:"redeem_request_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		gotRedeemID = payload.RedeemRequestID
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	resp, err := ConsumeResetCredit(context.Background(), account, "")
+	if err != nil {
+		t.Fatalf("ConsumeResetCredit error: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("resp = %+v, want 200", resp)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", gotMethod)
+	}
+	if !strings.HasPrefix(gotAuth, "Bearer ") {
+		t.Errorf("Authorization = %q, want Bearer prefix", gotAuth)
+	}
+	if gotAccountID != "acc-1" {
+		t.Errorf("chatgpt-account-id = %q, want acc-1", gotAccountID)
+	}
+	if gotRedeemID == "" {
+		t.Errorf("redeem_request_id missing in request body")
+	}
+}
+
+func TestConsumeResetCredit_NonOKReturnsResp(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	resp, err := ConsumeResetCredit(context.Background(), account, "")
+	if err == nil {
+		t.Fatal("expected error on non-2xx")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("resp = %+v, want 401 surfaced to caller", resp)
+	}
+	_ = resp.Body.Close()
+}
+
+func TestConsumeResetCredit_NoToken(t *testing.T) {
+	account := &auth.Account{DBID: 1}
+	if _, err := ConsumeResetCredit(context.Background(), account, ""); err == nil {
+		t.Fatal("expected error when account has no access token")
 	}
 }

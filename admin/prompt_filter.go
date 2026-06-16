@@ -46,11 +46,18 @@ type promptFilterRulesResponse struct {
 }
 
 func (h *Handler) inspectImageStudioPromptFilter(c *gin.Context, text string, model string, keyID int64, keyName string, keyMasked string) bool {
+	return h.inspectImagePromptFilter(c, text, model, keyID, keyName, keyMasked, "/api/admin/images/jobs", nil, false)
+}
+
+func (h *Handler) inspectImagePromptFilter(c *gin.Context, text string, model string, keyID int64, keyName string, keyMasked string, endpoint string, writeBlock func(*gin.Context), redactPreview bool) bool {
 	if h == nil || h.store == nil {
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
 	verdict := promptfilter.InspectText(text, cfg)
+	if shouldReviewPromptFilterVerdict(verdict, cfg) {
+		verdict = reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
+	}
 	if verdict.Action == promptfilter.ActionWarn {
 		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
 		return false
@@ -58,22 +65,33 @@ func (h *Handler) inspectImageStudioPromptFilter(c *gin.Context, text string, mo
 	if verdict.Action != promptfilter.ActionBlock {
 		return false
 	}
+	textPreview := verdict.TextPreview
+	if redactPreview {
+		textPreview = "[redacted]"
+	}
 	h.recordPromptFilterLog(c, &database.PromptFilterLogInput{
 		Source:          "local_filter",
-		Endpoint:        "/api/admin/images/jobs",
+		Endpoint:        endpoint,
 		Model:           model,
 		Action:          verdict.Action,
 		Mode:            verdict.Mode,
 		Score:           verdict.Score,
 		Threshold:       verdict.Threshold,
 		MatchedPatterns: promptfilter.MatchesJSON(verdict.Matched),
-		TextPreview:     verdict.TextPreview,
+		TextPreview:     textPreview,
 		APIKeyID:        keyID,
 		APIKeyName:      keyName,
 		APIKeyMasked:    keyMasked,
 		ClientIP:        c.ClientIP(),
+		ReviewModel:     verdict.ReviewModel,
+		ReviewFlagged:   verdict.ReviewFlagged,
+		ReviewError:     verdict.ReviewError,
 	})
-	writeError(c, http.StatusBadRequest, "Prompt 被检查规则拦截")
+	if writeBlock != nil {
+		writeBlock(c)
+	} else {
+		writeError(c, http.StatusBadRequest, "Prompt 被检查规则拦截")
+	}
 	return true
 }
 
@@ -127,6 +145,42 @@ func (h *Handler) ClearPromptFilterLogs(c *gin.Context) {
 	writeMessage(c, http.StatusOK, "Prompt 检查日志已清空")
 }
 
+// MatchPromptFilterLog 按时间/端点/APIKey 找到与某次请求最接近的一条提示词过滤日志，
+// 用于「使用统计」里点击 cyber_policy 报错时查看触发的完整请求内容。
+// GET /api/prompt-filter/logs/match?at=<RFC3339>&endpoint=&api_key_id=&source=
+func (h *Handler) MatchPromptFilterLog(c *gin.Context) {
+	atRaw := strings.TrimSpace(c.Query("at"))
+	if atRaw == "" {
+		writeError(c, http.StatusBadRequest, "缺少 at 参数")
+		return
+	}
+	at, err := time.Parse(time.RFC3339, atRaw)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "at 参数格式无效（需 RFC3339）")
+		return
+	}
+	source := strings.TrimSpace(c.Query("source"))
+	if source == "" {
+		source = "upstream_cyber_policy"
+	}
+	apiKeyID := int64(0)
+	if raw := strings.TrimSpace(c.Query("api_key_id")); raw != "" {
+		if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			apiKeyID = parsed
+		}
+	}
+	windowSeconds := positiveQueryInt(c, "window", 15)
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	log, err := h.db.FindNearestPromptFilterLog(ctx, at, source, strings.TrimSpace(c.Query("endpoint")), apiKeyID, windowSeconds)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"found": log != nil, "log": log})
+}
+
 func (h *Handler) TestPromptFilter(c *gin.Context) {
 	var req promptFilterTestRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -145,6 +199,9 @@ func (h *Handler) TestPromptFilter(c *gin.Context) {
 	cfg := h.store.GetPromptFilterConfig()
 	cfg.Enabled = true
 	verdict := promptfilter.InspectText(req.Text, cfg)
+	if shouldReviewPromptFilterVerdict(verdict, cfg) {
+		verdict = reviewPromptFilterVerdict(c.Request.Context(), req.Text, verdict, cfg)
+	}
 	c.JSON(http.StatusOK, promptFilterTestResponse{Verdict: verdict})
 }
 
@@ -184,4 +241,16 @@ func positiveQueryInt(c *gin.Context, key string, fallback int) int {
 		return fallback
 	}
 	return parsed
+}
+
+func shouldReviewPromptFilterVerdict(verdict promptfilter.Verdict, cfg promptfilter.Config) bool {
+	if verdict.Action != promptfilter.ActionWarn && verdict.Action != promptfilter.ActionBlock {
+		return false
+	}
+	return promptfilter.NormalizeReviewConfig(cfg.Review).Ready()
+}
+
+func reviewPromptFilterVerdict(ctx context.Context, text string, verdict promptfilter.Verdict, cfg promptfilter.Config) promptfilter.Verdict {
+	flagged, model, err := promptfilter.DefaultReviewClient.ReviewText(ctx, text, cfg.Review)
+	return promptfilter.ApplyReviewResult(verdict, flagged, model, err, cfg.Review)
 }

@@ -11,7 +11,7 @@
     inherit version;
 
     src = ./frontend;
-    npmDepsHash = "sha256-TIl1imV2IBGOLYrKiyzmPtD3MlniKBjV+h7RM8Uhpzg=";
+    npmDepsHash = "sha256-NWZZeROBgKSJV9ao9qzy9nODL/8zYdbyN9H0ur7bGKE=";
 
     VITE_APP_VERSION = version;
 

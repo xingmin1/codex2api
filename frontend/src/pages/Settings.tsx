@@ -708,6 +708,13 @@ export default function Settings() {
     prompt_filter_sensitive_words: '',
     prompt_filter_custom_patterns: '[]',
     prompt_filter_disabled_patterns: '[]',
+    prompt_filter_review_enabled: false,
+    prompt_filter_review_api_key: '',
+    prompt_filter_review_api_key_configured: false,
+    prompt_filter_review_base_url: 'https://api.openai.com',
+    prompt_filter_review_model: 'omni-moderation-latest',
+    prompt_filter_review_timeout_seconds: 10,
+    prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
     codex_min_cli_version: '0.118.0',
     usage_log_mode: 'full',
@@ -727,6 +734,8 @@ export default function Settings() {
     image_s3_secret_key: '',
     image_s3_prefix: '',
     image_s3_force_path_style: false,
+    auto_pause_5h_threshold: 0,
+    auto_pause_7d_threshold: 0,
   })
   const lazyModeActive = settingsForm.lazy_mode
   const [savingSettings, setSavingSettings] = useState(false)
@@ -1326,6 +1335,49 @@ export default function Settings() {
               </div>
             </SettingsCard>
           </div>
+
+          <SettingsCard title={t('settings.globalAutoPauseTitle')} description={t('settings.globalAutoPauseDesc')}>
+            <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">
+              <SettingField label={t('settings.globalAutoPause5h')} description={t('settings.globalAutoPauseHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  inputMode="decimal"
+                  placeholder={t('settings.globalAutoPausePlaceholder')}
+                  value={settingsForm.auto_pause_5h_threshold > 0 ? (settingsForm.auto_pause_5h_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
+                    setSettingsForm(f => ({ ...f, auto_pause_5h_threshold: isNaN(ratio) ? 0 : ratio }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ auto_pause_5h_threshold: settingsForm.auto_pause_5h_threshold })
+                  }}
+                />
+              </SettingField>
+              <SettingField label={t('settings.globalAutoPause7d')} description={t('settings.globalAutoPauseHint')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={0.1}
+                  inputMode="decimal"
+                  placeholder={t('settings.globalAutoPausePlaceholder')}
+                  value={settingsForm.auto_pause_7d_threshold > 0 ? (settingsForm.auto_pause_7d_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => {
+                    const raw = e.target.value
+                    const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
+                    setSettingsForm(f => ({ ...f, auto_pause_7d_threshold: isNaN(ratio) ? 0 : ratio }))
+                  }}
+                  onBlur={() => {
+                    void autoSaveSettingsPatch({ auto_pause_7d_threshold: settingsForm.auto_pause_7d_threshold })
+                  }}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
 
           <SettingsCard title={t('settings.codexWebsocket')} description={t('settings.codexWebsocketDesc')}>
             <div className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))] gap-4">

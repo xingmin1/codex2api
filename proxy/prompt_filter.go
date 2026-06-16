@@ -13,12 +13,20 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+// promptFilterFullTextMaxRunes 限制被拦截请求记录的完整文本长度（按字符截断），
+// 避免单条日志过大撑爆数据库；80KB 提取上限下取 ~32K 字符足够定位问题。
+const promptFilterFullTextMaxRunes = 32000
+
 func (h *Handler) inspectPromptFilterOpenAI(c *gin.Context, rawBody []byte, endpoint string, model string) bool {
 	if h == nil || h.store == nil {
 		return false
 	}
 	cfg := h.store.GetPromptFilterConfig()
 	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+	if shouldReviewPromptFilterVerdict(verdict, cfg) {
+		text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
+	}
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 	if verdict.Action == promptfilter.ActionWarn {
 		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
@@ -40,6 +48,9 @@ func (h *Handler) inspectPromptFilterTextOpenAI(c *gin.Context, text string, end
 	}
 	cfg := h.store.GetPromptFilterConfig()
 	verdict := promptfilter.InspectText(text, cfg)
+	if shouldReviewPromptFilterVerdict(verdict, cfg) {
+		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
+	}
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 	if verdict.Action == promptfilter.ActionWarn {
 		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
@@ -61,6 +72,10 @@ func (h *Handler) inspectPromptFilterAnthropic(c *gin.Context, rawBody []byte, e
 	}
 	cfg := h.store.GetPromptFilterConfig()
 	verdict := promptfilter.Inspect(rawBody, endpoint, cfg)
+	if shouldReviewPromptFilterVerdict(verdict, cfg) {
+		text := promptfilter.ExtractText(rawBody, endpoint, cfg.MaxTextLength)
+		verdict = h.reviewPromptFilterVerdict(c.Request.Context(), text, verdict, cfg)
+	}
 	h.logPromptFilterVerdict(c, endpoint, model, "local_filter", "", verdict)
 	if verdict.Action == promptfilter.ActionWarn {
 		c.Header("X-Prompt-Filter-Warning", verdict.Reason)
@@ -97,6 +112,14 @@ func (h *Handler) logPromptFilterVerdict(c *gin.Context, endpoint string, model 
 		TextPreview:     verdict.TextPreview,
 		ClientIP:        c.ClientIP(),
 		ErrorCode:       errorCode,
+		ReviewModel:     verdict.ReviewModel,
+		ReviewFlagged:   verdict.ReviewFlagged,
+		ReviewError:     verdict.ReviewError,
+	}
+	// 被拦截（block）的请求记录完整检查文本，便于排查到底是什么触发了拦截
+	// （预览只有 500 字往往看不出内容）；放行/告警仍只存预览以控制存储。
+	if verdict.Action == promptfilter.ActionBlock {
+		input.FullText = promptfilter.Preview(verdict.FullText, promptFilterFullTextMaxRunes)
 	}
 	populatePromptFilterAPIKeyMeta(c, input)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -120,6 +143,9 @@ func (h *Handler) logUpstreamCyberPolicy(c *gin.Context, endpoint string, model 
 		Score:     0,
 		Threshold: cfg.Threshold,
 		Reason:    "upstream returned cyber policy",
+		// 上游 cyber_policy 没有本地提取文本，把上游错误体作为「详细内容」记录，
+		// 方便在日志里看清触发详情。
+		FullText: string(body),
 	}
 	h.logPromptFilterVerdict(c, endpoint, model, "upstream_cyber_policy", errorCode, verdict)
 }
@@ -162,4 +188,16 @@ func populatePromptFilterAPIKeyMeta(c *gin.Context, input *database.PromptFilter
 			input.APIKeyMasked = masked
 		}
 	}
+}
+
+func shouldReviewPromptFilterVerdict(verdict promptfilter.Verdict, cfg promptfilter.Config) bool {
+	if verdict.Action != promptfilter.ActionWarn && verdict.Action != promptfilter.ActionBlock {
+		return false
+	}
+	return promptfilter.NormalizeReviewConfig(cfg.Review).Ready()
+}
+
+func (h *Handler) reviewPromptFilterVerdict(ctx context.Context, text string, verdict promptfilter.Verdict, cfg promptfilter.Config) promptfilter.Verdict {
+	flagged, model, err := promptfilter.DefaultReviewClient.ReviewText(ctx, text, cfg.Review)
+	return promptfilter.ApplyReviewResult(verdict, flagged, model, err, cfg.Review)
 }

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,14 +11,21 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/google/uuid"
 )
 
 // WhamUsageURL 是 ChatGPT 后端用量查询端点。
 // 该端点返回结构化 JSON（不消耗任何额度），可用于零成本获取账号 5h/7d 用量。
 const WhamUsageURL = "https://chatgpt.com/backend-api/wham/usage"
 
+// WhamResetCreditsConsumeURL 是「消耗 1 次主动重置次数、立即重置额度」的端点。
+const WhamResetCreditsConsumeURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+
 // whamURLForTest 允许测试替换默认 URL。生产代码不要赋值。
 var whamURLForTest = ""
+
+// whamConsumeURLForTest 允许测试替换重置端点 URL。生产代码不要赋值。
+var whamConsumeURLForTest = ""
 
 // WhamUsage 是 /backend-api/wham/usage 的响应结构。
 type WhamUsage struct {
@@ -46,6 +54,12 @@ type WhamUsage struct {
 		Reached         bool        `json:"reached"`
 		IndividualLimit interface{} `json:"individual_limit"`
 	} `json:"spend_control,omitempty"`
+
+	// RateLimitResetCredits 是账号在 OpenAI 官方那边剩余的「主动重置次数」。
+	// available_count > 0 时可调用 wham/rate-limit-reset-credits/consume 立即重置额度。
+	RateLimitResetCredits *struct {
+		AvailableCount int `json:"available_count"`
+	} `json:"rate_limit_reset_credits,omitempty"`
 }
 
 // WhamUsageWindow 是单个限流窗口（primary=5h，secondary=7d）。
@@ -111,6 +125,57 @@ func queryWhamUsageWithURL(ctx context.Context, account *auth.Account, proxyURL,
 	return &usage, resp, nil
 }
 
+// ConsumeResetCredit 消耗账号 1 次「主动重置次数」以立即重置额度。
+// 向 /backend-api/wham/rate-limit-reset-credits/consume 发送 POST，body 携带一个
+// 随机幂等键 redeem_request_id。成功（2xx）返回 nil；非 2xx 返回带状态码的 resp，
+// 由调用方据此触发刷新 / 冷却 / 错误提示。
+func ConsumeResetCredit(ctx context.Context, account *auth.Account, proxyURL string) (*http.Response, error) {
+	url := WhamResetCreditsConsumeURL
+	if whamConsumeURLForTest != "" {
+		url = whamConsumeURLForTest
+	}
+	return consumeResetCreditWithURL(ctx, account, proxyURL, url)
+}
+
+func consumeResetCreditWithURL(ctx context.Context, account *auth.Account, proxyURL, url string) (*http.Response, error) {
+	if account == nil {
+		return nil, fmt.Errorf("account is nil")
+	}
+	accessToken := account.GetAccessToken()
+	if accessToken == "" {
+		return nil, fmt.Errorf("account has no access token")
+	}
+
+	payload, _ := json.Marshal(map[string]string{"redeem_request_id": uuid.New().String()})
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("build reset-credit request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", latestCodexCLIUserAgentPrefix)
+	req.Header.Set("Originator", Originator)
+	if accountID := strings.TrimSpace(account.AccountID); accountID != "" {
+		req.Header.Set("chatgpt-account-id", accountID)
+	}
+
+	client := &http.Client{Transport: newCodexStandardTransport(proxyURL)}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("reset-credit request: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// 保留 resp 让调用方读取 body 并据状态码处理（401 刷新、429 等）。
+		return resp, fmt.Errorf("reset-credit returned status %d", resp.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	_ = resp.Body.Close()
+	return resp, nil
+}
+
 // ApplyWhamUsage 将 /wham/usage 返回的数据写入账号 state + 持久化。
 // 行为与 SyncCodexUsageState（处理 /responses 响应头时）保持一致：
 //   - plan_type 同步到内存 + DB
@@ -129,13 +194,22 @@ func ApplyWhamUsage(store *auth.Store, account *auth.Account, usage *WhamUsage) 
 		store.UpdateAccountPlanType(account, usage.PlanType)
 	}
 
+	// 记录「主动重置次数」（OpenAI 官方剩余的手动重置额度次数）。
+	if usage.RateLimitResetCredits != nil {
+		account.SetRateLimitResetCredits(usage.RateLimitResetCredits.AvailableCount)
+	}
+
 	now := time.Now()
+
+	// 记录本次成功的 wham 探针时间。「主动重置次数」只能由 wham 刷新，
+	// 用它独立判断重置次数是否过期（见 auth.Account.NeedsUsageProbe）。
+	account.MarkResetCreditsProbed(now)
 
 	w5h, w7d := pickClassifiedWhamWindows(usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow, usage.PlanType, now)
 
 	if w5h != nil {
 		resetAt := whamWindowResetAt(w5h, now)
-		account.SetUsageSnapshot5h(w5h.UsedPercent, resetAt)
+		account.SetUsageSnapshot5hAt(w5h.UsedPercent, resetAt, now)
 		result.UsagePct5h = w5h.UsedPercent
 		result.Reset5hAt = resetAt
 		result.HasUsage5h = true

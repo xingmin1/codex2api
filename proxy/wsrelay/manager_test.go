@@ -3,11 +3,99 @@ package wsrelay
 import (
 	"context"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/codex2api/auth"
 )
+
+func TestManagerStopIdempotent(t *testing.T) {
+	manager := NewManager()
+
+	for i := 0; i < 3; i++ {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("Stop call %d panicked: %v", i+1, r)
+				}
+			}()
+			manager.Stop()
+		}()
+	}
+}
+
+func TestManagerStopConcurrent(t *testing.T) {
+	manager := NewManager()
+
+	const callers = 32
+	start := make(chan struct{})
+	panicCh := make(chan any, callers)
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(callers)
+
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panicCh <- r
+				}
+			}()
+			<-start
+			manager.Stop()
+		}()
+	}
+
+	close(start)
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("concurrent Stop calls timed out")
+	}
+	close(panicCh)
+
+	for r := range panicCh {
+		t.Fatalf("concurrent Stop panicked: %v", r)
+	}
+}
+
+func TestRemoveConnectionUsesEffectiveProxyKey(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+
+	account := &auth.Account{DBID: 42, ProxyURL: " http://proxy-a.example:8080 "}
+	wsURL := "wss://example.test/responses"
+	sessionKey := "session-1"
+	proxyURL := effectiveProxyURL(account, "")
+	key := manager.poolKey(account.ID(), wsURL, sessionKey, proxyURL)
+
+	session := NewSession(account.ID(), manager)
+	session.SetConnected(true)
+	conn := &WsConnection{session: session, URL: wsURL, PoolKey: key}
+	conn.SetState(StateConnected)
+	conn.Touch()
+	manager.connections.Store(key, conn)
+	manager.sessions.Store(key, session)
+
+	manager.RemoveConnection(account.ID(), wsURL, sessionKey, effectiveProxyURL(account, ""))
+
+	if _, ok := manager.connections.Load(key); ok {
+		t.Fatal("expected connection stored under effective proxy key to be removed")
+	}
+	if _, ok := manager.sessions.Load(key); ok {
+		t.Fatal("expected session stored under effective proxy key to be removed")
+	}
+	if conn.IsConnected() {
+		t.Fatal("expected removed connection to be closed")
+	}
+}
 
 func TestAcquireConnectionReusesIdleConnectedConnection(t *testing.T) {
 	manager := NewManager()
@@ -157,4 +245,67 @@ func TestAcquireConnectionWaitsWhileSessionHasPendingRequest(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected acquire to stop when session stays busy until context timeout")
 	}
+}
+
+func newTestSlotConnection(manager *Manager, account *auth.Account, wsURL, slotSession string) (*WsConnection, *Session) {
+	key := manager.poolKey(account.ID(), wsURL, slotSession, "")
+	session := NewSession(account.ID(), manager)
+	session.SetConnected(true)
+	conn := &WsConnection{
+		session:  session,
+		URL:      wsURL,
+		PoolKey:  key,
+		httpResp: &http.Response{StatusCode: http.StatusSwitchingProtocols},
+	}
+	conn.SetState(StateConnected)
+	conn.Touch()
+	manager.connections.Store(key, conn)
+	manager.sessions.Store(key, session)
+	return conn, session
+}
+
+func TestAcquireReusableConnectionReusesIdleSlot(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	manager.probeFunc = func(wc *WsConnection) bool { return true }
+
+	account := &auth.Account{DBID: 42}
+	wsURL := "wss://example.test/responses"
+	conn, _ := newTestSlotConnection(manager, account, wsURL, "cache-key#0")
+
+	got, pr, usedKey, err := manager.AcquireReusableConnection(context.Background(), account, wsURL, "cache-key", "stateless-xyz", 4, http.Header{}, "")
+	if err != nil {
+		t.Fatalf("AcquireReusableConnection() error = %v", err)
+	}
+	if got != conn {
+		t.Fatal("expected idle slot connection to be reused")
+	}
+	if usedKey != "cache-key#0" {
+		t.Fatalf("usedKey = %q, want cache-key#0", usedKey)
+	}
+	got.session.RemovePendingRequest(pr.RequestID)
+}
+
+func TestAcquireReusableConnectionSkipsBusySlot(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	manager.probeFunc = func(wc *WsConnection) bool { return true }
+
+	account := &auth.Account{DBID: 42}
+	wsURL := "wss://example.test/responses"
+	_, busySession := newTestSlotConnection(manager, account, wsURL, "cache-key#0")
+	busySession.AddPendingRequest("cache-key#0") // 占用 slot 0
+	idleConn, _ := newTestSlotConnection(manager, account, wsURL, "cache-key#1")
+
+	got, pr, usedKey, err := manager.AcquireReusableConnection(context.Background(), account, wsURL, "cache-key", "stateless-xyz", 4, http.Header{}, "")
+	if err != nil {
+		t.Fatalf("AcquireReusableConnection() error = %v", err)
+	}
+	if got != idleConn {
+		t.Fatal("expected busy slot 0 to be skipped and idle slot 1 reused")
+	}
+	if usedKey != "cache-key#1" {
+		t.Fatalf("usedKey = %q, want cache-key#1", usedKey)
+	}
+	got.session.RemovePendingRequest(pr.RequestID)
 }

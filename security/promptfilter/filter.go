@@ -38,6 +38,16 @@ type Config struct {
 	SensitiveWords   string          `json:"sensitive_words"`
 	CustomPatterns   []PatternConfig `json:"custom_patterns"`
 	DisabledPatterns []string        `json:"disabled_patterns"`
+	Review           ReviewConfig    `json:"review"`
+}
+
+type ReviewConfig struct {
+	Enabled        bool   `json:"enabled"`
+	APIKey         string `json:"api_key,omitempty"`
+	BaseURL        string `json:"base_url"`
+	Model          string `json:"model"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	FailClosed     bool   `json:"fail_closed"`
 }
 
 type PatternConfig struct {
@@ -67,7 +77,12 @@ type Verdict struct {
 	Matched        []Match `json:"matched"`
 	Reason         string  `json:"reason,omitempty"`
 	TextPreview    string  `json:"text_preview,omitempty"`
+	FullText       string  `json:"full_text,omitempty"`
 	ExtractedChars int     `json:"extracted_chars"`
+	Reviewed       bool    `json:"reviewed,omitempty"`
+	ReviewFlagged  bool    `json:"review_flagged,omitempty"`
+	ReviewError    string  `json:"review_error,omitempty"`
+	ReviewModel    string  `json:"review_model,omitempty"`
 }
 
 type Engine struct {
@@ -89,6 +104,16 @@ func DefaultConfig() Config {
 		StrictThreshold: DefaultStrictThreshold,
 		LogMatches:      true,
 		MaxTextLength:   DefaultMaxTextLength,
+		Review:          DefaultReviewConfig(),
+	}
+}
+
+func DefaultReviewConfig() ReviewConfig {
+	return ReviewConfig{
+		BaseURL:        DefaultReviewBaseURL,
+		Model:          DefaultReviewModel,
+		TimeoutSeconds: DefaultReviewTimeoutSeconds,
+		FailClosed:     true,
 	}
 }
 
@@ -174,6 +199,7 @@ func NormalizeConfig(cfg Config) Config {
 		cfg.MaxTextLength = 1024 * 1024
 	}
 	cfg.DisabledPatterns = normalizePatternNames(cfg.DisabledPatterns)
+	cfg.Review = NormalizeReviewConfig(cfg.Review)
 	return cfg
 }
 
@@ -254,6 +280,7 @@ func (e *Engine) InspectText(text string) Verdict {
 		Action:         ActionAllow,
 		Threshold:      cfg.Threshold,
 		TextPreview:    preview,
+		FullText:       text,
 		ExtractedChars: utf8.RuneCountInString(text),
 	}
 	if !cfg.Enabled || strings.TrimSpace(text) == "" {

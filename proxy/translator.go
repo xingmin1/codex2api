@@ -624,8 +624,21 @@ func hasStructuredResponsesFormat(body map[string]any) bool {
 	return false
 }
 
+// responsesModelRejectsHostedImageTool 判断模型是否不支持 hosted image_generation
+// 工具。gpt-5.3-codex-spark 是 ChatGPT 账号下的纯文本 Codex 模型，上游会直接拒绝
+// 带 hosted 图片工具的请求（issue #230）。
+func responsesModelRejectsHostedImageTool(body map[string]any) bool {
+	model := strings.TrimSpace(firstNonEmptyAnyString(body["model"]))
+	return strings.EqualFold(model, proOnlySparkModel)
+}
+
 func shouldAutoInjectResponsesImageGenerationTool(body map[string]any) bool {
 	if len(body) == 0 || hasResponsesImageGenerationTool(body) {
+		return false
+	}
+	// 不为拒绝 hosted 图片工具的模型自动注入默认图片工具及桥接 instructions；
+	// 用户显式自带的图片工具仍由上面 hasResponsesImageGenerationTool 分支保留。
+	if responsesModelRejectsHostedImageTool(body) {
 		return false
 	}
 	if hasResponsesImageGenerationToolChoice(body) {
@@ -910,6 +923,9 @@ func isInvalidEncryptedContentError(statusCode int, body []byte) bool {
 	if statusCode != http.StatusBadRequest {
 		return false
 	}
+	if isMissingEncryptedContentError(body) {
+		return true
+	}
 	for _, path := range []string{"error.code", "detail.code", "code"} {
 		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, path).String()), "invalid_encrypted_content") {
 			return true
@@ -931,6 +947,16 @@ func isInvalidEncryptedContentError(statusCode int, body []byte) bool {
 		}
 	}
 	return false
+}
+
+func isMissingEncryptedContentError(body []byte) bool {
+	code := strings.TrimSpace(gjson.GetBytes(body, "error.code").String())
+	param := strings.TrimSpace(gjson.GetBytes(body, "error.param").String())
+	if !strings.EqualFold(code, "missing_required_parameter") || !strings.HasSuffix(param, ".encrypted_content") {
+		return false
+	}
+	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	return strings.Contains(msg, "encrypted_content")
 }
 
 func stripInvalidEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
@@ -979,13 +1005,16 @@ func stripInvalidEncryptedContentValue(value any, arrayItem bool) (any, bool, bo
 		changed := false
 		itemType := strings.TrimSpace(firstNonEmptyAnyString(v["type"]))
 		if isEncryptedOnlyResponsesItemType(itemType) {
-			if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
-				if arrayItem {
-					return nil, true, false
-				}
-				delete(v, "encrypted_content")
-				changed = true
+			if arrayItem {
+				return nil, true, false
 			}
+			if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
+				delete(v, "encrypted_content")
+			}
+			if len(v) == 1 {
+				return nil, true, false
+			}
+			changed = true
 		} else if _, hasEncrypted := v["encrypted_content"]; hasEncrypted {
 			delete(v, "encrypted_content")
 			changed = true
@@ -1022,6 +1051,51 @@ func responsesInputRaw(body []byte) string {
 		return ""
 	}
 	return input.Raw
+}
+
+func dropBareReasoningInputItems(body map[string]any) bool {
+	input, ok := body["input"]
+	if !ok {
+		return false
+	}
+	cleaned, changed, keep := dropBareReasoningInputValue(input)
+	if !changed {
+		return false
+	}
+	if keep {
+		body["input"] = cleaned
+	} else {
+		delete(body, "input")
+	}
+	return true
+}
+
+func dropBareReasoningInputValue(value any) (any, bool, bool) {
+	switch v := value.(type) {
+	case []any:
+		changed := false
+		out := make([]any, 0, len(v))
+		for _, item := range v {
+			cleaned, itemChanged, keep := dropBareReasoningInputValue(item)
+			if itemChanged {
+				changed = true
+			}
+			if !keep {
+				changed = true
+				continue
+			}
+			out = append(out, cleaned)
+		}
+		return out, changed, true
+	case map[string]any:
+		if strings.TrimSpace(firstNonEmptyAnyString(v["type"])) == "reasoning" &&
+			firstNonEmptyAnyString(v["encrypted_content"]) == "" {
+			return nil, true, false
+		}
+		return v, false, true
+	default:
+		return value, false, true
+	}
 }
 
 func normalizeResponsesInputFileFields(item map[string]any) bool {
@@ -1303,11 +1377,32 @@ func normalizeResponsesFunctionTools(body map[string]any) bool {
 	}
 
 	modified := false
+	kept := make([]any, 0, len(tools))
 	for _, rawTool := range tools {
 		tool, ok := rawTool.(map[string]any)
-		if !ok || strings.TrimSpace(firstNonEmptyAnyString(tool["type"])) != "function" {
+		if !ok {
+			kept = append(kept, rawTool)
 			continue
 		}
+		toolType := strings.TrimSpace(firstNonEmptyAnyString(tool["type"]))
+		if toolType == "" {
+			// 上游对缺失或为 null 的工具 type 返回 400 "Unsupported tool
+			// type: None"（issue #219）。带 function 形态（function 子对象
+			// 或顶层 name）的工具按 OpenAI SDK 惯例视为 function；无法识别
+			// 形态的工具直接剔除，避免整个请求被上游拒绝。
+			function, _ := tool["function"].(map[string]any)
+			if function == nil &&
+				strings.TrimSpace(firstNonEmptyAnyString(tool["name"])) == "" {
+				modified = true
+				continue
+			}
+			tool["type"] = "function"
+			modified = true
+		} else if toolType != "function" {
+			kept = append(kept, tool)
+			continue
+		}
+		kept = append(kept, tool)
 		function, _ := tool["function"].(map[string]any)
 		if function == nil {
 			continue
@@ -1337,6 +1432,44 @@ func normalizeResponsesFunctionTools(body map[string]any) bool {
 			}
 		}
 		delete(tool, "function")
+		modified = true
+	}
+	if modified {
+		body["tools"] = kept
+	}
+	return modified
+}
+
+func normalizeResponsesToolChoice(body map[string]any) bool {
+	rawChoice, ok := body["tool_choice"]
+	if !ok {
+		return false
+	}
+	choice, ok := rawChoice.(map[string]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	toolType := strings.TrimSpace(firstNonEmptyAnyString(choice["type"]))
+	function, _ := choice["function"].(map[string]any)
+	name := strings.TrimSpace(firstNonEmptyAnyString(choice["name"]))
+	if toolType == "" && (function != nil || name != "") {
+		choice["type"] = "function"
+		toolType = "function"
+		modified = true
+	}
+	if toolType != "function" {
+		return modified
+	}
+	if name == "" && function != nil {
+		if nestedName := strings.TrimSpace(firstNonEmptyAnyString(function["name"])); nestedName != "" {
+			choice["name"] = nestedName
+			modified = true
+		}
+	}
+	if function != nil {
+		delete(choice, "function")
 		modified = true
 	}
 	return modified
@@ -1429,6 +1562,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 	normalizeResponsesStructuredOutputFormat(body)
 	normalizeResponsesFunctionTools(body)
+	normalizeResponsesToolChoice(body)
 	normalizeResponsesWebSearchTools(body)
 
 	// 5. 工具描述补充 + schema 清理 + 上游数量限制
@@ -1489,6 +1623,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
 	normalizeResponsesInputItemIDs(body)
+	dropBareReasoningInputItems(body)
 
 	// 保存展开后的 input 原始 JSON（用于响应缓存链路）
 	var expandedInputRaw string
@@ -1555,6 +1690,7 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 
 	normalizeResponsesStructuredOutputFormat(body)
 	normalizeResponsesFunctionTools(body)
+	normalizeResponsesToolChoice(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
 	if shouldInjectOpenAIResponsesImageGenerationTool(body) {
@@ -1768,12 +1904,29 @@ func convertToolsToCodexFormat(rawTools []json.RawMessage) []any {
 			continue
 		}
 
-		if parsed.Type != "function" || parsed.Function == nil {
+		// type 缺失或为 null 时按 OpenAI SDK 惯例视为 function（前提是带
+		// function 对象）；上游对空 type 一律返回 400 "Unsupported tool
+		// type: None"（issue #219），无法识别形态的工具直接丢弃。
+		isFunction := parsed.Function != nil &&
+			(parsed.Type == "function" || parsed.Type == "")
+		if !isFunction {
+			if parsed.Type == "" {
+				// 无 function 对象但有顶层 name（Codex 格式缺 type）→ 补全
+				// type 后保留；其余直接丢弃。
+				var toolMap map[string]any
+				if json.Unmarshal(raw, &toolMap) == nil &&
+					strings.TrimSpace(firstNonEmptyAnyString(toolMap["name"])) != "" {
+					toolMap["type"] = "function"
+					normalizeFunctionToolParameters(toolMap)
+					tools = append(tools, toolMap)
+				}
+				continue
+			}
 			// 非 function 类型 → 透传原始 JSON
 			// 例外：把 web_search_preview 等变体归一为 web_search，
 			// Codex 上游只认裸 "web_search"。归一时保留白名单字段，
 			// 与 PrepareResponsesBody 路径行为一致。
-			if parsed.Type != "" && strings.HasPrefix(parsed.Type, "web_search") {
+			if strings.HasPrefix(parsed.Type, "web_search") {
 				var toolMap map[string]any
 				if json.Unmarshal(raw, &toolMap) == nil && toolMap != nil {
 					tools = append(tools, normalizeCodexWebSearchTool(toolMap))
@@ -2537,25 +2690,30 @@ func NewStreamTranslator(chunkID, model string, created int64) *StreamTranslator
 
 // Translate 将单个 Codex SSE 事件翻译为 OpenAI Chat Completions 流式格式
 func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
-	eventType := gjson.GetBytes(eventData, "type").String()
+	return st.TranslateParsed(gjson.ParseBytes(eventData))
+}
+
+// TranslateParsed 将已解析的 Codex SSE 事件翻译为 OpenAI Chat Completions 流式格式。
+func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) {
+	eventType := parsed.Get("type").String()
 
 	switch eventType {
 	case "response.output_text.delta":
-		delta := gjson.GetBytes(eventData, "delta").String()
+		delta := parsed.Get("delta").String()
 		return newContentChunk(st.ChunkID, st.Model, st.Created, delta), false
 
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
-		delta := gjson.GetBytes(eventData, "delta").String()
+		delta := parsed.Get("delta").String()
 		return newReasoningChunk(st.ChunkID, st.Model, st.Created, delta), false
 
 	case "response.output_item.added":
-		itemType := gjson.GetBytes(eventData, "item.type").String()
+		itemType := parsed.Get("item.type").String()
 		if itemType != "function_call" {
 			return nil, false
 		}
-		callID := gjson.GetBytes(eventData, "item.call_id").String()
-		name := gjson.GetBytes(eventData, "item.name").String()
-		itemID := gjson.GetBytes(eventData, "item.id").String()
+		callID := parsed.Get("item.call_id").String()
+		name := parsed.Get("item.name").String()
+		itemID := parsed.Get("item.id").String()
 
 		tcIdx := st.nextIdx
 		st.toolCallMap[itemID] = tcIdx
@@ -2565,19 +2723,19 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		return newToolCallAnnouncementChunk(st.ChunkID, st.Model, st.Created, tcIdx, callID, name), false
 
 	case "response.function_call_arguments.delta":
-		itemID := gjson.GetBytes(eventData, "item_id").String()
+		itemID := parsed.Get("item_id").String()
 		tcIdx, ok := st.toolCallMap[itemID]
 		if !ok {
 			return nil, false
 		}
-		delta := gjson.GetBytes(eventData, "delta").String()
+		delta := parsed.Get("delta").String()
 		return newToolCallDeltaChunk(st.ChunkID, st.Model, st.Created, tcIdx, delta), false
 
 	case "response.function_call_arguments.done":
 		return nil, false
 
 	case "response.completed":
-		usage := extractUsage(eventData)
+		usage := extractUsageFromResult(parsed.Get("response.usage"))
 		finishReason := "stop"
 		if st.HasToolCalls {
 			finishReason = "tool_calls"
@@ -2585,7 +2743,7 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		return newFinalChunk(st.ChunkID, st.Model, st.Created, finishReason, usage), true
 
 	case "response.failed":
-		errMsg := gjson.GetBytes(eventData, "response.error.message").String()
+		errMsg := parsed.Get("response.error.message").String()
 		if errMsg == "" {
 			errMsg = "Codex upstream error"
 		}
@@ -2600,7 +2758,7 @@ func (st *StreamTranslator) Translate(eventData []byte) ([]byte, bool) {
 		return nil, false
 
 	default:
-		if delta := gjson.GetBytes(eventData, "delta"); delta.Exists() && delta.Type == gjson.String {
+		if delta := parsed.Get("delta"); delta.Exists() && delta.Type == gjson.String {
 			return newContentChunk(st.ChunkID, st.Model, st.Created, delta.String()), false
 		}
 		return nil, false
