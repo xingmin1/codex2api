@@ -194,7 +194,7 @@ func TestResponsesWebSocketForwardsResponsesEvents(t *testing.T) {
 	})
 
 	bodyCh := make(chan []byte, 2)
-	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		bodyCh <- append([]byte(nil), requestBody...)
 		sse := "" +
 			`data: {"type":"response.output_text.delta","delta":"hi"}` + "\n\n" +
@@ -287,7 +287,7 @@ func TestResponsesWebSocketFlushesSkeletonBeforeContent(t *testing.T) {
 	ApplyRuntimeSettings(nextSettings)
 
 	release := make(chan struct{})
-	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		pr, pw := io.Pipe()
 		go func() {
 			// 骨架帧先到：created（生命周期，缓冲）+ output_item.added（结构帧，触发 flush）。
@@ -364,7 +364,7 @@ func TestResponsesWebSocketRetriesFirstTokenTimeoutBeforeRelay(t *testing.T) {
 	ApplyRuntimeSettings(nextSettings)
 
 	attemptCh := make(chan int64, 4)
-	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		attemptCh <- account.ID()
 		if account.ID() == 1 {
 			pr, pw := io.Pipe()
@@ -457,7 +457,7 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 	})
 
 	wsCalls := 0
-	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		wsCalls++
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -543,7 +543,7 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	ApplyRuntimeSettings(nextSettings)
 
 	wsCalls := 0
-	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		wsCalls++
 		return &http.Response{
 			StatusCode: http.StatusOK,
@@ -610,7 +610,7 @@ func TestResponsesWebSocketSilentRetryDisabledRelaysRetryableFailure(t *testing.
 	ApplyRuntimeSettings(nextSettings)
 
 	attemptCh := make(chan int64, 4)
-	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		attemptCh <- account.ID()
 		sse := `data: {"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"raw quota exhausted"}}}` + "\n\n"
 		return &http.Response{
@@ -684,7 +684,7 @@ func TestResponsesWebSocketHidesUpstreamErrorAfterSilentRetriesExhausted(t *test
 	ApplyRuntimeSettings(nextSettings)
 
 	attemptCh := make(chan int64, 4)
-	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		attemptCh <- account.ID()
 		sse := `data: {"type":"response.failed","response":{"error":{"type":"usage_limit_reached","message":"raw quota secret"}}}` + "\n\n"
 		return &http.Response{
@@ -3332,7 +3332,7 @@ func TestResponsesWebSocketStripsInjectedImageTool(t *testing.T) {
 	t.Cleanup(func() { WebsocketExecuteFunc = previousExec })
 
 	bodyCh := make(chan []byte, 1)
-	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (*http.Response, error) {
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		bodyCh <- append([]byte(nil), requestBody...)
 		sse := `data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2},"service_tier":"default"}}` + "\n\n"
 		return &http.Response{

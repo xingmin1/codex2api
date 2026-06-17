@@ -72,6 +72,10 @@ type Handler struct {
 	resetRadarHookMu     sync.Mutex
 	resetRadarHookState  resetRadarHookState
 	resetRadarHookRunner func(context.Context, string) resetRadarHookResult
+
+	// 「主动重置次数」消耗操作的账号级互斥锁（dbID -> *sync.Mutex），
+	// 串行化同一账号的并发重置，避免重复消耗与次数计数竞态。
+	resetCreditLocks sync.Map
 }
 
 type chartCacheEntry struct {
@@ -548,6 +552,7 @@ type accountResponse struct {
 	Name                        string                     `json:"name"`
 	Email                       string                     `json:"email"`
 	EmailDomain                 string                     `json:"email_domain,omitempty"`
+	ChatGPTAccountID            string                     `json:"chatgpt_account_id,omitempty"`
 	PlanType                    string                     `json:"plan_type"`
 	SubscriptionExpiresAt       string                     `json:"subscription_expires_at,omitempty"`
 	Status                      string                     `json:"status"`
@@ -701,6 +706,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Name:                     row.Name,
 			Email:                    email,
 			EmailDomain:              accountEmailDomain(email),
+			ChatGPTAccountID:         row.GetCredential("account_id"),
 			PlanType:                 planType,
 			SubscriptionExpiresAt:    row.GetCredential("subscription_expires_at"),
 			Status:                   row.Status,

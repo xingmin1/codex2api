@@ -402,6 +402,7 @@
     "email": "邮箱",
     "plan": "计划",
     "status": "状态",
+    "activeRequestsTooltip": "当前正在处理 {{count}} 个请求",
     "requests": "请求(7d)",
     "usage": "用量",
     "updatedAt": "更新时间",

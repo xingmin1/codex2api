@@ -402,6 +402,7 @@
     "email": "Email",
     "plan": "Plan",
     "status": "Status",
+    "activeRequestsTooltip": "{{count}} request(s) in progress",
     "requests": "Requests(7d)",
     "usage": "Usage",
     "updatedAt": "Updated",

@@ -28,6 +28,7 @@ export interface AccountRow {
   name: string
   email: string
   email_domain?: string
+  chatgpt_account_id?: string
   plan_type: string
   subscription_expires_at?: string
   status: AccountStatus

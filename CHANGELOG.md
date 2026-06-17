@@ -1,5 +1,60 @@
 # Changelog
 
+## v2.3.5-xmin.1 - 2026-06-17
+
+### Features
+
+- **Upstream v2.3.5 merge.** Merged the official v2.3.5 changes, including per-request upstream isolation, account in-flight indicators, `chatgpt_account_id` display, reset-credit hardening, `TRUSTED_PROXIES`, reset error localization, 1h metric granularity, and account card layout refinements.
+- **Fork release packaging preserved.** Kept the fork release workflow, `VERSION`, and Nix packaging files used by the Home Manager release-tarball deployment path.
+
+### Fixes
+
+- **Fork behavior reconciliation.** Preserved the long compact account pool fallback, persistent compact transient retry, encrypted-content downgrade retry, and "Ignore all failure cooldowns" semantics while applying official v2.3.5 changes.
+
+## v2.3.5 - 2026-06-17
+
+### Features
+
+- **Per-request upstream isolation by default (#268).** For requests without an explicit session, the upstream identity key (`prompt_cache_key` + session/conversation id) was previously derived deterministically from the downstream API key, so different requests sharing one API key collapsed onto the same upstream session id and leaked context across requests. The upstream identity is now decoupled from local connection reuse and account affinity: by default each sessionless request gets a unique upstream identity (`isolated` mode), while the 8-slot WS connection pool still routes by a stable API-key-derived pool key (preserving reuse and 503 handshake-throttle resistance) and account affinity is unchanged. Set `CODEX_REQUEST_ISOLATION_MODE=per-api-key` to restore the old shared-cache behavior.
+- **Active in-flight request indicator (accounts).** The account list status column now shows a blue pill with a breathing dot and the live in-flight request count (`active_requests`), visible only when greater than zero, to surface which accounts are busy and how concurrent.
+- **Display `chatgpt_account_id` (team workspace id).** The account list now shows the `chatgpt_account_id` (the team-plan workspace id decoded from the access-token JWT) under the email in monospace, so multiple workspaces under the same login email can be told apart.
+- **Hardened + optimized OpenAI active reset-credits flow.** The wham/usage and reset/consume calls now go through the uTLS Chrome-fingerprint transport (matching the `/responses` gateway) to reduce Cloudflare blocks; consume reuses a single `redeem_request_id` as an idempotency key so a retry after refresh no longer burns an extra reset, a per-account mutex removes the check→consume TOCTOU race, a 401 auto-refreshes the token and retries once, and the post-reset wham round-trip is moved to the background to shorten the response path. Successful resets are written to `account_events` audit records.
+- **`TRUSTED_PROXIES` env to configure trusted reverse proxies.** PR #265 disabled all trusted proxies (secure by default) but stripped the real client IP behind a reverse proxy; operators can now opt back in via `TRUSTED_PROXIES` (comma-separated IP/CIDR list). Empty/unset keeps the secure default; invalid entries fail fast at startup.
+- **Localized upstream reset error codes.** When an active reset is rejected by upstream (e.g. `rate_limit_not_resettable` on business/credits-only plans), known codes are translated to a Chinese explanation with the original upstream JSON appended; unknown codes fall back to the raw upstream text, and empty bodies fall back to the status code.
+- **1h metrics sampling granularity.** The 1h time range now samples at 1-minute granularity across 60 buckets.
+- **Account card layout refinements.**
+
+### Fixes
+
+- **Discard broken upstream WS connections instead of reusing them.** After an upstream WS error (close 1006/1009/1011, broken pipe, unexpected EOF), `WsResponse.Close()` only removed the pending entry and returned the connection to the pool without closing the underlying socket, so the broken connection was misjudged reusable (a CLOSE_WAIT probe Ping still succeeds, a false positive) — causing slow first tokens / dropped streams and leaking fds in CLOSE_WAIT. Read errors now mark the connection broken, and `Close()` distinguishes normal completion (release for reuse) from abnormal termination (discard: close the socket and remove it from the pool via `CompareAndDelete`). Refs #267.
+- **Refresh reset credits independent of usage freshness.** The reset-credits count is only refreshed by the wham/usage probe, but probing was gated on usage-snapshot freshness; since normal `/responses` traffic bumps that snapshot via response headers (which don't carry reset credits), busy accounts looked fresh and never got a wham probe. Reset-credit probe time is now tracked separately, and a zero-cost wham-only probe is allowed during rate-limited cooldown and premium 5h limits.
+- **Disabled Gin's default trusted proxies (#265).**
+- **Codex invite account dropdown only showed one account.** The account combobox pre-filled and filtered by the selected account's email, so opening it matched only that account; it now shows all eligible Codex OAuth accounts when opened and filters by text only while the user is actively typing.
+
+## v2.3.4 - 2026-06-16
+
+### Features
+
+- **Account health visualization and "personal mode".** The account list/cards gain a "health status" bar (time-bucketed coloring based on recent request success/failure), the dashboard adds a system-level health overview between the top cards and usage stats, and the time-range selector is promoted to a page-level shared control. The accounts page adds a "pool mode / personal mode" toggle — personal mode renders accounts as richer two-column cards (avatar, equal-height alignment, icon+text action area), with the initial mode auto-selected by pool size on first upgrade.
+- **Active reset credits for Codex (#249).** The account usage dialog, list badges, desktop table, and card action areas can all view the remaining "active reset count" and reset it in one click (with confirmation, refreshing after consuming 1), reusing the existing wham upstream path instead of the generic passthrough.
+- **Prompt-filter review key (#257).** After a local rule match, an optional review model (OpenAI/Anthropic-compatible moderation) can re-check the request to reduce false positives; supports base_url / model / timeout / fail-closed configuration.
+- **Blocked requests record full content and are queryable (#259).** Blocked requests now record the full request content in "prompt filter → logs" (no longer just a 500-char preview, truncated at 32K) and are included in search; in usage stats, cyber_policy errors can be clicked to view the full triggering request content.
+- **Local token-counting compatibility endpoints (#238).** Added `POST /v1/messages/count_tokens` and `POST /v1/responses/input_tokens`, which return a local `input_tokens` estimate without forwarding upstream or consuming quota, so clients like LiteLLM no longer get a 404 when probing token-counting endpoints.
+- **Codex referral invite feature (#260).** Added a Codex referral invite UI and batch invite capability, plus an improved account picker (#264).
+- **Deduplicate accounts by OAuth identity (#262).** Imported/added accounts are deduplicated by OAuth identity to avoid the same account entering the pool twice.
+- **Account bulk-update API (#263).** Added a bulk account update endpoint supporting batch scheduling and other config changes.
+- **Edit OAuth account auth config and re-authorize UI (#250).** Supports editing an existing OAuth account's auth config and re-authorizing from the frontend.
+- **External async image task API (#254).** Added an external async image-generation task API.
+- **Backend streaming forwarding performance (#252).** Optimized the streaming forwarding path performance.
+
+### Fixes
+
+- **Streaming cyber_policy penalties not recorded (#258).** cyber_policy bans are delivered as `response.failed` (HTTP 200) in Codex streaming responses, but previously only non-2xx errors were written to `prompt_filter_logs`, so streaming-path cyber_policy was invisible in the prompt-filter logs; recording is now added across the 4 streaming failure paths.
+- **Failed image request usage not counted (#239).** Fixed error image-request records not showing in usage stats.
+- **`/v1/messages` cached-token double billing (#253).** Anthropic usage now deducts cache-hit tokens to avoid double-billing the cached portion.
+- **Claude Code tool argument sanitization correction (#251).** Fixed compatibility issues caused by overly broad tool argument sanitization.
+- **Upgraded vite to fix npm audit high severity (#261).** Frontend dependency upgrade fixing an npm audit high vulnerability.
+
 ## v2.3.4-xmin.1 - 2026-06-16
 
 ### Features

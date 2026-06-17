@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -440,5 +441,143 @@ func TestConsumeResetCredit_NoToken(t *testing.T) {
 	account := &auth.Account{DBID: 1}
 	if _, err := ConsumeResetCredit(context.Background(), account, ""); err == nil {
 		t.Fatal("expected error when account has no access token")
+	}
+}
+
+// TestConsumeResetCreditWithID_ReusesProvidedIdempotencyKey 验证调用方提供的
+// redeem_request_id 会原样发给上游——重试同一次重置时复用它，可借助上游幂等去重，
+// 避免重复消耗一次重置次数。
+func TestConsumeResetCreditWithID_ReusesProvidedIdempotencyKey(t *testing.T) {
+	var gotIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			RedeemRequestID string `json:"redeem_request_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		gotIDs = append(gotIDs, payload.RedeemRequestID)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	const fixedID = "fixed-redeem-id-123"
+
+	// 两次调用复用同一个 ID（模拟刷新后重试）。
+	for i := 0; i < 2; i++ {
+		resp, err := ConsumeResetCreditWithID(context.Background(), account, "", fixedID)
+		if err != nil {
+			t.Fatalf("ConsumeResetCreditWithID error: %v", err)
+		}
+		_ = resp.Body.Close()
+	}
+
+	if len(gotIDs) != 2 {
+		t.Fatalf("server saw %d requests, want 2", len(gotIDs))
+	}
+	for i, id := range gotIDs {
+		if id != fixedID {
+			t.Errorf("request %d redeem_request_id = %q, want %q (idempotency key must be reused)", i, id, fixedID)
+		}
+	}
+}
+
+// TestConsumeResetCreditWithID_EmptyIDFallsBackToGenerated 验证空 ID 时仍会生成一个，
+// 不会发出空幂等键。
+func TestConsumeResetCreditWithID_EmptyIDFallsBackToGenerated(t *testing.T) {
+	var gotID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			RedeemRequestID string `json:"redeem_request_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		gotID = payload.RedeemRequestID
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	resp, err := ConsumeResetCreditWithID(context.Background(), account, "", "   ")
+	if err != nil {
+		t.Fatalf("ConsumeResetCreditWithID error: %v", err)
+	}
+	_ = resp.Body.Close()
+	if gotID == "" {
+		t.Fatal("redeem_request_id should fall back to a generated value, got empty")
+	}
+}
+
+// TestConsumeResetCreditParsed_ReturnsWindowsResetAndCredit 验证成功响应被解析为
+// WhamResetResult（windows_reset / credit），供调用方即时反馈、省去重置后再查一次 usage。
+func TestConsumeResetCreditParsed_ReturnsWindowsResetAndCredit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"code":"ok","windows_reset":2,"credit":{"id":"cr-1","reset_type":"manual","status":"redeemed","redeemed_at":"2026-06-16T00:00:00Z"}}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	result, resp, err := ConsumeResetCreditParsed(context.Background(), account, "", "rid-1")
+	if err != nil {
+		t.Fatalf("ConsumeResetCreditParsed error: %v", err)
+	}
+	if resp == nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("resp = %+v, want 200", resp)
+	}
+	if result == nil {
+		t.Fatal("result is nil, want parsed WhamResetResult")
+	}
+	if result.WindowsReset != 2 {
+		t.Errorf("WindowsReset = %d, want 2", result.WindowsReset)
+	}
+	if result.Code != "ok" {
+		t.Errorf("Code = %q, want ok", result.Code)
+	}
+	if result.Credit == nil || result.Credit.Status != "redeemed" {
+		t.Errorf("Credit = %+v, want status=redeemed", result.Credit)
+	}
+}
+
+// TestConsumeResetCreditParsed_NonOKReturnsRespForCaller 验证非 2xx 时 result 为 nil、
+// resp 保留（body 未关闭）供调用方读取错误详情。
+func TestConsumeResetCreditParsed_NonOKReturnsRespForCaller(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer server.Close()
+
+	oldURL := whamConsumeURLForTest
+	whamConsumeURLForTest = server.URL
+	defer func() { whamConsumeURLForTest = oldURL }()
+
+	account := &auth.Account{DBID: 1, AccessToken: "at-123", AccountID: "acc-1"}
+	result, resp, err := ConsumeResetCreditParsed(context.Background(), account, "", "rid-1")
+	if err == nil {
+		t.Fatal("expected error on non-2xx")
+	}
+	if result != nil {
+		t.Fatalf("result = %+v, want nil on non-2xx", result)
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("resp = %+v, want 401 surfaced to caller", resp)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if len(body) == 0 {
+		t.Error("expected error body to remain readable for caller")
 	}
 }

@@ -209,10 +209,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		downstreamHeaders := c.Request.Header.Clone()
-		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
-		if useWebsocket && explicitSessionID == "" {
-			upstreamSessionID = ""
-		}
+		upstreamSessionID := resolveUpstreamSessionID(apiKeyID, sessionID, explicitSessionID, useWebsocket)
 		if lastUpstreamCancel != nil {
 			lastUpstreamCancel()
 		}
