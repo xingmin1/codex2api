@@ -90,6 +90,8 @@ export interface AccountRow {
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
   price_multiplier?: number | null
+  cheap_probe_recovery_margin?: number | null
+  cheap_probe_bonus_duration_minutes?: number | null
   last_cheap_probe_at?: ISODateString
   last_cheap_probe_success_at?: ISODateString
   last_cheap_probe_error?: string
@@ -231,6 +233,8 @@ export interface UpdateAccountSchedulerRequest {
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
   price_multiplier?: number | null
+  cheap_probe_recovery_margin?: number | null
+  cheap_probe_bonus_duration_minutes?: number | null
 }
 
 export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
@@ -491,10 +495,14 @@ export interface RuntimeStatusResponse {
     status: RuntimeHealthStatus
     lazy_mode: boolean
     background_refresh_interval_minutes: number
-	    usage_probe_max_age_minutes: number
-	    usage_probe_concurrency: number
-	    usage_probe_responses_fallback_enabled: boolean
-	    recovery_probe_interval_minutes: number
+    usage_probe_max_age_minutes: number
+    usage_probe_concurrency: number
+    usage_probe_responses_fallback_enabled: boolean
+    recovery_probe_interval_minutes: number
+    cheap_probe_enabled: boolean
+    cheap_probe_scan_interval_seconds: number
+    cheap_probe_concurrency: number
+    cheap_probe_recovery_margin: number
     usage_probe_running: boolean
     recovery_probe_running: boolean
     auto_cleanup_running: boolean
@@ -639,10 +647,19 @@ export interface SystemSettings {
   test_model: string
   test_concurrency: number
   background_refresh_interval_minutes: number
-	  usage_probe_max_age_minutes: number
-	  usage_probe_concurrency: number
-	  usage_probe_responses_fallback_enabled: boolean
-	  recovery_probe_interval_minutes: number
+  usage_probe_max_age_minutes: number
+  usage_probe_concurrency: number
+  usage_probe_responses_fallback_enabled: boolean
+  recovery_probe_interval_minutes: number
+  cheap_probe_enabled: boolean
+  cheap_probe_scan_interval_seconds: number
+  cheap_probe_concurrency: number
+  cheap_probe_timeout_seconds: number
+  cheap_probe_recovery_margin: number
+  cheap_probe_bonus_duration_minutes: number
+  cheap_probe_rank_base_interval_seconds: number
+  cheap_probe_rank_step_seconds: number
+  cheap_probe_rank_min_interval_seconds: number
   lazy_mode: boolean
   proxy_url?: string
   pg_max_conns: number

@@ -246,16 +246,20 @@ type runtimeUsageLogResponse struct {
 }
 
 type runtimeProbesResponse struct {
-	Status                             string `json:"status"`
-	LazyMode                           bool   `json:"lazy_mode"`
-	BackgroundRefreshIntervalMinutes   int    `json:"background_refresh_interval_minutes"`
-	UsageProbeMaxAgeMinutes            int    `json:"usage_probe_max_age_minutes"`
-	UsageProbeConcurrency              int    `json:"usage_probe_concurrency"`
-	UsageProbeResponsesFallbackEnabled bool   `json:"usage_probe_responses_fallback_enabled"`
-	RecoveryProbeIntervalMinutes       int    `json:"recovery_probe_interval_minutes"`
-	UsageProbeRunning                  bool   `json:"usage_probe_running"`
-	RecoveryProbeRunning               bool   `json:"recovery_probe_running"`
-	AutoCleanupRunning                 bool   `json:"auto_cleanup_running"`
+	Status                             string  `json:"status"`
+	LazyMode                           bool    `json:"lazy_mode"`
+	BackgroundRefreshIntervalMinutes   int     `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes            int     `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency              int     `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled bool    `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes       int     `json:"recovery_probe_interval_minutes"`
+	CheapProbeEnabled                  bool    `json:"cheap_probe_enabled"`
+	CheapProbeScanIntervalSeconds      int     `json:"cheap_probe_scan_interval_seconds"`
+	CheapProbeConcurrency              int     `json:"cheap_probe_concurrency"`
+	CheapProbeRecoveryMargin           float64 `json:"cheap_probe_recovery_margin"`
+	UsageProbeRunning                  bool    `json:"usage_probe_running"`
+	RecoveryProbeRunning               bool    `json:"recovery_probe_running"`
+	AutoCleanupRunning                 bool    `json:"auto_cleanup_running"`
 }
 
 type runtimeAccountsResponse struct {

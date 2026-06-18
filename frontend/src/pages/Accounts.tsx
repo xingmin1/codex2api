@@ -395,6 +395,39 @@ function priceMultiplierInputToNumber(value: string): number | null {
   return parsed;
 }
 
+function formatOptionalPositiveNumberInput(value?: number | null): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return "";
+  }
+  return String(value);
+}
+
+function isOptionalPositiveNumberInputInvalid(
+  value: string,
+  maxValue: number,
+): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  const parsed = Number(trimmed);
+  return !Number.isFinite(parsed) || parsed <= 0 || parsed > maxValue;
+}
+
+function optionalPositiveNumberInputToNumber(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
+function optionalPositiveIntegerInputToNumber(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  if (!Number.isInteger(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
 function getMediaQueryMatch(query: string): boolean {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
     return false;
@@ -599,6 +632,14 @@ export default function Accounts() {
 		setEditIgnoreUnauthorizedCooldown,
 	] = useState(false);
 	const [editPriceMultiplierInput, setEditPriceMultiplierInput] = useState("");
+  const [
+    editCheapProbeRecoveryMarginInput,
+    setEditCheapProbeRecoveryMarginInput,
+  ] = useState("");
+  const [
+    editCheapProbeBonusDurationInput,
+    setEditCheapProbeBonusDurationInput,
+  ] = useState("");
 	const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
 		number[]
 	>([]);
@@ -2734,6 +2775,12 @@ export default function Accounts() {
 	setEditPriceMultiplierInput(
 		formatPriceMultiplierInput(account.price_multiplier),
 	);
+  setEditCheapProbeRecoveryMarginInput(
+    formatOptionalPositiveNumberInput(account.cheap_probe_recovery_margin),
+  );
+  setEditCheapProbeBonusDurationInput(
+    formatOptionalPositiveNumberInput(account.cheap_probe_bonus_duration_minutes),
+  );
 	setAllowedAPIKeySelection(
 		filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
     );
@@ -2772,6 +2819,8 @@ export default function Accounts() {
 	setEditIgnoreUsageLimit429Cooldown(false);
 	setEditIgnoreUnauthorizedCooldown(false);
 	setEditPriceMultiplierInput("");
+  setEditCheapProbeRecoveryMarginInput("");
+  setEditCheapProbeBonusDurationInput("");
 	setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
     setEditTags([]);
@@ -2815,6 +2864,12 @@ export default function Accounts() {
 	const editPriceMultiplierInvalid = isPriceMultiplierInputInvalid(
 		editPriceMultiplierInput,
 	);
+  const editCheapProbeRecoveryMarginInvalid =
+    isOptionalPositiveNumberInputInvalid(editCheapProbeRecoveryMarginInput, 10000);
+  const editCheapProbeBonusDurationInvalid =
+    isOptionalPositiveNumberInputInvalid(editCheapProbeBonusDurationInput, 1440) ||
+    (editCheapProbeBonusDurationInput.trim() !== "" &&
+      optionalPositiveIntegerInputToNumber(editCheapProbeBonusDurationInput) === null);
 	const batchAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
 		batchAutoPause5hThresholdInput,
 	);
@@ -2873,7 +2928,9 @@ export default function Accounts() {
 		concurrencyInputInvalid ||
 		editAutoPause5hThresholdInvalid ||
 		editAutoPause7dThresholdInvalid ||
-		editPriceMultiplierInvalid
+		editPriceMultiplierInvalid ||
+    editCheapProbeRecoveryMarginInvalid ||
+    editCheapProbeBonusDurationInvalid
 	) {
 		showToast(t("accounts.schedulerInvalidInput"), "error");
 		return;
@@ -2901,6 +2958,12 @@ export default function Accounts() {
 		ignore_usage_limit_429_cooldown: editIgnoreUsageLimit429Cooldown,
 		ignore_unauthorized_cooldown: editIgnoreUnauthorizedCooldown,
 		price_multiplier: priceMultiplierInputToNumber(editPriceMultiplierInput),
+    cheap_probe_recovery_margin: optionalPositiveNumberInputToNumber(
+      editCheapProbeRecoveryMarginInput,
+    ),
+    cheap_probe_bonus_duration_minutes: optionalPositiveIntegerInputToNumber(
+      editCheapProbeBonusDurationInput,
+    ),
 	};
       await api.updateAccountScheduler(editingAccount.id, payload);
       showToast(t("accounts.schedulerSaveSuccess"));
@@ -5750,6 +5813,73 @@ export default function Accounts() {
                           {editPriceMultiplierInvalid
                             ? t("accounts.priceMultiplierRange")
                             : t("accounts.priceMultiplierEmptyHint")}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.cheapProbeAccountOverrides")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.cheapProbeAccountOverridesHint")}
+                        </div>
+                        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                          <div>
+                            <label className="text-xs font-medium text-muted-foreground">
+                              {t("accounts.cheapProbeRecoveryMarginLabel")}
+                            </label>
+                            <Input
+                              className="mt-1.5"
+                              type="number"
+                              min={0}
+                              max={10000}
+                              value={editCheapProbeRecoveryMarginInput}
+                              onChange={(event) =>
+                                setEditCheapProbeRecoveryMarginInput(
+                                  event.target.value,
+                                )
+                              }
+                              placeholder={t(
+                                "accounts.cheapProbeRecoveryMarginPlaceholder",
+                              )}
+                              inputMode="decimal"
+                            />
+                            <div
+                              className={`mt-1.5 text-xs ${editCheapProbeRecoveryMarginInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                            >
+                              {editCheapProbeRecoveryMarginInvalid
+                                ? t("accounts.cheapProbeRecoveryMarginRange")
+                                : t("accounts.cheapProbeOverrideEmptyHint")}
+                            </div>
+                          </div>
+                          <div>
+                            <label className="text-xs font-medium text-muted-foreground">
+                              {t("accounts.cheapProbeBonusDurationLabel")}
+                            </label>
+                            <Input
+                              className="mt-1.5"
+                              type="number"
+                              min={1}
+                              max={1440}
+                              value={editCheapProbeBonusDurationInput}
+                              onChange={(event) =>
+                                setEditCheapProbeBonusDurationInput(
+                                  event.target.value,
+                                )
+                              }
+                              placeholder={t(
+                                "accounts.cheapProbeBonusDurationPlaceholder",
+                              )}
+                              inputMode="numeric"
+                            />
+                            <div
+                              className={`mt-1.5 text-xs ${editCheapProbeBonusDurationInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                            >
+                              {editCheapProbeBonusDurationInvalid
+                                ? t("accounts.cheapProbeBonusDurationRange")
+                                : t("accounts.cheapProbeOverrideEmptyHint")}
+                            </div>
+                          </div>
                         </div>
                       </div>
 

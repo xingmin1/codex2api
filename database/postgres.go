@@ -706,6 +706,15 @@ func (db *DB) migrate(ctx context.Context) error {
 				usage_probe_concurrency INT DEFAULT 16,
 				usage_probe_responses_fallback_enabled BOOLEAN DEFAULT TRUE,
 				recovery_probe_interval_minutes INT DEFAULT 30,
+				cheap_probe_enabled BOOLEAN DEFAULT TRUE,
+				cheap_probe_scan_interval_seconds INT DEFAULT 10,
+				cheap_probe_concurrency INT DEFAULT 2,
+				cheap_probe_timeout_seconds INT DEFAULT 30,
+				cheap_probe_recovery_margin DOUBLE PRECISION DEFAULT 10,
+				cheap_probe_bonus_duration_minutes INT DEFAULT 10,
+				cheap_probe_rank_base_interval_seconds INT DEFAULT 180,
+				cheap_probe_rank_step_seconds INT DEFAULT 30,
+				cheap_probe_rank_min_interval_seconds INT DEFAULT 30,
 			scheduler_mode VARCHAR(20) DEFAULT 'round_robin'
 		);
 	CREATE TABLE IF NOT EXISTS account_model_cooldowns (
@@ -742,6 +751,15 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_concurrency INT DEFAULT 16;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_responses_fallback_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cheap_probe_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cheap_probe_scan_interval_seconds INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cheap_probe_concurrency INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cheap_probe_timeout_seconds INT DEFAULT 30;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cheap_probe_recovery_margin DOUBLE PRECISION DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cheap_probe_bonus_duration_minutes INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cheap_probe_rank_base_interval_seconds INT DEFAULT 180;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cheap_probe_rank_step_seconds INT DEFAULT 30;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS cheap_probe_rank_min_interval_seconds INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_mode VARCHAR(20) DEFAULT 'round_robin';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS affinity_mode VARCHAR(16) DEFAULT 'bounded';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
@@ -1315,6 +1333,15 @@ type SystemSettings struct {
 	UsageProbeConcurrency              int
 	UsageProbeResponsesFallbackEnabled bool
 	RecoveryProbeIntervalMinutes       int
+	CheapProbeEnabled                  bool
+	CheapProbeScanIntervalSeconds      int
+	CheapProbeConcurrency              int
+	CheapProbeTimeoutSeconds           int
+	CheapProbeRecoveryMargin           float64
+	CheapProbeBonusDurationMinutes     int
+	CheapProbeRankBaseIntervalSeconds  int
+	CheapProbeRankStepSeconds          int
+	CheapProbeRankMinIntervalSeconds   int
 	SchedulerMode                      string
 	AffinityMode                       string // session 粘性模式: bounded / off / strict
 	ResinURL                           string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
@@ -1396,6 +1423,15 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(usage_probe_concurrency, 16),
 			       COALESCE(usage_probe_responses_fallback_enabled, true),
 			       COALESCE(recovery_probe_interval_minutes, 30),
+			       COALESCE(cheap_probe_enabled, true),
+			       COALESCE(cheap_probe_scan_interval_seconds, 10),
+			       COALESCE(cheap_probe_concurrency, 2),
+			       COALESCE(cheap_probe_timeout_seconds, 30),
+			       COALESCE(cheap_probe_recovery_margin, 10),
+			       COALESCE(cheap_probe_bonus_duration_minutes, 10),
+			       COALESCE(cheap_probe_rank_base_interval_seconds, 180),
+			       COALESCE(cheap_probe_rank_step_seconds, 30),
+			       COALESCE(cheap_probe_rank_min_interval_seconds, 30),
 		       COALESCE(scheduler_mode, 'round_robin'),
 		       COALESCE(affinity_mode, 'bounded'),
 		       COALESCE(resin_url, ''),
@@ -1445,6 +1481,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping, &s.CodexModelMapping,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.UsageProbeConcurrency, &s.UsageProbeResponsesFallbackEnabled, &s.RecoveryProbeIntervalMinutes,
+		&s.CheapProbeEnabled, &s.CheapProbeScanIntervalSeconds, &s.CheapProbeConcurrency, &s.CheapProbeTimeoutSeconds,
+		&s.CheapProbeRecoveryMargin, &s.CheapProbeBonusDurationMinutes, &s.CheapProbeRankBaseIntervalSeconds,
+		&s.CheapProbeRankStepSeconds, &s.CheapProbeRankMinIntervalSeconds,
 		&s.SchedulerMode,
 		&s.AffinityMode,
 		&s.ResinURL, &s.ResinPlatformName,
@@ -1499,6 +1538,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				fast_scheduler_enabled, max_retries, max_rate_limit_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, lazy_mode, model_mapping, codex_model_mapping,
 					background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
 					usage_probe_concurrency, usage_probe_responses_fallback_enabled,
+					cheap_probe_enabled, cheap_probe_scan_interval_seconds, cheap_probe_concurrency,
+					cheap_probe_timeout_seconds, cheap_probe_recovery_margin, cheap_probe_bonus_duration_minutes,
+					cheap_probe_rank_base_interval_seconds, cheap_probe_rank_step_seconds, cheap_probe_rank_min_interval_seconds,
 				resin_url, resin_platform_name, prompt_filter_enabled, prompt_filter_mode, prompt_filter_threshold,
 				prompt_filter_strict_threshold, prompt_filter_log_matches, prompt_filter_max_text_length,
 				prompt_filter_sensitive_words, prompt_filter_custom_patterns, prompt_filter_disabled_patterns,
@@ -1524,7 +1566,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					auto_pause_5h_threshold,
 					auto_pause_7d_threshold
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1554,6 +1596,15 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					usage_probe_concurrency = EXCLUDED.usage_probe_concurrency,
 					usage_probe_responses_fallback_enabled = EXCLUDED.usage_probe_responses_fallback_enabled,
 					recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
+					cheap_probe_enabled = EXCLUDED.cheap_probe_enabled,
+					cheap_probe_scan_interval_seconds = EXCLUDED.cheap_probe_scan_interval_seconds,
+					cheap_probe_concurrency = EXCLUDED.cheap_probe_concurrency,
+					cheap_probe_timeout_seconds = EXCLUDED.cheap_probe_timeout_seconds,
+					cheap_probe_recovery_margin = EXCLUDED.cheap_probe_recovery_margin,
+					cheap_probe_bonus_duration_minutes = EXCLUDED.cheap_probe_bonus_duration_minutes,
+					cheap_probe_rank_base_interval_seconds = EXCLUDED.cheap_probe_rank_base_interval_seconds,
+					cheap_probe_rank_step_seconds = EXCLUDED.cheap_probe_rank_step_seconds,
+					cheap_probe_rank_min_interval_seconds = EXCLUDED.cheap_probe_rank_min_interval_seconds,
 				resin_url               = EXCLUDED.resin_url,
 				resin_platform_name     = EXCLUDED.resin_platform_name,
 				prompt_filter_enabled   = EXCLUDED.prompt_filter_enabled,
@@ -1601,6 +1652,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping, s.CodexModelMapping,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
 		s.UsageProbeConcurrency, s.UsageProbeResponsesFallbackEnabled,
+		s.CheapProbeEnabled, s.CheapProbeScanIntervalSeconds, s.CheapProbeConcurrency,
+		s.CheapProbeTimeoutSeconds, s.CheapProbeRecoveryMargin, s.CheapProbeBonusDurationMinutes,
+		s.CheapProbeRankBaseIntervalSeconds, s.CheapProbeRankStepSeconds, s.CheapProbeRankMinIntervalSeconds,
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
 		s.PromptFilterStrictThreshold, s.PromptFilterLogMatches, s.PromptFilterMaxTextLength,
 		s.PromptFilterSensitiveWords, s.PromptFilterCustomPatterns, s.PromptFilterDisabledPatterns,

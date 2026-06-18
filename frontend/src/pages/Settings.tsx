@@ -662,11 +662,20 @@ export default function Settings() {
     global_rpm: 0,
     test_model: '',
     test_concurrency: 50,
-	    background_refresh_interval_minutes: 2,
-	    usage_probe_max_age_minutes: 10,
-	    usage_probe_concurrency: 16,
-	    usage_probe_responses_fallback_enabled: true,
-	    recovery_probe_interval_minutes: 30,
+    background_refresh_interval_minutes: 2,
+    usage_probe_max_age_minutes: 10,
+    usage_probe_concurrency: 16,
+    usage_probe_responses_fallback_enabled: true,
+    recovery_probe_interval_minutes: 30,
+    cheap_probe_enabled: true,
+    cheap_probe_scan_interval_seconds: 10,
+    cheap_probe_concurrency: 2,
+    cheap_probe_timeout_seconds: 30,
+    cheap_probe_recovery_margin: 10,
+    cheap_probe_bonus_duration_minutes: 10,
+    cheap_probe_rank_base_interval_seconds: 180,
+    cheap_probe_rank_step_seconds: 30,
+    cheap_probe_rank_min_interval_seconds: 30,
     lazy_mode: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
@@ -1275,6 +1284,85 @@ export default function Settings() {
                     value={lazyModeActive ? '∞' : settingsForm.recovery_probe_interval_minutes}
                     disabled={lazyModeActive}
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, recovery_probe_interval_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.cheapProbeEnabled')} description={t('settings.cheapProbeEnabledDesc')}>
+                  <Select
+                    value={settingsForm.cheap_probe_enabled ? 'true' : 'false'}
+                    onValueChange={(value) => autoSaveBooleanField('cheap_probe_enabled', value)}
+                    options={booleanOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.cheapProbeScanInterval')} description={t('settings.cheapProbeScanIntervalDesc')}>
+                  <Input
+                    type="number"
+                    min={5}
+                    max={3600}
+                    value={settingsForm.cheap_probe_scan_interval_seconds}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, cheap_probe_scan_interval_seconds: parseInt(e.target.value) || 5 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.cheapProbeConcurrency')} description={t('settings.cheapProbeConcurrencyDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={32}
+                    value={settingsForm.cheap_probe_concurrency}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, cheap_probe_concurrency: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.cheapProbeTimeout')} description={t('settings.cheapProbeTimeoutDesc')}>
+                  <Input
+                    type="number"
+                    min={5}
+                    max={300}
+                    value={settingsForm.cheap_probe_timeout_seconds}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, cheap_probe_timeout_seconds: parseInt(e.target.value) || 5 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.cheapProbeRecoveryMargin')} description={t('settings.cheapProbeRecoveryMarginDesc')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10000}
+                    value={settingsForm.cheap_probe_recovery_margin}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, cheap_probe_recovery_margin: Number(e.target.value) || 0 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.cheapProbeBonusDuration')} description={t('settings.cheapProbeBonusDurationDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={1440}
+                    value={settingsForm.cheap_probe_bonus_duration_minutes}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, cheap_probe_bonus_duration_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.cheapProbeRankBaseInterval')} description={t('settings.cheapProbeRankBaseIntervalDesc')}>
+                  <Input
+                    type="number"
+                    min={10}
+                    max={86400}
+                    value={settingsForm.cheap_probe_rank_base_interval_seconds}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, cheap_probe_rank_base_interval_seconds: parseInt(e.target.value) || 10 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.cheapProbeRankStep')} description={t('settings.cheapProbeRankStepDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={3600}
+                    value={settingsForm.cheap_probe_rank_step_seconds}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, cheap_probe_rank_step_seconds: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.cheapProbeRankMinInterval')} description={t('settings.cheapProbeRankMinIntervalDesc')}>
+                  <Input
+                    type="number"
+                    min={5}
+                    max={86400}
+                    value={settingsForm.cheap_probe_rank_min_interval_seconds}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, cheap_probe_rank_min_interval_seconds: parseInt(e.target.value) || 5 }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.lazyMode')} description={t('settings.lazyModeDesc')}>

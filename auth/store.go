@@ -93,7 +93,9 @@ type Account struct {
 	AutoPause7dDisabled         bool
 	IgnoreUsageLimit429Cooldown bool
 	IgnoreUnauthorizedCooldown  bool
-	PriceMultiplier             float64 // 价格倍率，0 表示未显式配置且未从账号名推断
+	PriceMultiplier             float64 // 价格倍率，0 表示未显式配置
+	CheapProbeRecoveryMargin    float64 // 便宜账号探测成功后高出当前最高分的账号级覆盖，0 表示继承全局
+	CheapProbeBonusDuration     time.Duration
 	effectiveAutoPause5h        float64 // resolved: account > group > global
 	effectiveAutoPause7d        float64
 
@@ -183,11 +185,13 @@ const (
 	defaultCheapProbeRecoveryMargin  = 10.0
 	defaultCheapProbeBonusDuration   = 10 * time.Minute
 	defaultCheapProbeTimeout         = 30 * time.Second
+	defaultCheapProbeRankBase        = 180 * time.Second
+	defaultCheapProbeRankStep        = 30 * time.Second
+	defaultCheapProbeRankMin         = 30 * time.Second
 )
 
 var (
 	accountNamePriceMultiplierRe = regexp.MustCompile(`(?:^|[^0-9])([0-9]+\.[0-9]+)\s*$`)
-	cheapProbeRankIntervals      = []time.Duration{180 * time.Second, 120 * time.Second, 90 * time.Second, 60 * time.Second, 30 * time.Second}
 )
 
 // SchedulerBreakdown 调度评分拆解
@@ -653,9 +657,6 @@ func resolveAccountRowPriceMultiplier(row *database.AccountRow) float64 {
 			return normalized
 		}
 	}
-	if inferred, ok := ParsePriceMultiplierFromName(row.Name); ok {
-		return inferred
-	}
 	return 0
 }
 
@@ -666,14 +667,62 @@ func priceMultiplierForComparison(value float64) float64 {
 	return 1
 }
 
-func cheapProbeIntervalForRank(rank int) time.Duration {
-	if rank < 0 {
-		rank = 0
+func normalizeCheapProbeDuration(value, fallback, minValue, maxValue time.Duration) time.Duration {
+	if value <= 0 {
+		return fallback
 	}
-	if rank >= len(cheapProbeRankIntervals) {
-		return cheapProbeRankIntervals[len(cheapProbeRankIntervals)-1]
+	if value < minValue {
+		return minValue
 	}
-	return cheapProbeRankIntervals[rank]
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func normalizeCheapProbePositiveInt(value, fallback, minValue, maxValue int) int {
+	if value <= 0 {
+		return fallback
+	}
+	if value < minValue {
+		return minValue
+	}
+	if value > maxValue {
+		return maxValue
+	}
+	return value
+}
+
+func normalizeCheapProbeRecoveryMargin(value float64) float64 {
+	if value < 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return defaultCheapProbeRecoveryMargin
+	}
+	if value > 10000 {
+		return 10000
+	}
+	return value
+}
+
+func normalizeAccountCheapProbeRecoveryMargin(value float64) float64 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0
+	}
+	if value > 10000 {
+		return 10000
+	}
+	return value
+}
+
+func normalizeAccountCheapProbeBonusDuration(value time.Duration) time.Duration {
+	if value <= 0 {
+		return 0
+	}
+	return normalizeCheapProbeDuration(value, defaultCheapProbeBonusDuration, time.Minute, 24*time.Hour)
+}
+
+func cheapProbeRecoveryMarginFromBits(bits uint64) float64 {
+	value := math.Float64frombits(bits)
+	return normalizeCheapProbeRecoveryMargin(value)
 }
 
 func (a *Account) schedulerBreakdownLocked(now time.Time) SchedulerBreakdown {
@@ -1675,6 +1724,13 @@ func (a *Account) CheapProbeRuntimeSnapshot() (float64, time.Time, time.Time, st
 	return a.PriceMultiplier, a.LastCheapProbeAt, a.LastCheapProbeSuccessAt, a.LastCheapProbeError, a.CheapProbeRecoveryBonus, a.CheapProbeBonusUntil
 }
 
+// CheapProbeConfigSnapshot 返回账号级便宜账号探测覆盖配置。
+func (a *Account) CheapProbeConfigSnapshot() (float64, time.Duration) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.CheapProbeRecoveryMargin, a.CheapProbeBonusDuration
+}
+
 // NeedsCheapProbe 判断当前账号在指定间隔下是否需要便宜账号探测。
 func (a *Account) NeedsCheapProbe(now time.Time, interval time.Duration) bool {
 	a.mu.RLock()
@@ -1884,6 +1940,15 @@ type Store struct {
 	usageProbeConcurrency              int64 // 用量探针并行度
 	usageProbeResponsesFallbackEnabled atomic.Bool
 	recoveryProbeInterval              int64 // 恢复探测最小间隔（ns）
+	cheapProbeEnabled                  atomic.Bool
+	cheapProbeScanInterval             int64 // 便宜账号探测扫描间隔（ns）
+	cheapProbeConcurrency              int64
+	cheapProbeTimeout                  int64 // 单个便宜账号探测超时（ns）
+	cheapProbeRecoveryMarginBits       atomic.Uint64
+	cheapProbeBonusDuration            int64 // 便宜账号探测成功后的全局加分持续时间（ns）
+	cheapProbeRankBaseInterval         int64 // 倍率排名第 0 名的探测间隔（ns）
+	cheapProbeRankStepInterval         int64 // 排名每前进一档减少的探测间隔（ns）
+	cheapProbeRankMinInterval          int64 // 倍率排名探测间隔下限（ns）
 	backgroundRefreshWakeCh            chan struct{}
 	lazyRefreshInFlight                sync.Map
 	stopCh                             chan struct{}
@@ -2293,6 +2358,15 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			UsageProbeConcurrency:              defaultUsageProbeConcurrency,
 			UsageProbeResponsesFallbackEnabled: true,
 			RecoveryProbeIntervalMinutes:       30,
+			CheapProbeEnabled:                  true,
+			CheapProbeScanIntervalSeconds:      int(defaultCheapProbeScanInterval / time.Second),
+			CheapProbeConcurrency:              defaultCheapProbeConcurrency,
+			CheapProbeTimeoutSeconds:           int(defaultCheapProbeTimeout / time.Second),
+			CheapProbeRecoveryMargin:           defaultCheapProbeRecoveryMargin,
+			CheapProbeBonusDurationMinutes:     int(defaultCheapProbeBonusDuration / time.Minute),
+			CheapProbeRankBaseIntervalSeconds:  int(defaultCheapProbeRankBase / time.Second),
+			CheapProbeRankStepSeconds:          int(defaultCheapProbeRankStep / time.Second),
+			CheapProbeRankMinIntervalSeconds:   int(defaultCheapProbeRankMin / time.Second),
 			LazyMode:                           false,
 			ProxyURL:                           "",
 			MaxRateLimitRetries:                1,
@@ -2319,6 +2393,36 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.SetUsageProbeConcurrency(settings.UsageProbeConcurrency)
 	s.SetUsageProbeResponsesFallbackEnabled(settings.UsageProbeResponsesFallbackEnabled)
 	s.SetRecoveryProbeInterval(time.Duration(settings.RecoveryProbeIntervalMinutes) * time.Minute)
+	if !settings.CheapProbeEnabled &&
+		settings.CheapProbeScanIntervalSeconds == 0 &&
+		settings.CheapProbeConcurrency == 0 &&
+		settings.CheapProbeTimeoutSeconds == 0 &&
+		settings.CheapProbeRecoveryMargin == 0 &&
+		settings.CheapProbeBonusDurationMinutes == 0 &&
+		settings.CheapProbeRankBaseIntervalSeconds == 0 &&
+		settings.CheapProbeRankStepSeconds == 0 &&
+		settings.CheapProbeRankMinIntervalSeconds == 0 {
+		settings.CheapProbeEnabled = true
+		settings.CheapProbeScanIntervalSeconds = int(defaultCheapProbeScanInterval / time.Second)
+		settings.CheapProbeConcurrency = defaultCheapProbeConcurrency
+		settings.CheapProbeTimeoutSeconds = int(defaultCheapProbeTimeout / time.Second)
+		settings.CheapProbeRecoveryMargin = defaultCheapProbeRecoveryMargin
+		settings.CheapProbeBonusDurationMinutes = int(defaultCheapProbeBonusDuration / time.Minute)
+		settings.CheapProbeRankBaseIntervalSeconds = int(defaultCheapProbeRankBase / time.Second)
+		settings.CheapProbeRankStepSeconds = int(defaultCheapProbeRankStep / time.Second)
+		settings.CheapProbeRankMinIntervalSeconds = int(defaultCheapProbeRankMin / time.Second)
+	}
+	s.SetCheapProbeEnabled(settings.CheapProbeEnabled)
+	s.SetCheapProbeScanInterval(time.Duration(settings.CheapProbeScanIntervalSeconds) * time.Second)
+	s.SetCheapProbeConcurrency(settings.CheapProbeConcurrency)
+	s.SetCheapProbeTimeout(time.Duration(settings.CheapProbeTimeoutSeconds) * time.Second)
+	s.SetCheapProbeRecoveryMargin(settings.CheapProbeRecoveryMargin)
+	s.SetCheapProbeBonusDuration(time.Duration(settings.CheapProbeBonusDurationMinutes) * time.Minute)
+	s.SetCheapProbeRankPolicy(
+		time.Duration(settings.CheapProbeRankBaseIntervalSeconds)*time.Second,
+		time.Duration(settings.CheapProbeRankStepSeconds)*time.Second,
+		time.Duration(settings.CheapProbeRankMinIntervalSeconds)*time.Second,
+	)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
@@ -2843,6 +2947,141 @@ func (s *Store) GetRecoveryProbeInterval() time.Duration {
 	return d
 }
 
+// SetCheapProbeEnabled 设置便宜账号探测是否启用。
+func (s *Store) SetCheapProbeEnabled(enabled bool) {
+	s.cheapProbeEnabled.Store(enabled)
+}
+
+// CheapProbeEnabled 返回便宜账号探测是否启用。
+func (s *Store) CheapProbeEnabled() bool {
+	if s == nil {
+		return false
+	}
+	return s.cheapProbeEnabled.Load()
+}
+
+// SetCheapProbeScanInterval 设置便宜账号探测扫描间隔。
+func (s *Store) SetCheapProbeScanInterval(d time.Duration) {
+	d = normalizeCheapProbeDuration(d, defaultCheapProbeScanInterval, 5*time.Second, time.Hour)
+	atomic.StoreInt64(&s.cheapProbeScanInterval, int64(d))
+}
+
+// GetCheapProbeScanInterval 获取便宜账号探测扫描间隔。
+func (s *Store) GetCheapProbeScanInterval() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.cheapProbeScanInterval))
+	return normalizeCheapProbeDuration(d, defaultCheapProbeScanInterval, 5*time.Second, time.Hour)
+}
+
+// GetCheapProbeScanIntervalSeconds 获取便宜账号探测扫描间隔秒数。
+func (s *Store) GetCheapProbeScanIntervalSeconds() int {
+	return int(s.GetCheapProbeScanInterval() / time.Second)
+}
+
+// SetCheapProbeConcurrency 设置便宜账号探测并发度。
+func (s *Store) SetCheapProbeConcurrency(n int) {
+	n = normalizeCheapProbePositiveInt(n, defaultCheapProbeConcurrency, 1, 32)
+	atomic.StoreInt64(&s.cheapProbeConcurrency, int64(n))
+}
+
+// GetCheapProbeConcurrency 获取便宜账号探测并发度。
+func (s *Store) GetCheapProbeConcurrency() int {
+	n := int(atomic.LoadInt64(&s.cheapProbeConcurrency))
+	return normalizeCheapProbePositiveInt(n, defaultCheapProbeConcurrency, 1, 32)
+}
+
+// SetCheapProbeTimeout 设置单个便宜账号探测超时。
+func (s *Store) SetCheapProbeTimeout(d time.Duration) {
+	d = normalizeCheapProbeDuration(d, defaultCheapProbeTimeout, 5*time.Second, 5*time.Minute)
+	atomic.StoreInt64(&s.cheapProbeTimeout, int64(d))
+}
+
+// GetCheapProbeTimeout 获取单个便宜账号探测超时。
+func (s *Store) GetCheapProbeTimeout() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.cheapProbeTimeout))
+	return normalizeCheapProbeDuration(d, defaultCheapProbeTimeout, 5*time.Second, 5*time.Minute)
+}
+
+// GetCheapProbeTimeoutSeconds 获取单个便宜账号探测超时秒数。
+func (s *Store) GetCheapProbeTimeoutSeconds() int {
+	return int(s.GetCheapProbeTimeout() / time.Second)
+}
+
+// SetCheapProbeRecoveryMargin 设置便宜账号探测成功后的全局恢复加分边距。
+func (s *Store) SetCheapProbeRecoveryMargin(margin float64) {
+	s.cheapProbeRecoveryMarginBits.Store(math.Float64bits(normalizeCheapProbeRecoveryMargin(margin)))
+}
+
+// GetCheapProbeRecoveryMargin 获取便宜账号探测成功后的全局恢复加分边距。
+func (s *Store) GetCheapProbeRecoveryMargin() float64 {
+	return cheapProbeRecoveryMarginFromBits(s.cheapProbeRecoveryMarginBits.Load())
+}
+
+// SetCheapProbeBonusDuration 设置便宜账号探测成功后的全局加分持续时间。
+func (s *Store) SetCheapProbeBonusDuration(d time.Duration) {
+	d = normalizeCheapProbeDuration(d, defaultCheapProbeBonusDuration, time.Minute, 24*time.Hour)
+	atomic.StoreInt64(&s.cheapProbeBonusDuration, int64(d))
+}
+
+// GetCheapProbeBonusDuration 获取便宜账号探测成功后的全局加分持续时间。
+func (s *Store) GetCheapProbeBonusDuration() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.cheapProbeBonusDuration))
+	return normalizeCheapProbeDuration(d, defaultCheapProbeBonusDuration, time.Minute, 24*time.Hour)
+}
+
+// GetCheapProbeBonusDurationMinutes 获取便宜账号探测成功后的全局加分持续分钟数。
+func (s *Store) GetCheapProbeBonusDurationMinutes() int {
+	return int(s.GetCheapProbeBonusDuration() / time.Minute)
+}
+
+// SetCheapProbeRankPolicy 设置按价格倍率排名计算探测间隔的策略。
+func (s *Store) SetCheapProbeRankPolicy(base, step, minValue time.Duration) {
+	base = normalizeCheapProbeDuration(base, defaultCheapProbeRankBase, 10*time.Second, 24*time.Hour)
+	step = normalizeCheapProbeDuration(step, defaultCheapProbeRankStep, time.Second, time.Hour)
+	minValue = normalizeCheapProbeDuration(minValue, defaultCheapProbeRankMin, 5*time.Second, 24*time.Hour)
+	if minValue > base {
+		minValue = base
+	}
+	atomic.StoreInt64(&s.cheapProbeRankBaseInterval, int64(base))
+	atomic.StoreInt64(&s.cheapProbeRankStepInterval, int64(step))
+	atomic.StoreInt64(&s.cheapProbeRankMinInterval, int64(minValue))
+}
+
+// GetCheapProbeRankPolicySeconds 返回便宜账号排名频率策略的秒数配置。
+func (s *Store) GetCheapProbeRankPolicySeconds() (int, int, int) {
+	return int(s.getCheapProbeRankBaseInterval() / time.Second),
+		int(s.getCheapProbeRankStepInterval() / time.Second),
+		int(s.getCheapProbeRankMinInterval() / time.Second)
+}
+
+func (s *Store) getCheapProbeRankBaseInterval() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.cheapProbeRankBaseInterval))
+	return normalizeCheapProbeDuration(d, defaultCheapProbeRankBase, 10*time.Second, 24*time.Hour)
+}
+
+func (s *Store) getCheapProbeRankStepInterval() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.cheapProbeRankStepInterval))
+	return normalizeCheapProbeDuration(d, defaultCheapProbeRankStep, time.Second, time.Hour)
+}
+
+func (s *Store) getCheapProbeRankMinInterval() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.cheapProbeRankMinInterval))
+	return normalizeCheapProbeDuration(d, defaultCheapProbeRankMin, 5*time.Second, 24*time.Hour)
+}
+
+func (s *Store) cheapProbeIntervalForRank(rank int) time.Duration {
+	if rank < 0 {
+		rank = 0
+	}
+	base := s.getCheapProbeRankBaseInterval()
+	step := s.getCheapProbeRankStepInterval()
+	minValue := s.getCheapProbeRankMinInterval()
+	interval := base - time.Duration(rank)*step
+	if interval < minValue {
+		return minValue
+	}
+	return interval
+}
+
 // RecoveryProbeRunning reports whether a batch recovery probe is currently active.
 func (s *Store) RecoveryProbeRunning() bool {
 	if s == nil {
@@ -3066,6 +3305,12 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 		account.AutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(threshold)
 	}
 	account.PriceMultiplier = resolveAccountRowPriceMultiplier(row)
+	if margin, ok := row.GetCredentialFloat64("cheap_probe_recovery_margin"); ok {
+		account.CheapProbeRecoveryMargin = normalizeAccountCheapProbeRecoveryMargin(margin)
+	}
+	if minutes, ok := row.GetCredentialFloat64("cheap_probe_bonus_duration_minutes"); ok {
+		account.CheapProbeBonusDuration = normalizeAccountCheapProbeBonusDuration(time.Duration(minutes) * time.Minute)
+	}
 	account.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 	account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 	account.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
@@ -3117,12 +3362,13 @@ func (s *Store) StartBackgroundRefresh() {
 	go func() {
 		defer s.wg.Done()
 		refreshTimer := time.NewTimer(s.GetBackgroundRefreshInterval())
-		cheapProbeTicker := time.NewTicker(defaultCheapProbeScanInterval)
+		cheapProbeTicker := time.NewTicker(time.Second)
 		autoCleanupTicker := time.NewTicker(30 * time.Second)
 		fullUsageCleanupTicker := time.NewTicker(5 * time.Minute)
 		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
 		// 添加定时重建 FastScheduler 以优化性能
 		rebuildSchedulerTicker := time.NewTicker(10 * time.Minute)
+		lastCheapProbeScan := time.Time{}
 		defer refreshTimer.Stop()
 		defer cheapProbeTicker.Stop()
 		defer autoCleanupTicker.Stop()
@@ -3155,8 +3401,9 @@ func (s *Store) StartBackgroundRefresh() {
 				resetRefreshTimer()
 			case <-autoCleanupTicker.C:
 				s.TriggerAutoCleanupAsync()
-			case <-cheapProbeTicker.C:
-				if !s.GetLazyMode() {
+			case now := <-cheapProbeTicker.C:
+				if !s.GetLazyMode() && s.CheapProbeEnabled() && (lastCheapProbeScan.IsZero() || now.Sub(lastCheapProbeScan) >= s.GetCheapProbeScanInterval()) {
+					lastCheapProbeScan = now
 					s.TriggerCheapProbeAsync()
 				}
 			case <-fullUsageCleanupTicker.C:
@@ -4355,6 +4602,24 @@ func (s *Store) ApplyAccountPriceMultiplier(dbID int64, priceMultiplier float64)
 	return true
 }
 
+// ApplyAccountCheapProbeConfig 更新账号级便宜账号探测覆盖配置。
+func (s *Store) ApplyAccountCheapProbeConfig(dbID int64, marginSet bool, margin float64, durationSet bool, durationMinutes int) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	if marginSet {
+		acc.CheapProbeRecoveryMargin = normalizeAccountCheapProbeRecoveryMargin(margin)
+	}
+	if durationSet {
+		acc.CheapProbeBonusDuration = normalizeAccountCheapProbeBonusDuration(time.Duration(durationMinutes) * time.Minute)
+	}
+	acc.mu.Unlock()
+	return true
+}
+
 func (s *Store) ApplyAccountTags(dbID int64, tags []string) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
@@ -5066,6 +5331,9 @@ func (s *Store) TriggerUsageProbeAsync() {
 
 // TriggerCheapProbeAsync 异步触发一次便宜账号可用性探针。
 func (s *Store) TriggerCheapProbeAsync() {
+	if !s.CheapProbeEnabled() {
+		return
+	}
 	if !s.cheapProbeBatch.CompareAndSwap(false, true) {
 		return
 	}
@@ -5370,7 +5638,7 @@ func (s *Store) cheapProbeCandidates(accounts []*Account, now time.Time) ([]chea
 
 	targets := make([]cheapProbeTarget, 0, len(candidates))
 	for rank, acc := range candidates {
-		interval := cheapProbeIntervalForRank(rank)
+		interval := s.cheapProbeIntervalForRank(rank)
 		if !acc.NeedsCheapProbe(now, interval) {
 			continue
 		}
@@ -5412,10 +5680,18 @@ func (s *Store) RecordCheapProbeSuccess(acc *Account, currentMaxDispatchScore fl
 	acc.CheapProbeRecoveryBonus = 0
 	acc.CheapProbeBonusUntil = time.Time{}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-	targetScore := currentMaxDispatchScore + defaultCheapProbeRecoveryMargin
+	recoveryMargin := s.GetCheapProbeRecoveryMargin()
+	if acc.CheapProbeRecoveryMargin > 0 {
+		recoveryMargin = acc.CheapProbeRecoveryMargin
+	}
+	bonusDuration := s.GetCheapProbeBonusDuration()
+	if acc.CheapProbeBonusDuration > 0 {
+		bonusDuration = acc.CheapProbeBonusDuration
+	}
+	targetScore := currentMaxDispatchScore + recoveryMargin
 	if acc.DispatchScore < targetScore {
 		acc.CheapProbeRecoveryBonus = targetScore - acc.DispatchScore
-		acc.CheapProbeBonusUntil = now.Add(defaultCheapProbeBonusDuration)
+		acc.CheapProbeBonusUntil = now.Add(bonusDuration)
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
@@ -5461,6 +5737,9 @@ func (s *Store) RecordCheapProbeFailure(acc *Account, err error) {
 }
 
 func (s *Store) parallelCheapProbe(ctx context.Context) {
+	if !s.CheapProbeEnabled() {
+		return
+	}
 	s.usageProbeMu.RLock()
 	probeFn := s.cheapProbe
 	s.usageProbeMu.RUnlock()
@@ -5479,7 +5758,8 @@ func (s *Store) parallelCheapProbe(ctx context.Context) {
 		return
 	}
 
-	sem := make(chan struct{}, defaultCheapProbeConcurrency)
+	sem := make(chan struct{}, s.GetCheapProbeConcurrency())
+	timeout := s.GetCheapProbeTimeout()
 	var wg sync.WaitGroup
 	for _, target := range targets {
 		account := target.account
@@ -5493,7 +5773,7 @@ func (s *Store) parallelCheapProbe(ctx context.Context) {
 			defer func() { <-sem }()
 			defer account.FinishCheapProbe()
 
-			probeCtx, cancel := context.WithTimeout(ctx, defaultCheapProbeTimeout)
+			probeCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			if err := probeFn(probeCtx, account); err != nil {
 				s.RecordCheapProbeFailure(account, err)

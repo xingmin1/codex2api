@@ -940,53 +940,63 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.UpdateSystemSettings(ctx, &SystemSettings{
-		SiteName:                         "CodexProxy",
-		MaxConcurrency:                   2,
-		GlobalRPM:                        0,
-		TestModel:                        "gpt-5.4",
-		TestConcurrency:                  50,
-		BackgroundRefreshIntervalMinutes: 2,
-		UsageProbeMaxAgeMinutes:          10,
-		UsageProbeConcurrency:            16,
-		RecoveryProbeIntervalMinutes:     30,
-		PgMaxConns:                       50,
-		RedisPoolSize:                    30,
-		MaxRetries:                       2,
-		MaxRateLimitRetries:              1,
-		ModelMapping:                     "{}",
-		CodexModelMapping:                `{"gpt-5.2":"gpt-5.5"}`,
-		ReasoningEffortModels:            `[{"model":"gpt-5.5","effort":"xhigh"}]`,
-		PromptFilterMode:                 "monitor",
-		PromptFilterThreshold:            50,
-		PromptFilterStrictThreshold:      90,
-		PromptFilterLogMatches:           true,
-		PromptFilterMaxTextLength:        81920,
-		PromptFilterCustomPatterns:       "[]",
-		PromptFilterDisabledPatterns:     "[]",
-		PromptFilterReviewEnabled:        true,
-		PromptFilterReviewAPIKey:         "sk-review-test",
-		PromptFilterReviewBaseURL:        "https://review.example.com",
-		PromptFilterReviewModel:          "review-model",
-		PromptFilterReviewTimeoutSeconds: 7,
-		PromptFilterReviewFailClosed:     false,
-		ClientCompatMode:                 "preserve",
-		CodexMinCLIVersion:               "0.118.0",
-		UsageLogMode:                     "full",
-		UsageLogBatchSize:                200,
-		UsageLogFlushIntervalSeconds:     5,
-		StreamFlushPolicy:                "immediate",
-		StreamFlushIntervalMS:            20,
-		FirstTokenMode:                   "loose",
-		FirstTokenTimeoutSeconds:         17,
-		BillingTierPolicy:                "requested",
-		ImageStorageConfig:               "{}",
-		SchedulerMode:                    "round_robin",
-		AffinityMode:                     "bounded",
-		BackgroundConfig:                 "{}",
-		ShowFullUsageNumbers:             true,
-		CodexWSHideUpstreamErrors:        true,
-		CodexWSSilentRetryEnabled:        true,
-		CodexWSSilentMaxRetries:          4,
+		SiteName:                           "CodexProxy",
+		MaxConcurrency:                     2,
+		GlobalRPM:                          0,
+		TestModel:                          "gpt-5.4",
+		TestConcurrency:                    50,
+		BackgroundRefreshIntervalMinutes:   2,
+		UsageProbeMaxAgeMinutes:            10,
+		UsageProbeConcurrency:              16,
+		UsageProbeResponsesFallbackEnabled: true,
+		RecoveryProbeIntervalMinutes:       30,
+		CheapProbeEnabled:                  true,
+		CheapProbeScanIntervalSeconds:      15,
+		CheapProbeConcurrency:              3,
+		CheapProbeTimeoutSeconds:           45,
+		CheapProbeRecoveryMargin:           12.5,
+		CheapProbeBonusDurationMinutes:     20,
+		CheapProbeRankBaseIntervalSeconds:  210,
+		CheapProbeRankStepSeconds:          35,
+		CheapProbeRankMinIntervalSeconds:   25,
+		PgMaxConns:                         50,
+		RedisPoolSize:                      30,
+		MaxRetries:                         2,
+		MaxRateLimitRetries:                1,
+		ModelMapping:                       "{}",
+		CodexModelMapping:                  `{"gpt-5.2":"gpt-5.5"}`,
+		ReasoningEffortModels:              `[{"model":"gpt-5.5","effort":"xhigh"}]`,
+		PromptFilterMode:                   "monitor",
+		PromptFilterThreshold:              50,
+		PromptFilterStrictThreshold:        90,
+		PromptFilterLogMatches:             true,
+		PromptFilterMaxTextLength:          81920,
+		PromptFilterCustomPatterns:         "[]",
+		PromptFilterDisabledPatterns:       "[]",
+		PromptFilterReviewEnabled:          true,
+		PromptFilterReviewAPIKey:           "sk-review-test",
+		PromptFilterReviewBaseURL:          "https://review.example.com",
+		PromptFilterReviewModel:            "review-model",
+		PromptFilterReviewTimeoutSeconds:   7,
+		PromptFilterReviewFailClosed:       false,
+		ClientCompatMode:                   "preserve",
+		CodexMinCLIVersion:                 "0.118.0",
+		UsageLogMode:                       "full",
+		UsageLogBatchSize:                  200,
+		UsageLogFlushIntervalSeconds:       5,
+		StreamFlushPolicy:                  "immediate",
+		StreamFlushIntervalMS:              20,
+		FirstTokenMode:                     "loose",
+		FirstTokenTimeoutSeconds:           17,
+		BillingTierPolicy:                  "requested",
+		ImageStorageConfig:                 "{}",
+		SchedulerMode:                      "round_robin",
+		AffinityMode:                       "bounded",
+		BackgroundConfig:                   "{}",
+		ShowFullUsageNumbers:               true,
+		CodexWSHideUpstreamErrors:          true,
+		CodexWSSilentRetryEnabled:          true,
+		CodexWSSilentMaxRetries:            4,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1012,6 +1022,21 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.CodexModelMapping != `{"gpt-5.2":"gpt-5.5"}` {
 		t.Fatalf("CodexModelMapping = %q, want gpt-5.2 mapping", settings.CodexModelMapping)
+	}
+	if !settings.CheapProbeEnabled {
+		t.Fatal("CheapProbeEnabled = false, want true")
+	}
+	if settings.CheapProbeScanIntervalSeconds != 15 {
+		t.Fatalf("CheapProbeScanIntervalSeconds = %d, want 15", settings.CheapProbeScanIntervalSeconds)
+	}
+	if settings.CheapProbeConcurrency != 3 || settings.CheapProbeTimeoutSeconds != 45 {
+		t.Fatalf("cheap probe runtime settings = concurrency:%d timeout:%d, want 3/45", settings.CheapProbeConcurrency, settings.CheapProbeTimeoutSeconds)
+	}
+	if settings.CheapProbeRecoveryMargin != 12.5 || settings.CheapProbeBonusDurationMinutes != 20 {
+		t.Fatalf("cheap probe bonus settings = margin:%v duration:%d, want 12.5/20", settings.CheapProbeRecoveryMargin, settings.CheapProbeBonusDurationMinutes)
+	}
+	if settings.CheapProbeRankBaseIntervalSeconds != 210 || settings.CheapProbeRankStepSeconds != 35 || settings.CheapProbeRankMinIntervalSeconds != 25 {
+		t.Fatalf("cheap probe rank settings = %d/%d/%d, want 210/35/25", settings.CheapProbeRankBaseIntervalSeconds, settings.CheapProbeRankStepSeconds, settings.CheapProbeRankMinIntervalSeconds)
 	}
 	if settings.ReasoningEffortModels != `[{"model":"gpt-5.5","effort":"xhigh"}]` {
 		t.Fatalf("ReasoningEffortModels = %q, want gpt-5.5 xhigh entry", settings.ReasoningEffortModels)

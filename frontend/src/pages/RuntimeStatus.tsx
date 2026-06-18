@@ -149,6 +149,10 @@ export default function RuntimeStatus() {
                   [t('runtime.usageProbeMaxAge'), t('runtime.minutesValue', { count: status.probes.usage_probe_max_age_minutes })],
                   [t('runtime.usageProbeConcurrency'), formatNumber(status.probes.usage_probe_concurrency)],
                   [t('runtime.recoveryProbeInterval'), t('runtime.minutesValue', { count: status.probes.recovery_probe_interval_minutes })],
+                  [t('runtime.cheapProbe'), status.probes.cheap_probe_enabled ? t('common.enabled') : t('common.disabled')],
+                  [t('runtime.cheapProbeScanInterval'), t('runtime.seconds', { count: status.probes.cheap_probe_scan_interval_seconds })],
+                  [t('runtime.cheapProbeConcurrency'), formatNumber(status.probes.cheap_probe_concurrency)],
+                  [t('runtime.cheapProbeRecoveryMargin'), formatNumber(status.probes.cheap_probe_recovery_margin)],
                   [t('runtime.runningJobs'), runningJobs(status, t)],
                 ]}
               />

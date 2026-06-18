@@ -786,6 +786,18 @@ func TestParsePriceMultiplierFromName(t *testing.T) {
 	}
 }
 
+func TestResolveAccountRowPriceMultiplierRequiresExplicitCredential(t *testing.T) {
+	row := &database.AccountRow{Name: "cheap-0.5", Credentials: map[string]interface{}{}}
+	if got := resolveAccountRowPriceMultiplier(row); got != 0 {
+		t.Fatalf("multiplier inferred from name = %v, want 0", got)
+	}
+
+	row.Credentials["price_multiplier"] = 0.5
+	if got := resolveAccountRowPriceMultiplier(row); got != 0.5 {
+		t.Fatalf("explicit multiplier = %v, want 0.5", got)
+	}
+}
+
 func TestPriceMultiplierDoesNotDirectlyChangeDispatchScore(t *testing.T) {
 	base := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus"}
 	cheap := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.25}
@@ -818,11 +830,33 @@ func TestCheapProbeCandidatesUseMultiplierRanking(t *testing.T) {
 	if len(targets) != 2 {
 		t.Fatalf("targets = %d, want 2", len(targets))
 	}
-	if targets[0].account.DBID != mid.DBID || targets[0].interval != cheapProbeIntervalForRank(0) {
+	if targets[0].account.DBID != mid.DBID || targets[0].interval != store.cheapProbeIntervalForRank(0) {
 		t.Fatalf("first target = dbID %d interval %s, want mid interval rank0", targets[0].account.DBID, targets[0].interval)
 	}
-	if targets[1].account.DBID != low.DBID || targets[1].interval != cheapProbeIntervalForRank(1) {
+	if targets[1].account.DBID != low.DBID || targets[1].interval != store.cheapProbeIntervalForRank(1) {
 		t.Fatalf("second target = dbID %d interval %s, want low interval rank1", targets[1].account.DBID, targets[1].interval)
+	}
+}
+
+func TestCheapProbeRankPolicyIsConfigurable(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                    2,
+		TestConcurrency:                   1,
+		TestModel:                         "gpt-5.4",
+		CheapProbeEnabled:                 true,
+		CheapProbeRankBaseIntervalSeconds: 200,
+		CheapProbeRankStepSeconds:         40,
+		CheapProbeRankMinIntervalSeconds:  80,
+	})
+
+	if got := store.cheapProbeIntervalForRank(0); got != 200*time.Second {
+		t.Fatalf("rank0 interval = %s, want 200s", got)
+	}
+	if got := store.cheapProbeIntervalForRank(1); got != 160*time.Second {
+		t.Fatalf("rank1 interval = %s, want 160s", got)
+	}
+	if got := store.cheapProbeIntervalForRank(4); got != 80*time.Second {
+		t.Fatalf("rank4 interval = %s, want min 80s", got)
 	}
 }
 
@@ -864,6 +898,43 @@ func TestRecordCheapProbeSuccessAddsTemporaryBonusAboveCurrentMax(t *testing.T) 
 	}
 	if cheap.CheapProbeRecoveryBonus <= 0 || !cheap.CheapProbeBonusUntil.After(time.Now()) {
 		t.Fatalf("cheap probe bonus not active: bonus=%v until=%v", cheap.CheapProbeRecoveryBonus, cheap.CheapProbeBonusUntil)
+	}
+}
+
+func TestRecordCheapProbeSuccessUsesAccountOverride(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                 2,
+		TestConcurrency:                1,
+		TestModel:                      "gpt-5.4",
+		CheapProbeEnabled:              true,
+		CheapProbeRecoveryMargin:       10,
+		CheapProbeBonusDurationMinutes: 10,
+	})
+	top := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 1}
+	top.ScoreBiasOverride = int64Ptr(60)
+	cheap := &Account{
+		DBID:                     2,
+		AccessToken:              "token",
+		Status:                   StatusReady,
+		PlanType:                 "plus",
+		PriceMultiplier:          0.2,
+		CheapProbeRecoveryMargin: 25,
+		CheapProbeBonusDuration:  time.Minute,
+	}
+	store.AddAccount(top)
+	store.AddAccount(cheap)
+	topScore := top.GetDispatchScore()
+
+	start := time.Now()
+	store.RecordCheapProbeSuccess(cheap, topScore)
+
+	cheap.mu.RLock()
+	defer cheap.mu.RUnlock()
+	if cheap.DispatchScore < topScore+25 {
+		t.Fatalf("DispatchScore = %v, want >= %v", cheap.DispatchScore, topScore+25)
+	}
+	if cheap.CheapProbeBonusUntil.Before(start.Add(time.Minute)) || cheap.CheapProbeBonusUntil.After(start.Add(2*time.Minute)) {
+		t.Fatalf("CheapProbeBonusUntil = %v, want about 1 minute after start", cheap.CheapProbeBonusUntil)
 	}
 }
 
