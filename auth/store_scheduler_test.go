@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -756,5 +757,159 @@ func TestStoreNextPrefersPremium5hResetSoonWithinTier(t *testing.T) {
 
 	if got.DBID != soon.DBID {
 		t.Fatalf("Next() picked dbID=%d, want reset-soon account %d", got.DBID, soon.DBID)
+	}
+}
+
+func TestParsePriceMultiplierFromName(t *testing.T) {
+	tests := []struct {
+		name string
+		want float64
+		ok   bool
+	}{
+		{name: "cheap-0.5", want: 0.5, ok: true},
+		{name: "proxy 0.25", want: 0.25, ok: true},
+		{name: "pool_a_0.8", want: 0.8, ok: true},
+		{name: "plain", ok: false},
+		{name: "integer-2", ok: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := ParsePriceMultiplierFromName(tc.name)
+			if ok != tc.ok {
+				t.Fatalf("ok = %t, want %t", ok, tc.ok)
+			}
+			if ok && got != tc.want {
+				t.Fatalf("multiplier = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPriceMultiplierDoesNotDirectlyChangeDispatchScore(t *testing.T) {
+	base := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus"}
+	cheap := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.25}
+
+	recomputeTestAccount(base, 4)
+	recomputeTestAccount(cheap, 4)
+
+	if base.DispatchScore != cheap.DispatchScore {
+		t.Fatalf("cheap DispatchScore = %v, want same as base %v", cheap.DispatchScore, base.DispatchScore)
+	}
+}
+
+func TestCheapProbeCandidatesUseMultiplierRanking(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	top := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 1}
+	mid := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.8}
+	low := &Account{DBID: 3, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.2}
+	normal := &Account{DBID: 4, AccessToken: "token", Status: StatusReady, PlanType: "plus"}
+	top.ScoreBiasOverride = int64Ptr(60)
+	store.AddAccount(top)
+	store.AddAccount(mid)
+	store.AddAccount(low)
+	store.AddAccount(normal)
+
+	targets, probeTop := store.cheapProbeCandidates(store.Accounts(), time.Now())
+
+	if !probeTop.found || probeTop.dbID != top.DBID {
+		t.Fatalf("top = %+v, want dbID %d", probeTop, top.DBID)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("targets = %d, want 2", len(targets))
+	}
+	if targets[0].account.DBID != mid.DBID || targets[0].interval != cheapProbeIntervalForRank(0) {
+		t.Fatalf("first target = dbID %d interval %s, want mid interval rank0", targets[0].account.DBID, targets[0].interval)
+	}
+	if targets[1].account.DBID != low.DBID || targets[1].interval != cheapProbeIntervalForRank(1) {
+		t.Fatalf("second target = dbID %d interval %s, want low interval rank1", targets[1].account.DBID, targets[1].interval)
+	}
+}
+
+func TestRecordCheapProbeSuccessAddsTemporaryBonusAboveCurrentMax(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	top := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 1}
+	top.ScoreBiasOverride = int64Ptr(60)
+	cheap := &Account{
+		DBID:                2,
+		AccessToken:         "token",
+		Status:              StatusCooldown,
+		CooldownUtil:        time.Now().Add(time.Hour),
+		CooldownReason:      "rate_limited",
+		ErrorMsg:            "old cooldown",
+		PlanType:            "plus",
+		PriceMultiplier:     0.2,
+		HealthTier:          HealthTierRisky,
+		UsagePercent5h:      100,
+		UsagePercent5hValid: true,
+		Reset5hAt:           time.Now().Add(time.Hour),
+		UsageUpdatedAt5h:    time.Now().Add(-time.Minute),
+	}
+	store.AddAccount(top)
+	store.AddAccount(cheap)
+	topScore := top.GetDispatchScore()
+
+	store.RecordCheapProbeSuccess(cheap, topScore)
+
+	cheap.mu.RLock()
+	defer cheap.mu.RUnlock()
+	if cheap.Status != StatusReady || !cheap.CooldownUtil.IsZero() || cheap.CooldownReason != "" || cheap.ErrorMsg != "" {
+		t.Fatalf("cheap status not cleared: status=%v cooldown=%v reason=%q error=%q", cheap.Status, cheap.CooldownUtil, cheap.CooldownReason, cheap.ErrorMsg)
+	}
+	if cheap.UsagePercent5hValid || !cheap.Reset5hAt.IsZero() || !cheap.UsageUpdatedAt5h.IsZero() {
+		t.Fatalf("5h usage marker not cleared: valid=%t reset=%v updated=%v", cheap.UsagePercent5hValid, cheap.Reset5hAt, cheap.UsageUpdatedAt5h)
+	}
+	if cheap.DispatchScore < topScore+defaultCheapProbeRecoveryMargin {
+		t.Fatalf("DispatchScore = %v, want >= %v", cheap.DispatchScore, topScore+defaultCheapProbeRecoveryMargin)
+	}
+	if cheap.CheapProbeRecoveryBonus <= 0 || !cheap.CheapProbeBonusUntil.After(time.Now()) {
+		t.Fatalf("cheap probe bonus not active: bonus=%v until=%v", cheap.CheapProbeRecoveryBonus, cheap.CheapProbeBonusUntil)
+	}
+}
+
+func TestRecordCheapProbeFailureDoesNotWriteCooldownOrError(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	acc := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.5}
+
+	store.RecordCheapProbeFailure(acc, fmt.Errorf("temporary upstream failure"))
+
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
+	if acc.Status != StatusReady {
+		t.Fatalf("Status = %v, want ready", acc.Status)
+	}
+	if !acc.CooldownUtil.IsZero() || acc.CooldownReason != "" || acc.ErrorMsg != "" {
+		t.Fatalf("failure wrote cooldown/error: cooldown=%v reason=%q error=%q", acc.CooldownUtil, acc.CooldownReason, acc.ErrorMsg)
+	}
+	if acc.LastCheapProbeError == "" {
+		t.Fatal("LastCheapProbeError is empty, want recorded probe error")
+	}
+}
+
+func TestApplyAccountPriceMultiplierClearsCheapProbeBonusWhenDisabled(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	acc := &Account{
+		DBID:                    1,
+		AccessToken:             "token",
+		Status:                  StatusReady,
+		PlanType:                "plus",
+		PriceMultiplier:         0.5,
+		LastCheapProbeError:     "old probe error",
+		CheapProbeRecoveryBonus: 20,
+		CheapProbeBonusUntil:    time.Now().Add(time.Minute),
+	}
+	store.AddAccount(acc)
+
+	if !store.ApplyAccountPriceMultiplier(acc.DBID, 0) {
+		t.Fatal("ApplyAccountPriceMultiplier returned false")
+	}
+
+	acc.mu.RLock()
+	defer acc.mu.RUnlock()
+	if acc.PriceMultiplier != 0 {
+		t.Fatalf("PriceMultiplier = %v, want 0", acc.PriceMultiplier)
+	}
+	if acc.LastCheapProbeError != "" || acc.CheapProbeRecoveryBonus != 0 || !acc.CheapProbeBonusUntil.IsZero() {
+		t.Fatalf("cheap probe state not cleared: err=%q bonus=%v until=%v", acc.LastCheapProbeError, acc.CheapProbeRecoveryBonus, acc.CheapProbeBonusUntil)
 	}
 }

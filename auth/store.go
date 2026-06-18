@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -92,6 +93,7 @@ type Account struct {
 	AutoPause7dDisabled         bool
 	IgnoreUsageLimit429Cooldown bool
 	IgnoreUnauthorizedCooldown  bool
+	PriceMultiplier             float64 // 价格倍率，0 表示未显式配置且未从账号名推断
 	effectiveAutoPause5h        float64 // resolved: account > group > global
 	effectiveAutoPause7d        float64
 
@@ -112,6 +114,12 @@ type Account struct {
 	LastTimeoutAt            time.Time
 	LastServerErrorAt        time.Time
 	LastRecoveryProbeAt      time.Time
+	cheapProbeInFlight       bool
+	LastCheapProbeAt         time.Time
+	LastCheapProbeSuccessAt  time.Time
+	LastCheapProbeError      string
+	CheapProbeRecoveryBonus  float64
+	CheapProbeBonusUntil     time.Time
 
 	// 滑动窗口成功率（最近 N 次请求）
 	RecentResults    [20]uint8 // 1=成功, 0=失败
@@ -170,6 +178,16 @@ const (
 	expiryUrgencyWarnDays            = 7
 	expiryUrgencyUrgentBonus         = 60.0
 	expiryUrgencyWarnBonus           = 25.0
+	defaultCheapProbeScanInterval    = 10 * time.Second
+	defaultCheapProbeConcurrency     = 2
+	defaultCheapProbeRecoveryMargin  = 10.0
+	defaultCheapProbeBonusDuration   = 10 * time.Minute
+	defaultCheapProbeTimeout         = 30 * time.Second
+)
+
+var (
+	accountNamePriceMultiplierRe = regexp.MustCompile(`(?:^|[^0-9])([0-9]+\.[0-9]+)\s*$`)
+	cheapProbeRankIntervals      = []time.Duration{180 * time.Second, 120 * time.Second, 90 * time.Second, 60 * time.Second, 30 * time.Second}
 )
 
 // SchedulerBreakdown 调度评分拆解
@@ -185,6 +203,7 @@ type SchedulerBreakdown struct {
 	UsageUrgencyBonus5h float64
 	UsageUrgencyBonus7d float64
 	ExpiryUrgencyBonus  float64
+	CheapProbeBonus     float64
 	LatencyPenalty      float64
 	SuccessRatePenalty  float64 // 滑动窗口成功率惩罚
 }
@@ -605,6 +624,58 @@ func linearDecay(base float64, elapsed, window time.Duration) float64 {
 	return base * (1.0 - float64(elapsed)/float64(window))
 }
 
+func normalizePriceMultiplier(value float64) (float64, bool) {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return 0, false
+	}
+	return value, true
+}
+
+// ParsePriceMultiplierFromName 从账号名末尾的小数后缀解析价格倍率。
+func ParsePriceMultiplierFromName(name string) (float64, bool) {
+	matches := accountNamePriceMultiplierRe.FindStringSubmatch(strings.TrimSpace(name))
+	if len(matches) != 2 {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(matches[1], 64)
+	if err != nil {
+		return 0, false
+	}
+	return normalizePriceMultiplier(value)
+}
+
+func resolveAccountRowPriceMultiplier(row *database.AccountRow) float64 {
+	if row == nil {
+		return 0
+	}
+	if value, ok := row.GetCredentialFloat64("price_multiplier"); ok {
+		if normalized, valid := normalizePriceMultiplier(value); valid {
+			return normalized
+		}
+	}
+	if inferred, ok := ParsePriceMultiplierFromName(row.Name); ok {
+		return inferred
+	}
+	return 0
+}
+
+func priceMultiplierForComparison(value float64) float64 {
+	if normalized, ok := normalizePriceMultiplier(value); ok {
+		return normalized
+	}
+	return 1
+}
+
+func cheapProbeIntervalForRank(rank int) time.Duration {
+	if rank < 0 {
+		rank = 0
+	}
+	if rank >= len(cheapProbeRankIntervals) {
+		return cheapProbeRankIntervals[len(cheapProbeRankIntervals)-1]
+	}
+	return cheapProbeRankIntervals[rank]
+}
+
 func (a *Account) schedulerBreakdownLocked(now time.Time) SchedulerBreakdown {
 	breakdown := SchedulerBreakdown{}
 	premium5hLimited := a.premium5hRateLimitedLocked(now)
@@ -646,6 +717,10 @@ func (a *Account) schedulerBreakdownLocked(now time.Time) SchedulerBreakdown {
 		case rate < 0.75:
 			breakdown.SuccessRatePenalty = 8
 		}
+	}
+
+	if !a.CheapProbeBonusUntil.IsZero() && now.Before(a.CheapProbeBonusUntil) && a.CheapProbeRecoveryBonus > 0 {
+		breakdown.CheapProbeBonus = a.CheapProbeRecoveryBonus
 	}
 
 	if !(a.CreditEnabled && a.CreditSkipUsageWindow) && a.UsagePercent7dValid && strings.EqualFold(a.PlanType, "free") {
@@ -884,7 +959,7 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 		breakdown.UsageUrgencyBonus7d = a.premium7dUsageUrgencyBonusLocked(now)
 		breakdown.ExpiryUrgencyBonus = a.expiryUrgencyBonusLocked(now)
 	}
-	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d + breakdown.ExpiryUrgencyBonus
+	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d + breakdown.ExpiryUrgencyBonus + breakdown.CheapProbeBonus
 
 	a.HealthTier = tier
 	a.SchedulerScore = score
@@ -1350,6 +1425,13 @@ func (a *Account) GetDispatchScore() float64 {
 	return a.DispatchScore
 }
 
+// GetPriceMultiplier 获取账号价格倍率；返回 ok=false 表示未配置倍率。
+func (a *Account) GetPriceMultiplier() (float64, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return normalizePriceMultiplier(a.PriceMultiplier)
+}
+
 // GetScoreBiasOverride 获取账号级分数 override
 func (a *Account) GetScoreBiasOverride() (int64, bool) {
 	a.mu.RLock()
@@ -1586,6 +1668,50 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 	}
 }
 
+// CheapProbeRuntimeSnapshot 返回便宜账号探测相关运行时状态。
+func (a *Account) CheapProbeRuntimeSnapshot() (float64, time.Time, time.Time, string, float64, time.Time) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.PriceMultiplier, a.LastCheapProbeAt, a.LastCheapProbeSuccessAt, a.LastCheapProbeError, a.CheapProbeRecoveryBonus, a.CheapProbeBonusUntil
+}
+
+// NeedsCheapProbe 判断当前账号在指定间隔下是否需要便宜账号探测。
+func (a *Account) NeedsCheapProbe(now time.Time, interval time.Duration) bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.cheapProbeInFlight {
+		return false
+	}
+	if _, ok := normalizePriceMultiplier(a.PriceMultiplier); !ok {
+		return false
+	}
+	if !a.CheapProbeBonusUntil.IsZero() && now.Before(a.CheapProbeBonusUntil) {
+		return false
+	}
+	if a.LastCheapProbeAt.IsZero() {
+		return true
+	}
+	return now.Sub(a.LastCheapProbeAt) >= interval
+}
+
+// TryBeginCheapProbe 尝试标记账号正在进行便宜账号探测。
+func (a *Account) TryBeginCheapProbe() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cheapProbeInFlight {
+		return false
+	}
+	a.cheapProbeInFlight = true
+	return true
+}
+
+// FinishCheapProbe 结束便宜账号探测中的运行时标记。
+func (a *Account) FinishCheapProbe() {
+	a.mu.Lock()
+	a.cheapProbeInFlight = false
+	a.mu.Unlock()
+}
+
 // NeedsUsageProbe 判断是否需要主动探针刷新用量
 func (a *Account) NeedsUsageProbe(maxAge time.Duration) bool {
 	a.mu.RLock()
@@ -1740,8 +1866,10 @@ type Store struct {
 	apiKeyAllowedGroupSets             map[int64]map[int64]struct{}
 	usageProbeMu                       sync.RWMutex
 	usageProbe                         func(context.Context, *Account) error
+	cheapProbe                         func(context.Context, *Account) error
 	usageProbeBatch                    atomic.Bool
 	recoveryProbeBatch                 atomic.Bool
+	cheapProbeBatch                    atomic.Bool
 	autoCleanUnauthorized              atomic.Bool
 	autoCleanRateLimited               atomic.Bool
 	autoCleanFullUsage                 atomic.Bool
@@ -2937,6 +3065,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	if threshold, ok := row.GetCredentialFloat64("auto_pause_7d_threshold"); ok {
 		account.AutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(threshold)
 	}
+	account.PriceMultiplier = resolveAccountRowPriceMultiplier(row)
 	account.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 	account.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 	account.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
@@ -2988,12 +3117,14 @@ func (s *Store) StartBackgroundRefresh() {
 	go func() {
 		defer s.wg.Done()
 		refreshTimer := time.NewTimer(s.GetBackgroundRefreshInterval())
+		cheapProbeTicker := time.NewTicker(defaultCheapProbeScanInterval)
 		autoCleanupTicker := time.NewTicker(30 * time.Second)
 		fullUsageCleanupTicker := time.NewTicker(5 * time.Minute)
 		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
 		// 添加定时重建 FastScheduler 以优化性能
 		rebuildSchedulerTicker := time.NewTicker(10 * time.Minute)
 		defer refreshTimer.Stop()
+		defer cheapProbeTicker.Stop()
 		defer autoCleanupTicker.Stop()
 		defer fullUsageCleanupTicker.Stop()
 		defer expiredCleanupTicker.Stop()
@@ -3024,6 +3155,10 @@ func (s *Store) StartBackgroundRefresh() {
 				resetRefreshTimer()
 			case <-autoCleanupTicker.C:
 				s.TriggerAutoCleanupAsync()
+			case <-cheapProbeTicker.C:
+				if !s.GetLazyMode() {
+					s.TriggerCheapProbeAsync()
+				}
 			case <-fullUsageCleanupTicker.C:
 				if s.GetAutoCleanFullUsage() && !s.GetLazyMode() {
 					go s.CleanFullUsageAccounts(context.Background())
@@ -4196,6 +4331,30 @@ func (s *Store) ApplyAccountUnauthorizedCooldownConfig(dbID int64, ignore bool) 
 	return true
 }
 
+// ApplyAccountPriceMultiplier 更新账号级价格倍率。
+func (s *Store) ApplyAccountPriceMultiplier(dbID int64, priceMultiplier float64) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	if normalized, ok := normalizePriceMultiplier(priceMultiplier); ok {
+		priceMultiplier = normalized
+	} else {
+		priceMultiplier = 0
+	}
+	acc.mu.Lock()
+	acc.PriceMultiplier = priceMultiplier
+	if priceMultiplier == 0 {
+		acc.LastCheapProbeError = ""
+		acc.CheapProbeRecoveryBonus = 0
+		acc.CheapProbeBonusUntil = time.Time{}
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
 func (s *Store) ApplyAccountTags(dbID int64, tags []string) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
@@ -4886,6 +5045,13 @@ func (s *Store) SetUsageProbeFunc(fn func(context.Context, *Account) error) {
 	s.usageProbe = fn
 }
 
+// SetCheapProbeFunc 注册便宜账号可用性探针回调。
+func (s *Store) SetCheapProbeFunc(fn func(context.Context, *Account) error) {
+	s.usageProbeMu.Lock()
+	defer s.usageProbeMu.Unlock()
+	s.cheapProbe = fn
+}
+
 // TriggerUsageProbeAsync 异步触发一次批量用量探针
 func (s *Store) TriggerUsageProbeAsync() {
 	if !s.usageProbeBatch.CompareAndSwap(false, true) {
@@ -4895,6 +5061,18 @@ func (s *Store) TriggerUsageProbeAsync() {
 	go func() {
 		defer s.usageProbeBatch.Store(false)
 		s.parallelProbeUsage(context.Background())
+	}()
+}
+
+// TriggerCheapProbeAsync 异步触发一次便宜账号可用性探针。
+func (s *Store) TriggerCheapProbeAsync() {
+	if !s.cheapProbeBatch.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		defer s.cheapProbeBatch.Store(false)
+		s.parallelCheapProbe(context.Background())
 	}()
 }
 
@@ -5115,6 +5293,218 @@ func (s *Store) RemoveAccounts(dbIDs []int64) {
 
 func (s *Store) parallelProbeUsage(ctx context.Context) {
 	s.parallelProbeUsageWith(ctx, s.GetUsageProbeMaxAge())
+}
+
+type cheapProbeTarget struct {
+	account  *Account
+	rank     int
+	interval time.Duration
+}
+
+type cheapProbeTopAccount struct {
+	dbID            int64
+	dispatchScore   float64
+	priceMultiplier float64
+	found           bool
+}
+
+func (s *Store) cheapProbeTopAccount(accounts []*Account, now time.Time) cheapProbeTopAccount {
+	baseLimit := atomic.LoadInt64(&s.maxConcurrency)
+	best := cheapProbeTopAccount{dispatchScore: -math.MaxFloat64}
+	for _, acc := range accounts {
+		if acc == nil {
+			continue
+		}
+		tier, dispatchScore, limit, _, available := acc.fastSchedulerSnapshot(baseLimit, now)
+		if !available || limit <= 0 {
+			continue
+		}
+		if tier != HealthTierHealthy && tier != HealthTierWarm && tier != HealthTierRisky {
+			continue
+		}
+		priceMultiplier := 0.0
+		acc.mu.RLock()
+		priceMultiplier = acc.PriceMultiplier
+		acc.mu.RUnlock()
+		if !best.found || dispatchScore > best.dispatchScore {
+			best = cheapProbeTopAccount{
+				dbID:            acc.DBID,
+				dispatchScore:   dispatchScore,
+				priceMultiplier: priceMultiplierForComparison(priceMultiplier),
+				found:           true,
+			}
+		}
+	}
+	return best
+}
+
+func (s *Store) cheapProbeCandidates(accounts []*Account, now time.Time) ([]cheapProbeTarget, cheapProbeTopAccount) {
+	top := s.cheapProbeTopAccount(accounts, now)
+	if !top.found {
+		return nil, top
+	}
+	candidates := make([]*Account, 0)
+	for _, acc := range accounts {
+		if acc == nil || acc.DBID == top.dbID {
+			continue
+		}
+		acc.mu.RLock()
+		priceMultiplier := acc.PriceMultiplier
+		hasCredential := acc.hasDispatchCredentialLocked()
+		dispatchPaused := atomic.LoadInt32(&acc.DispatchPaused) != 0
+		acc.mu.RUnlock()
+		normalized, ok := normalizePriceMultiplier(priceMultiplier)
+		if !ok || normalized >= top.priceMultiplier || !hasCredential || dispatchPaused {
+			continue
+		}
+		candidates = append(candidates, acc)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, _ := candidates[i].GetPriceMultiplier()
+		right, _ := candidates[j].GetPriceMultiplier()
+		if left == right {
+			return candidates[i].DBID < candidates[j].DBID
+		}
+		return left > right
+	})
+
+	targets := make([]cheapProbeTarget, 0, len(candidates))
+	for rank, acc := range candidates {
+		interval := cheapProbeIntervalForRank(rank)
+		if !acc.NeedsCheapProbe(now, interval) {
+			continue
+		}
+		targets = append(targets, cheapProbeTarget{
+			account:  acc,
+			rank:     rank,
+			interval: interval,
+		})
+	}
+	return targets, top
+}
+
+// RecordCheapProbeSuccess 记录便宜账号探测成功，并给账号一个短期恢复加分。
+func (s *Store) RecordCheapProbeSuccess(acc *Account, currentMaxDispatchScore float64) {
+	if s == nil || acc == nil {
+		return
+	}
+	now := time.Now()
+	atomic.StoreInt32(&acc.Disabled, 0)
+	acc.mu.Lock()
+	acc.LastCheapProbeAt = now
+	acc.LastCheapProbeSuccessAt = now
+	acc.LastCheapProbeError = ""
+	acc.Status = StatusReady
+	acc.ErrorMsg = ""
+	acc.CooldownUtil = time.Time{}
+	acc.CooldownReason = ""
+	acc.UsagePercent7d = 0
+	acc.UsagePercent7dValid = false
+	acc.Reset7dAt = time.Time{}
+	acc.UsagePercent5h = 0
+	acc.UsagePercent5hValid = false
+	acc.Reset5hAt = time.Time{}
+	acc.UsageUpdatedAt = time.Time{}
+	acc.UsageUpdatedAt5h = time.Time{}
+	if acc.HealthTier == HealthTierBanned || acc.HealthTier == HealthTierRisky || acc.HealthTier == "" {
+		acc.HealthTier = HealthTierWarm
+	}
+	acc.CheapProbeRecoveryBonus = 0
+	acc.CheapProbeBonusUntil = time.Time{}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	targetScore := currentMaxDispatchScore + defaultCheapProbeRecoveryMargin
+	if acc.DispatchScore < targetScore {
+		acc.CheapProbeRecoveryBonus = targetScore - acc.DispatchScore
+		acc.CheapProbeBonusUntil = now.Add(defaultCheapProbeBonusDuration)
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+
+	s.fastSchedulerUpdate(acc)
+	s.deleteCachedAccountCooldown(acc.DBID)
+	if s.db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.ClearError(ctx, acc.DBID); err != nil {
+		log.Printf("[账号 %d] 便宜账号探测成功后清理账号状态失败: %v", acc.DBID, err)
+	}
+	if err := s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{
+		"codex_7d_used_percent":     "",
+		"codex_7d_reset_at":         "",
+		"codex_usage_updated_at":    "",
+		"codex_5h_used_percent":     "",
+		"codex_5h_reset_at":         "",
+		"codex_5h_usage_updated_at": "",
+	}); err != nil {
+		log.Printf("[账号 %d] 便宜账号探测成功后清理用量状态失败: %v", acc.DBID, err)
+	}
+}
+
+// RecordCheapProbeFailure 记录便宜账号探测失败；不会写冷却或错误状态。
+func (s *Store) RecordCheapProbeFailure(acc *Account, err error) {
+	if acc == nil {
+		return
+	}
+	errText := ""
+	if err != nil {
+		errText = normalizeAccountErrorMessage(err.Error(), "便宜账号探测失败")
+	}
+	if len([]rune(errText)) > 500 {
+		errText = string([]rune(errText)[:500])
+	}
+	acc.mu.Lock()
+	acc.LastCheapProbeAt = time.Now()
+	acc.LastCheapProbeError = errText
+	acc.mu.Unlock()
+}
+
+func (s *Store) parallelCheapProbe(ctx context.Context) {
+	s.usageProbeMu.RLock()
+	probeFn := s.cheapProbe
+	s.usageProbeMu.RUnlock()
+	if probeFn == nil {
+		return
+	}
+
+	s.mu.RLock()
+	accounts := make([]*Account, len(s.accounts))
+	copy(accounts, s.accounts)
+	s.mu.RUnlock()
+
+	now := time.Now()
+	targets, top := s.cheapProbeCandidates(accounts, now)
+	if len(targets) == 0 || !top.found {
+		return
+	}
+
+	sem := make(chan struct{}, defaultCheapProbeConcurrency)
+	var wg sync.WaitGroup
+	for _, target := range targets {
+		account := target.account
+		if account == nil || !account.TryBeginCheapProbe() {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(account *Account, topScore float64) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			defer account.FinishCheapProbe()
+
+			probeCtx, cancel := context.WithTimeout(ctx, defaultCheapProbeTimeout)
+			defer cancel()
+			if err := probeFn(probeCtx, account); err != nil {
+				s.RecordCheapProbeFailure(account, err)
+				log.Printf("[账号 %d] 便宜账号探测失败: %v", account.DBID, err)
+				return
+			}
+			s.RecordCheapProbeSuccess(account, topScore)
+			log.Printf("[账号 %d] 便宜账号探测成功，已添加临时恢复加分", account.DBID)
+		}(account, top.dispatchScore)
+	}
+	wg.Wait()
 }
 
 // parallelProbeUsageWith 以指定 maxAge 阈值执行一次批量用量探针。

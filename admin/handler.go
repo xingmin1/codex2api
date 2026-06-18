@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -594,6 +595,12 @@ type accountResponse struct {
 	AutoPause7dDisabled         bool                       `json:"auto_pause_7d_disabled"`
 	IgnoreUsageLimit429Cooldown bool                       `json:"ignore_usage_limit_429_cooldown"`
 	IgnoreUnauthorizedCooldown  bool                       `json:"ignore_unauthorized_cooldown"`
+	PriceMultiplier             *float64                   `json:"price_multiplier"`
+	LastCheapProbeAt            string                     `json:"last_cheap_probe_at,omitempty"`
+	LastCheapProbeSuccessAt     string                     `json:"last_cheap_probe_success_at,omitempty"`
+	LastCheapProbeError         string                     `json:"last_cheap_probe_error,omitempty"`
+	CheapProbeRecoveryBonus     float64                    `json:"cheap_probe_recovery_bonus,omitempty"`
+	CheapProbeBonusUntil        string                     `json:"cheap_probe_bonus_until,omitempty"`
 	Usage5hDetail               *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
 	Usage7dDetail               *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                   string                     `json:"reset_5h_at,omitempty"`
@@ -650,6 +657,28 @@ func accountEmailDomain(email string) string {
 	return domain
 }
 
+func accountPriceMultiplier(row *database.AccountRow) *float64 {
+	if row == nil {
+		return nil
+	}
+	if value, ok := row.GetCredentialFloat64("price_multiplier"); ok {
+		if normalized, ok := normalizePositiveFloatPointer(value); ok {
+			return normalized
+		}
+	}
+	if value, ok := auth.ParsePriceMultiplierFromName(row.Name); ok {
+		return &value
+	}
+	return nil
+}
+
+func normalizePositiveFloatPointer(value float64) (*float64, bool) {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil, false
+	}
+	return &value, true
+}
+
 type schedulerBreakdownResponse struct {
 	UnauthorizedPenalty float64 `json:"unauthorized_penalty"`
 	RateLimitPenalty    float64 `json:"rate_limit_penalty"`
@@ -661,6 +690,7 @@ type schedulerBreakdownResponse struct {
 	UsageUrgencyBonus5h float64 `json:"usage_urgency_bonus_5h"`
 	UsageUrgencyBonus7d float64 `json:"usage_urgency_bonus_7d"`
 	ExpiryUrgencyBonus  float64 `json:"expiry_urgency_bonus"`
+	CheapProbeBonus     float64 `json:"cheap_probe_bonus"`
 	LatencyPenalty      float64 `json:"latency_penalty"`
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
@@ -733,6 +763,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			CodexUsageUpdatedAt:      row.GetCredential("codex_usage_updated_at"),
 			Codex5HUsageUpdatedAt:    row.GetCredential("codex_5h_usage_updated_at"),
 		}
+		resp.PriceMultiplier = accountPriceMultiplier(row)
 		resp.AutoPause5hThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_5h_threshold")
 		resp.AutoPause7dThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_7d_threshold")
 		resp.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
@@ -769,9 +800,19 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				UsageUrgencyBonus5h: debug.Breakdown.UsageUrgencyBonus5h,
 				UsageUrgencyBonus7d: debug.Breakdown.UsageUrgencyBonus7d,
 				ExpiryUrgencyBonus:  debug.Breakdown.ExpiryUrgencyBonus,
+				CheapProbeBonus:     debug.Breakdown.CheapProbeBonus,
 				LatencyPenalty:      debug.Breakdown.LatencyPenalty,
 				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
 			}
+			priceMultiplier, lastCheapProbeAt, lastCheapProbeSuccessAt, lastCheapProbeError, cheapProbeBonus, cheapProbeBonusUntil := acc.CheapProbeRuntimeSnapshot()
+			if normalized, ok := normalizePositiveFloatPointer(priceMultiplier); ok {
+				resp.PriceMultiplier = normalized
+			}
+			resp.LastCheapProbeAt = formatOptionalTime(lastCheapProbeAt)
+			resp.LastCheapProbeSuccessAt = formatOptionalTime(lastCheapProbeSuccessAt)
+			resp.LastCheapProbeError = lastCheapProbeError
+			resp.CheapProbeRecoveryBonus = cheapProbeBonus
+			resp.CheapProbeBonusUntil = formatOptionalTime(cheapProbeBonusUntil)
 			if usagePct, ok := acc.GetUsagePercent7d(); ok {
 				resp.UsagePercent7d = &usagePct
 			}
@@ -901,6 +942,7 @@ type updateAccountSchedulerReq struct {
 	AutoPause7dDisabled         json.RawMessage `json:"auto_pause_7d_disabled"`
 	IgnoreUsageLimit429Cooldown json.RawMessage `json:"ignore_usage_limit_429_cooldown"`
 	IgnoreUnauthorizedCooldown  json.RawMessage `json:"ignore_unauthorized_cooldown"`
+	PriceMultiplier             json.RawMessage `json:"price_multiplier"`
 	ProxyURL                    json.RawMessage `json:"proxy_url"`
 }
 
@@ -917,6 +959,7 @@ type accountSchedulerUpdate struct {
 	AutoPause7dDisabled         database.OptionalBool
 	IgnoreUsageLimit429Cooldown database.OptionalBool
 	IgnoreUnauthorizedCooldown  database.OptionalBool
+	PriceMultiplier             optionalFloat64
 	ProxyURL                    database.OptionalString
 	CredentialUpdates           map[string]interface{}
 }
@@ -971,6 +1014,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	priceMultiplier, err := parseOptionalPositiveFloatField(req.PriceMultiplier, "price_multiplier", 0.000001, 1000)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 	proxyURL, err := parseOptionalStringField(req.ProxyURL, "proxy_url", security.ValidateProxyURL)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
@@ -994,6 +1041,9 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if ignoreUnauthorizedCooldown.Set {
 		credentialUpdates["ignore_unauthorized_cooldown"] = ignoreUnauthorizedCooldown.Value
 	}
+	if priceMultiplier.Set {
+		credentialUpdates["price_multiplier"] = priceMultiplier.Value
+	}
 	if len(credentialUpdates) == 0 {
 		credentialUpdates = nil
 	}
@@ -1011,6 +1061,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		AutoPause7dDisabled:         autoPause7dDisabled,
 		IgnoreUsageLimit429Cooldown: ignoreUsageLimit429Cooldown,
 		IgnoreUnauthorizedCooldown:  ignoreUnauthorizedCooldown,
+		PriceMultiplier:             priceMultiplier,
 		ProxyURL:                    proxyURL,
 		CredentialUpdates:           credentialUpdates,
 	}, nil
@@ -1029,6 +1080,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.AutoPause7dDisabled.Set ||
 		u.IgnoreUsageLimit429Cooldown.Set ||
 		u.IgnoreUnauthorizedCooldown.Set ||
+		u.PriceMultiplier.Set ||
 		u.ProxyURL.Set
 }
 
@@ -1179,6 +1231,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	if update.IgnoreUnauthorizedCooldown.Set {
 		h.store.ApplyAccountUnauthorizedCooldownConfig(id, update.IgnoreUnauthorizedCooldown.Value)
 	}
+	if update.PriceMultiplier.Set {
+		h.store.ApplyAccountPriceMultiplier(id, update.PriceMultiplier.Value)
+	}
 	if update.Tags.Set {
 		h.store.ApplyAccountTags(id, update.Tags.Values)
 	}
@@ -1306,6 +1361,28 @@ func parseOptionalRatioField(raw json.RawMessage, field string) (optionalFloat64
 	}
 	if value < 0 || value > 1 {
 		return optionalFloat64{}, fmt.Errorf("%s 超出范围，必须在 0..1 之间", field)
+	}
+	return optionalFloat64{Set: true, Value: value}, nil
+}
+
+func parseOptionalPositiveFloatField(raw json.RawMessage, field string, minValue, maxValue float64) (optionalFloat64, error) {
+	if len(raw) == 0 {
+		return optionalFloat64{}, nil
+	}
+	if string(raw) == "null" {
+		return optionalFloat64{Set: true, Value: 0}, nil
+	}
+
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err != nil {
+		return optionalFloat64{}, fmt.Errorf("%s 必须是正数或 null", field)
+	}
+	value, err := number.Float64()
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+		return optionalFloat64{}, fmt.Errorf("%s 必须是正数或 null", field)
+	}
+	if value < minValue || value > maxValue {
+		return optionalFloat64{}, fmt.Errorf("%s 超出范围，必须在 %.6g..%.6g 之间", field, minValue, maxValue)
 	}
 	return optionalFloat64{Set: true, Value: value}, nil
 }
@@ -1441,6 +1518,13 @@ func dispatchScoreFallback(schedulerScore float64, scoreBiasEffective int64, hea
 		return schedulerScore
 	}
 	return schedulerScore + float64(scoreBiasEffective)
+}
+
+func formatOptionalTime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.Format(time.RFC3339)
 }
 
 func allowScoreBias(healthTier string, status string) bool {

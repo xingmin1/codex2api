@@ -242,11 +242,13 @@ func main() {
 	// 初始化 admin handler 的连接池设置跟踪
 	adminHandler.SetPoolSizes(settings.PgMaxConns, settings.RedisPoolSize)
 	store.SetUsageProbeFunc(adminHandler.ProbeUsageSnapshot)
+	store.SetCheapProbeFunc(adminHandler.ProbeCheapAccountReadiness)
 
 	// 启动后台刷新
 	store.StartBackgroundRefresh()
 	store.TriggerUsageProbeAsync()
 	store.TriggerRecoveryProbeAsync()
+	store.TriggerCheapProbeAsync()
 	store.TriggerAutoCleanupAsync()
 	defer store.Stop()
 

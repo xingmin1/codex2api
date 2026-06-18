@@ -60,6 +60,8 @@ export interface AccountRow {
     usage_penalty_7d: number
     usage_urgency_bonus_5h?: number
     usage_urgency_bonus_7d?: number
+    expiry_urgency_bonus?: number
+    cheap_probe_bonus?: number
     latency_penalty: number
     success_rate_penalty?: number
   }
@@ -87,6 +89,12 @@ export interface AccountRow {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
+  price_multiplier?: number | null
+  last_cheap_probe_at?: ISODateString
+  last_cheap_probe_success_at?: ISODateString
+  last_cheap_probe_error?: string
+  cheap_probe_recovery_bonus?: number
+  cheap_probe_bonus_until?: ISODateString
   usage_5h_detail?: AccountUsageWindow
   usage_7d_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
@@ -222,6 +230,7 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
+  price_multiplier?: number | null
 }
 
 export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {

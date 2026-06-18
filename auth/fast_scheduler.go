@@ -458,7 +458,8 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	defer a.mu.Unlock()
 
 	if (isPremium5hPlan(a.PlanType) && a.UsagePercent5hValid) ||
-		(IsPlusOrHigherPlan(a.PlanType) && a.UsagePercent7dValid) {
+		(IsPlusOrHigherPlan(a.PlanType) && a.UsagePercent7dValid) ||
+		!a.CheapProbeBonusUntil.IsZero() {
 		a.recomputeSchedulerLocked(baseLimit)
 	}
 

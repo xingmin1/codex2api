@@ -373,6 +373,28 @@ function percentThresholdInputToRatio(value: string): number | null {
   return parsed / 100;
 }
 
+function formatPriceMultiplierInput(value?: number | null): string {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return "";
+  }
+  return String(value);
+}
+
+function isPriceMultiplierInputInvalid(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  const parsed = Number(trimmed);
+  return !Number.isFinite(parsed) || parsed <= 0 || parsed > 1000;
+}
+
+function priceMultiplierInputToNumber(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
+}
+
 function getMediaQueryMatch(query: string): boolean {
   if (typeof window === "undefined" || typeof window.matchMedia !== "function") {
     return false;
@@ -572,13 +594,14 @@ export default function Accounts() {
     editIgnoreUsageLimit429Cooldown,
     setEditIgnoreUsageLimit429Cooldown,
   ] = useState(false);
-  const [
-    editIgnoreUnauthorizedCooldown,
-    setEditIgnoreUnauthorizedCooldown,
-  ] = useState(false);
-  const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
-    number[]
-  >([]);
+	const [
+		editIgnoreUnauthorizedCooldown,
+		setEditIgnoreUnauthorizedCooldown,
+	] = useState(false);
+	const [editPriceMultiplierInput, setEditPriceMultiplierInput] = useState("");
+	const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
+		number[]
+	>([]);
   const [editProxyUrl, setEditProxyUrl] = useState("");
   const [testingProxyKey, setTestingProxyKey] = useState<string | null>(null);
   const [editOpenAIForm, setEditOpenAIForm] =
@@ -2705,11 +2728,14 @@ export default function Accounts() {
     setEditIgnoreUsageLimit429Cooldown(
       account.ignore_usage_limit_429_cooldown ?? false,
     );
-    setEditIgnoreUnauthorizedCooldown(
-      account.ignore_unauthorized_cooldown ?? false,
-    );
-    setAllowedAPIKeySelection(
-      filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
+	setEditIgnoreUnauthorizedCooldown(
+		account.ignore_unauthorized_cooldown ?? false,
+	);
+	setEditPriceMultiplierInput(
+		formatPriceMultiplierInput(account.price_multiplier),
+	);
+	setAllowedAPIKeySelection(
+		filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
     );
     setEditProxyUrl(account.proxy_url ?? "");
     setEditTags(account.tags ?? []);
@@ -2742,10 +2768,11 @@ export default function Accounts() {
     setEditAutoPause5hThresholdInput("");
     setEditAutoPause7dThresholdInput("");
     setEditAutoPause5hDisabled(false);
-    setEditAutoPause7dDisabled(false);
-    setEditIgnoreUsageLimit429Cooldown(false);
-    setEditIgnoreUnauthorizedCooldown(false);
-    setAllowedAPIKeySelection([]);
+	setEditAutoPause7dDisabled(false);
+	setEditIgnoreUsageLimit429Cooldown(false);
+	setEditIgnoreUnauthorizedCooldown(false);
+	setEditPriceMultiplierInput("");
+	setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
     setEditTags([]);
     setEditGroupIds([]);
@@ -2782,12 +2809,15 @@ export default function Accounts() {
   const editAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
     editAutoPause5hThresholdInput,
   );
-  const editAutoPause7dThresholdInvalid = isPercentThresholdInputInvalid(
-    editAutoPause7dThresholdInput,
-  );
-  const batchAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
-    batchAutoPause5hThresholdInput,
-  );
+	const editAutoPause7dThresholdInvalid = isPercentThresholdInputInvalid(
+		editAutoPause7dThresholdInput,
+	);
+	const editPriceMultiplierInvalid = isPriceMultiplierInputInvalid(
+		editPriceMultiplierInput,
+	);
+	const batchAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
+		batchAutoPause5hThresholdInput,
+	);
   const batchAutoPause7dThresholdInvalid = isPercentThresholdInputInvalid(
     batchAutoPause7dThresholdInput,
   );
@@ -2840,12 +2870,13 @@ export default function Accounts() {
     if (!editingAccount) return;
     if (
       scoreInputInvalid ||
-      concurrencyInputInvalid ||
-      editAutoPause5hThresholdInvalid ||
-      editAutoPause7dThresholdInvalid
-    ) {
-      showToast(t("accounts.schedulerInvalidInput"), "error");
-      return;
+		concurrencyInputInvalid ||
+		editAutoPause5hThresholdInvalid ||
+		editAutoPause7dThresholdInvalid ||
+		editPriceMultiplierInvalid
+	) {
+		showToast(t("accounts.schedulerInvalidInput"), "error");
+		return;
     }
 
     setEditSubmitting(true);
@@ -2866,10 +2897,11 @@ export default function Accounts() {
           editAutoPause7dThresholdInput,
         ),
         auto_pause_5h_disabled: editAutoPause5hDisabled,
-        auto_pause_7d_disabled: editAutoPause7dDisabled,
-        ignore_usage_limit_429_cooldown: editIgnoreUsageLimit429Cooldown,
-        ignore_unauthorized_cooldown: editIgnoreUnauthorizedCooldown,
-      };
+		auto_pause_7d_disabled: editAutoPause7dDisabled,
+		ignore_usage_limit_429_cooldown: editIgnoreUsageLimit429Cooldown,
+		ignore_unauthorized_cooldown: editIgnoreUnauthorizedCooldown,
+		price_multiplier: priceMultiplierInputToNumber(editPriceMultiplierInput),
+	};
       await api.updateAccountScheduler(editingAccount.id, payload);
       showToast(t("accounts.schedulerSaveSuccess"));
       await Promise.all([reload(), reloadGroups()]);
@@ -5695,119 +5727,146 @@ export default function Accounts() {
                       </div>
 
                       <div className="rounded-xl border border-border p-4">
+                        <label className="text-sm font-semibold text-foreground">
+                          {t("accounts.priceMultiplierLabel")}
+                        </label>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.priceMultiplierHint")}
+                        </div>
+                        <Input
+                          className="mt-3"
+                          value={editPriceMultiplierInput}
+                          onChange={(event) =>
+                            setEditPriceMultiplierInput(event.target.value)
+                          }
+                          placeholder={t(
+                            "accounts.priceMultiplierPlaceholder",
+                          )}
+                          inputMode="decimal"
+                        />
+                        <div
+                          className={`mt-1.5 text-xs ${editPriceMultiplierInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                        >
+                          {editPriceMultiplierInvalid
+                            ? t("accounts.priceMultiplierRange")
+                            : t("accounts.priceMultiplierEmptyHint")}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4">
                         <div className="text-sm font-semibold text-foreground">
                           {t("accounts.allowedAPIKeysLabel")}
                         </div>
                         <div className="mt-1 text-xs text-muted-foreground">
                           {t("accounts.allowedAPIKeysHint")}
                         </div>
-                          <div className="mt-3">
-                            <APIKeyMultiSelect
-                              options={apiKeys}
-                              value={allowedAPIKeySelection}
-                              disabled={apiKeys.length === 0}
-                              onChange={setAllowedAPIKeySelection}
-                              allLabel={t("accounts.allowedAPIKeysAll")}
-                              selectedLabel={t(
-                                "accounts.allowedAPIKeysSelected",
-                                {
-                                  count: allowedAPIKeySelection.length,
-                                },
-                              )}
-                              placeholder={t("accounts.allowedAPIKeysPlaceholder")}
-                              emptyLabel={t("accounts.allowedAPIKeysNoOptions")}
-                              emptyHint={t("accounts.allowedAPIKeysNoOptionsHint")}
-                            />
-                          </div>
-                    </div>
-
-                    <div className="rounded-xl border border-border p-4">
-                      {renderProxyInput({
-                        value: editProxyUrl,
-                        testKey: "edit-account-proxy",
-                        onChange: setEditProxyUrl,
-                      })}
-                    </div>
-
-                    <div className="grid gap-4 md:grid-cols-2">
-                      <div className="rounded-xl border border-border p-4">
-                        <div className="text-sm font-semibold text-foreground">
-                          {t("accounts.tagsLabel")}
-                        </div>
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          {t("accounts.tagsHint")}
-                        </div>
-                        <ChipInput
-                          className="mt-3"
-                          value={editTags}
-                          onChange={setEditTags}
-                          placeholder={t("accounts.tagsPlaceholder")}
-                          maxVisible={3}
-                        />
-                      </div>
-
-                      <div className="rounded-xl border border-border p-4">
-                        <div className="flex items-start justify-between gap-3">
-                          <div>
-                            <div className="text-sm font-semibold text-foreground">
-                              {t("accounts.groupsLabel")}
-                            </div>
-                            <div className="mt-1 text-xs text-muted-foreground">
-                              {t("accounts.groupsHint")}
-                            </div>
-                          </div>
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="xs"
-                            onClick={() => setShowGroupManager(true)}
-                          >
-                            <FolderOpen className="size-3" />
-                            {t("accounts.groupManage")}
-                          </Button>
-                        </div>
                         <div className="mt-3">
-                          <AccountGroupMultiSelect
-                            groups={allGroups}
-                            value={editGroupIds}
-                            onChange={setEditGroupIds}
-                            allLabel={t("accounts.groupsUnbound")}
-                            selectedLabel={t("accounts.groupsSelected", {
-                              count: editGroupIds.length,
-                            })}
-                            placeholder={t("accounts.groupsPlaceholder")}
-                            emptyLabel={t("accounts.groupsNone")}
-                            emptyHint={t("accounts.groupsSelectHint")}
+                          <APIKeyMultiSelect
+                            options={apiKeys}
+                            value={allowedAPIKeySelection}
+                            disabled={apiKeys.length === 0}
+                            onChange={setAllowedAPIKeySelection}
+                            allLabel={t("accounts.allowedAPIKeysAll")}
+                            selectedLabel={t(
+                              "accounts.allowedAPIKeysSelected",
+                              {
+                                count: allowedAPIKeySelection.length,
+                              },
+                            )}
+                            placeholder={t("accounts.allowedAPIKeysPlaceholder")}
+                            emptyLabel={t("accounts.allowedAPIKeysNoOptions")}
+                            emptyHint={t("accounts.allowedAPIKeysNoOptionsHint")}
                           />
                         </div>
                       </div>
-                    </div>
 
-                    <div className="rounded-xl border border-border bg-white/60 px-4 py-4 dark:bg-white/5">
-                      <div className="text-sm font-semibold text-foreground">
-                        {t("accounts.schedulerPreviewTitle")}
+                      <div className="rounded-xl border border-border p-4">
+                        {renderProxyInput({
+                          value: editProxyUrl,
+                          testKey: "edit-account-proxy",
+                          onChange: setEditProxyUrl,
+                        })}
                       </div>
-                      <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                        <PreviewItem
-                          label={t("accounts.schedulerPreviewRawScore")}
-                          value={String(editPreview.rawScore)}
-                        />
-                        <PreviewItem
-                          label={t("accounts.schedulerPreviewDispatchScore")}
-                          value={String(editPreview.dispatchScore)}
-                        />
-                        <PreviewItem
-                          label={t("accounts.schedulerPreviewHealthTier")}
-                          value={formatHealthTier(editPreview.healthTier, t)}
-                        />
-                        <PreviewItem
-                          label={t(
-                            "accounts.schedulerPreviewDynamicConcurrency",
-                          )}
-                          value={String(editPreview.dynamicConcurrency)}
-                        />
+
+                      <div className="grid gap-4 md:grid-cols-2">
+                        <div className="rounded-xl border border-border p-4">
+                          <div className="text-sm font-semibold text-foreground">
+                            {t("accounts.tagsLabel")}
+                          </div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            {t("accounts.tagsHint")}
+                          </div>
+                          <ChipInput
+                            className="mt-3"
+                            value={editTags}
+                            onChange={setEditTags}
+                            placeholder={t("accounts.tagsPlaceholder")}
+                            maxVisible={3}
+                          />
+                        </div>
+
+                        <div className="rounded-xl border border-border p-4">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="text-sm font-semibold text-foreground">
+                                {t("accounts.groupsLabel")}
+                              </div>
+                              <div className="mt-1 text-xs text-muted-foreground">
+                                {t("accounts.groupsHint")}
+                              </div>
+                            </div>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="xs"
+                              onClick={() => setShowGroupManager(true)}
+                            >
+                              <FolderOpen className="size-3" />
+                              {t("accounts.groupManage")}
+                            </Button>
+                          </div>
+                          <div className="mt-3">
+                            <AccountGroupMultiSelect
+                              groups={allGroups}
+                              value={editGroupIds}
+                              onChange={setEditGroupIds}
+                              allLabel={t("accounts.groupsUnbound")}
+                              selectedLabel={t("accounts.groupsSelected", {
+                                count: editGroupIds.length,
+                              })}
+                              placeholder={t("accounts.groupsPlaceholder")}
+                              emptyLabel={t("accounts.groupsNone")}
+                              emptyHint={t("accounts.groupsSelectHint")}
+                            />
+                          </div>
+                        </div>
                       </div>
-                    </div>
+
+                      <div className="rounded-xl border border-border bg-white/60 px-4 py-4 dark:bg-white/5">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.schedulerPreviewTitle")}
+                        </div>
+                        <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                          <PreviewItem
+                            label={t("accounts.schedulerPreviewRawScore")}
+                            value={String(editPreview.rawScore)}
+                          />
+                          <PreviewItem
+                            label={t("accounts.schedulerPreviewDispatchScore")}
+                            value={String(editPreview.dispatchScore)}
+                          />
+                          <PreviewItem
+                            label={t("accounts.schedulerPreviewHealthTier")}
+                            value={formatHealthTier(editPreview.healthTier, t)}
+                          />
+                          <PreviewItem
+                            label={t(
+                              "accounts.schedulerPreviewDynamicConcurrency",
+                            )}
+                            value={String(editPreview.dynamicConcurrency)}
+                          />
+                        </div>
+                      </div>
                   </>
                 )}
               </div>

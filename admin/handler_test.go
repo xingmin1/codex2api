@@ -1207,6 +1207,34 @@ func TestUpdateAccountSchedulerPersistsQuotaAutoPauseConfig(t *testing.T) {
 	}
 }
 
+func TestUpdateAccountSchedulerPersistsPriceMultiplier(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	handler := &Handler{db: db, store: auth.NewStore(db, nil, nil)}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"price_multiplier":0.35}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateAccountScheduler(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusOK)
+	}
+	rows, err := db.ListActive(context.Background())
+	if err != nil {
+		t.Fatalf("ListActive: %v", err)
+	}
+	priceMultiplier, ok := rows[0].GetCredentialFloat64("price_multiplier")
+	if !ok || priceMultiplier != 0.35 {
+		t.Fatalf("price_multiplier = (%v, %t), want (0.35, true)", priceMultiplier, ok)
+	}
+}
+
 func TestUpdateAccountSchedulerResetsToAutoOnNull(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
