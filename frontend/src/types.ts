@@ -999,7 +999,9 @@ export interface UsageLog {
   image_bytes: number
   image_format: string
   image_size: string
+  account_name: string
   account_email: string
+  account_price_multiplier?: number | null
   created_at: ISODateString
   account_billed: number
   user_billed: number

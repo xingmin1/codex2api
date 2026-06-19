@@ -110,6 +110,7 @@ const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
 const ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY =
   "codex2api:accounts:email-domain-tags-visible";
 const ACCOUNT_VISIBLE_COLUMNS_KEY = "codex2api:accounts:visible-columns";
+const ACCOUNT_SORT_KEY = "codex2api:accounts:sort";
 const ACCOUNT_TABLE_COLUMNS = [
   "sequence",
   "email",
@@ -119,6 +120,7 @@ const ACCOUNT_TABLE_COLUMNS = [
   "status",
   "requests",
   "usage",
+  "priceMultiplier",
   "billed",
   "importTime",
   "updatedAt",
@@ -134,6 +136,21 @@ const ACCOUNT_GROUP_COLORS = [
   "#64748b",
 ] as const;
 type AccountTableColumn = (typeof ACCOUNT_TABLE_COLUMNS)[number];
+type AccountSortKey =
+  | "name"
+  | "requests"
+  | "usage"
+  | "usage5h"
+  | "priceMultiplier"
+  | "billed"
+  | "lastUsed"
+  | "importTime"
+  | "updatedAt";
+type SortDirection = "asc" | "desc";
+type AccountSortPreference = {
+  key: AccountSortKey | null;
+  direction: SortDirection;
+};
 type AccountGroupDraft = {
   id: number | null;
   name: string;
@@ -184,6 +201,52 @@ function persistAccountVisibleColumns(
     );
   } catch {
     // Keep the in-memory preference working when localStorage is unavailable.
+  }
+}
+
+const ACCOUNT_SORT_KEYS = new Set<AccountSortKey>([
+  "name",
+  "requests",
+  "usage",
+  "usage5h",
+  "priceMultiplier",
+  "billed",
+  "lastUsed",
+  "importTime",
+  "updatedAt",
+]);
+
+function defaultAccountSortDirection(key: AccountSortKey | null): SortDirection {
+  switch (key) {
+    case "name":
+    case "priceMultiplier":
+      return "asc";
+    default:
+      return "desc";
+  }
+}
+
+function getInitialAccountSortPreference(): AccountSortPreference {
+  try {
+    const raw = window.localStorage.getItem(ACCOUNT_SORT_KEY);
+    if (!raw) return { key: null, direction: "desc" };
+    const parsed = JSON.parse(raw) as Partial<AccountSortPreference>;
+    const key =
+      typeof parsed.key === "string" && ACCOUNT_SORT_KEYS.has(parsed.key)
+        ? parsed.key
+        : null;
+    const direction = parsed.direction === "asc" ? "asc" : "desc";
+    return { key, direction };
+  } catch {
+    return { key: null, direction: "desc" };
+  }
+}
+
+function persistAccountSortPreference(preference: AccountSortPreference) {
+  try {
+    window.localStorage.setItem(ACCOUNT_SORT_KEY, JSON.stringify(preference));
+  } catch {
+    // localStorage 不可用时仅保留当前会话内排序。
   }
 }
 
@@ -250,6 +313,90 @@ function emailDomainTag(domain: string): string {
 
 function formatAccountListEmail(account: AccountRow): string {
   return account.email?.trim() || account.name || `ID ${account.id}`;
+}
+
+function sortMissingNumber(direction: SortDirection): number {
+  return direction === "asc" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
+}
+
+function accountSortNumber(
+  value: number | null | undefined,
+  direction: SortDirection,
+): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : sortMissingNumber(direction);
+}
+
+function accountSortTime(value: string | undefined, direction: SortDirection): number {
+  if (!value) return sortMissingNumber(direction);
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : sortMissingNumber(direction);
+}
+
+function accountTotalRequests(account: AccountRow): number {
+  return (
+    account.total_requests ??
+    (account.success_requests ?? 0) + (account.error_requests ?? 0)
+  );
+}
+
+function accountRecentUsage(account: AccountRow): number {
+  const tokens = account.usage_5h_detail?.tokens ?? 0;
+  if (tokens > 0) return tokens;
+  return account.usage_5h_detail?.requests ?? 0;
+}
+
+function accountSortValue(
+  account: AccountRow,
+  key: AccountSortKey,
+  direction: SortDirection,
+): number | string {
+  switch (key) {
+    case "name":
+      return formatAccountName(account).toLowerCase();
+    case "requests":
+      return accountTotalRequests(account);
+    case "usage":
+      return accountSortNumber(account.usage_percent_7d, direction);
+    case "usage5h":
+      return accountRecentUsage(account);
+    case "priceMultiplier":
+      return accountSortNumber(account.price_multiplier, direction);
+    case "billed":
+      return accountSortNumber(account.billed_7d ?? account.billed_5h, direction);
+    case "lastUsed":
+      return accountSortTime(account.last_used_at, direction);
+    case "importTime":
+      return accountSortTime(account.created_at, direction);
+    case "updatedAt":
+      return accountSortTime(account.updated_at, direction);
+  }
+}
+
+function compareAccountsBySort(
+  left: AccountRow,
+  right: AccountRow,
+  key: AccountSortKey,
+  direction: SortDirection,
+): number {
+  const leftValue = accountSortValue(left, key, direction);
+  const rightValue = accountSortValue(right, key, direction);
+  let diff = 0;
+
+  if (typeof leftValue === "string" || typeof rightValue === "string") {
+    diff = String(leftValue).localeCompare(String(rightValue), undefined, {
+      sensitivity: "base",
+      numeric: true,
+    });
+  } else {
+    diff = leftValue - rightValue;
+  }
+
+  if (diff === 0) {
+    diff = left.id - right.id;
+  }
+  return direction === "asc" ? diff : -diff;
 }
 
 function getInitialAnalysisVisibility(): boolean {
@@ -378,6 +525,11 @@ function formatPriceMultiplierInput(value?: number | null): string {
     return "";
   }
   return String(value);
+}
+
+function formatPriceMultiplierDisplay(value?: number | null): string {
+  const input = formatPriceMultiplierInput(value);
+  return input ? `${input}x` : "-";
 }
 
 function isPriceMultiplierInputInvalid(value: string): boolean {
@@ -566,10 +718,16 @@ export default function Accounts() {
   const [planFilter, setPlanFilter] = useState<
     "all" | "pro" | "prolite" | "plus" | "team" | "free"
   >("all");
-  const [sortKey, setSortKey] = useState<
-    "requests" | "usage" | "importTime" | null
-  >(null);
-  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const initialSortPreference = useRef<AccountSortPreference | null>(null);
+  if (initialSortPreference.current === null) {
+    initialSortPreference.current = getInitialAccountSortPreference();
+  }
+  const [sortKey, setSortKey] = useState<AccountSortKey | null>(
+    initialSortPreference.current.key,
+  );
+  const [sortDir, setSortDir] = useState<SortDirection>(
+    initialSortPreference.current.direction,
+  );
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: "",
     session_token: "",
@@ -1083,6 +1241,10 @@ export default function Accounts() {
   }, [visibleColumns]);
 
   useEffect(() => {
+    persistAccountSortPreference({ key: sortKey, direction: sortDir });
+  }, [sortDir, sortKey]);
+
+  useEffect(() => {
     persistAccountViewMode(viewMode);
   }, [viewMode]);
 
@@ -1327,23 +1489,50 @@ export default function Accounts() {
 
   const sortedAccounts = useMemo(() => {
     if (!sortKey) return filteredAccounts;
-    return [...filteredAccounts].sort((a, b) => {
-      let diff = 0;
-      if (sortKey === "requests") {
-        diff =
-          (a.success_requests ?? 0) +
-          (a.error_requests ?? 0) -
-          ((b.success_requests ?? 0) + (b.error_requests ?? 0));
-      } else if (sortKey === "usage") {
-        diff = (a.usage_percent_7d ?? -1) - (b.usage_percent_7d ?? -1);
-      } else if (sortKey === "importTime") {
-        diff =
-          new Date(a.created_at || 0).getTime() -
-          new Date(b.created_at || 0).getTime();
-      }
-      return sortDir === "asc" ? diff : -diff;
-    });
+    return [...filteredAccounts].sort((a, b) =>
+      compareAccountsBySort(a, b, sortKey, sortDir),
+    );
   }, [filteredAccounts, sortDir, sortKey]);
+
+  const accountSortOptions = useMemo(
+    () => [
+      { label: t("accounts.sortDefault"), value: "" },
+      { label: t("accounts.sortName"), value: "name" },
+      { label: t("accounts.sortRequests"), value: "requests" },
+      { label: t("accounts.sortUsage7d"), value: "usage" },
+      { label: t("accounts.sortUsage5h"), value: "usage5h" },
+      { label: t("accounts.sortPriceMultiplier"), value: "priceMultiplier" },
+      { label: t("accounts.sortBilled"), value: "billed" },
+      { label: t("accounts.sortLastUsed"), value: "lastUsed" },
+      { label: t("accounts.sortImportTime"), value: "importTime" },
+      { label: t("accounts.sortUpdatedAt"), value: "updatedAt" },
+    ],
+    [t],
+  );
+
+  const renderSortableAccountHead = useCallback(
+    (
+      key: AccountSortKey,
+      label: string,
+      className = "text-[13px] font-semibold",
+    ) => (
+      <TableHead
+        className={`${className} cursor-pointer select-none hover:text-primary transition-colors`}
+        onClick={() => {
+          if (sortKey === key) {
+            setSortDir((direction) => (direction === "asc" ? "desc" : "asc"));
+          } else {
+            setSortKey(key);
+            setSortDir(defaultAccountSortDirection(key));
+          }
+          setPage(1);
+        }}
+      >
+        {label} {sortKey === key ? (sortDir === "desc" ? "↓" : "↑") : ""}
+      </TableHead>
+    ),
+    [sortDir, sortKey],
+  );
 
   const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize));
   const currentPage = Math.min(page, totalPages);
@@ -3601,6 +3790,37 @@ export default function Accounts() {
             </Button>
             {!isPersonalMode && (
             <div className="flex w-full shrink-0 items-center gap-1.5 @min-[1600px]/accounts:ml-auto @min-[1600px]/accounts:w-auto">
+              <div className="flex min-w-0 items-center gap-1.5">
+                <Select
+                  compact
+                  className="w-[170px]"
+                  value={sortKey ?? ""}
+                  onValueChange={(value) => {
+                    const nextKey = value ? (value as AccountSortKey) : null;
+                    setSortKey(nextKey);
+                    setSortDir(defaultAccountSortDirection(nextKey));
+                    setPage(1);
+                  }}
+                  options={accountSortOptions}
+                  placeholder={t("accounts.sortDefault")}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setSortDir((direction) =>
+                      direction === "asc" ? "desc" : "asc",
+                    );
+                    setPage(1);
+                  }}
+                  title={t("accounts.sortDirection")}
+                  aria-label={t("accounts.sortDirection")}
+                  className="px-2"
+                >
+                  {sortDir === "desc" ? "↓" : "↑"}
+                </Button>
+              </div>
               <div className="hidden lg:inline-flex items-center rounded-md border border-border bg-muted/50 p-0.5">
                 <button
                   type="button"
@@ -3654,6 +3874,7 @@ export default function Accounts() {
                   status: t("accounts.status"),
                   requests: t("accounts.requests"),
                   usage: t("accounts.usage"),
+                  priceMultiplier: t("accounts.priceMultiplierShort"),
                   billed: t("accounts.billed"),
                   importTime: t("accounts.importTime"),
                   updatedAt: t("accounts.updatedAt"),
@@ -3859,9 +4080,7 @@ export default function Accounts() {
                           </TableHead>
                         )}
                         {visibleColumns.email && (
-                          <TableHead className="text-[13px] font-semibold">
-                            {t("accounts.email")}
-                          </TableHead>
+                          renderSortableAccountHead("name", t("accounts.email"))
                         )}
                         {visibleColumns.tags && (
                           <TableHead className="text-[13px] font-semibold">
@@ -3884,83 +4103,25 @@ export default function Accounts() {
                           </TableHead>
                         )}
                         {visibleColumns.requests && (
-                          <TableHead
-                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
-                            onClick={() => {
-                              if (sortKey === "requests") {
-                                setSortDir((d) =>
-                                  d === "asc" ? "desc" : "asc",
-                                );
-                              } else {
-                                setSortKey("requests");
-                                setSortDir("desc");
-                              }
-                              setPage(1);
-                            }}
-                          >
-                            {t("accounts.requests")}{" "}
-                            {sortKey === "requests"
-                              ? sortDir === "desc"
-                                ? "↓"
-                                : "↑"
-                              : ""}
-                          </TableHead>
+                          renderSortableAccountHead("requests", t("accounts.requests"))
                         )}
                         {visibleColumns.usage && (
-                          <TableHead
-                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
-                            onClick={() => {
-                              if (sortKey === "usage") {
-                                setSortDir((d) =>
-                                  d === "asc" ? "desc" : "asc",
-                                );
-                              } else {
-                                setSortKey("usage");
-                                setSortDir("desc");
-                              }
-                              setPage(1);
-                            }}
-                          >
-                            {t("accounts.usage")}{" "}
-                            {sortKey === "usage"
-                              ? sortDir === "desc"
-                                ? "↓"
-                                : "↑"
-                              : ""}
-                          </TableHead>
+                          renderSortableAccountHead("usage", t("accounts.usage"))
+                        )}
+                        {visibleColumns.priceMultiplier && (
+                          renderSortableAccountHead(
+                            "priceMultiplier",
+                            t("accounts.priceMultiplierShort"),
+                          )
                         )}
                         {visibleColumns.billed && (
-                          <TableHead className="text-[13px] font-semibold">
-                            {t("accounts.billed")}
-                          </TableHead>
+                          renderSortableAccountHead("billed", t("accounts.billed"))
                         )}
                         {visibleColumns.importTime && (
-                          <TableHead
-                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
-                            onClick={() => {
-                              if (sortKey === "importTime") {
-                                setSortDir((d) =>
-                                  d === "asc" ? "desc" : "asc",
-                                );
-                              } else {
-                                setSortKey("importTime");
-                                setSortDir("desc");
-                              }
-                              setPage(1);
-                            }}
-                          >
-                            {t("accounts.importTime")}{" "}
-                            {sortKey === "importTime"
-                              ? sortDir === "desc"
-                                ? "↓"
-                                : "↑"
-                              : ""}
-                          </TableHead>
+                          renderSortableAccountHead("importTime", t("accounts.importTime"))
                         )}
                         {visibleColumns.updatedAt && (
-                          <TableHead className="text-[13px] font-semibold">
-                            {t("accounts.updatedAt")}
-                          </TableHead>
+                          renderSortableAccountHead("updatedAt", t("accounts.updatedAt"))
                         )}
                         {visibleColumns.actions && (
                           <TableHead className="text-[13px] font-semibold text-right">
@@ -4207,6 +4368,13 @@ export default function Accounts() {
                             {visibleColumns.usage && (
                               <TableCell>
                                 <UsageCell account={account} />
+                              </TableCell>
+                            )}
+                            {visibleColumns.priceMultiplier && (
+                              <TableCell className="whitespace-nowrap text-[13px] font-mono text-muted-foreground">
+                                {formatPriceMultiplierDisplay(
+                                  account.price_multiplier,
+                                )}
                               </TableCell>
                             )}
                             {visibleColumns.billed && (

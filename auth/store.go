@@ -4591,11 +4591,11 @@ func (s *Store) ApplyAccountPriceMultiplier(dbID int64, priceMultiplier float64)
 	}
 	acc.mu.Lock()
 	acc.PriceMultiplier = priceMultiplier
-	if priceMultiplier == 0 {
-		acc.LastCheapProbeError = ""
-		acc.CheapProbeRecoveryBonus = 0
-		acc.CheapProbeBonusUntil = time.Time{}
-	}
+	acc.LastCheapProbeAt = time.Time{}
+	acc.LastCheapProbeSuccessAt = time.Time{}
+	acc.LastCheapProbeError = ""
+	acc.CheapProbeRecoveryBonus = 0
+	acc.CheapProbeBonusUntil = time.Time{}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
@@ -4831,6 +4831,21 @@ func (s *Store) ApplyAccountEnabled(dbID int64, enabled bool) bool {
 		atomic.StoreInt32(&acc.DispatchPaused, 0)
 	} else {
 		atomic.StoreInt32(&acc.DispatchPaused, 1)
+	}
+	s.fastSchedulerUpdate(acc)
+	return true
+}
+
+// ApplyAccountLocked 更新运行时账号锁定状态。
+func (s *Store) ApplyAccountLocked(dbID int64, locked bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	if locked {
+		atomic.StoreInt32(&acc.Locked, 1)
+	} else {
+		atomic.StoreInt32(&acc.Locked, 0)
 	}
 	s.fastSchedulerUpdate(acc)
 	return true
@@ -5576,11 +5591,23 @@ type cheapProbeTopAccount struct {
 	found           bool
 }
 
+func cheapProbeSelectable(acc *Account) bool {
+	if acc == nil {
+		return false
+	}
+	if atomic.LoadInt32(&acc.Disabled) != 0 ||
+		atomic.LoadInt32(&acc.DispatchPaused) != 0 ||
+		atomic.LoadInt32(&acc.Locked) != 0 {
+		return false
+	}
+	return true
+}
+
 func (s *Store) cheapProbeTopAccount(accounts []*Account, now time.Time) cheapProbeTopAccount {
 	baseLimit := atomic.LoadInt64(&s.maxConcurrency)
 	best := cheapProbeTopAccount{dispatchScore: -math.MaxFloat64}
 	for _, acc := range accounts {
-		if acc == nil {
+		if !cheapProbeSelectable(acc) {
 			continue
 		}
 		tier, dispatchScore, limit, _, available := acc.fastSchedulerSnapshot(baseLimit, now)
@@ -5613,16 +5640,15 @@ func (s *Store) cheapProbeCandidates(accounts []*Account, now time.Time) ([]chea
 	}
 	candidates := make([]*Account, 0)
 	for _, acc := range accounts {
-		if acc == nil || acc.DBID == top.dbID {
+		if !cheapProbeSelectable(acc) || acc.DBID == top.dbID {
 			continue
 		}
 		acc.mu.RLock()
 		priceMultiplier := acc.PriceMultiplier
 		hasCredential := acc.hasDispatchCredentialLocked()
-		dispatchPaused := atomic.LoadInt32(&acc.DispatchPaused) != 0
 		acc.mu.RUnlock()
 		normalized, ok := normalizePriceMultiplier(priceMultiplier)
-		if !ok || normalized >= top.priceMultiplier || !hasCredential || dispatchPaused {
+		if !ok || normalized >= top.priceMultiplier || !hasCredential {
 			continue
 		}
 		candidates = append(candidates, acc)

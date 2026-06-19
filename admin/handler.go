@@ -3778,13 +3778,7 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 				h.store.ApplyAccountEnabled(id, enabled.Value)
 			}
 			if locked.Set {
-				if acc := h.store.FindByID(id); acc != nil {
-					if locked.Value {
-						atomic.StoreInt32(&acc.Locked, 1)
-					} else {
-						atomic.StoreInt32(&acc.Locked, 0)
-					}
-				}
+				h.store.ApplyAccountLocked(id, locked.Value)
 			}
 			h.applyAccountSchedulerRuntimeUpdate(id, schedulerUpdate)
 		}
@@ -4028,12 +4022,8 @@ func (h *Handler) ToggleAccountLock(c *gin.Context) {
 	}
 
 	// 同步更新内存中的状态
-	if acc := h.store.FindByID(id); acc != nil {
-		if req.Locked {
-			atomic.StoreInt32(&acc.Locked, 1)
-		} else {
-			atomic.StoreInt32(&acc.Locked, 0)
-		}
+	if h.store != nil {
+		h.store.ApplyAccountLocked(id, req.Locked)
 	}
 
 	if req.Locked {
@@ -4744,6 +4734,8 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 				End:       endTime,
 				Page:      page,
 				PageSize:  pageSize,
+				SortBy:    c.Query("sort_by"),
+				SortDir:   c.Query("sort_dir"),
 				Email:     c.Query("email"),
 				Model:     c.Query("model"),
 				Endpoint:  c.Query("endpoint"),

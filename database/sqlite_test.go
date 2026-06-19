@@ -805,6 +805,71 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 	}
 }
 
+func TestUsageLogsPagedReturnsAccountMetadataAndSortsByMultiplier(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	expensiveID, err := db.InsertAccountWithCredentials(ctx, "expensive-user", map[string]interface{}{
+		"email":            "expensive@example.com",
+		"price_multiplier": 0.5,
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials expensive 返回错误: %v", err)
+	}
+	cheapID, err := db.InsertAccountWithCredentials(ctx, "cheap-user", map[string]interface{}{
+		"email":            "cheap@example.com",
+		"price_multiplier": 0.1,
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials cheap 返回错误: %v", err)
+	}
+
+	for _, usageLog := range []*UsageLogInput{
+		{AccountID: expensiveID, Endpoint: "/v1/responses", Model: "gpt-5.4", StatusCode: 200, TotalTokens: 100},
+		{AccountID: cheapID, Endpoint: "/v1/responses", Model: "gpt-5.4", StatusCode: 200, TotalTokens: 200},
+	} {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	now := time.Now()
+	page, err := db.ListUsageLogsByTimeRangePaged(ctx, UsageLogFilter{
+		Start:    now.Add(-1 * time.Hour),
+		End:      now.Add(1 * time.Hour),
+		Page:     1,
+		PageSize: 10,
+		SortBy:   "price_multiplier",
+		SortDir:  "asc",
+	})
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged 返回错误: %v", err)
+	}
+	if page.Total != 2 || len(page.Logs) != 2 {
+		t.Fatalf("page = total %d len %d, want 2/2", page.Total, len(page.Logs))
+	}
+	first := page.Logs[0]
+	if first.AccountID != cheapID {
+		t.Fatalf("first.AccountID = %d, want cheap account %d", first.AccountID, cheapID)
+	}
+	if first.AccountName != "cheap-user" {
+		t.Fatalf("AccountName = %q, want cheap-user", first.AccountName)
+	}
+	if first.AccountEmail != "cheap@example.com" {
+		t.Fatalf("AccountEmail = %q, want cheap@example.com", first.AccountEmail)
+	}
+	if first.AccountPriceMultiplier == nil || *first.AccountPriceMultiplier != 0.1 {
+		t.Fatalf("AccountPriceMultiplier = %v, want 0.1", first.AccountPriceMultiplier)
+	}
+}
+
 func TestUsageLogModeOffSkipsAllLogs(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

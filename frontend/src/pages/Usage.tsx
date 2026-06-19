@@ -197,6 +197,12 @@ function safeNumber(value?: number | null): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0
 }
 
+function formatUsagePriceMultiplier(value?: number | null): string {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? `${value}x`
+    : '-'
+}
+
 function formatUSD(value?: number | null, digits = 6): string {
   return `$${safeNumber(value).toFixed(digits)}`
 }
@@ -1075,12 +1081,16 @@ function EmptyPanel({ accent, icon, text }: { accent: PanelAccentKey; icon: Reac
   )
 }
 
-type UsageTableColumn = 'status' | 'model' | 'account' | 'apiKey' | 'clientIp' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'firstToken' | 'duration' | 'time'
+type UsageTableColumn = 'status' | 'model' | 'account' | 'username' | 'priceMultiplier' | 'apiKey' | 'clientIp' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'firstToken' | 'duration' | 'time'
+type UsageLogSortKey = 'status' | 'model' | 'account' | 'username' | 'price_multiplier' | 'api_key' | 'client_ip' | 'endpoint' | 'tokens' | 'cost' | 'cached' | 'first_token' | 'duration' | 'time'
+type UsageLogSortDir = 'asc' | 'desc'
 
 const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string }> = [
   { key: 'status', labelKey: 'usage.tableStatus' },
   { key: 'model', labelKey: 'usage.tableModel' },
   { key: 'account', labelKey: 'usage.tableAccount' },
+  { key: 'username', labelKey: 'usage.tableUsername' },
+  { key: 'priceMultiplier', labelKey: 'usage.tablePriceMultiplier' },
   { key: 'apiKey', labelKey: 'usage.tableApiKey' },
   { key: 'clientIp', labelKey: 'usage.tableClientIP' },
   { key: 'endpoint', labelKey: 'usage.tableEndpoint' },
@@ -1098,6 +1108,8 @@ const DEFAULT_USAGE_VISIBLE_COLUMNS: Record<UsageTableColumn, boolean> = {
   status: true,
   model: true,
   account: true,
+  username: true,
+  priceMultiplier: true,
   apiKey: true,
   clientIp: true,
   endpoint: true,
@@ -1207,6 +1219,8 @@ export default function Usage() {
   const [filterAccountId, setFilterAccountId] = useState(getInitialUsageAccountID)
   const [filterFast, setFilterFast] = useState('')
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
+  const [logSortKey, setLogSortKey] = useState<UsageLogSortKey>('time')
+  const [logSortDir, setLogSortDir] = useState<UsageLogSortDir>('desc')
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
@@ -1226,6 +1240,26 @@ export default function Usage() {
       setPage(1)
     }, 400)
   }, [])
+
+  const renderSortableUsageHead = useCallback((key: UsageLogSortKey, label: string, hint?: string) => (
+    <TableHead
+      className={`${usageTableHeadClass} cursor-pointer select-none hover:text-primary transition-colors`}
+      onClick={() => {
+        if (logSortKey === key) {
+          setLogSortDir((direction) => direction === 'asc' ? 'desc' : 'asc')
+        } else {
+          setLogSortKey(key)
+          setLogSortDir(key === 'price_multiplier' ? 'asc' : 'desc')
+        }
+        setPage(1)
+      }}
+    >
+      <span title={hint} className={hint ? 'cursor-help underline decoration-dotted underline-offset-2' : undefined}>
+        {label}
+      </span>{' '}
+      {logSortKey === key ? (logSortDir === 'desc' ? '↓' : '↑') : ''}
+    </TableHead>
+  ), [logSortDir, logSortKey])
 
   // 仅加载轻量统计（秒级）—— 联动同页 timeRange,与下方请求记录的范围保持一致
   const loadStats = useCallback(async () => {
@@ -1270,6 +1304,8 @@ export default function Usage() {
         accountId: filterAccountId || undefined,
         fast: filterFast || undefined,
         stream: filterStream || undefined,
+        sortBy: logSortKey,
+        sortDir: logSortDir,
       })
       setLogs(res.logs ?? [])
       setLogsTotal(res.total ?? 0)
@@ -1278,7 +1314,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterStream])
+  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterStream, logSortKey, logSortDir])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -1739,19 +1775,21 @@ export default function Usage() {
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      {visibleColumns.status && <TableHead className={usageTableHeadClass}>{t('usage.tableStatus')}</TableHead>}
-                      {visibleColumns.model && <TableHead className={usageTableHeadClass}>{t('usage.tableModel')}</TableHead>}
-                      {visibleColumns.account && <TableHead className={usageTableHeadClass}>{t('usage.tableAccount')}</TableHead>}
-                      {visibleColumns.apiKey && <TableHead className={usageTableHeadClass}>{t('usage.tableApiKey')}</TableHead>}
-                      {visibleColumns.clientIp && <TableHead className={usageTableHeadClass}>{t('usage.tableClientIP')}</TableHead>}
-                      {visibleColumns.endpoint && <TableHead className={usageTableHeadClass}>{t('usage.tableEndpoint')}</TableHead>}
+                      {visibleColumns.status && renderSortableUsageHead('status', t('usage.tableStatus'))}
+                      {visibleColumns.model && renderSortableUsageHead('model', t('usage.tableModel'))}
+                      {visibleColumns.account && renderSortableUsageHead('account', t('usage.tableAccount'))}
+                      {visibleColumns.username && renderSortableUsageHead('username', t('usage.tableUsername'))}
+                      {visibleColumns.priceMultiplier && renderSortableUsageHead('price_multiplier', t('usage.tablePriceMultiplier'))}
+                      {visibleColumns.apiKey && renderSortableUsageHead('api_key', t('usage.tableApiKey'))}
+                      {visibleColumns.clientIp && renderSortableUsageHead('client_ip', t('usage.tableClientIP'))}
+                      {visibleColumns.endpoint && renderSortableUsageHead('endpoint', t('usage.tableEndpoint'))}
                       {visibleColumns.type && <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>}
-                      {visibleColumns.token && <TableHead className={usageTableHeadClass}>{t('usage.tableToken')}</TableHead>}
-                      {visibleColumns.cost && <TableHead className={usageTableHeadClass}>{t('usage.tableCost')}</TableHead>}
-                      {visibleColumns.cached && <TableHead className={usageTableHeadClass}>{t('usage.tableCached')}</TableHead>}
-                      {visibleColumns.firstToken && <TableHead className={usageTableHeadClass}><span title={t('usage.tableFirstTokenHint')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableFirstToken')}</span></TableHead>}
-                      {visibleColumns.duration && <TableHead className={usageTableHeadClass}>{t('usage.tableDuration')}</TableHead>}
-                      {visibleColumns.time && <TableHead className={usageTableHeadClass}>{t('usage.tableTime')}</TableHead>}
+                      {visibleColumns.token && renderSortableUsageHead('tokens', t('usage.tableToken'))}
+                      {visibleColumns.cost && renderSortableUsageHead('cost', t('usage.tableCost'))}
+                      {visibleColumns.cached && renderSortableUsageHead('cached', t('usage.tableCached'))}
+                      {visibleColumns.firstToken && renderSortableUsageHead('first_token', t('usage.tableFirstToken'), t('usage.tableFirstTokenHint'))}
+                      {visibleColumns.duration && renderSortableUsageHead('duration', t('usage.tableDuration'))}
+                      {visibleColumns.time && renderSortableUsageHead('time', t('usage.tableTime'))}
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -1814,6 +1852,14 @@ export default function Usage() {
                         </TableCell>}
                         {visibleColumns.account && <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
                           {formatCompactEmail(log.account_email)}
+                        </TableCell>}
+                        {visibleColumns.username && <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
+                          <span className="block max-w-[180px] truncate whitespace-nowrap" title={log.account_name || `ID ${log.account_id}`}>
+                            {log.account_name || `ID ${log.account_id}`}
+                          </span>
+                        </TableCell>}
+                        {visibleColumns.priceMultiplier && <TableCell className={`${usageTableMonoClass} text-muted-foreground whitespace-nowrap`}>
+                          {formatUsagePriceMultiplier(log.account_price_multiplier)}
                         </TableCell>}
                         {visibleColumns.apiKey && <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
                           <span className="block max-w-[180px] truncate whitespace-nowrap font-mono text-[12px]" title={formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}>

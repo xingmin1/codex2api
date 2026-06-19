@@ -1921,59 +1921,61 @@ func (db *DB) UpdateProxyTestResult(ctx context.Context, id int64, ip, location 
 
 // UsageLog 请求日志行
 type UsageLog struct {
-	ID                   int64     `json:"id"`
-	AccountID            int64     `json:"account_id"`
-	ClientIP             string    `json:"client_ip"`
-	Endpoint             string    `json:"endpoint"`
-	Model                string    `json:"model"`
-	EffectiveModel       string    `json:"effective_model"`
-	PromptTokens         int       `json:"prompt_tokens"`
-	CompletionTokens     int       `json:"completion_tokens"`
-	TotalTokens          int       `json:"total_tokens"`
-	StatusCode           int       `json:"status_code"`
-	DurationMs           int       `json:"duration_ms"`
-	InputTokens          int       `json:"input_tokens"`
-	OutputTokens         int       `json:"output_tokens"`
-	ReasoningTokens      int       `json:"reasoning_tokens"`
-	FirstTokenMs         int       `json:"first_token_ms"`
-	ReasoningEffort      string    `json:"reasoning_effort"`
-	InboundEndpoint      string    `json:"inbound_endpoint"`
-	UpstreamEndpoint     string    `json:"upstream_endpoint"`
-	Stream               bool      `json:"stream"`
-	Compact              bool      `json:"compact"`
-	ViaWebsocket         bool      `json:"via_websocket"`
-	CachedTokens         int       `json:"cached_tokens"`
-	ServiceTier          string    `json:"service_tier"`
-	RequestedServiceTier string    `json:"requested_service_tier"`
-	ActualServiceTier    string    `json:"actual_service_tier"`
-	BillingServiceTier   string    `json:"billing_service_tier"`
-	APIKeyID             int64     `json:"api_key_id"`
-	APIKeyName           string    `json:"api_key_name"`
-	APIKeyMasked         string    `json:"api_key_masked"`
-	ImageCount           int       `json:"image_count"`
-	ImageWidth           int       `json:"image_width"`
-	ImageHeight          int       `json:"image_height"`
-	ImageBytes           int       `json:"image_bytes"`
-	ImageFormat          string    `json:"image_format"`
-	ImageSize            string    `json:"image_size"`
-	AccountEmail         string    `json:"account_email"`
-	CreatedAt            time.Time `json:"created_at"`
-	AccountBilled        float64   `json:"account_billed"`
-	UserBilled           float64   `json:"user_billed"`
-	InputCost            float64   `json:"input_cost"`
-	OutputCost           float64   `json:"output_cost"`
-	CacheReadCost        float64   `json:"cache_read_cost"`
-	TotalCost            float64   `json:"total_cost"`
-	InputPrice           float64   `json:"input_price_per_mtoken"`
-	OutputPrice          float64   `json:"output_price_per_mtoken"`
-	CacheReadPrice       float64   `json:"cache_read_price_per_mtoken"`
-	RateMultiplier       float64   `json:"rate_multiplier"`
-	LongContext          bool      `json:"long_context"`
-	LongContextThreshold int       `json:"long_context_threshold"`
-	IsRetryAttempt       bool      `json:"is_retry_attempt"`
-	AttemptIndex         int       `json:"attempt_index"`
-	UpstreamErrorKind    string    `json:"upstream_error_kind"`
-	ErrorMessage         string    `json:"error_message"`
+	ID                     int64     `json:"id"`
+	AccountID              int64     `json:"account_id"`
+	ClientIP               string    `json:"client_ip"`
+	Endpoint               string    `json:"endpoint"`
+	Model                  string    `json:"model"`
+	EffectiveModel         string    `json:"effective_model"`
+	PromptTokens           int       `json:"prompt_tokens"`
+	CompletionTokens       int       `json:"completion_tokens"`
+	TotalTokens            int       `json:"total_tokens"`
+	StatusCode             int       `json:"status_code"`
+	DurationMs             int       `json:"duration_ms"`
+	InputTokens            int       `json:"input_tokens"`
+	OutputTokens           int       `json:"output_tokens"`
+	ReasoningTokens        int       `json:"reasoning_tokens"`
+	FirstTokenMs           int       `json:"first_token_ms"`
+	ReasoningEffort        string    `json:"reasoning_effort"`
+	InboundEndpoint        string    `json:"inbound_endpoint"`
+	UpstreamEndpoint       string    `json:"upstream_endpoint"`
+	Stream                 bool      `json:"stream"`
+	Compact                bool      `json:"compact"`
+	ViaWebsocket           bool      `json:"via_websocket"`
+	CachedTokens           int       `json:"cached_tokens"`
+	ServiceTier            string    `json:"service_tier"`
+	RequestedServiceTier   string    `json:"requested_service_tier"`
+	ActualServiceTier      string    `json:"actual_service_tier"`
+	BillingServiceTier     string    `json:"billing_service_tier"`
+	APIKeyID               int64     `json:"api_key_id"`
+	APIKeyName             string    `json:"api_key_name"`
+	APIKeyMasked           string    `json:"api_key_masked"`
+	ImageCount             int       `json:"image_count"`
+	ImageWidth             int       `json:"image_width"`
+	ImageHeight            int       `json:"image_height"`
+	ImageBytes             int       `json:"image_bytes"`
+	ImageFormat            string    `json:"image_format"`
+	ImageSize              string    `json:"image_size"`
+	AccountName            string    `json:"account_name"`
+	AccountEmail           string    `json:"account_email"`
+	AccountPriceMultiplier *float64  `json:"account_price_multiplier,omitempty"`
+	CreatedAt              time.Time `json:"created_at"`
+	AccountBilled          float64   `json:"account_billed"`
+	UserBilled             float64   `json:"user_billed"`
+	InputCost              float64   `json:"input_cost"`
+	OutputCost             float64   `json:"output_cost"`
+	CacheReadCost          float64   `json:"cache_read_cost"`
+	TotalCost              float64   `json:"total_cost"`
+	InputPrice             float64   `json:"input_price_per_mtoken"`
+	OutputPrice            float64   `json:"output_price_per_mtoken"`
+	CacheReadPrice         float64   `json:"cache_read_price_per_mtoken"`
+	RateMultiplier         float64   `json:"rate_multiplier"`
+	LongContext            bool      `json:"long_context"`
+	LongContextThreshold   int       `json:"long_context_threshold"`
+	IsRetryAttempt         bool      `json:"is_retry_attempt"`
+	AttemptIndex           int       `json:"attempt_index"`
+	UpstreamErrorKind      string    `json:"upstream_error_kind"`
+	ErrorMessage           string    `json:"error_message"`
 }
 
 // InsertUsageLog 将日志追加到内存缓冲（非阻塞）
@@ -3343,6 +3345,8 @@ type UsageLogFilter struct {
 	End             time.Time
 	Page            int
 	PageSize        int
+	SortBy          string
+	SortDir         string
 	Email           string // LIKE 模糊匹配
 	Model           string // 精确匹配
 	Endpoint        string // 精确匹配 inbound_endpoint
@@ -3356,6 +3360,76 @@ type UsageLogFilter struct {
 	StatusFamily    string
 	ErrorKind       string
 	Query           string
+}
+
+func (db *DB) usageLogPriceMultiplierExpr() string {
+	if db.isSQLite() {
+		return `NULLIF(CAST(json_extract(a.credentials, '$.price_multiplier') AS REAL), 0)`
+	}
+	return `CASE
+		WHEN (a.credentials->>'price_multiplier') ~ '^[0-9]+(\.[0-9]+)?$'
+		THEN (a.credentials->>'price_multiplier')::double precision
+		ELSE NULL
+	END`
+}
+
+func (db *DB) usageLogAccountEmailExpr() string {
+	if db.isSQLite() {
+		return `COALESCE(json_extract(a.credentials, '$.email'), '')`
+	}
+	return `COALESCE(a.credentials->>'email', '')`
+}
+
+func (db *DB) usageLogOrderBy(f UsageLogFilter) string {
+	key := strings.ToLower(strings.TrimSpace(f.SortBy))
+	direction := "DESC"
+	if strings.EqualFold(strings.TrimSpace(f.SortDir), "asc") {
+		direction = "ASC"
+	}
+
+	priceMultiplierExpr := db.usageLogPriceMultiplierExpr()
+	accountEmailExpr := db.usageLogAccountEmailExpr()
+	expr := "u.created_at"
+	switch key {
+	case "status":
+		expr = "u.status_code"
+	case "model":
+		expr = "LOWER(COALESCE(NULLIF(u.effective_model, ''), u.model, ''))"
+	case "account":
+		expr = "LOWER(" + accountEmailExpr + ")"
+	case "account_name", "username":
+		expr = "LOWER(COALESCE(a.name, ''))"
+	case "price_multiplier", "multiplier":
+		expr = priceMultiplierExpr
+	case "api_key":
+		expr = "LOWER(COALESCE(u.api_key_name, u.api_key_masked, ''))"
+	case "client_ip":
+		expr = "COALESCE(u.client_ip, '')"
+	case "endpoint":
+		expr = "LOWER(COALESCE(NULLIF(u.inbound_endpoint, ''), u.endpoint, ''))"
+	case "token", "tokens":
+		expr = "u.total_tokens"
+	case "cost":
+		expr = "u.user_billed"
+	case "cached":
+		expr = "COALESCE(u.cached_tokens, 0)"
+	case "first_token":
+		expr = "COALESCE(u.first_token_ms, 0)"
+	case "duration":
+		expr = "u.duration_ms"
+	case "time", "created_at", "":
+		expr = "u.created_at"
+	}
+
+	if key == "price_multiplier" || key == "multiplier" {
+		order := fmt.Sprintf("%s %s", expr, direction)
+		if db.isSQLite() {
+			return fmt.Sprintf("ORDER BY %s IS NULL ASC, %s, u.created_at DESC, u.id DESC", expr, order)
+		}
+		order += " NULLS LAST"
+		return fmt.Sprintf("ORDER BY %s, u.created_at DESC, u.id DESC", order)
+	}
+	return fmt.Sprintf("ORDER BY %s %s, u.created_at DESC, u.id DESC", expr, direction)
 }
 
 func (db *DB) buildUsageLogWhere(f UsageLogFilter) (string, []interface{}) {
@@ -3504,10 +3578,11 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 	where, args := db.buildUsageLogWhere(f)
 	offset := (f.Page - 1) * f.PageSize
 	paramIdx := len(args) + 1
-	where += fmt.Sprintf(` ORDER BY u.created_at DESC LIMIT $%d OFFSET $%d`, paramIdx, paramIdx+1)
+	where += fmt.Sprintf(` %s LIMIT $%d OFFSET $%d`, db.usageLogOrderBy(f), paramIdx, paramIdx+1)
 	args = append(args, f.PageSize, offset)
+	priceMultiplierExpr := db.usageLogPriceMultiplierExpr()
 
-	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
+	query := fmt.Sprintf(`SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 	            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 	            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 	            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
@@ -3517,11 +3592,11 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 			            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 			            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
-			            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
+			            COALESCE(a.name, ''), %[1]s, COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
-	           WHERE ` + where
+	           WHERE `+where, priceMultiplierExpr)
 
 	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -3534,11 +3609,16 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		l := &UsageLog{}
 		var credentialRaw interface{}
 		var createdAtRaw interface{}
+		var priceMultiplier sql.NullFloat64
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
-			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
+			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &l.AccountName, &priceMultiplier, &credentialRaw, &createdAtRaw, &result.Total); err != nil {
 			return nil, err
+		}
+		if priceMultiplier.Valid && priceMultiplier.Float64 > 0 {
+			value := priceMultiplier.Float64
+			l.AccountPriceMultiplier = &value
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
 		l.CreatedAt, err = parseDBTimeValue(createdAtRaw)
