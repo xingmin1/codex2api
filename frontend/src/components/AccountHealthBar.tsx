@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { AccountHealthBucket } from '../types'
+import { formatHourMinute } from '../utils/time'
 
 // 「健康状态」条：把账号最近的请求成败分桶渲染成一排色块 + 成功率。
 // 移植自 CLIProxyAPI 的 ProviderStatusBar，改为 Tailwind 实现。
@@ -41,10 +42,7 @@ function rateToColor(rate: number): string {
 }
 
 function formatClock(timestamp: number): string {
-  const date = new Date(timestamp)
-  const h = date.getHours().toString().padStart(2, '0')
-  const m = date.getMinutes().toString().padStart(2, '0')
-  return `${h}:${m}`
+  return formatHourMinute(timestamp)
 }
 
 function formatSuccessRate(rate: number): string {

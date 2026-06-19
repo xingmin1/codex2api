@@ -19,6 +19,11 @@ import { Card, CardContent } from '@/components/ui/card'
 import StateShell from './StateShell'
 import type { ChartAggregation } from '../types'
 import { getBucketConfig, type TimeRangeKey } from '../lib/timeRange'
+import {
+  formatClockTime,
+  getZonedDateTimeParts,
+  type ZonedDateTimeParts,
+} from '../utils/time'
 
 interface DashboardUsageChartsProps {
   chartData: ChartAggregation | null
@@ -84,10 +89,10 @@ export default function DashboardUsageCharts({
     const totalRequests = serverData.timeline.reduce((sum, p) => sum + p.requests, 0)
 
     const timelineData: TimelinePoint[] = serverData.timeline.map((point) => {
-      const d = new Date(point.bucket)
+      const parts = getZonedDateTimeParts(point.bucket)
       return {
-        label: useFullDate ? formatDateLabel(d, bucketMinutes) : formatMinuteLabel(d),
-        fullLabel: formatFullLabel(d, bucketMinutes),
+        label: parts ? useFullDate ? formatDateLabel(parts, bucketMinutes) : formatMinuteLabel(parts) : '',
+        fullLabel: parts ? formatFullLabel(parts, bucketMinutes) : point.bucket,
         requests: point.requests,
         avgLatency: point.avg_latency > 0 ? Math.round(point.avg_latency) : null,
         inputTokens: point.input_tokens,
@@ -311,42 +316,22 @@ function ChartCard({ title, description, children }: { title: string; descriptio
   )
 }
 
-function formatMinuteLabel(date: Date): string {
-  const hours = String(date.getHours()).padStart(2, '0')
-  const minutes = String(date.getMinutes()).padStart(2, '0')
-  return `${hours}:${minutes}`
+function formatMinuteLabel(parts: ZonedDateTimeParts): string {
+  return `${parts.hour}:${parts.minute}`
 }
 
-function formatDateLabel(date: Date, bucketMinutes: number): string {
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
+function formatDateLabel(parts: ZonedDateTimeParts, bucketMinutes: number): string {
   if (bucketMinutes >= 1440) {
-    return `${month}-${day}`
+    return `${parts.month}-${parts.day}`
   }
-  const hour = String(date.getHours()).padStart(2, '0')
-  return `${month}-${day} ${hour}:00`
+  return `${parts.month}-${parts.day} ${parts.hour}:00`
 }
 
-function formatFullLabel(date: Date, bucketMinutes: number): string {
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  const hour = String(date.getHours()).padStart(2, '0')
-  const minute = String(date.getMinutes()).padStart(2, '0')
+function formatFullLabel(parts: ZonedDateTimeParts, bucketMinutes: number): string {
   if (bucketMinutes >= 1440) {
-    return `${date.getFullYear()}-${month}-${day}`
+    return `${parts.year}-${parts.month}-${parts.day}`
   }
-  return `${month}-${day} ${hour}:${minute}`
-}
-
-function formatClockTime(value: number | null): string {
-  if (!value) return '--:--:--'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return '--:--:--'
-  return date.toLocaleTimeString([], {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  })
+  return `${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`
 }
 
 function truncateLabel(value: string, maxLength: number): string {

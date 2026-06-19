@@ -13,6 +13,7 @@ import {
 import { api } from '../api'
 import { Card, CardContent } from '@/components/ui/card'
 import type { AccountEventTrendPoint } from '../types'
+import { getZonedDateTimeParts } from '../utils/time'
 
 type TrendRange = '24h' | '7d' | '30d'
 
@@ -87,23 +88,22 @@ export default function AccountTrendChart() {
 
   const displayData = useMemo<DisplayPoint[]>(() => {
     return rawData.map((p) => {
-      const d = new Date(p.bucket)
-      const mm = String(d.getMonth() + 1).padStart(2, '0')
-      const dd = String(d.getDate()).padStart(2, '0')
-      const hh = String(d.getHours()).padStart(2, '0')
-      const mi = String(d.getMinutes()).padStart(2, '0')
+      const parts = getZonedDateTimeParts(p.bucket)
+      if (!parts) {
+        return { label: p.bucket, fullLabel: p.bucket, added: p.added, deleted: p.deleted }
+      }
 
       let label: string
       let fullLabel: string
       if (bucketMinutes >= 1440) {
-        label = `${mm}-${dd}`
-        fullLabel = `${d.getFullYear()}-${mm}-${dd}`
+        label = `${parts.month}-${parts.day}`
+        fullLabel = `${parts.year}-${parts.month}-${parts.day}`
       } else if (bucketMinutes >= 360) {
-        label = `${mm}-${dd} ${hh}:00`
-        fullLabel = `${mm}-${dd} ${hh}:${mi}`
+        label = `${parts.month}-${parts.day} ${parts.hour}:00`
+        fullLabel = `${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`
       } else {
-        label = `${hh}:${mi}`
-        fullLabel = `${mm}-${dd} ${hh}:${mi}`
+        label = `${parts.hour}:${parts.minute}`
+        fullLabel = `${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`
       }
 
       return { label, fullLabel, added: p.added, deleted: p.deleted }

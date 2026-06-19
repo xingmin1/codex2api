@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { Card, CardContent } from '@/components/ui/card'
 import { getBucketConfig, type TimeRangeKey } from '../lib/timeRange'
 import type { ChartAggregation } from '../types'
+import { formatHourMinute, getZonedDateTimeParts, getZonedTimezoneOffsetMs } from '../utils/time'
 
 // SystemHealthBar 是仪表盘的系统级「健康状态」条：把所选时间跨度内服务端聚合的
 // 时间线（每个桶的请求数 / 4xx / 5xx）渲染成一排成功率色块 + 总体成功率。
@@ -35,15 +36,12 @@ function rateToColor(rate: number): string {
 }
 
 function formatDate(timestamp: number): string {
-  const date = new Date(timestamp)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+  const parts = getZonedDateTimeParts(timestamp)
+  return parts ? `${parts.month}-${parts.day}` : '--'
 }
 
 function formatClock(timestamp: number, withDate: boolean): string {
-  const date = new Date(timestamp)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  const hm = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const hm = formatHourMinute(timestamp)
   return withDate ? `${formatDate(timestamp)} ${hm}` : hm
 }
 
@@ -73,7 +71,7 @@ export default function SystemHealthBar({ chartData, timeRange, loading = false 
 
   // 把栅格对齐到本地时钟边界（天桶→当天 00:00，小时桶→整点），而不是锚定在
   // 「现在」这个零碎时刻，否则长跨度的桶起点会出现 03:16 这种怪值。
-  const tzOffsetMs = new Date().getTimezoneOffset() * 60 * 1000
+  const tzOffsetMs = getZonedTimezoneOffsetMs(Date.now()) ?? new Date().getTimezoneOffset() * 60 * 1000
   const alignToBucket = (ms: number) =>
     Math.floor((ms - tzOffsetMs) / bucketDurationMs) * bucketDurationMs + tzOffsetMs
   const now = Date.now()

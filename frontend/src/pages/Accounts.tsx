@@ -29,7 +29,7 @@ import type {
   RecycleBinAccountRow,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
-import { formatRelativeTime, formatBeijingTime } from "../utils/time";
+import { formatRelativeTime, formatBeijingTime, formatDateOnly } from "../utils/time";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -8194,7 +8194,7 @@ function ExpiryBadge({ expiresAt, planType }: { expiresAt?: string; planType?: s
   if (Number.isNaN(timestamp)) return null;
 
   const days = Math.floor((timestamp - Date.now()) / 86_400_000);
-  const localDate = new Date(timestamp).toLocaleDateString(i18n.language);
+  const localDate = formatDateOnly(timestamp, i18n.language);
 
   if (days < 0) {
     return (

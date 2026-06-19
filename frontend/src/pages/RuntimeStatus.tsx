@@ -19,6 +19,7 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import type { RuntimeCheck, RuntimeHealthStatus, RuntimeStatusResponse } from '../types'
+import { formatClockTime } from '../utils/time'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -42,7 +43,7 @@ export default function RuntimeStatus() {
     return () => window.clearInterval(timer)
   }, [reloadSilently])
 
-  const updatedLabel = status?.updated_at ? formatTimeLabel(status.updated_at) : '--:--:--'
+  const updatedLabel = formatClockTime(status?.updated_at)
 
   return (
     <StateShell
@@ -328,16 +329,6 @@ function summaryToneClass(tone: StatusTone): string {
 
 function formatNumber(value: number): string {
   return value.toLocaleString()
-}
-
-function formatTimeLabel(iso: string): string {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) {
-    return '--:--:--'
-  }
-  return date.toLocaleTimeString('zh-CN', {
-    hour12: false,
-  })
 }
 
 function formatUptime(seconds: number, t: (key: string) => string): string {

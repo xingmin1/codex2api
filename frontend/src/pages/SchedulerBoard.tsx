@@ -10,6 +10,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import StatusBadge from '../components/StatusBadge'
 import type { AccountRow, OpsOverviewResponse } from '../types'
 import { formatCompactEmail } from '../lib/utils'
+import { formatClockTime } from '../utils/time'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -58,7 +59,7 @@ export default function SchedulerBoard() {
 
   const overview = data.overview
   const accounts = data.accounts
-  const updatedLabel = overview?.updated_at ? formatTimeLabel(overview.updated_at) : '--:--:--'
+  const updatedLabel = formatClockTime(overview?.updated_at)
   const schedulerCounts = useMemo(() => ({
     healthy: accounts.filter((account) => account.health_tier === 'healthy').length,
     warm: accounts.filter((account) => account.health_tier === 'warm').length,
@@ -447,14 +448,4 @@ function getDispatchScore(account: AccountRow): number {
 
 function formatNumber(value: number): string {
   return value.toLocaleString()
-}
-
-function formatTimeLabel(iso: string): string {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) {
-    return '--:--:--'
-  }
-  return date.toLocaleTimeString('zh-CN', {
-    hour12: false,
-  })
 }

@@ -7,6 +7,7 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import type { ResetRadarResponse } from '../types'
+import { getTimezone } from '../utils/time'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -517,6 +518,7 @@ function formatDateTime(value: string | undefined, locale: string) {
   const date = new Date(value)
   if (Number.isNaN(date.getTime())) return value
   return new Intl.DateTimeFormat(locale, {
+    timeZone: getTimezone(),
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',

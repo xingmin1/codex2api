@@ -19,6 +19,7 @@ import OpsTabs from '../components/OpsTabs'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import type { OpsOverviewResponse } from '../types'
+import { formatClockTime } from '../utils/time'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
 
@@ -41,7 +42,7 @@ export default function Operations() {
     return () => window.clearInterval(timer)
   }, [reloadSilently])
 
-  const updatedLabel = overview?.updated_at ? formatTimeLabel(overview.updated_at) : '--:--:--'
+  const updatedLabel = formatClockTime(overview?.updated_at)
 
   return (
     <StateShell
@@ -286,16 +287,6 @@ function formatBytes(bytes: number): string {
 
 function formatNumber(value: number): string {
   return value.toLocaleString()
-}
-
-function formatTimeLabel(iso: string): string {
-  const date = new Date(iso)
-  if (Number.isNaN(date.getTime())) {
-    return '--:--:--'
-  }
-  return date.toLocaleTimeString('zh-CN', {
-    hour12: false,
-  })
 }
 
 function formatUptime(seconds: number, t: (key: string) => string): string {
