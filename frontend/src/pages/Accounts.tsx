@@ -3788,7 +3788,6 @@ export default function Accounts() {
               <FolderOpen className="size-3.5" />
               {t("accounts.groupManage")}
             </Button>
-            {!isPersonalMode && (
             <div className="flex w-full shrink-0 items-center gap-1.5 @min-[1600px]/accounts:ml-auto @min-[1600px]/accounts:w-auto">
               <div className="flex min-w-0 items-center gap-1.5">
                 <Select
@@ -3821,69 +3820,72 @@ export default function Accounts() {
                   {sortDir === "desc" ? "↓" : "↑"}
                 </Button>
               </div>
-              <div className="hidden lg:inline-flex items-center rounded-md border border-border bg-muted/50 p-0.5">
-                <button
-                  type="button"
-                  onClick={() => setViewMode("table")}
-                  title={t("accounts.viewModeTable")}
-                  aria-label={t("accounts.viewModeTable")}
-                  aria-pressed={viewMode === "table"}
-                  className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] font-medium transition-colors ${
-                    viewMode === "table"
-                      ? "bg-background text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  <Rows3 className="size-3.5" />
-                  {t("accounts.viewModeTable")}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setViewMode("grid")}
-                  title={t("accounts.viewModeGrid")}
-                  aria-label={t("accounts.viewModeGrid")}
-                  aria-pressed={viewMode === "grid"}
-                  className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] font-medium transition-colors ${
-                    viewMode === "grid"
-                      ? "bg-background text-foreground shadow-sm"
-                      : "text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  <LayoutGrid className="size-3.5" />
-                  {t("accounts.viewModeGrid")}
-                </button>
-              </div>
-              <ColumnSettingsMenu
-                columns={visibleColumns}
-                onToggle={(column) =>
-                  setVisibleColumns((current) => ({
-                    ...current,
-                    [column]: !current[column],
-                  }))
-                }
-                onReset={() =>
-                  setVisibleColumns(getDefaultAccountVisibleColumns())
-                }
-                resetTitle={t("accounts.columnReset")}
-                labels={{
-                  sequence: t("accounts.sequence"),
-                  email: t("accounts.email"),
-                  plan: t("accounts.plan"),
-                  tags: t("accounts.tagsLabel"),
-                  groups: t("accounts.groupsLabel"),
-                  status: t("accounts.status"),
-                  requests: t("accounts.requests"),
-                  usage: t("accounts.usage"),
-                  priceMultiplier: t("accounts.priceMultiplierShort"),
-                  billed: t("accounts.billed"),
-                  importTime: t("accounts.importTime"),
-                  updatedAt: t("accounts.updatedAt"),
-                  actions: t("accounts.actions"),
-                }}
-                title={t("accounts.columnSettings")}
-              />
+              {!isPersonalMode && (
+                <>
+                  <div className="hidden lg:inline-flex items-center rounded-md border border-border bg-muted/50 p-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setViewMode("table")}
+                      title={t("accounts.viewModeTable")}
+                      aria-label={t("accounts.viewModeTable")}
+                      aria-pressed={viewMode === "table"}
+                      className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] font-medium transition-colors ${
+                        viewMode === "table"
+                          ? "bg-background text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      <Rows3 className="size-3.5" />
+                      {t("accounts.viewModeTable")}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setViewMode("grid")}
+                      title={t("accounts.viewModeGrid")}
+                      aria-label={t("accounts.viewModeGrid")}
+                      aria-pressed={viewMode === "grid"}
+                      className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] font-medium transition-colors ${
+                        viewMode === "grid"
+                          ? "bg-background text-foreground shadow-sm"
+                          : "text-muted-foreground hover:text-foreground"
+                      }`}
+                    >
+                      <LayoutGrid className="size-3.5" />
+                      {t("accounts.viewModeGrid")}
+                    </button>
+                  </div>
+                  <ColumnSettingsMenu
+                    columns={visibleColumns}
+                    onToggle={(column) =>
+                      setVisibleColumns((current) => ({
+                        ...current,
+                        [column]: !current[column],
+                      }))
+                    }
+                    onReset={() =>
+                      setVisibleColumns(getDefaultAccountVisibleColumns())
+                    }
+                    resetTitle={t("accounts.columnReset")}
+                    labels={{
+                      sequence: t("accounts.sequence"),
+                      email: t("accounts.email"),
+                      plan: t("accounts.plan"),
+                      tags: t("accounts.tagsLabel"),
+                      groups: t("accounts.groupsLabel"),
+                      status: t("accounts.status"),
+                      requests: t("accounts.requests"),
+                      usage: t("accounts.usage"),
+                      priceMultiplier: t("accounts.priceMultiplierShort"),
+                      billed: t("accounts.billed"),
+                      importTime: t("accounts.importTime"),
+                      updatedAt: t("accounts.updatedAt"),
+                      actions: t("accounts.actions"),
+                    }}
+                    title={t("accounts.columnSettings")}
+                  />
+                </>
+              )}
             </div>
-            )}
           </div>
 
           {selected.size > 0 && (
