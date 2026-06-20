@@ -682,7 +682,7 @@ func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Tim
 			continue
 		}
 
-		bucket := createdAt.Truncate(time.Duration(bucketMinutes) * time.Minute).Format("2006-01-02T15:04:05")
+		bucket := formatAPITimeBucket(createdAt, bucketMinutes)
 		agg, ok := timelineMap[bucket]
 		if !ok {
 			agg = &bucketAgg{}
@@ -806,12 +806,7 @@ func (db *DB) getAccountEventTrendSQLite(ctx context.Context, start, end time.Ti
 			continue
 		}
 
-		// 对齐到桶
-		minute := createdAt.Minute()
-		aligned := minute - (minute % bucketMinutes)
-		bucketTime := time.Date(createdAt.Year(), createdAt.Month(), createdAt.Day(),
-			createdAt.Hour(), aligned, 0, 0, createdAt.Location())
-		key := bucketTime.Format("2006-01-02T15:04:05")
+		key := formatAPITimeBucket(createdAt, bucketMinutes)
 
 		agg, ok := bucketMap[key]
 		if !ok {

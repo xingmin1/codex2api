@@ -2142,6 +2142,50 @@ func TestSQLiteUsageLogsTimeRangeUsesUTCStorage(t *testing.T) {
 	if got := page.Logs[0].Model; got != "gpt-image-2" {
 		t.Fatalf("Model = %q, want gpt-image-2", got)
 	}
+
+	charts, err := db.GetChartAggregation(ctx, localCreated.Add(-1*time.Hour), localCreated.Add(1*time.Hour), 5)
+	if err != nil {
+		t.Fatalf("GetChartAggregation 返回错误: %v", err)
+	}
+	if len(charts.Timeline) != 1 {
+		t.Fatalf("len(charts.Timeline) = %d, want 1", len(charts.Timeline))
+	}
+	if got, want := charts.Timeline[0].Bucket, "2026-04-23T20:05:00Z"; got != want {
+		t.Fatalf("chart bucket = %q, want %q", got, want)
+	}
+}
+
+func TestSQLiteAccountEventTrendReturnsRFC3339Buckets(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	createdUTC := time.Date(2026, 4, 23, 20, 6, 0, 0, time.UTC)
+	if _, err := db.conn.ExecContext(ctx, `
+		INSERT INTO account_events (account_id, event_type, source, created_at)
+		VALUES (1, 'added', 'manual', $1)
+	`, sqliteTimeParam(createdUTC)); err != nil {
+		t.Fatalf("insert account event 返回错误: %v", err)
+	}
+
+	trend, err := db.GetAccountEventTrend(ctx, createdUTC.Add(-1*time.Hour), createdUTC.Add(1*time.Hour), 60)
+	if err != nil {
+		t.Fatalf("GetAccountEventTrend 返回错误: %v", err)
+	}
+	if len(trend) != 1 {
+		t.Fatalf("len(trend) = %d, want 1", len(trend))
+	}
+	if got, want := trend[0].Bucket, "2026-04-23T20:00:00Z"; got != want {
+		t.Fatalf("event trend bucket = %q, want %q", got, want)
+	}
+	if trend[0].Added != 1 || trend[0].Deleted != 0 {
+		t.Fatalf("event trend = %+v, want added=1 deleted=0", trend[0])
+	}
 }
 
 func TestGetAccountUsageStatsAggregatesRecentAccountSummary(t *testing.T) {

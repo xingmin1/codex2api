@@ -2978,12 +2978,14 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 
 	// 时间轴聚合：按 bucketMinutes 分桶
 	timelineQuery := `
-	SELECT
-		TO_CHAR(
-			date_trunc('minute', created_at)
-			- (EXTRACT(MINUTE FROM created_at)::int % $3) * INTERVAL '1 minute',
-			'YYYY-MM-DD"T"HH24:MI:SS'
-		) AS bucket,
+		SELECT
+			TO_CHAR(
+				TO_TIMESTAMP(
+					FLOOR(EXTRACT(EPOCH FROM created_at) / ($3::double precision * 60))
+					* ($3::double precision * 60)
+				) AT TIME ZONE 'UTC',
+				'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+			) AS bucket,
 		COUNT(*)                              AS requests,
 		COALESCE(AVG(duration_ms), 0)         AS avg_latency,
 		COALESCE(SUM(input_tokens), 0)        AS input_tokens,
@@ -5399,12 +5401,14 @@ func (db *DB) GetAccountEventTrend(ctx context.Context, start, end time.Time, bu
 	}
 
 	query := `
-	SELECT
-		TO_CHAR(
-			date_trunc('minute', created_at)
-			- (EXTRACT(MINUTE FROM created_at)::int % $3) * INTERVAL '1 minute',
-			'YYYY-MM-DD"T"HH24:MI:SS'
-		) AS bucket,
+		SELECT
+			TO_CHAR(
+				TO_TIMESTAMP(
+					FLOOR(EXTRACT(EPOCH FROM created_at) / ($3::double precision * 60))
+					* ($3::double precision * 60)
+				) AT TIME ZONE 'UTC',
+				'YYYY-MM-DD"T"HH24:MI:SS"Z"'
+			) AS bucket,
 		COALESCE(SUM(CASE WHEN event_type = 'added' THEN 1 ELSE 0 END), 0) AS added,
 		COALESCE(SUM(CASE WHEN event_type = 'deleted' AND source = 'manual' THEN 1 ELSE 0 END), 0) AS deleted
 	FROM account_events

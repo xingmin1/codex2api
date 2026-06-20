@@ -76,6 +76,21 @@ func sqliteTimeParam(value time.Time) string {
 	return value.UTC().Format("2006-01-02 15:04:05")
 }
 
+func formatAPITime(value time.Time) string {
+	if value.IsZero() {
+		return ""
+	}
+	return value.UTC().Truncate(time.Second).Format(time.RFC3339)
+}
+
+func formatAPITimeBucket(value time.Time, bucketMinutes int) string {
+	if bucketMinutes < 1 {
+		bucketMinutes = 1
+	}
+	bucket := value.UTC().Truncate(time.Duration(bucketMinutes) * time.Minute)
+	return formatAPITime(bucket)
+}
+
 func (db *DB) timeRangeArgs(start, end time.Time) (interface{}, interface{}) {
 	if db != nil && db.isSQLite() {
 		return sqliteTimeParam(start), sqliteTimeParam(end)
