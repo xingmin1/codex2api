@@ -894,10 +894,8 @@ func TestCheapProbeRankPolicyIsConfigurable(t *testing.T) {
 	}
 }
 
-func TestRecordCheapProbeSuccessAddsTemporaryBonusAboveCurrentMax(t *testing.T) {
+func TestRecordCheapProbeSuccessClearsCheapProbeState(t *testing.T) {
 	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
-	top := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 1}
-	top.ScoreBiasOverride = int64Ptr(60)
 	cheap := &Account{
 		DBID:                2,
 		AccessToken:         "token",
@@ -913,11 +911,11 @@ func TestRecordCheapProbeSuccessAddsTemporaryBonusAboveCurrentMax(t *testing.T) 
 		Reset5hAt:           time.Now().Add(time.Hour),
 		UsageUpdatedAt5h:    time.Now().Add(-time.Minute),
 	}
-	store.AddAccount(top)
 	store.AddAccount(cheap)
-	topScore := top.GetDispatchScore()
 
-	store.RecordCheapProbeSuccess(cheap, topScore)
+	if !store.RecordCheapProbeSuccess(cheap) {
+		t.Fatal("RecordCheapProbeSuccess returned false, want state cleared")
+	}
 
 	cheap.mu.RLock()
 	defer cheap.mu.RUnlock()
@@ -927,15 +925,12 @@ func TestRecordCheapProbeSuccessAddsTemporaryBonusAboveCurrentMax(t *testing.T) 
 	if cheap.UsagePercent5hValid || !cheap.Reset5hAt.IsZero() || !cheap.UsageUpdatedAt5h.IsZero() {
 		t.Fatalf("5h usage marker not cleared: valid=%t reset=%v updated=%v", cheap.UsagePercent5hValid, cheap.Reset5hAt, cheap.UsageUpdatedAt5h)
 	}
-	if cheap.DispatchScore < topScore+defaultCheapProbeRecoveryMargin {
-		t.Fatalf("DispatchScore = %v, want >= %v", cheap.DispatchScore, topScore+defaultCheapProbeRecoveryMargin)
-	}
-	if cheap.CheapProbeRecoveryBonus <= 0 || !cheap.CheapProbeBonusUntil.After(time.Now()) {
-		t.Fatalf("cheap probe bonus not active: bonus=%v until=%v", cheap.CheapProbeRecoveryBonus, cheap.CheapProbeBonusUntil)
+	if cheap.CheapProbeRecoveryBonus != 0 || !cheap.CheapProbeBonusUntil.IsZero() {
+		t.Fatalf("cheap probe bonus state not cleared: bonus=%v until=%v", cheap.CheapProbeRecoveryBonus, cheap.CheapProbeBonusUntil)
 	}
 }
 
-func TestRecordCheapProbeSuccessUsesAccountOverride(t *testing.T) {
+func TestApplyCheapProbeRecoveryBonusUsesAccountOverride(t *testing.T) {
 	store := NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency:                 2,
 		TestConcurrency:                1,
@@ -958,9 +953,22 @@ func TestRecordCheapProbeSuccessUsesAccountOverride(t *testing.T) {
 	store.AddAccount(top)
 	store.AddAccount(cheap)
 	topScore := top.GetDispatchScore()
+	topSnapshot := cheapProbeTopAccount{
+		dbID:            top.DBID,
+		dispatchScore:   topScore,
+		priceMultiplier: 1,
+		found:           true,
+	}
+	batchVersion := store.cheapProbeTopologyVersion.Load()
+
+	if !store.RecordCheapProbeSuccess(cheap) {
+		t.Fatal("RecordCheapProbeSuccess returned false, want state cleared")
+	}
 
 	start := time.Now()
-	store.RecordCheapProbeSuccess(cheap, topScore)
+	if !store.applyCheapProbeRecoveryBonus(cheap, topSnapshot, start, batchVersion) {
+		t.Fatal("applyCheapProbeRecoveryBonus returned false, want account override bonus applied")
+	}
 
 	cheap.mu.RLock()
 	defer cheap.mu.RUnlock()
@@ -969,6 +977,75 @@ func TestRecordCheapProbeSuccessUsesAccountOverride(t *testing.T) {
 	}
 	if cheap.CheapProbeBonusUntil.Before(start.Add(time.Minute)) || cheap.CheapProbeBonusUntil.After(start.Add(2*time.Minute)) {
 		t.Fatalf("CheapProbeBonusUntil = %v, want about 1 minute after start", cheap.CheapProbeBonusUntil)
+	}
+}
+
+func TestApplyCheapProbeRecoveryBonusSkipsBonusWhenCandidateNoLongerCheaperThanTop(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                 2,
+		TestConcurrency:                1,
+		TestModel:                      "gpt-5.4",
+		CheapProbeEnabled:              true,
+		CheapProbeRecoveryMargin:       10,
+		CheapProbeBonusDurationMinutes: 10,
+	})
+	top := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.049}
+	top.ScoreBiasOverride = int64Ptr(60)
+	alsoCheap := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.0503}
+	store.AddAccount(top)
+	store.AddAccount(alsoCheap)
+
+	topSnapshot := cheapProbeTopAccount{
+		dbID:            top.DBID,
+		dispatchScore:   top.GetDispatchScore(),
+		priceMultiplier: 0.049,
+		found:           true,
+	}
+	batchVersion := store.cheapProbeTopologyVersion.Load()
+	if !store.RecordCheapProbeSuccess(alsoCheap) {
+		t.Fatal("alsoCheap state not cleared")
+	}
+	if store.applyCheapProbeRecoveryBonus(alsoCheap, topSnapshot, time.Now(), batchVersion) {
+		t.Fatal("alsoCheap bonus applied even though current top has a lower price multiplier")
+	}
+
+	alsoCheap.mu.RLock()
+	alsoCheapBonus := alsoCheap.CheapProbeRecoveryBonus
+	alsoCheapBonusUntil := alsoCheap.CheapProbeBonusUntil
+	alsoCheap.mu.RUnlock()
+
+	if alsoCheapBonus != 0 {
+		t.Fatalf("alsoCheap bonus = %v, want 0", alsoCheapBonus)
+	}
+	if !alsoCheapBonusUntil.IsZero() {
+		t.Fatalf("alsoCheap bonus until = %v, want zero", alsoCheapBonusUntil)
+	}
+}
+
+func TestCheapProbeTopologyChangesMarkRescanRequested(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	acc := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.5}
+
+	if version := store.cheapProbeTopologyVersion.Load(); version != 0 {
+		t.Fatalf("initial cheapProbeTopologyVersion = %d, want 0", version)
+	}
+
+	store.AddAccount(acc)
+	if version := store.cheapProbeTopologyVersion.Load(); version != 1 {
+		t.Fatalf("version after AddAccount = %d, want 1", version)
+	}
+	if !store.cheapProbeRescanRequested.Load() {
+		t.Fatal("cheapProbeRescanRequested is false after AddAccount, want true")
+	}
+
+	if !store.ApplyAccountPriceMultiplier(acc.DBID, 0.25) {
+		t.Fatal("ApplyAccountPriceMultiplier returned false")
+	}
+	if version := store.cheapProbeTopologyVersion.Load(); version != 2 {
+		t.Fatalf("version after ApplyAccountPriceMultiplier = %d, want 2", version)
+	}
+	if !store.cheapProbeRescanRequested.Load() {
+		t.Fatal("cheapProbeRescanRequested is false after ApplyAccountPriceMultiplier, want true")
 	}
 }
 
@@ -1008,6 +1085,7 @@ func TestApplyAccountPriceMultiplierClearsCheapProbeState(t *testing.T) {
 		CheapProbeBonusUntil:    time.Now().Add(time.Minute),
 	}
 	store.AddAccount(acc)
+	beforeVersion := store.cheapProbeTopologyVersion.Load()
 
 	if !store.ApplyAccountPriceMultiplier(acc.DBID, 0.25) {
 		t.Fatal("ApplyAccountPriceMultiplier returned false")
@@ -1022,5 +1100,11 @@ func TestApplyAccountPriceMultiplierClearsCheapProbeState(t *testing.T) {
 		acc.LastCheapProbeError != "" || acc.CheapProbeRecoveryBonus != 0 || !acc.CheapProbeBonusUntil.IsZero() {
 		t.Fatalf("cheap probe state not cleared: last=%v success=%v err=%q bonus=%v until=%v",
 			acc.LastCheapProbeAt, acc.LastCheapProbeSuccessAt, acc.LastCheapProbeError, acc.CheapProbeRecoveryBonus, acc.CheapProbeBonusUntil)
+	}
+	if got := store.cheapProbeTopologyVersion.Load(); got != beforeVersion+1 {
+		t.Fatalf("cheapProbeTopologyVersion = %d, want %d", got, beforeVersion+1)
+	}
+	if !store.cheapProbeRescanRequested.Load() {
+		t.Fatal("cheapProbeRescanRequested is false after ApplyAccountPriceMultiplier, want true")
 	}
 }

@@ -1926,6 +1926,8 @@ type Store struct {
 	usageProbeBatch                    atomic.Bool
 	recoveryProbeBatch                 atomic.Bool
 	cheapProbeBatch                    atomic.Bool
+	cheapProbeTopologyVersion          atomic.Uint64
+	cheapProbeRescanRequested          atomic.Bool
 	autoCleanUnauthorized              atomic.Bool
 	autoCleanRateLimited               atomic.Bool
 	autoCleanFullUsage                 atomic.Bool
@@ -3399,10 +3401,13 @@ func (s *Store) StartBackgroundRefresh() {
 				refreshTimer.Reset(s.GetBackgroundRefreshInterval())
 			case <-s.backgroundRefreshWakeCh:
 				resetRefreshTimer()
+				if !s.GetLazyMode() && s.CheapProbeEnabled() && s.cheapProbeRescanRequested.Load() {
+					s.TriggerCheapProbeAsync()
+				}
 			case <-autoCleanupTicker.C:
 				s.TriggerAutoCleanupAsync()
 			case now := <-cheapProbeTicker.C:
-				if !s.GetLazyMode() && s.CheapProbeEnabled() && (lastCheapProbeScan.IsZero() || now.Sub(lastCheapProbeScan) >= s.GetCheapProbeScanInterval()) {
+				if !s.GetLazyMode() && s.CheapProbeEnabled() && (s.cheapProbeRescanRequested.Load() || lastCheapProbeScan.IsZero() || now.Sub(lastCheapProbeScan) >= s.GetCheapProbeScanInterval()) {
 					lastCheapProbeScan = now
 					s.TriggerCheapProbeAsync()
 				}
@@ -4418,6 +4423,7 @@ func (s *Store) AddAccount(acc *Account) {
 	s.accounts = append(s.accounts, acc)
 	s.rebuildAccountIndex()
 	s.fastSchedulerUpdate(acc)
+	s.markCheapProbeTopologyChanged()
 }
 
 // RemoveAccount 从内存池移除账号
@@ -4434,6 +4440,7 @@ func (s *Store) RemoveAccount(dbID int64) {
 			if scheduler := s.GetRefreshScheduler(); scheduler != nil {
 				scheduler.CancelTask(dbID)
 			}
+			s.markCheapProbeTopologyChanged()
 			return
 		}
 	}
@@ -4472,6 +4479,19 @@ func (s *Store) rebuildAccountIndex() {
 	s.accountsByID = idx
 }
 
+// markCheapProbeTopologyChanged 标记便宜账号探测基准需要重新计算。
+func (s *Store) markCheapProbeTopologyChanged() {
+	if s == nil {
+		return
+	}
+	s.cheapProbeTopologyVersion.Add(1)
+	s.cheapProbeRescanRequested.Store(true)
+	select {
+	case s.backgroundRefreshWakeCh <- struct{}{}:
+	default:
+	}
+}
+
 // ApplyAccountSchedulerOverrides 更新运行时账号的调度 override 并立即重算。
 func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, baseConcurrencyOverride *int64, skipWarmTier *bool) bool {
 	acc := s.FindByID(dbID)
@@ -4488,6 +4508,7 @@ func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, ba
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	s.markCheapProbeTopologyChanged()
 	return true
 }
 
@@ -4510,6 +4531,7 @@ func (s *Store) ApplyAccountSchedulerOverridePatch(dbID int64, scoreBiasSet bool
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	s.markCheapProbeTopologyChanged()
 	return true
 }
 
@@ -4549,6 +4571,7 @@ func (s *Store) ApplyAccountQuotaAutoPauseConfig(dbID int64, threshold5h, thresh
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	s.markCheapProbeTopologyChanged()
 	return true
 }
 
@@ -4599,6 +4622,7 @@ func (s *Store) ApplyAccountPriceMultiplier(dbID int64, priceMultiplier float64)
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	s.markCheapProbeTopologyChanged()
 	return true
 }
 
@@ -5352,9 +5376,15 @@ func (s *Store) TriggerCheapProbeAsync() {
 	if !s.cheapProbeBatch.CompareAndSwap(false, true) {
 		return
 	}
+	s.cheapProbeRescanRequested.Store(false)
 
 	go func() {
-		defer s.cheapProbeBatch.Store(false)
+		defer func() {
+			s.cheapProbeBatch.Store(false)
+			if s.cheapProbeRescanRequested.Swap(false) {
+				s.TriggerCheapProbeAsync()
+			}
+		}()
 		s.parallelCheapProbe(context.Background())
 	}()
 }
@@ -5676,10 +5706,10 @@ func (s *Store) cheapProbeCandidates(accounts []*Account, now time.Time) ([]chea
 	return targets, top
 }
 
-// RecordCheapProbeSuccess 记录便宜账号探测成功，并给账号一个短期恢复加分。
-func (s *Store) RecordCheapProbeSuccess(acc *Account, currentMaxDispatchScore float64) {
+// RecordCheapProbeSuccess 记录便宜账号探测成功，并清理便宜探测相关运行时状态。
+func (s *Store) RecordCheapProbeSuccess(acc *Account) bool {
 	if s == nil || acc == nil {
-		return
+		return false
 	}
 	now := time.Now()
 	atomic.StoreInt32(&acc.Disabled, 0)
@@ -5705,26 +5735,11 @@ func (s *Store) RecordCheapProbeSuccess(acc *Account, currentMaxDispatchScore fl
 	acc.CheapProbeRecoveryBonus = 0
 	acc.CheapProbeBonusUntil = time.Time{}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-	recoveryMargin := s.GetCheapProbeRecoveryMargin()
-	if acc.CheapProbeRecoveryMargin > 0 {
-		recoveryMargin = acc.CheapProbeRecoveryMargin
-	}
-	bonusDuration := s.GetCheapProbeBonusDuration()
-	if acc.CheapProbeBonusDuration > 0 {
-		bonusDuration = acc.CheapProbeBonusDuration
-	}
-	targetScore := currentMaxDispatchScore + recoveryMargin
-	if acc.DispatchScore < targetScore {
-		acc.CheapProbeRecoveryBonus = targetScore - acc.DispatchScore
-		acc.CheapProbeBonusUntil = now.Add(bonusDuration)
-	}
-	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
-
 	s.fastSchedulerUpdate(acc)
 	s.deleteCachedAccountCooldown(acc.DBID)
 	if s.db == nil {
-		return
+		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -5741,6 +5756,48 @@ func (s *Store) RecordCheapProbeSuccess(acc *Account, currentMaxDispatchScore fl
 	}); err != nil {
 		log.Printf("[账号 %d] 便宜账号探测成功后清理用量状态失败: %v", acc.DBID, err)
 	}
+	return true
+}
+
+func (s *Store) applyCheapProbeRecoveryBonus(acc *Account, top cheapProbeTopAccount, now time.Time, batchVersion uint64) bool {
+	if s == nil || acc == nil {
+		return false
+	}
+	if s.cheapProbeTopologyVersion.Load() != batchVersion {
+		return false
+	}
+	acc.mu.RLock()
+	candidateMultiplier, ok := normalizePriceMultiplier(acc.PriceMultiplier)
+	acc.mu.RUnlock()
+	if !ok || !top.found || top.dbID == acc.DBID || candidateMultiplier >= top.priceMultiplier {
+		return false
+	}
+
+	acc.mu.Lock()
+	defer acc.mu.Unlock()
+	if s.cheapProbeTopologyVersion.Load() != batchVersion {
+		return false
+	}
+	candidateMultiplier, ok = normalizePriceMultiplier(acc.PriceMultiplier)
+	if !ok || candidateMultiplier >= top.priceMultiplier {
+		return false
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	recoveryMargin := s.GetCheapProbeRecoveryMargin()
+	if acc.CheapProbeRecoveryMargin > 0 {
+		recoveryMargin = acc.CheapProbeRecoveryMargin
+	}
+	bonusDuration := s.GetCheapProbeBonusDuration()
+	if acc.CheapProbeBonusDuration > 0 {
+		bonusDuration = acc.CheapProbeBonusDuration
+	}
+	targetScore := top.dispatchScore + recoveryMargin
+	if acc.DispatchScore < targetScore {
+		acc.CheapProbeRecoveryBonus = targetScore - acc.DispatchScore
+		acc.CheapProbeBonusUntil = now.Add(bonusDuration)
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	return acc.CheapProbeRecoveryBonus > 0 && acc.CheapProbeBonusUntil.After(now)
 }
 
 // RecordCheapProbeFailure 记录便宜账号探测失败；不会写冷却或错误状态。
@@ -5778,6 +5835,7 @@ func (s *Store) parallelCheapProbe(ctx context.Context) {
 	s.mu.RUnlock()
 
 	now := time.Now()
+	batchVersion := s.cheapProbeTopologyVersion.Load()
 	targets, top := s.cheapProbeCandidates(accounts, now)
 	if len(targets) == 0 || !top.found {
 		return
@@ -5786,6 +5844,8 @@ func (s *Store) parallelCheapProbe(ctx context.Context) {
 	sem := make(chan struct{}, s.GetCheapProbeConcurrency())
 	timeout := s.GetCheapProbeTimeout()
 	var wg sync.WaitGroup
+	var successMu sync.Mutex
+	successes := make([]*Account, 0, len(targets))
 	for _, target := range targets {
 		account := target.account
 		if account == nil || !account.TryBeginCheapProbe() {
@@ -5793,7 +5853,7 @@ func (s *Store) parallelCheapProbe(ctx context.Context) {
 		}
 		wg.Add(1)
 		sem <- struct{}{}
-		go func(account *Account, topScore float64) {
+		go func(account *Account) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			defer account.FinishCheapProbe()
@@ -5805,11 +5865,56 @@ func (s *Store) parallelCheapProbe(ctx context.Context) {
 				log.Printf("[账号 %d] 便宜账号探测失败: %v", account.DBID, err)
 				return
 			}
-			s.RecordCheapProbeSuccess(account, topScore)
-			log.Printf("[账号 %d] 便宜账号探测成功，已添加临时恢复加分", account.DBID)
-		}(account, top.dispatchScore)
+			successMu.Lock()
+			successes = append(successes, account)
+			successMu.Unlock()
+		}(account)
 	}
 	wg.Wait()
+
+	sort.SliceStable(successes, func(i, j int) bool {
+		left, leftOK := successes[i].GetPriceMultiplier()
+		right, rightOK := successes[j].GetPriceMultiplier()
+		if leftOK != rightOK {
+			return leftOK
+		}
+		if left != right {
+			return left < right
+		}
+		return successes[i].DBID < successes[j].DBID
+	})
+
+	if batchVersion != s.cheapProbeTopologyVersion.Load() {
+		for _, account := range successes {
+			if s.RecordCheapProbeSuccess(account) {
+				log.Printf("[账号 %d] 便宜账号探测成功，但账号池结构已变化，本轮仅清理状态", account.DBID)
+			}
+		}
+		return
+	}
+
+	batchTop := top
+	for _, account := range successes {
+		s.RecordCheapProbeSuccess(account)
+		candidateMultiplier, ok := account.GetPriceMultiplier()
+		if !ok || candidateMultiplier >= batchTop.priceMultiplier {
+			log.Printf("[账号 %d] 便宜账号探测成功，当前批次未满足加分条件，仅清理状态", account.DBID)
+			continue
+		}
+		if s.applyCheapProbeRecoveryBonus(account, batchTop, now, batchVersion) {
+			log.Printf("[账号 %d] 便宜账号探测成功，已添加临时恢复加分", account.DBID)
+		} else {
+			log.Printf("[账号 %d] 便宜账号探测成功，当前批次未满足加分条件，仅清理状态", account.DBID)
+		}
+		if dispatchScore := account.GetDispatchScore(); dispatchScore > batchTop.dispatchScore {
+			batchTop = cheapProbeTopAccount{
+				dbID:            account.DBID,
+				dispatchScore:   dispatchScore,
+				priceMultiplier: candidateMultiplier,
+				found:           true,
+			}
+		}
+	}
 }
 
 // parallelProbeUsageWith 以指定 maxAge 阈值执行一次批量用量探针。
