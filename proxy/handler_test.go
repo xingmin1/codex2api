@@ -918,6 +918,56 @@ func TestCloudflareOriginResponseTimeoutDetection(t *testing.T) {
 	}
 }
 
+func TestResponsesCompactAllowsLongCompactAccountForRegularCompact(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	hits := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id":"resp_long_compact_regular",
+			"object":"response",
+			"created_at":1710000000,
+			"model":"gpt-4.1-direct",
+			"output":[],
+			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+		}`))
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-long",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+		Tags:         []string{longCompactAccountTag},
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	recorder := performResponsesCompactRequest(t, handler, []byte(`{"model":"gpt-4.1-direct","input":"hello"}`), "compact-session")
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if hits != 1 {
+		t.Fatalf("hits = %d, want 1", hits)
+	}
+	if id := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); id != "resp_long_compact_regular" {
+		t.Fatalf("response id = %q, want resp_long_compact_regular; body=%s", id, recorder.Body.String())
+	}
+	if handler.shouldPreferLongCompactFallback(longCompactFallbackPreferenceKey(0, "compact-session")) {
+		t.Fatal("regular compact success should not mark long compact fallback preference")
+	}
+}
+
 func TestResponsesCompactFallsBackToLongCompactAccountAfterCloudflare524(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -949,13 +999,15 @@ func TestResponsesCompactFallsBackToLongCompactAccountAfterCloudflare524(t *test
 		MaxRetries:          0,
 		MaxRateLimitRetries: 0,
 	})
+	normalScoreBias := int64(100)
 	store.AddAccount(&auth.Account{
-		DBID:         1,
-		UpstreamType: auth.UpstreamOpenAIResponses,
-		BaseURL:      normalUpstream.URL,
-		APIKey:       "sk-normal",
-		Models:       []string{"gpt-4.1-direct"},
-		PlanType:     "api",
+		DBID:              1,
+		UpstreamType:      auth.UpstreamOpenAIResponses,
+		BaseURL:           normalUpstream.URL,
+		APIKey:            "sk-normal",
+		Models:            []string{"gpt-4.1-direct"},
+		PlanType:          "api",
+		ScoreBiasOverride: &normalScoreBias,
 	})
 	store.AddAccount(&auth.Account{
 		DBID:         2,

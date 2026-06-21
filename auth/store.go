@@ -5596,8 +5596,7 @@ func cheapProbeSelectable(acc *Account) bool {
 		return false
 	}
 	if atomic.LoadInt32(&acc.Disabled) != 0 ||
-		atomic.LoadInt32(&acc.DispatchPaused) != 0 ||
-		atomic.LoadInt32(&acc.Locked) != 0 {
+		atomic.LoadInt32(&acc.DispatchPaused) != 0 {
 		return false
 	}
 	return true

@@ -841,12 +841,12 @@ func TestCheapProbeCandidatesUseMultiplierRanking(t *testing.T) {
 func TestCheapProbeCandidatesRespectDispatchSelectionState(t *testing.T) {
 	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	pausedHighScore := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.2}
-	lockedHighScore := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.16}
+	lockedHighScore := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.04}
 	top := &Account{DBID: 3, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.05}
 	expensive := &Account{DBID: 4, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.1}
 	cheap := &Account{DBID: 5, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.03}
 	pausedHighScore.ScoreBiasOverride = int64Ptr(300)
-	lockedHighScore.ScoreBiasOverride = int64Ptr(280)
+	lockedHighScore.ScoreBiasOverride = int64Ptr(80)
 	top.ScoreBiasOverride = int64Ptr(100)
 	atomic.StoreInt32(&pausedHighScore.DispatchPaused, 1)
 	atomic.StoreInt32(&lockedHighScore.Locked, 1)
@@ -861,11 +861,14 @@ func TestCheapProbeCandidatesRespectDispatchSelectionState(t *testing.T) {
 	if !probeTop.found || probeTop.dbID != top.DBID || probeTop.priceMultiplier != top.PriceMultiplier {
 		t.Fatalf("top = %+v, want dbID %d multiplier %v", probeTop, top.DBID, top.PriceMultiplier)
 	}
-	if len(targets) != 1 {
-		t.Fatalf("targets = %d, want only lower-multiplier selectable account", len(targets))
+	if len(targets) != 2 {
+		t.Fatalf("targets = %d, want locked and lower-multiplier selectable accounts", len(targets))
 	}
-	if targets[0].account.DBID != cheap.DBID {
-		t.Fatalf("target dbID = %d, want cheap account %d", targets[0].account.DBID, cheap.DBID)
+	if targets[0].account.DBID != lockedHighScore.DBID {
+		t.Fatalf("first target dbID = %d, want locked account %d", targets[0].account.DBID, lockedHighScore.DBID)
+	}
+	if targets[1].account.DBID != cheap.DBID {
+		t.Fatalf("second target dbID = %d, want cheap account %d", targets[1].account.DBID, cheap.DBID)
 	}
 }
 

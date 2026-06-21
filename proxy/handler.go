@@ -292,15 +292,6 @@ func longCompactAccountFilter(base auth.AccountFilter) auth.AccountFilter {
 	}
 }
 
-func regularCompactAccountFilter(base auth.AccountFilter) auth.AccountFilter {
-	return func(account *auth.Account) bool {
-		if base != nil && !base(account) {
-			return false
-		}
-		return !accountHasTag(account, longCompactAccountTag)
-	}
-}
-
 func longCompactFallbackPreferenceKey(apiKeyID int64, sessionID string) string {
 	if apiKeyID > 0 {
 		return fmt.Sprintf("api-key:%d", apiKeyID)
@@ -2853,7 +2844,6 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
-	regularCompactFilter := regularCompactAccountFilter(accountFilter)
 	longCompactFilter := longCompactAccountFilter(accountFilter)
 	longCompactPreferenceKey := longCompactFallbackPreferenceKey(apiKeyID, sessionID)
 	preferLongCompactAccounts := h.shouldPreferLongCompactFallback(longCompactPreferenceKey)
@@ -2874,7 +2864,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	persistentEncryptedContentStripped := false
 
 	for attempt := 0; ; attempt++ {
-		activeAccountFilter := regularCompactFilter
+		activeAccountFilter := accountFilter
 		if preferLongCompactAccounts {
 			activeAccountFilter = longCompactFilter
 		}
