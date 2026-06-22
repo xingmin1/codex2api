@@ -972,16 +972,22 @@ func TestResponsesCompactFallsBackToLongCompactAccountAfterCloudflare524(t *test
 	gin.SetMode(gin.TestMode)
 
 	normalHits := 0
+	var normalBodies [][]byte
 	normalUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		normalHits++
+		body, _ := io.ReadAll(r.Body)
+		normalBodies = append(normalBodies, body)
 		w.WriteHeader(cloudflareOriginResponseTimeoutStatus)
 		_, _ = w.Write([]byte(`{"error_name":"origin_response_timeout","error_code":524,"retry_after":120}`))
 	}))
 	defer normalUpstream.Close()
 
 	longHits := 0
+	var longBodies [][]byte
 	longUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		longHits++
+		body, _ := io.ReadAll(r.Body)
+		longBodies = append(longBodies, body)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id":"resp_long_compact",
@@ -1019,7 +1025,14 @@ func TestResponsesCompactFallsBackToLongCompactAccountAfterCloudflare524(t *test
 		Tags:         []string{longCompactAccountTag},
 	})
 	handler := NewHandler(store, nil, nil, nil)
-	body := []byte(`{"model":"gpt-4.1-direct","input":"hello"}`)
+	body := []byte(`{
+		"model":"gpt-4.1-direct",
+		"input":[
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
+			{"type":"function_call_output","call_id":"call_123","output":"done"}
+		]
+	}`)
 
 	first := performResponsesCompactRequest(t, handler, body, "compact-session")
 	if first.Code != http.StatusOK {
@@ -1030,6 +1043,15 @@ func TestResponsesCompactFallsBackToLongCompactAccountAfterCloudflare524(t *test
 	}
 	if normalHits != 1 || longHits != 1 {
 		t.Fatalf("hits after first request = normal %d long %d, want 1/1", normalHits, longHits)
+	}
+	if len(normalBodies) != 1 || !bytes.Contains(normalBodies[0], []byte("encrypted_content")) {
+		t.Fatalf("normal compact request should preserve encrypted_content before 524 fallback: %q", normalBodies)
+	}
+	if len(longBodies) != 1 {
+		t.Fatalf("long compact hits = %d, want 1", len(longBodies))
+	}
+	if bytes.Contains(longBodies[0], []byte("encrypted_content")) {
+		t.Fatalf("long compact fallback body should strip encrypted_content: %s", longBodies[0])
 	}
 	if !handler.shouldPreferLongCompactFallback(longCompactFallbackPreferenceKey(0, "compact-session")) {
 		t.Fatal("expected compact session to remember long compact preference after 524")

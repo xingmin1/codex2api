@@ -1865,8 +1865,38 @@ func (h *Handler) Responses(c *gin.Context) {
 	retryExclusions := newRetryAccountExclusions()
 	transientRetry := transientUpstreamRetryState{}
 	forceHTTPAfterWSMessageTooBig := false
-	invalidEncryptedContentRetried := false
+	encryptedContentStrippedRetried := false
+	encryptedContentFailureCount := 0
 	persistentEncryptedContentStripped := false
+	shouldStripEncryptedContentForFailure := func(explicitInvalidEncryptedContent bool) bool {
+		if encryptedContentStrippedRetried {
+			return false
+		}
+		if explicitInvalidEncryptedContent {
+			return true
+		}
+		_, _, changed := stripPersistentEncryptedContentRetryBodies(rawBody, codexBody)
+		if !changed {
+			return false
+		}
+		encryptedContentFailureCount++
+		// 一次失败可能只是中转瞬时波动。第二次仍失败时再丢弃 encrypted_content，
+		// 在保留上下文质量和避免同一个坏加密状态拖垮多账号重试之间取折中。
+		return encryptedContentFailureCount >= 2
+	}
+	stripEncryptedContentForRetry := func(message string, args ...any) bool {
+		strippedRawBody, strippedCodexBody, changed := stripPersistentEncryptedContentRetryBodies(rawBody, codexBody)
+		if !changed {
+			return false
+		}
+		encryptedContentStrippedRetried = true
+		rawBody = strippedRawBody
+		codexBody = strippedCodexBody
+		resetOpenAIResponsesBody()
+		expandedInputRaw = responsesInputRaw(codexBody)
+		log.Printf(message, args...)
+		return true
+	}
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -1890,7 +1920,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					if changed {
 						round := transientRetry.rounds + 1
 						persistentEncryptedContentStripped = true
-						invalidEncryptedContentRetried = true
+						encryptedContentStrippedRetried = true
 						rawBody = strippedRawBody
 						codexBody = strippedCodexBody
 						openAIResponsesBody = PrepareOpenAIResponsesBody(rawBody)
@@ -1986,6 +2016,13 @@ func (h *Handler) Responses(c *gin.Context) {
 					shouldRetry = true
 					log.Printf("OpenAI Responses 上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr)
 				}
+				// encrypted_content 可能只是不被当前 relay 背后的真实上游身份接受。
+				// 先保留当前 session affinity，去掉加密上下文重试一次；若仍失败，再按普通失败流程
+				// 记分、解绑并换号，避免把一次可恢复的加密上下文不兼容直接放大成账号池轮流失败。
+				if retryable && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游请求连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr) {
+					h.store.Release(account)
+					continue
+				}
 				if kind != "" && !(timedOut && shouldRetry) {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
@@ -2033,22 +2070,14 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 
-				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-					strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
-					if rawChanged || codexChanged {
-						invalidEncryptedContentRetried = true
-						if rawChanged {
-							rawBody = strippedRawBody
-							resetOpenAIResponsesBody()
-						}
-						if codexChanged {
-							codexBody = strippedCodexBody
-							expandedInputRaw = responsesInputRaw(codexBody)
-						}
-						log.Printf("OpenAI Responses 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+				explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
+				if shouldStripEncryptedContentForFailure(explicitInvalidEncryptedContent) {
+					message := "OpenAI Responses 上游返回错误且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
+					if explicitInvalidEncryptedContent {
+						message = "OpenAI Responses 上游拒绝 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
+					}
+					if stripEncryptedContentForRetry(message, attempt+1, resp.StatusCode, account.ID()) {
 						h.store.Release(account)
-						h.store.UnbindSessionAffinity(affinityKey, account.ID())
 						continue
 					}
 				}
@@ -2223,6 +2252,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 			}
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+				if shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
+					resp.Body.Close()
+					h.store.Release(account)
+					continue
+				}
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
 				if isFirstTokenTimeoutOutcome(outcome) {
@@ -2354,6 +2388,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				shouldRetry = true
 				log.Printf("上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr)
 			}
+			// encrypted_content 不是普通可跨真实上游身份复用的状态。Codex/OAuth 路径同样
+			// 先用当前账号去掉加密上下文重试一次；只有重试后仍失败才进入普通换号流程。
+			if retryable && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("上游请求连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr) {
+				h.store.Release(account)
+				continue
+			}
 			if kind != "" && !(timedOut && shouldRetry) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -2399,22 +2439,14 @@ func (h *Handler) Responses(c *gin.Context) {
 				return
 			}
 
-			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
-				if rawChanged || codexChanged {
-					invalidEncryptedContentRetried = true
-					if rawChanged {
-						rawBody = strippedRawBody
-						resetOpenAIResponsesBody()
-					}
-					if codexChanged {
-						codexBody = strippedCodexBody
-						expandedInputRaw = responsesInputRaw(codexBody)
-					}
-					log.Printf("上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
+			explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
+			if shouldStripEncryptedContentForFailure(explicitInvalidEncryptedContent) {
+				message := "上游返回错误且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d, /v1/responses)"
+				if explicitInvalidEncryptedContent {
+					message = "上游拒绝 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d, /v1/responses)"
+				}
+				if stripEncryptedContentForRetry(message, attempt+1, resp.StatusCode, account.ID()) {
 					h.store.Release(account)
-					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					continue
 				}
 			}
@@ -2658,6 +2690,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			continue
 		}
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+			if shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
+				resp.Body.Close()
+				h.store.Release(account)
+				continue
+			}
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
@@ -2860,8 +2897,37 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
 	transientRetry := transientUpstreamRetryState{}
-	invalidEncryptedContentRetried := false
+	encryptedContentStrippedRetried := false
+	encryptedContentFailureCount := 0
 	persistentEncryptedContentStripped := false
+	shouldStripCompactEncryptedContentForFailure := func(explicitInvalidEncryptedContent bool) bool {
+		if encryptedContentStrippedRetried {
+			return false
+		}
+		if explicitInvalidEncryptedContent {
+			return true
+		}
+		_, _, changed := stripPersistentEncryptedContentRetryBodies(rawBody, codexBody)
+		if !changed {
+			return false
+		}
+		encryptedContentFailureCount++
+		// 普通 compact 失败也先容忍一次，避免偶发中转抖动就丢加密上下文。
+		// 真正切 long-compact 池时会在 fallback 分支单独无条件剥离。
+		return encryptedContentFailureCount >= 2
+	}
+	stripCompactEncryptedContentForRetry := func(message string, args ...any) bool {
+		strippedRawBody, strippedCodexBody, changed := stripPersistentEncryptedContentRetryBodies(rawBody, codexBody)
+		if !changed {
+			return false
+		}
+		encryptedContentStrippedRetried = true
+		rawBody = strippedRawBody
+		codexBody = strippedCodexBody
+		openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+		log.Printf(message, args...)
+		return true
+	}
 
 	for attempt := 0; ; attempt++ {
 		activeAccountFilter := accountFilter
@@ -2894,7 +2960,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 						if changed {
 							round := transientRetry.rounds + 1
 							persistentEncryptedContentStripped = true
-							invalidEncryptedContentRetried = true
+							encryptedContentStrippedRetried = true
 							rawBody = strippedRawBody
 							codexBody = strippedCodexBody
 							openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
@@ -2960,6 +3026,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					shouldRetry = true
 					log.Printf("OpenAI Responses compact 上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr)
 				}
+				if retryable && shouldStripCompactEncryptedContentForFailure(false) && stripCompactEncryptedContentForRetry("OpenAI Responses compact 上游请求连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr) {
+					h.store.Release(account)
+					continue
+				}
 				if kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
@@ -2989,22 +3059,18 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 
-				if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-					strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-					strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
-					if rawChanged || codexChanged {
-						invalidEncryptedContentRetried = true
-						if rawChanged {
-							rawBody = strippedRawBody
-							openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+				fallbackToLongCompact := shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
+				if !fallbackToLongCompact {
+					explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
+					if shouldStripCompactEncryptedContentForFailure(explicitInvalidEncryptedContent) {
+						message := "OpenAI Responses compact 上游返回错误且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
+						if explicitInvalidEncryptedContent {
+							message = "OpenAI Responses compact 上游拒绝 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
 						}
-						if codexChanged {
-							codexBody = strippedCodexBody
+						if stripCompactEncryptedContentForRetry(message, attempt+1, resp.StatusCode, account.ID()) {
+							h.store.Release(account)
+							continue
 						}
-						log.Printf("OpenAI Responses compact 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
-						h.store.Release(account)
-						h.store.UnbindSessionAffinity(affinityKey, account.ID())
-						continue
 					}
 				}
 
@@ -3024,7 +3090,6 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					shouldRetry = true
 					log.Printf("OpenAI Responses compact 上游 %d 已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d)", resp.StatusCode, attempt+1, account.ID())
 				}
-				fallbackToLongCompact := shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -3047,6 +3112,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				})
 
 				if fallbackToLongCompact {
+					// long-compact fallback 是切换长耗时承载路径，不是普通失败重试。
+					// encrypted_content 不能可靠跨真实上游身份复用，因此进入长压缩池前必须剥离。
+					stripCompactEncryptedContentForRetry("compact 上游返回 Cloudflare 524，切换长压缩账号池前已移除 encrypted_content (attempt %d, account %d)", attempt+1, account.ID())
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
 					h.rememberLongCompactFallback(longCompactPreferenceKey)
@@ -3078,12 +3146,16 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if kind == "" {
 					kind = "transport"
 				}
+				shouldRetry := shouldRetryRequestError(readErr, &generalRetries, maxRetries)
+				if shouldRetry && shouldStripCompactEncryptedContentForFailure(false) && stripCompactEncryptedContentForRetry("OpenAI Responses compact 上游响应读取连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d): %v", attempt+1, account.ID(), readErr) {
+					h.store.Release(account)
+					continue
+				}
 				h.store.ReportRequestFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				excludeAccounts[account.ID()] = true
 
-				shouldRetry := shouldRetryRequestError(readErr, &generalRetries, maxRetries)
 				usageTiers := resolveUsageServiceTiers("", serviceTier)
 				h.logUsageForRequest(c, &database.UsageLogInput{
 					AccountID:            account.ID(),
@@ -3188,6 +3260,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				shouldRetry = true
 				log.Printf("compact 上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr)
 			}
+			if retryable && shouldStripCompactEncryptedContentForFailure(false) && stripCompactEncryptedContentForRetry("compact 上游请求连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr) {
+				h.store.Release(account)
+				continue
+			}
 			if kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -3217,22 +3293,18 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
-			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
-				if rawChanged || codexChanged {
-					invalidEncryptedContentRetried = true
-					if rawChanged {
-						rawBody = strippedRawBody
-						openAIResponsesBody = PrepareOpenAIResponsesCompactBody(rawBody)
+			fallbackToLongCompact := shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
+			if !fallbackToLongCompact {
+				explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
+				if shouldStripCompactEncryptedContentForFailure(explicitInvalidEncryptedContent) {
+					message := "compact 上游返回错误且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
+					if explicitInvalidEncryptedContent {
+						message = "compact 上游拒绝 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
 					}
-					if codexChanged {
-						codexBody = strippedCodexBody
+					if stripCompactEncryptedContentForRetry(message, attempt+1, resp.StatusCode, account.ID()) {
+						h.store.Release(account)
+						continue
 					}
-					log.Printf("compact 上游拒绝 encrypted_content，已移除加密 reasoning 上下文并重试一次 (attempt %d)", attempt+1)
-					h.store.Release(account)
-					h.store.UnbindSessionAffinity(affinityKey, account.ID())
-					continue
 				}
 			}
 
@@ -3253,7 +3325,6 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				shouldRetry = true
 				log.Printf("compact 上游 %d 已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d)", resp.StatusCode, attempt+1, account.ID())
 			}
-			fallbackToLongCompact := shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -3276,6 +3347,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			})
 
 			if fallbackToLongCompact {
+				// long-compact fallback 是切换长耗时承载路径，不是普通失败重试。
+				// encrypted_content 不能可靠跨真实上游身份复用，因此进入长压缩池前必须剥离。
+				stripCompactEncryptedContentForRetry("compact 上游返回 Cloudflare 524，切换长压缩账号池前已移除 encrypted_content (attempt %d, account %d)", attempt+1, account.ID())
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				h.rememberLongCompactFallback(longCompactPreferenceKey)
@@ -3308,13 +3382,17 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if kind == "" {
 				kind = "transport"
 			}
+			shouldRetry := shouldRetryRequestError(readErr, &generalRetries, maxRetries)
+			if shouldRetry && shouldStripCompactEncryptedContentForFailure(false) && stripCompactEncryptedContentForRetry("compact 上游响应读取连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d): %v", attempt+1, account.ID(), readErr) {
+				h.store.Release(account)
+				continue
+			}
 			h.store.ReportRequestFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
-			shouldRetry := shouldRetryRequestError(readErr, &generalRetries, maxRetries)
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
