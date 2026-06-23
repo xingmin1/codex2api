@@ -578,7 +578,7 @@ func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropic
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		return t.handleThinkingDelta(eventData)
 
-	case "response.function_call_arguments.delta":
+	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 		return t.handleToolInputDelta(eventData)
 
 	case "response.output_text.done", "response.reasoning_summary_text.done",
@@ -645,9 +645,12 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 			},
 		})
 
-	case "function_call":
+	case "function_call", "custom_tool_call":
 		events = append(events, t.closeCurrentBlock()...)
 		callID := fromCodexCallID(gjson.GetBytes(data, "item.call_id").String())
+		if callID == "" {
+			callID = fromCodexCallID(gjson.GetBytes(data, "item.id").String())
+		}
 		name := gjson.GetBytes(data, "item.name").String()
 		idx := t.contentBlockIndex
 		t.contentBlockIndex++
@@ -1077,11 +1080,17 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 				return true
 			})
 
-		case "function_call":
-			// function_call → tool_use block
+		case "function_call", "custom_tool_call":
+			// function_call/custom_tool_call → tool_use block
 			callID := fromCodexCallID(item.Get("call_id").String())
+			if callID == "" {
+				callID = fromCodexCallID(item.Get("id").String())
+			}
 			name := item.Get("name").String()
 			args := item.Get("arguments").String()
+			if itemType == "custom_tool_call" {
+				args = item.Get("input").String()
+			}
 			if cleaned := sanitizeToolInputJSON(name, args); cleaned != "" {
 				args = cleaned
 			} else {

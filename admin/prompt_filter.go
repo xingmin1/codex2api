@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,16 @@ type promptFilterTestRequest struct {
 
 type promptFilterTestResponse struct {
 	Verdict promptfilter.Verdict `json:"verdict"`
+}
+
+type promptFilterRulePatternTestRequest struct {
+	Pattern string `json:"pattern"`
+	Text    string `json:"text"`
+}
+
+type promptFilterRulePatternTestResponse struct {
+	Matched bool   `json:"matched"`
+	Error   string `json:"error,omitempty"`
 }
 
 type promptFilterRuleItem struct {
@@ -65,7 +76,7 @@ func (h *Handler) inspectImagePromptFilter(c *gin.Context, text string, model st
 	if verdict.Action != promptfilter.ActionBlock {
 		return false
 	}
-	textPreview := verdict.TextPreview
+	textPreview := promptfilter.RedactedPreview(verdict.TextPreview, 500)
 	if redactPreview {
 		textPreview = "[redacted]"
 	}
@@ -203,6 +214,37 @@ func (h *Handler) TestPromptFilter(c *gin.Context) {
 		verdict = reviewPromptFilterVerdict(c.Request.Context(), req.Text, verdict, cfg)
 	}
 	c.JSON(http.StatusOK, promptFilterTestResponse{Verdict: verdict})
+}
+
+func (h *Handler) TestPromptFilterRulePattern(c *gin.Context) {
+	var req promptFilterRulePatternTestRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求体无效")
+		return
+	}
+	trimmedPattern := strings.TrimSpace(req.Pattern)
+	if trimmedPattern == "" {
+		writeError(c, http.StatusBadRequest, "pattern 不能为空")
+		return
+	}
+	if req.Text == "" {
+		writeError(c, http.StatusBadRequest, "text 不能为空")
+		return
+	}
+	if len([]rune(req.Pattern)) > 5000 {
+		writeError(c, http.StatusBadRequest, "pattern 不能超过 5000 个字符")
+		return
+	}
+	if len([]rune(req.Text)) > 20000 {
+		writeError(c, http.StatusBadRequest, "text 不能超过 20000 个字符")
+		return
+	}
+	re, err := regexp.Compile(req.Pattern)
+	if err != nil {
+		c.JSON(http.StatusOK, promptFilterRulePatternTestResponse{Matched: false, Error: err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, promptFilterRulePatternTestResponse{Matched: re.MatchString(req.Text)})
 }
 
 func (h *Handler) GetPromptFilterRules(c *gin.Context) {

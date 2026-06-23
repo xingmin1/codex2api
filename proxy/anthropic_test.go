@@ -570,6 +570,42 @@ func TestAnthropicStreamTranslator_ToolInputBufferedAndCleaned(t *testing.T) {
 	}
 }
 
+func TestAnthropicStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
+	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
+	tr.translateEvent([]byte(`{"type":"response.created"}`))
+	tr.translateEvent([]byte(`{
+		"type":"response.output_item.added",
+		"item":{"type":"custom_tool_call","id":"call_custom","name":"CustomTool"}
+	}`))
+
+	streamed := tr.translateEvent([]byte(`{
+		"type":"response.custom_tool_call_input.delta",
+		"delta":"{\"query\":\"hello\"}"
+	}`))
+	for _, evt := range streamed {
+		if evt.Type == "content_block_delta" {
+			t.Fatalf("expected no content_block_delta during streaming, got %+v", evt)
+		}
+	}
+
+	closing := tr.translateEvent([]byte(`{"type":"response.output_item.done"}`))
+	var sawDelta bool
+	for _, evt := range closing {
+		if evt.Type == "content_block_delta" {
+			sawDelta = true
+			if evt.Delta == nil || evt.Delta.Type != "input_json_delta" {
+				t.Fatalf("expected input_json_delta, got %+v", evt.Delta)
+			}
+			if !jsonEqual(t, evt.Delta.PartialJSON, `{"query":"hello"}`) {
+				t.Fatalf("custom tool input = %q", evt.Delta.PartialJSON)
+			}
+		}
+	}
+	if !sawDelta {
+		t.Fatalf("expected custom tool input_json_delta on close")
+	}
+}
+
 func TestAnthropicResponseAccumulatorUsesStreamDeltasWhenCompletedOutputIsEmpty(t *testing.T) {
 	tr := newAnthropicStreamTranslator("claude-sonnet-4-5")
 	acc := newAnthropicResponseAccumulator("claude-sonnet-4-5")

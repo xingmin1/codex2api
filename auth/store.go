@@ -98,6 +98,8 @@ type Account struct {
 	CheapProbeBonusDuration     time.Duration
 	effectiveAutoPause5h        float64 // resolved: account > group > global
 	effectiveAutoPause7d        float64
+	autoPause5hGuardBandPercent float64 // percentage points, 0 = disabled
+	autoPause5hGuardConcurrency int     // 0 = disabled; otherwise guard-band concurrency cap
 
 	// 调度健康信号
 	HealthTier               AccountHealthTier
@@ -1008,14 +1010,14 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 		breakdown.UsageUrgencyBonus7d = a.premium7dUsageUrgencyBonusLocked(now)
 		breakdown.ExpiryUrgencyBonus = a.expiryUrgencyBonusLocked(now)
 	}
-	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d + breakdown.ExpiryUrgencyBonus + breakdown.CheapProbeBonus
+	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d + breakdown.ExpiryUrgencyBonus + breakdown.CheapProbeBonus - a.quotaAutoPause5hGuardDispatchPenaltyLocked(now)
 
 	a.HealthTier = tier
 	a.SchedulerScore = score
 	a.DispatchScore = dispatchScore
 	a.ScoreBiasEffective = scoreBiasEffective
 	a.BaseConcurrencyEffective = baseConcurrencyEffective
-	a.DynamicConcurrencyLimit = concurrencyLimitForTier(baseConcurrencyEffective, tier)
+	a.DynamicConcurrencyLimit = a.quotaAutoPause5hGuardConcurrencyLimitLocked(concurrencyLimitForTier(baseConcurrencyEffective, tier), now)
 	if a.premium5hRateLimitedLocked(now) && a.DynamicConcurrencyLimit > 1 {
 		a.DynamicConcurrencyLimit = 1
 	}
@@ -1079,6 +1081,32 @@ func normalizeQuotaAutoPauseThreshold(value float64) float64 {
 	}
 }
 
+const (
+	defaultAutoPause5hGuardBandPercent = 5.0
+	defaultAutoPause5hGuardConcurrency = 1
+	maxAutoPause5hGuardDispatchPenalty = 50.0
+)
+
+func normalizeAutoPause5hGuardBandPercent(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
+}
+
+func normalizeAutoPause5hGuardConcurrency(value int) int {
+	if value < 0 {
+		return 0
+	}
+	if value > 1000 {
+		return 1000
+	}
+	return value
+}
+
 func quotaAutoPausedByWindow(usage float64, valid bool, resetAt time.Time, threshold float64, disabled bool, now time.Time) bool {
 	if disabled || threshold <= 0 || !valid {
 		return false
@@ -1087,6 +1115,40 @@ func quotaAutoPausedByWindow(usage float64, valid bool, resetAt time.Time, thres
 		return false
 	}
 	return usage/100 >= threshold
+}
+
+func (a *Account) quotaAutoPause5hGuardConcurrencyLimitLocked(limit int64, now time.Time) int64 {
+	if limit <= 1 || a.AutoPause5hDisabled || a.effectiveAutoPause5h <= 0 || !a.UsagePercent5hValid || a.autoPause5hGuardBandPercent <= 0 || a.autoPause5hGuardConcurrency <= 0 {
+		return limit
+	}
+	if !a.Reset5hAt.IsZero() && !now.Before(a.Reset5hAt) {
+		return limit
+	}
+
+	remainingPercent := a.effectiveAutoPause5h*100 - a.UsagePercent5h
+	if remainingPercent <= 0 {
+		return 0
+	}
+	if remainingPercent <= a.autoPause5hGuardBandPercent && limit > int64(a.autoPause5hGuardConcurrency) {
+		return int64(a.autoPause5hGuardConcurrency)
+	}
+	return limit
+}
+
+func (a *Account) quotaAutoPause5hGuardDispatchPenaltyLocked(now time.Time) float64 {
+	if a.AutoPause5hDisabled || a.effectiveAutoPause5h <= 0 || !a.UsagePercent5hValid || a.autoPause5hGuardBandPercent <= 0 || a.autoPause5hGuardConcurrency <= 0 {
+		return 0
+	}
+	if !a.Reset5hAt.IsZero() && !now.Before(a.Reset5hAt) {
+		return 0
+	}
+
+	remainingPercent := a.effectiveAutoPause5h*100 - a.UsagePercent5h
+	if remainingPercent <= 0 || remainingPercent > a.autoPause5hGuardBandPercent {
+		return 0
+	}
+	progress := (a.autoPause5hGuardBandPercent - remainingPercent) / a.autoPause5hGuardBandPercent
+	return progress * maxAutoPause5hGuardDispatchPenalty
 }
 
 func (a *Account) quotaAutoPausedLocked(now time.Time) bool {
@@ -1099,6 +1161,13 @@ func (a *Account) quotaAutoPausedLocked(now time.Time) bool {
 func (a *Account) recomputeEffectiveAutoPause(s *Store) {
 	a.effectiveAutoPause5h = resolveEffectiveThreshold(a.AutoPause5hThreshold, a.GroupIDs, s, true)
 	a.effectiveAutoPause7d = resolveEffectiveThreshold(a.AutoPause7dThreshold, a.GroupIDs, s, false)
+	if s != nil {
+		a.autoPause5hGuardBandPercent = s.GetAutoPause5hGuardBandPercent()
+		a.autoPause5hGuardConcurrency = s.GetAutoPause5hGuardConcurrency()
+	} else {
+		a.autoPause5hGuardBandPercent = defaultAutoPause5hGuardBandPercent
+		a.autoPause5hGuardConcurrency = defaultAutoPause5hGuardConcurrency
+	}
 }
 
 func resolveEffectiveThreshold(accountThreshold float64, groupIDs []int64, s *Store, is5h bool) float64 {
@@ -1987,9 +2056,11 @@ type Store struct {
 	sessionMu             sync.RWMutex
 	sessionBindings       map[string]sessionAffinity
 
-	globalAutoPause5hThreshold float64  // protected by mu
-	globalAutoPause7dThreshold float64  // protected by mu
-	groupAutoPauseThresholds   sync.Map // int64 -> [2]float64 {5h, 7d}
+	globalAutoPause5hThreshold  float64  // protected by mu
+	globalAutoPause7dThreshold  float64  // protected by mu
+	autoPause5hGuardBandPercent float64  // protected by mu, percentage points
+	autoPause5hGuardConcurrency int      // protected by mu, 0 = disabled
+	groupAutoPauseThresholds    sync.Map // int64 -> [2]float64 {5h, 7d}
 }
 
 // sessionAffinity 记录某个 sessionKey 当前粘附到哪个账号/代理。
@@ -2376,6 +2447,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			CodexWSHideUpstreamErrors:          true,
 			CodexWSSilentRetryEnabled:          true,
 			CodexWSSilentMaxRetries:            2,
+			AutoPause5hGuardBandPercent:        defaultAutoPause5hGuardBandPercent,
+			AutoPause5hGuardConcurrency:        defaultAutoPause5hGuardConcurrency,
 		}
 	}
 	s := &Store{
@@ -2472,6 +2545,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
 	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause7dThreshold)
+	s.autoPause5hGuardBandPercent = normalizeAutoPause5hGuardBandPercent(settings.AutoPause5hGuardBandPercent)
+	s.autoPause5hGuardConcurrency = normalizeAutoPause5hGuardConcurrency(settings.AutoPause5hGuardConcurrency)
 
 	// 加载代理池
 	if settings.ProxyPoolEnabled {
@@ -4374,6 +4449,34 @@ func (s *Store) GetGlobalAutoPause7dThreshold() float64 {
 	return v
 }
 
+func (s *Store) SetAutoPause5hGuardBandPercent(value float64) {
+	s.mu.Lock()
+	s.autoPause5hGuardBandPercent = normalizeAutoPause5hGuardBandPercent(value)
+	s.mu.Unlock()
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) GetAutoPause5hGuardBandPercent() float64 {
+	s.mu.RLock()
+	v := s.autoPause5hGuardBandPercent
+	s.mu.RUnlock()
+	return v
+}
+
+func (s *Store) SetAutoPause5hGuardConcurrency(value int) {
+	s.mu.Lock()
+	s.autoPause5hGuardConcurrency = normalizeAutoPause5hGuardConcurrency(value)
+	s.mu.Unlock()
+	s.recomputeAllEffectiveAutoPause()
+}
+
+func (s *Store) GetAutoPause5hGuardConcurrency() int {
+	s.mu.RLock()
+	v := s.autoPause5hGuardConcurrency
+	s.mu.RUnlock()
+	return v
+}
+
 func (s *Store) SetGroupAutoPauseThresholds(groupID int64, t5h, t7d float64) {
 	s.groupAutoPauseThresholds.Store(groupID, [2]float64{
 		normalizeQuotaAutoPauseThreshold(t5h),
@@ -5270,6 +5373,49 @@ func (s *Store) PersistUsageSnapshot(acc *Account, pct7d float64) {
 	}
 }
 
+// UpdateAccountSubscriptionExpiresAt persists the latest subscription expiration observed from upstream.
+func (s *Store) UpdateAccountSubscriptionExpiresAt(acc *Account, expiresAt time.Time) bool {
+	if s == nil || acc == nil || expiresAt.IsZero() {
+		return false
+	}
+
+	acc.mu.Lock()
+	changed := acc.SubscriptionExpiresAt.IsZero() || !acc.SubscriptionExpiresAt.Equal(expiresAt)
+	if changed {
+		acc.SubscriptionExpiresAt = expiresAt
+		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	}
+	acc.mu.Unlock()
+	if changed {
+		s.fastSchedulerUpdate(acc)
+	}
+
+	if s.db == nil {
+		return changed
+	}
+
+	formatted := expiresAt.Format(time.RFC3339)
+	if !changed {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		row, err := s.db.GetAccountByID(ctx, acc.DBID)
+		if err != nil {
+			log.Printf("[账号 %d] 读取 subscription_expires_at 失败: %v", acc.DBID, err)
+			return changed
+		}
+		if row.GetCredential("subscription_expires_at") == formatted {
+			return changed
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"subscription_expires_at": formatted}); err != nil {
+		log.Printf("[账号 %d] 持久化 subscription_expires_at 失败: %v", acc.DBID, err)
+	}
+	return changed
+}
+
 // UpdateAccountPlanType persists the latest Codex plan type observed from upstream headers.
 func (s *Store) UpdateAccountPlanType(acc *Account, planType string) bool {
 	if s == nil || acc == nil {
@@ -5299,6 +5445,44 @@ func (s *Store) UpdateAccountPlanType(acc *Account, planType string) bool {
 	defer cancel()
 	if err := s.db.UpdateCredentials(ctx, acc.DBID, map[string]interface{}{"plan_type": plan}); err != nil {
 		log.Printf("[账号 %d] 持久化 plan_type 失败: %v", acc.DBID, err)
+	}
+	return changed
+}
+
+// UpdateAccountIdentity persists account identity observed from upstream usage APIs.
+func (s *Store) UpdateAccountIdentity(acc *Account, email, accountID string) bool {
+	if s == nil || acc == nil {
+		return false
+	}
+	email = strings.TrimSpace(email)
+	accountID = strings.TrimSpace(accountID)
+	if email == "" && accountID == "" {
+		return false
+	}
+
+	fields := make(map[string]interface{}, 2)
+	acc.mu.Lock()
+	changed := false
+	if email != "" && acc.Email != email {
+		acc.Email = email
+		fields["email"] = email
+		changed = true
+	}
+	if accountID != "" && acc.AccountID != accountID {
+		acc.AccountID = accountID
+		fields["account_id"] = accountID
+		changed = true
+	}
+	acc.mu.Unlock()
+
+	if s.db == nil || len(fields) == 0 {
+		return changed
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.UpdateCredentials(ctx, acc.DBID, fields); err != nil {
+		log.Printf("[账号 %d] 持久化账号身份失败: %v", acc.DBID, err)
 	}
 	return changed
 }

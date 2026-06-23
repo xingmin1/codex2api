@@ -33,8 +33,10 @@ import type {
   OpsOverviewResponse,
   PromptFilterLog,
   PromptFilterLogsResponse,
+  PromptFilterRulePatternTestResponse,
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
+  PublicAPIKeyUsageResponse,
   RecycleBinAccountsResponse,
   RuntimeStatusResponse,
   ResetRadarResponse,
@@ -145,6 +147,24 @@ async function requestPublic<T>(path: string, options: RequestInit = {}): Promis
   return (await res.json()) as T
 }
 
+async function requestAPIKeyUsage<T>(path: string, apiKey: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers)
+  headers.set('Authorization', `Bearer ${apiKey}`)
+
+  const res = await fetch('/api/key-usage' + path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+    headers,
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  return (await res.json()) as T
+}
+
 async function requestBlob(path: string, options: RequestInit = {}): Promise<Blob> {
   const headers = new Headers(options.headers)
 
@@ -200,6 +220,13 @@ function buildOpsErrorSearchParams(params: {
 
 export const api = {
   getBranding: () => requestPublic<SiteBranding>('/api/branding'),
+  getPublicAPIKeyUsage: (apiKey: string, range = '30d', params: { page?: number; pageSize?: number } = {}) => {
+    const search = new URLSearchParams()
+    search.set('range', range)
+    if (params.page) search.set('page', String(params.page))
+    if (params.pageSize) search.set('page_size', String(params.pageSize))
+    return requestAPIKeyUsage<PublicAPIKeyUsageResponse>(`/summary?${search.toString()}`, apiKey)
+  },
   getStats: () => request<StatsResponse>('/stats'),
   getAccounts: () => request<AccountsResponse>('/accounts'),
   addAccount: (data: AddAccountRequest) =>
@@ -231,6 +258,14 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
   forceUsageProbe: () =>
     request<{ triggered: boolean; concurrency: number; reason?: string; mode?: string }>(`/accounts/usage/probe`, { method: 'POST' }),
+  refreshAccountUsage: (id: number) =>
+    request<{
+      refreshed: boolean
+      usage_percent_5h?: number
+      usage_percent_7d?: number
+      reset_5h_at?: string
+      reset_7d_at?: string
+    }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
   listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
@@ -482,6 +517,8 @@ export const api = {
   },
   testPromptFilter: (data: { text: string; endpoint?: string; model?: string }) =>
     request<PromptFilterTestResponse>('/prompt-filter/test', { method: 'POST', body: JSON.stringify(data) }),
+  testPromptFilterRulePattern: (data: { pattern: string; text: string }) =>
+    request<PromptFilterRulePatternTestResponse>('/prompt-filter/rules/test', { method: 'POST', body: JSON.stringify(data) }),
   getPromptFilterRules: () =>
     request<PromptFilterRulesResponse>('/prompt-filter/rules'),
   getModels: () => request<ModelsResponse>('/models'),

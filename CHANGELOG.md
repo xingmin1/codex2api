@@ -1,5 +1,46 @@
 # Changelog
 
+## v2.3.8-xmin.1 - 2026-06-23
+
+### Features
+
+- **合并官方 v2.3.8。** 包含官方 v2.3.6-v2.3.8 的 API key 自助用量页、单账号用量刷新、Prompt Filter 额外规则编辑、5h 保护带降速并发、Codex `codex_at` 账号身份识别等更新。
+- **复制账号。** 账号管理页新增复制账号入口，可复制凭据、代理、标签、分组、调度覆盖、价格倍率和便宜账号探测等用户配置，生成新的正常账号。
+
+### Fixes
+
+- **保留 fork 调度与 compact 语义。** 合并官方 5h guard-band 调度惩罚时，继续保留便宜账号探测恢复加分、长压缩账号附加能力、compact transient retry 和 encrypted_content 降级重试等 fork 行为。
+- **保留 fork 发布与 Nix 包装。** 官方已删除 `VERSION`/flake 包装文件，本版本继续保留 Home Manager release-tarball 部署路径所需的版本文件和 Nix 构建入口。
+
+## v2.3.8 - 2026-06-20
+
+### Fixes
+
+- **Codex 专属 `at-...` Access Token 不再按 JWT 解码，并可通过 WHAM 自动补齐账号身份。** `at-...` 现在会识别为 `codex_at` 类型，导入/添加时不会再尝试按 JWT 解析；账号列表的 AT 徽章会显示为 `codex_at`。对于已经导入但缺少邮箱或 `account_id` 的 codex_at 账号，后续单账号用量刷新或后台 wham 用量探针会把 WHAM 返回的 `email` / `account_id` / `user_id` 写回运行时和数据库，无需重新导入。
+
+## v2.3.7 - 2026-06-19
+
+### Features
+
+- **Per-account on-demand usage refresh button (accounts).** Added `POST /api/admin/accounts/:id/usage/refresh`, which synchronously runs `ProbeUsageSnapshot` (preferring the wham endpoint — zero quota cost, no test conversation) and returns the latest 5h/7d usage. The usage column now shows a refresh icon next to each progress bar (wired into the desktop table, mobile cards, and personal mode) that re-pulls that account's bars instantly, with a spinner and failure toast. Also fixes progress bars not refreshing after a test connection: accounts that just finished a test are now force-scheduled for a delayed re-pull even when they already have usage data (e.g. showing 100%), bypassing the "has data = fresh" check in `needsUsageReload`.
+- **Editable Prompt Filter extra rules.** The prompt-filter "extra rules" can now be edited from the UI (add/update/remove) instead of being config-only, with full validation feedback on the edit form.
+- **Sync WHAM subscription expiry.** The subscription expiry time is now parsed from the WHAM usage response and used to refresh `subscription_expires_at` in both the runtime and the database via the wham probe, with added time-format compatibility and persistence-consistency tests.
+
+### Fixes
+
+- **Codex invite dropdown no longer hides disabled/abnormal but credential-usable accounts (#281).** Relaxed `isCodexInviteCandidate` to match the backend: only relay / AT-only accounts are excluded, dropping the `enabled`/`locked`/`status` filters, since `SendCodexInvite` only requires an access token and does not check those fields — otherwise accounts that were merely paused from scheduling or temporarily abnormal (but still credential-usable) were hidden. The account picker also gains status dots + disabled/locked/banned/error badges on items and the selected account, a light warning when an abnormal-but-usable account is selected, and full keyboard navigation (↑↓ to move, Enter to confirm, Esc to close, highlight scrolls into view).
+- **"Normal" account card count vs. filter mismatch yielding an empty list.** The "normal accounts" card counts as `total − abnormal − rate-limited` (folding `refreshing` and similar non-abnormal/non-rate-limited states into "normal"), but clicking the "normal" filter applied an extra hard `status ∈ {active, ready}` constraint that excluded `refreshing`/`cooldown` states. With many accounts refreshing this produced a card showing "40k+ normal" that opened to an empty list. Both paths now use the same health semantics (abnormal > rate-limited > normal): the "normal" filter is `not abnormal && not rate-limited`, matching the card exactly.
+- **Transient failures no longer force admin logout (#admin auth).** `checkAuth` previously cleared `admin_key` and forced re-login on any `catch` or `!res.ok`, so any network blip / service restart / 5xx during the 30s polling loop logged the user out and required re-entering the key. The key is now cleared only on a genuine 401 (invalid key); under transient network/5xx failures an existing key optimistically stays logged in and the next poll self-corrects.
+- **Improved Prompt Filter hit-log context display.** Refined how prompt-filter match context is captured and rendered in the hit logs for clearer surrounding context.
+
+## v2.3.6 - 2026-06-18
+
+### Features
+
+- **API key self-service usage portal `/key-usage` (#271).** Added a public, login-free `/key-usage` page where a carpool/shared-key user can paste their own API key and view that key's usage (totals, model breakdown, recent logs) without admin access. The API key management page now surfaces the portal address with copy and open shortcuts, and each key has a shareable direct link, backed by a dedicated public usage endpoint that only exposes the data for the presented key.
+- **Per-key usage reset (#271).** A single API key's accumulated usage can now be reset (`reset_quota`) when editing the key, zeroing just that key's counters without minting a new key — so monthly re-accounting for shared/carpool keys no longer requires recreating keys.
+- **5h guard-band slowdown concurrency (#270).** Added a configurable "guard band" before the 5h usage auto-pause threshold: as an account's remaining 5h quota enters the band (default 5 percentage points), its scheduler dispatch score is progressively penalized and its dynamic concurrency is capped to a configured ceiling (default 1), giving accounts a soft landing instead of slamming into the hard auto-pause. Both the band width and the guard concurrency are configurable from Settings (with global defaults), and disabling either turns the slowdown off.
+
 ## v2.3.5-xmin.2 - 2026-06-18
 
 ### Features
@@ -31,7 +72,7 @@
 - **Active in-flight request indicator (accounts).** The account list status column now shows a blue pill with a breathing dot and the live in-flight request count (`active_requests`), visible only when greater than zero, to surface which accounts are busy and how concurrent.
 - **Display `chatgpt_account_id` (team workspace id).** The account list now shows the `chatgpt_account_id` (the team-plan workspace id decoded from the access-token JWT) under the email in monospace, so multiple workspaces under the same login email can be told apart.
 - **Hardened + optimized OpenAI active reset-credits flow.** The wham/usage and reset/consume calls now go through the uTLS Chrome-fingerprint transport (matching the `/responses` gateway) to reduce Cloudflare blocks; consume reuses a single `redeem_request_id` as an idempotency key so a retry after refresh no longer burns an extra reset, a per-account mutex removes the check→consume TOCTOU race, a 401 auto-refreshes the token and retries once, and the post-reset wham round-trip is moved to the background to shorten the response path. Successful resets are written to `account_events` audit records.
-- **`TRUSTED_PROXIES` env to configure trusted reverse proxies.** PR #265 disabled all trusted proxies (secure by default) but stripped the real client IP behind a reverse proxy; operators can now opt back in via `TRUSTED_PROXIES` (comma-separated IP/CIDR list). Empty/unset keeps the secure default; invalid entries fail fast at startup.
+- **`CODEX_TRUSTED_PROXIES` env to configure trusted reverse proxies.** PR #265 disabled Gin's default trusted proxies but stripped the real client IP behind reverse proxies; Codex2API now trusts loopback and common private networks by default for same-host/Docker WAF deployments, and operators can tighten or disable this via `CODEX_TRUSTED_PROXIES` (comma/space-separated IP/CIDR list, or `none` to disable). Invalid entries fail fast at startup.
 - **Localized upstream reset error codes.** When an active reset is rejected by upstream (e.g. `rate_limit_not_resettable` on business/credits-only plans), known codes are translated to a Chinese explanation with the original upstream JSON appended; unknown codes fall back to the raw upstream text, and empty bodies fall back to the status code.
 - **1h metrics sampling granularity.** The 1h time range now samples at 1-minute granularity across 60 buckets.
 - **Account card layout refinements.**

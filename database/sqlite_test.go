@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"math"
 	"path/filepath"
 	"sync"
@@ -1059,6 +1060,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		AffinityMode:                       "bounded",
 		BackgroundConfig:                   "{}",
 		ShowFullUsageNumbers:               true,
+		PublicKeyUsagePageEnabled:          true,
 		CodexWSHideUpstreamErrors:          true,
 		CodexWSSilentRetryEnabled:          true,
 		CodexWSSilentMaxRetries:            4,
@@ -1081,6 +1083,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if !settings.ShowFullUsageNumbers {
 		t.Fatal("ShowFullUsageNumbers = false, want true")
+	}
+	if !settings.PublicKeyUsagePageEnabled {
+		t.Fatal("PublicKeyUsagePageEnabled = false, want true")
 	}
 	if settings.BillingTierPolicy != "requested" {
 		t.Fatalf("BillingTierPolicy = %q, want requested", settings.BillingTierPolicy)
@@ -1132,6 +1137,18 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.CodexWSSilentMaxRetries != 4 {
 		t.Fatalf("CodexWSSilentMaxRetries = %d, want 4", settings.CodexWSSilentMaxRetries)
+	}
+
+	settings.PublicKeyUsagePageEnabled = false
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings false PublicKeyUsagePageEnabled 返回错误: %v", err)
+	}
+	settings, err = db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings after false PublicKeyUsagePageEnabled 返回错误: %v", err)
+	}
+	if settings.PublicKeyUsagePageEnabled {
+		t.Fatal("PublicKeyUsagePageEnabled = true, want false")
 	}
 }
 
@@ -1647,6 +1664,134 @@ func TestUsageStatsIncludeCodex2APIBreakdowns(t *testing.T) {
 	}
 	if apiKeys[8].Requests != 1 || apiKeys[8].ErrorCount != 1 {
 		t.Fatalf("APIKeyStats[8] = %+v, want requests=1 errors=1", apiKeys[8])
+	}
+}
+
+func TestAPIKeySelfUsageReportScopesToSingleKey(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	keyID, err := db.InsertAPIKey(ctx, "Client A", "sk-self-usage-a-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey A 返回错误: %v", err)
+	}
+	otherKeyID, err := db.InsertAPIKey(ctx, "Client B", "sk-self-usage-b-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey B 返回错误: %v", err)
+	}
+	now := time.Now()
+	insertUsage := func(apiKeyID int64, model string, endpoint string, statusCode int, totalTokens int, userBilled float64) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `
+			INSERT INTO usage_logs (
+				api_key_id, api_key_name, api_key_masked, endpoint, inbound_endpoint, model,
+				status_code, total_tokens, input_tokens, output_tokens, user_billed, created_at
+			)
+			VALUES ($1, 'client', 'sk-...test', $2, $2, $3, $4, $5, $6, $7, $8, $9)
+		`, apiKeyID, endpoint, model, statusCode, totalTokens, totalTokens/2, totalTokens/2, userBilled, sqliteTimeParam(now)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+
+	insertUsage(keyID, "gpt-5.5", "/v1/responses", 200, 120, 0.12)
+	insertUsage(keyID, "gpt-5.5", "/v1/responses", 500, 80, 0.08)
+	insertUsage(keyID, "cancelled", "/v1/responses", 499, 1000, 9.99)
+	insertUsage(otherKeyID, "other", "/v1/messages", 200, 900, 7.77)
+
+	report, err := db.GetAPIKeySelfUsageReport(ctx, keyID, now.Add(-time.Hour), now.Add(time.Hour), 1, 10)
+	if err != nil {
+		t.Fatalf("GetAPIKeySelfUsageReport 返回错误: %v", err)
+	}
+	if report.Summary.Requests != 2 || report.Summary.Tokens != 200 || report.Summary.ErrorCount != 1 {
+		t.Fatalf("summary = %+v, want requests=2 tokens=200 errors=1", report.Summary)
+	}
+	if math.Abs(report.Summary.UserBilled-0.20) > 0.000001 {
+		t.Fatalf("summary.UserBilled = %.6f, want 0.20", report.Summary.UserBilled)
+	}
+	if report.Windows.Last30d.Requests != 2 || report.Windows.Last30d.Tokens != 200 {
+		t.Fatalf("last30d = %+v, want current key only", report.Windows.Last30d)
+	}
+	if len(report.Models) != 1 || report.Models[0].Name != "gpt-5.5" || report.Models[0].Requests != 2 {
+		t.Fatalf("models = %+v, want one gpt-5.5 bucket", report.Models)
+	}
+	if len(report.RecentLogs) != 2 {
+		t.Fatalf("recent logs = %d, want 2", len(report.RecentLogs))
+	}
+	if report.RecentLogsTotal != 2 || report.RecentLogsPage != 1 || report.RecentLogsPageSize != 10 {
+		t.Fatalf("recent log pagination = total %d page %d page_size %d, want 2/1/10", report.RecentLogsTotal, report.RecentLogsPage, report.RecentLogsPageSize)
+	}
+	for _, logRow := range report.RecentLogs {
+		if logRow.Model == "other" || logRow.StatusCode == 499 {
+			t.Fatalf("recent log leaked unrelated/cancelled row: %+v", logRow)
+		}
+	}
+}
+
+func TestAPIKeySelfUsageReportPaginatesRecentLogs(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	keyID, err := db.InsertAPIKey(ctx, "Client A", "sk-self-usage-page-a-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey A 返回错误: %v", err)
+	}
+	otherKeyID, err := db.InsertAPIKey(ctx, "Client B", "sk-self-usage-page-b-1234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey B 返回错误: %v", err)
+	}
+
+	now := time.Now()
+	insertUsage := func(apiKeyID int64, model string, statusCode int, totalTokens int) {
+		t.Helper()
+		if _, err := db.conn.ExecContext(ctx, `
+			INSERT INTO usage_logs (
+				api_key_id, api_key_name, api_key_masked, endpoint, inbound_endpoint, model,
+				status_code, total_tokens, input_tokens, output_tokens, user_billed, created_at
+			)
+			VALUES ($1, 'client', 'sk-...test', '/v1/responses', '/v1/responses', $2, $3, $4, $5, $6, 0, $7)
+		`, apiKeyID, model, statusCode, totalTokens, totalTokens/2, totalTokens/2, sqliteTimeParam(now)); err != nil {
+			t.Fatalf("insert usage log: %v", err)
+		}
+	}
+
+	for i := 1; i <= 5; i++ {
+		insertUsage(keyID, fmt.Sprintf("model-%d", i), 200, i*10)
+	}
+	insertUsage(keyID, "cancelled", 499, 999)
+	insertUsage(otherKeyID, "other", 200, 777)
+
+	report, err := db.GetAPIKeySelfUsageReport(ctx, keyID, now.Add(-time.Hour), now.Add(time.Hour), 2, 2)
+	if err != nil {
+		t.Fatalf("GetAPIKeySelfUsageReport 返回错误: %v", err)
+	}
+	if report.RecentLogsTotal != 5 || report.RecentLogsPage != 2 || report.RecentLogsPageSize != 2 {
+		t.Fatalf("recent log pagination = total %d page %d page_size %d, want 5/2/2", report.RecentLogsTotal, report.RecentLogsPage, report.RecentLogsPageSize)
+	}
+	if len(report.RecentLogs) != 2 {
+		t.Fatalf("recent logs = %d, want 2", len(report.RecentLogs))
+	}
+	if report.RecentLogs[0].Model != "model-3" || report.RecentLogs[1].Model != "model-2" {
+		t.Fatalf("page 2 logs = %+v, want model-3 then model-2", report.RecentLogs)
+	}
+
+	clamped, err := db.GetAPIKeySelfUsageReport(ctx, keyID, now.Add(-time.Hour), now.Add(time.Hour), 99, 2)
+	if err != nil {
+		t.Fatalf("GetAPIKeySelfUsageReport clamped 返回错误: %v", err)
+	}
+	if clamped.RecentLogsPage != 3 || len(clamped.RecentLogs) != 1 || clamped.RecentLogs[0].Model != "model-1" {
+		t.Fatalf("clamped page logs = page %d rows %+v, want page 3 with model-1", clamped.RecentLogsPage, clamped.RecentLogs)
 	}
 }
 

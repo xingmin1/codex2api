@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
   AlertTriangle,
@@ -75,6 +76,43 @@ function accountSearchText(account: AccountRow): string {
     .toLowerCase()
 }
 
+function isCodexInviteCandidate(account: AccountRow): boolean {
+  // 仅排除发不出邀请的硬条件：中转 / AT-only 账号没有可用于 referral 的 Codex OAuth 凭证。
+  // enabled / locked / status 只是调度开关与健康状态，不影响 access token 是否可用——
+  // 后端 SendCodexInvite 只要求账号有 access token，不校验这些字段，故前端不在此过滤，
+  // 否则会把仅被禁用调度或临时异常、但凭证仍可用的账号从下拉中隐藏（见 issue #281）。
+  return !account.openai_responses_api && !account.at_only
+}
+
+// 状态圆点配色，与全局 StatusBadge 保持一致。
+const STATUS_DOT_COLOR: Record<string, string> = {
+  active: 'bg-emerald-500',
+  ready: 'bg-emerald-500',
+  cooldown: 'bg-amber-500',
+  rate_limited: 'bg-yellow-500',
+  usage_exhausted: 'bg-yellow-500',
+  quota_paused: 'bg-yellow-500',
+  unauthorized: 'bg-red-500',
+  error: 'bg-red-400',
+  refreshing: 'bg-blue-500 animate-pulse',
+  paused: 'bg-blue-500',
+}
+
+function statusDotColor(status?: string | null): string {
+  return STATUS_DOT_COLOR[(status || '').toLowerCase()] ?? 'bg-gray-400'
+}
+
+// 账号是否处于「非正常」状态。仅用于 UI 提示与视觉区分，不影响能否发送邀请——
+// 凭证（access token）可用即可发邀请，这里只是提醒用户当前选的是什么状态的号。
+function accountAbnormalKey(account: AccountRow): 'disabled' | 'locked' | 'unauthorized' | 'error' | null {
+  if (account.enabled === false) return 'disabled'
+  if (account.locked) return 'locked'
+  const status = (account.status || '').toLowerCase()
+  if (status === 'unauthorized') return 'unauthorized'
+  if (status === 'error') return 'error'
+  return null
+}
+
 function resolveAccountInput(accounts: AccountRow[], input: string): AccountRow | null {
   const normalized = input.trim().toLowerCase()
   if (!normalized) return null
@@ -97,9 +135,9 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
   const { t } = useTranslation()
   const { showToast } = useToast()
 
-  // 仅可用 Codex OAuth 账号发送邀请（中转 / AT-only 账号没有可用于 referral 的凭证）。
+  // 仅保留可用于 referral 的 Codex OAuth 账号；中转 / AT-only / 失效账号不能发送邀请。
   const codexAccounts = useMemo(
-    () => accounts.filter((a) => !a.openai_responses_api && !a.at_only),
+    () => accounts.filter(isCodexInviteCandidate),
     [accounts],
   )
   const firstAccount = codexAccounts[0] ?? null
@@ -110,6 +148,8 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
   // accountTyping 区分「用户正在输入搜索」与「输入框只是回显已选账号」。仅在输入时
   // 才按文本过滤，否则展开下拉应显示全部账号（否则会被已选账号的邮箱过滤成只剩一条）。
   const [accountTyping, setAccountTyping] = useState(false)
+  // 下拉键盘导航的高亮项索引（指向 filteredAccounts）。-1 表示未高亮任何项。
+  const [activeIndex, setActiveIndex] = useState(-1)
   const [emailsText, setEmailsText] = useState('')
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [proxyUrl, setProxyUrl] = useState('')
@@ -132,7 +172,67 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
   }, [accountTyping, accountQuery, codexAccounts])
   const overLimit = parsed.valid.length > MAX_EMAILS
   const canSend =
-    !sending && accountQuery.trim() !== '' && parsed.valid.length > 0 && !overLimit
+    !sending && accountQuery.trim() !== '' && parsed.valid.length > 0 && parsed.invalid.length === 0 && !overLimit
+  // 选中账号的非正常状态（禁用/锁定/封禁/错误）；用于提示用户当前选的不是正常号。
+  const selectedAbnormal = useMemo(
+    () => (selectedAccount ? accountAbnormalKey(selectedAccount) : null),
+    [selectedAccount],
+  )
+
+  // 统一的选中逻辑：下拉点击、键盘回车共用。
+  const selectAccount = (account: AccountRow) => {
+    setAccountId(account.id)
+    setAccountQuery(accountDisplayName(account))
+    setAccountOpen(false)
+    setAccountTyping(false)
+    setActiveIndex(-1)
+    setError(null)
+  }
+
+  // 打开下拉或过滤结果变化时，重置高亮到当前选中项（没有则不高亮）。
+  useEffect(() => {
+    if (!accountOpen) {
+      setActiveIndex(-1)
+      return
+    }
+    setActiveIndex((prev) => {
+      if (prev >= 0 && prev < filteredAccounts.length) return prev
+      const selectedIdx = filteredAccounts.findIndex((a) => a.id === accountId)
+      return selectedIdx >= 0 ? selectedIdx : filteredAccounts.length > 0 ? 0 : -1
+    })
+  }, [accountOpen, filteredAccounts, accountId])
+
+  // 下拉键盘导航：↑↓ 移动高亮、回车确认、Esc 关闭。
+  const handlePickerKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Escape') {
+      if (accountOpen) {
+        event.preventDefault()
+        setAccountOpen(false)
+      }
+      return
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      if (!accountOpen) {
+        setAccountOpen(true)
+        setAccountTyping(false)
+        return
+      }
+      if (filteredAccounts.length === 0) return
+      setActiveIndex((prev) => {
+        const delta = event.key === 'ArrowDown' ? 1 : -1
+        const base = prev < 0 ? (delta === 1 ? -1 : 0) : prev
+        return (base + delta + filteredAccounts.length) % filteredAccounts.length
+      })
+      return
+    }
+    if (event.key === 'Enter') {
+      if (accountOpen && activeIndex >= 0 && activeIndex < filteredAccounts.length) {
+        event.preventDefault()
+        selectAccount(filteredAccounts[activeIndex])
+      }
+    }
+  }
 
   useEffect(() => {
     if (accountId == null) return
@@ -223,6 +323,7 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
                     value={accountQuery}
                     onFocus={() => { setAccountOpen(true); setAccountTyping(false) }}
                     onClick={() => { setAccountOpen(true); setAccountTyping(false) }}
+                    onKeyDown={handlePickerKeyDown}
                     onChange={(e) => {
                       const next = e.target.value
                       setAccountQuery(next)
@@ -233,8 +334,14 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
                     }}
                     placeholder={t('invite.accountPlaceholder')}
                     role="combobox"
+                    autoComplete="off"
                     aria-expanded={accountOpen}
                     aria-controls="codex-invite-account-list"
+                    aria-activedescendant={
+                      accountOpen && activeIndex >= 0 && activeIndex < filteredAccounts.length
+                        ? `codex-invite-option-${filteredAccounts[activeIndex].id}`
+                        : undefined
+                    }
                     className="h-10 pr-9"
                   />
                   <button
@@ -253,31 +360,38 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
                     className="absolute z-30 mt-1.5 max-h-72 w-full overflow-auto rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg"
                   >
                     {filteredAccounts.length > 0 ? (
-                      filteredAccounts.map((account) => {
+                      filteredAccounts.map((account, index) => {
                         const active = account.id === accountId
+                        const highlighted = index === activeIndex
+                        const abnormal = accountAbnormalKey(account)
                         return (
                           <button
                             key={account.id}
+                            id={`codex-invite-option-${account.id}`}
                             type="button"
                             role="option"
                             aria-selected={active}
+                            ref={highlighted ? (el) => el?.scrollIntoView({ block: 'nearest' }) : undefined}
                             onMouseDown={(event) => event.preventDefault()}
-                            onClick={() => {
-                              setAccountId(account.id)
-                              setAccountQuery(accountDisplayName(account))
-                              setAccountOpen(false)
-                              setAccountTyping(false)
-                              setError(null)
-                            }}
+                            onMouseEnter={() => setActiveIndex(index)}
+                            onClick={() => selectAccount(account)}
                             className={`flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors ${
-                              active ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/70 hover:text-accent-foreground'
+                              highlighted ? 'bg-accent text-accent-foreground' : 'hover:bg-accent/70 hover:text-accent-foreground'
                             }`}
                           >
                             <span className="flex size-7 shrink-0 items-center justify-center rounded-md bg-muted text-[11px] font-semibold text-muted-foreground">
                               #{account.id}
                             </span>
                             <span className="min-w-0 flex-1">
-                              <span className="block truncate font-medium">{accountDisplayName(account)}</span>
+                              <span className="flex items-center gap-1.5">
+                                <span className={`size-1.5 shrink-0 rounded-full ${statusDotColor(account.status)}`} />
+                                <span className="truncate font-medium">{accountDisplayName(account)}</span>
+                                {abnormal && (
+                                  <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                                    {t(`invite.state.${abnormal}`)}
+                                  </span>
+                                )}
+                              </span>
                               <span className="block truncate text-xs text-muted-foreground">
                                 {[account.name && account.name !== account.email ? account.name : '', account.plan_type, account.status]
                                   .filter(Boolean)
@@ -303,6 +417,12 @@ export default function CodexInviteView({ accounts, onClose }: Props) {
                   )}
                   <InfoPill label={t('invite.statusLabel')} value={selectedAccount.status || '-'} />
                 </div>
+              )}
+              {selectedAbnormal && (
+                <p className="mt-2 flex items-start gap-1.5 text-xs text-amber-600">
+                  <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+                  <span>{t('invite.abnormalHint', { state: t(`invite.state.${selectedAbnormal}`) })}</span>
+                </p>
               )}
               <p className="mt-2 text-xs text-muted-foreground">{t('invite.accountHint')}</p>
             </div>

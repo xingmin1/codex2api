@@ -100,9 +100,12 @@ func main() {
 			FirstTokenTimeoutSeconds:         0,
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
+			PublicKeyUsagePageEnabled:        true,
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
+			AutoPause5hGuardBandPercent:      5,
+			AutoPause5hGuardConcurrency:      1,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -139,9 +142,12 @@ func main() {
 			FirstTokenTimeoutSeconds:         0,
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
 			ImageStorageConfig:               "{}",
+			PublicKeyUsagePageEnabled:        true,
 			CodexWSHideUpstreamErrors:        true,
 			CodexWSSilentRetryEnabled:        true,
 			CodexWSSilentMaxRetries:          2,
+			AutoPause5hGuardBandPercent:      5,
+			AutoPause5hGuardConcurrency:      1,
 		}
 	} else {
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
@@ -257,10 +263,9 @@ func main() {
 	// 6. 启动 HTTP 服务
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	// Gin 默认信任所有代理头（X-Forwarded-For/X-Real-IP），会让公网客户端伪造 c.ClientIP()。
-	// 默认禁用可信代理，避免绕过 bootstrap 本机来源限制与 IP 限流；
-	// 反代部署可通过 TRUSTED_PROXIES（逗号分隔的 IP/CIDR）显式声明可信代理以恢复真实客户端 IP。
-	if err := configureTrustedProxies(r, os.Getenv("TRUSTED_PROXIES")); err != nil {
+	// 默认信任本机回环与常见私有网段，兼顾同机 / Docker WAF 反代获取真实 IP 与公网直连防伪造；
+	// 如需收紧或扩展可信代理范围，可通过 CODEX_TRUSTED_PROXIES 显式配置 CIDR/IP。
+	if err := configureTrustedProxies(r, cfg.TrustedProxies); err != nil {
 		log.Fatalf("配置可信代理失败: %v", err)
 	}
 	r.Use(api.RecoveryMiddleware())
@@ -310,7 +315,7 @@ func main() {
 		// 预读 index.html（SPA 回退时直接返回，避免 FileServer 重定向）
 		indexHTML, _ := fs.ReadFile(subFS, "index.html")
 
-		serveAdmin := func(c *gin.Context) {
+		serveFrontend := func(c *gin.Context) {
 			fp := c.Param("filepath")
 			// 尝试打开请求的文件（排除目录和根路径）
 			if fp != "/" && len(fp) > 1 {
@@ -327,12 +332,32 @@ func main() {
 			// 文件不存在或者是目录 → 直接返回 index.html 字节（让 React Router 处理）
 			c.Data(http.StatusOK, "text/html; charset=utf-8", indexHTML)
 		}
+		serveKeyUsageFrontend := func(c *gin.Context) {
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+			defer cancel()
+
+			enabled, err := adminHandler.PublicAPIKeyUsagePageEnabled(ctx)
+			if err != nil {
+				log.Printf("读取 API Key 自助用量页开关失败: %v", err)
+				c.Status(http.StatusInternalServerError)
+				return
+			}
+			if !enabled {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			serveFrontend(c)
+		}
 
 		// 同时处理 /admin 和 /admin/*，避免依赖自动补斜杠重定向。
-		r.GET("/admin", serveAdmin)
-		r.GET("/admin/*filepath", serveAdmin)
-		r.HEAD("/admin", serveAdmin)
-		r.HEAD("/admin/*filepath", serveAdmin)
+		r.GET("/admin", serveFrontend)
+		r.GET("/admin/*filepath", serveFrontend)
+		r.HEAD("/admin", serveFrontend)
+		r.HEAD("/admin/*filepath", serveFrontend)
+		r.GET("/key-usage", serveKeyUsageFrontend)
+		r.GET("/key-usage/*filepath", serveKeyUsageFrontend)
+		r.HEAD("/key-usage", serveKeyUsageFrontend)
+		r.HEAD("/key-usage/*filepath", serveKeyUsageFrontend)
 	}
 
 	// 根路径重定向到管理后台（使用 302 避免浏览器永久缓存）
@@ -362,6 +387,7 @@ func main() {
 	log.Printf("  Listen: %s", addr)
 	log.Printf("  HTTP:   http://%s:%d", displayHost, cfg.Port)
 	log.Printf("  管理台: http://%s:%d/admin/", displayHost, cfg.Port)
+	log.Printf("  Key用量: http://%s:%d/key-usage", displayHost, cfg.Port)
 	log.Printf("  API:    POST /v1/chat/completions")
 	log.Printf("  API:    POST /v1/responses")
 	log.Printf("  API:    POST /v1/images/generations")
@@ -404,21 +430,10 @@ func main() {
 }
 
 // configureTrustedProxies 配置 Gin 的可信代理列表。
-//
-// trustedProxies 为逗号分隔的 IP/CIDR 列表（通常来自 TRUSTED_PROXIES 环境变量）：
-//   - 为空时禁用所有可信代理，c.ClientIP() 直接采用 TCP 连接来源，忽略转发头（默认安全）；
-//   - 非空时仅信任列表内的代理来源，从其转发头解析真实客户端 IP。
-func configureTrustedProxies(r *gin.Engine, trustedProxies string) error {
+func configureTrustedProxies(r *gin.Engine, proxies []string) error {
 	if r == nil {
 		return nil
 	}
-	var proxies []string
-	for _, p := range strings.Split(trustedProxies, ",") {
-		if p = strings.TrimSpace(p); p != "" {
-			proxies = append(proxies, p)
-		}
-	}
-	// proxies 为 nil 时等价于禁用全部可信代理。
 	return r.SetTrustedProxies(proxies)
 }
 

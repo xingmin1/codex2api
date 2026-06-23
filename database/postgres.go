@@ -689,6 +689,10 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ NULL;
 	CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);
 
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS total_used DOUBLE PRECISION NOT NULL DEFAULT 0;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS reset_count INTEGER NOT NULL DEFAULT 0;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_reset_at TIMESTAMPTZ;
+
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS allowed_group_ids JSONB DEFAULT '[]'::jsonb;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS limits JSONB DEFAULT '{}'::jsonb;
 
@@ -796,6 +800,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS billing_tier_policy VARCHAR(20) DEFAULT 'actual';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS image_storage_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS show_full_usage_numbers BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS public_key_usage_page_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_force_websocket BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_keepalive_interval_sec INT DEFAULT 60;
@@ -804,6 +809,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_ws_silent_max_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_band_percent DOUBLE PRECISION DEFAULT 5;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_concurrency INT DEFAULT 1;
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -977,6 +984,9 @@ type APIKeyRow struct {
 	Key             string       `json:"key"`
 	QuotaLimit      float64      `json:"quota_limit"`
 	QuotaUsed       float64      `json:"quota_used"`
+	TotalUsed       float64      `json:"total_used"`
+	ResetCount      int          `json:"reset_count"`
+	LastResetAt     sql.NullTime `json:"last_reset_at"`
 	ExpiresAt       sql.NullTime `json:"expires_at"`
 	AllowedGroupIDs []int64      `json:"allowed_group_ids"`
 	Limits          APIKeyLimits `json:"limits"`
@@ -1000,16 +1010,18 @@ type APIKeyLimits struct {
 	MaxConcurrency int      `json:"max_concurrency,omitempty"`
 	CostLimit5h    float64  `json:"cost_limit_5h,omitempty"`
 	CostLimit7d    float64  `json:"cost_limit_7d,omitempty"`
+	CostLimit30d   float64  `json:"cost_limit_30d,omitempty"`
 	TokenLimit5h   int64    `json:"token_limit_5h,omitempty"`
 	TokenLimit7d   int64    `json:"token_limit_7d,omitempty"`
+	TokenLimit30d  int64    `json:"token_limit_30d,omitempty"`
 }
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
 func (l APIKeyLimits) IsZero() bool {
 	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 &&
 		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
-		l.CostLimit5h == 0 && l.CostLimit7d == 0 &&
-		l.TokenLimit5h == 0 && l.TokenLimit7d == 0
+		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
+		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0
 }
 
 type APIKeyInput struct {
@@ -1027,6 +1039,7 @@ type APIKeyUpdate struct {
 	NameSet            bool
 	QuotaLimit         float64
 	QuotaLimitSet      bool
+	ResetQuota         bool
 	ExpiresAt          sql.NullTime
 	ExpiresAtSet       bool
 	AllowedGroupIDs    []int64
@@ -1035,7 +1048,7 @@ type APIKeyUpdate struct {
 	LimitsSet          bool
 }
 
-const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}')`
+const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}')`
 
 // ListAPIKeys 获取所有 API 密钥
 func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
@@ -1250,6 +1263,15 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 		}
 		sets = append(sets, "quota_limit = "+setArg(quotaLimit))
 	}
+	if update.ResetQuota {
+		sets = append(sets, "quota_used = 0")
+		sets = append(sets, "reset_count = COALESCE(reset_count, 0) + 1")
+		if db.isSQLite() {
+			sets = append(sets, "last_reset_at = CURRENT_TIMESTAMP")
+		} else {
+			sets = append(sets, "last_reset_at = NOW()")
+		}
+	}
 	if update.ExpiresAtSet {
 		sets = append(sets, "expires_at = "+setArg(nullableTimeArg(update.ExpiresAt)))
 	}
@@ -1277,6 +1299,24 @@ func (db *DB) UpdateAPIKey(ctx context.Context, id int64, update APIKeyUpdate) e
 	idPlaceholder := placeholder()
 	args[len(args)-1] = id
 	res, err := db.conn.ExecContext(ctx, "UPDATE api_keys SET "+strings.Join(sets, ", ")+" WHERE id = "+idPlaceholder, args...)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// ResetAPIKeyQuota resets the current period usage (quota_used) to 0 while preserving
+// total_used (cumulative history). Increments reset_count and sets last_reset_at.
+func (db *DB) ResetAPIKeyQuota(ctx context.Context, id int64) error {
+	res, err := db.conn.ExecContext(ctx,
+		`UPDATE api_keys SET quota_used = 0, reset_count = COALESCE(reset_count, 0) + 1, last_reset_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		return err
 	}
@@ -1378,6 +1418,7 @@ type SystemSettings struct {
 	BillingTierPolicy                  string
 	ImageStorageConfig                 string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
 	ShowFullUsageNumbers               bool
+	PublicKeyUsagePageEnabled          bool
 	CodexForceWebsocket                bool // 强制 Codex 上游走 WebSocket（复用连接池），默认 false
 	CodexWSKeepaliveEnabled            bool // 启用上游 WS 空闲连接保活（仅 Ping，不发业务帧），默认 false
 	CodexWSKeepaliveIntervalSec        int  // WS 保活 Ping 间隔（秒），默认 60
@@ -1386,6 +1427,8 @@ type SystemSettings struct {
 	CodexWSSilentMaxRetries            int  // WS 静默换号最大重试次数，默认 2
 	AutoPause5hThreshold               float64
 	AutoPause7dThreshold               float64
+	AutoPause5hGuardBandPercent        float64
+	AutoPause5hGuardConcurrency        int
 }
 
 func normalizeBillingTierPolicy(policy string) string {
@@ -1469,6 +1512,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(image_storage_config, '{}'),
 		       COALESCE(background_config, '{}'),
 		       COALESCE(show_full_usage_numbers, false),
+		       COALESCE(public_key_usage_page_enabled, true),
 			       COALESCE(reasoning_effort_models, '[]'),
 			       COALESCE(codex_force_websocket, false),
 			       COALESCE(codex_ws_keepalive_enabled, false),
@@ -1477,7 +1521,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(codex_ws_silent_retry_enabled, true),
 			       COALESCE(codex_ws_silent_max_retries, 2),
 			       COALESCE(auto_pause_5h_threshold, 0),
-			       COALESCE(auto_pause_7d_threshold, 0)
+			       COALESCE(auto_pause_7d_threshold, 0),
+			       COALESCE(auto_pause_5h_guard_band_percent, 5),
+			       COALESCE(auto_pause_5h_guard_concurrency, 1)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1505,6 +1551,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ImageStorageConfig,
 		&s.BackgroundConfig,
 		&s.ShowFullUsageNumbers,
+		&s.PublicKeyUsagePageEnabled,
 		&s.ReasoningEffortModels,
 		&s.CodexForceWebsocket,
 		&s.CodexWSKeepaliveEnabled,
@@ -1514,6 +1561,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexWSSilentMaxRetries,
 		&s.AutoPause5hThreshold,
 		&s.AutoPause7dThreshold,
+		&s.AutoPause5hGuardBandPercent,
+		&s.AutoPause5hGuardConcurrency,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1561,6 +1610,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				affinity_mode,
 				background_config,
 				show_full_usage_numbers,
+				public_key_usage_page_enabled,
 					reasoning_effort_models,
 					codex_force_websocket,
 					codex_ws_keepalive_enabled,
@@ -1569,9 +1619,11 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_silent_retry_enabled,
 					codex_ws_silent_max_retries,
 					auto_pause_5h_threshold,
-					auto_pause_7d_threshold
+					auto_pause_7d_threshold,
+					auto_pause_5h_guard_band_percent,
+					auto_pause_5h_guard_concurrency
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1642,6 +1694,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				affinity_mode = EXCLUDED.affinity_mode,
 				background_config = EXCLUDED.background_config,
 				show_full_usage_numbers = EXCLUDED.show_full_usage_numbers,
+				public_key_usage_page_enabled = EXCLUDED.public_key_usage_page_enabled,
 					reasoning_effort_models = EXCLUDED.reasoning_effort_models,
 					codex_force_websocket = EXCLUDED.codex_force_websocket,
 					codex_ws_keepalive_enabled = EXCLUDED.codex_ws_keepalive_enabled,
@@ -1650,7 +1703,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_ws_silent_retry_enabled = EXCLUDED.codex_ws_silent_retry_enabled,
 					codex_ws_silent_max_retries = EXCLUDED.codex_ws_silent_max_retries,
 					auto_pause_5h_threshold = EXCLUDED.auto_pause_5h_threshold,
-					auto_pause_7d_threshold = EXCLUDED.auto_pause_7d_threshold
+					auto_pause_7d_threshold = EXCLUDED.auto_pause_7d_threshold,
+					auto_pause_5h_guard_band_percent = EXCLUDED.auto_pause_5h_guard_band_percent,
+					auto_pause_5h_guard_concurrency = EXCLUDED.auto_pause_5h_guard_concurrency
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1667,10 +1722,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.PromptFilterReviewModel, s.PromptFilterReviewTimeoutSeconds, s.PromptFilterReviewFailClosed,
 		s.ClientCompatMode, s.CodexMinCLIVersion, s.UsageLogMode, s.UsageLogBatchSize,
 		s.UsageLogFlushIntervalSeconds, s.StreamFlushPolicy, s.StreamFlushIntervalMS,
-		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.BackgroundConfig, s.ShowFullUsageNumbers, reasoningEffortModels,
+		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.BackgroundConfig, s.ShowFullUsageNumbers, s.PublicKeyUsagePageEnabled, reasoningEffortModels,
 		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec),
 		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries),
-		s.AutoPause5hThreshold, s.AutoPause7dThreshold)
+		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency)
 	return err
 }
 
@@ -2372,7 +2427,7 @@ func (db *DB) applyAPIKeyQuotaUsageWithExec(ctx context.Context, execer sqlExece
 		if amount <= 0 {
 			continue
 		}
-		if _, err := execer.ExecContext(ctx, `UPDATE api_keys SET quota_used = COALESCE(quota_used, 0) + $1 WHERE id = $2`, amount, id); err != nil {
+		if _, err := execer.ExecContext(ctx, `UPDATE api_keys SET quota_used = COALESCE(quota_used, 0) + $1, total_used = COALESCE(total_used, 0) + $1 WHERE id = $2`, amount, id); err != nil {
 			return err
 		}
 	}

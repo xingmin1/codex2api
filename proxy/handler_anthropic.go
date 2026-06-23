@@ -384,7 +384,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				}
 
 				// 累计 delta 字符数
-				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
+				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
 
@@ -464,7 +464,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
-				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
+				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
 				if eventType == "response.completed" {

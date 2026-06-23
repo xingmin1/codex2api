@@ -33,6 +33,7 @@ const (
 	apiKeyRPDWindow            = 24 * time.Hour
 	apiKey5hWindow             = 5 * time.Hour
 	apiKey7dWindow             = 7 * 24 * time.Hour
+	apiKey30dWindow            = 30 * 24 * time.Hour
 )
 
 // apiKeyRowFromContext 从 gin context 中取出鉴权时已存的 APIKeyRow。
@@ -134,6 +135,21 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 				return http.StatusTooManyRequests,
 					fmt.Sprintf("API key token limit exceeded: %d / %d in last 7d",
 						usage.Tokens, limits.TokenLimit7d)
+			}
+		}
+	}
+	if limits.CostLimit30d > 0 || limits.TokenLimit30d > 0 {
+		usage, err := h.apiKeyWindowUsage(ctx, row.ID, "30d", apiKey30dWindow)
+		if err == nil && usage != nil {
+			if limits.CostLimit30d > 0 && usage.UserBilled >= limits.CostLimit30d {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key cost limit exceeded: $%.2f / $%.2f in last 30d",
+						usage.UserBilled, limits.CostLimit30d)
+			}
+			if limits.TokenLimit30d > 0 && usage.Tokens >= limits.TokenLimit30d {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key token limit exceeded: %d / %d in last 30d",
+						usage.Tokens, limits.TokenLimit30d)
 			}
 		}
 	}

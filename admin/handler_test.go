@@ -76,6 +76,20 @@ func TestAccountEmailDomain(t *testing.T) {
 	}
 }
 
+func TestAccountAccessTokenTypeInfersCodexAT(t *testing.T) {
+	row := &database.AccountRow{Credentials: map[string]interface{}{
+		"access_token": "at-opaque-codex-token",
+	}}
+	if got := accountAccessTokenType(row); got != accessTokenTypeCodexAT {
+		t.Fatalf("accountAccessTokenType() = %q, want %q", got, accessTokenTypeCodexAT)
+	}
+
+	row.Credentials["access_token_type"] = "custom"
+	if got := accountAccessTokenType(row); got != "custom" {
+		t.Fatalf("accountAccessTokenType() with stored type = %q, want custom", got)
+	}
+}
+
 func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 	rows := []*database.AccountRow{
 		{ID: 1, Status: "error", Enabled: true},   // DB stale, runtime active

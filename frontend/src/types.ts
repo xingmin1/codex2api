@@ -34,6 +34,7 @@ export interface AccountRow {
   status: AccountStatus
   error_message?: string
   at_only?: boolean
+  access_token_type?: string
   account_type?: string
   openai_responses_api?: boolean
   base_url?: string
@@ -166,6 +167,7 @@ export interface RecycleBinAccountRow {
   email: string
   plan_type: string
   at_only?: boolean
+  access_token_type?: string
   openai_responses_api?: boolean
   base_url?: string
   models?: string[]
@@ -726,6 +728,7 @@ export interface SystemSettings {
   first_token_timeout_seconds: number
   billing_tier_policy: 'actual' | 'requested' | string
   show_full_usage_numbers: boolean
+  public_key_usage_page_enabled: boolean
   image_storage_backend: 'local' | 's3' | string
   image_s3_endpoint: string
   image_s3_region: string
@@ -737,6 +740,8 @@ export interface SystemSettings {
   image_s3_force_path_style: boolean
   auto_pause_5h_threshold: number
   auto_pause_7d_threshold: number
+  auto_pause_5h_guard_band_percent: number
+  auto_pause_5h_guard_concurrency: number
 }
 
 export interface SetupHintsResponse {
@@ -766,8 +771,8 @@ export interface SetupHintsResponse {
 export interface PromptFilterMatch {
   name: string
   weight: number
-  category: string
-  strict: boolean
+  category?: string
+  strict?: boolean
 }
 
 export interface PromptFilterVerdict {
@@ -779,8 +784,8 @@ export interface PromptFilterVerdict {
   threshold: number
   strict_hit: boolean
   matched: PromptFilterMatch[]
-  text_preview: string
-  reason: string
+  text_preview?: string
+  reason?: string
   extracted_chars: number
   reviewed?: boolean
   review_flagged?: boolean
@@ -820,6 +825,11 @@ export interface PromptFilterLogsResponse {
 
 export interface PromptFilterTestResponse {
   verdict: PromptFilterVerdict
+}
+
+export interface PromptFilterRulePatternTestResponse {
+  matched: boolean
+  error?: string
 }
 
 export interface PromptFilterRule {
@@ -1074,8 +1084,19 @@ export interface APIKeyLimits {
   max_concurrency?: number
   cost_limit_5h?: number
   cost_limit_7d?: number
+  cost_limit_30d?: number
   token_limit_5h?: number
   token_limit_7d?: number
+  token_limit_30d?: number
+}
+
+export interface APIKeyWindowUsage {
+  requests?: number
+  tokens?: number
+  user_billed?: number
+  cost_5h: number
+  cost_7d: number
+  cost_30d: number
 }
 
 export interface APIKeyRow {
@@ -1085,10 +1106,14 @@ export interface APIKeyRow {
   raw_key: string
   quota_limit: number
   quota_used: number
+  total_used: number
+  reset_count: number
+  last_reset_at?: ISODateString | null
   expires_at?: ISODateString | null
   status?: 'active' | 'expired' | 'quota_exhausted'
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
+  window_usage?: APIKeyWindowUsage
   created_at: ISODateString
 }
 
@@ -1109,10 +1134,115 @@ export interface UpdateAPIKeyRequest {
   name?: string
   quota_limit?: number | null
   quota?: number | null
+  reset_quota?: boolean
   expires_at?: string | null
   expires_in_days?: number
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
+}
+
+export interface PublicAPIKeyUsageKey {
+  name: string
+  key: string
+  quota_limit: number
+  quota_used: number
+  total_used: number
+  reset_count: number
+  last_reset_at?: ISODateString | null
+  expires_at?: ISODateString | null
+  limits: APIKeyLimits
+  status: 'active' | 'expired' | 'quota_exhausted'
+  created_at: ISODateString
+}
+
+export interface PublicAPIKeyUsageRange {
+  name: 'today' | '7d' | '30d' | 'all' | string
+  start?: ISODateString | null
+  end: ISODateString
+}
+
+export interface PublicAPIKeyWindowUsage {
+  requests: number
+  tokens: number
+  user_billed: number
+}
+
+export interface PublicAPIKeyUsageWindows {
+  last_5h: PublicAPIKeyWindowUsage
+  last_7d: PublicAPIKeyWindowUsage
+  last_30d: PublicAPIKeyWindowUsage
+}
+
+export interface PublicAPIKeyUsageSummary {
+  requests: number
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  error_count: number
+  user_billed: number
+  avg_duration_ms: number
+  avg_first_token_ms: number
+  rpm: number
+  tpm: number
+}
+
+export interface PublicAPIKeyUsageBreakdown {
+  name: string
+  requests: number
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  error_count: number
+  user_billed: number
+}
+
+export interface PublicAPIKeyUsageLog {
+  id: number
+  endpoint: string
+  model: string
+  effective_model: string
+  status_code: number
+  duration_ms: number
+  first_token_ms: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  total_tokens: number
+  user_billed: number
+  input_cost: number
+  output_cost: number
+  cache_read_cost: number
+  total_cost: number
+  input_price_per_mtoken: number
+  output_price_per_mtoken: number
+  cache_read_price_per_mtoken: number
+  rate_multiplier: number
+  long_context: boolean
+  service_tier: string
+  stream: boolean
+  compact: boolean
+  via_websocket: boolean
+  upstream_error_kind: string
+  created_at: ISODateString
+}
+
+export interface PublicAPIKeyUsageReport {
+  summary: PublicAPIKeyUsageSummary
+  windows: PublicAPIKeyUsageWindows
+  models: PublicAPIKeyUsageBreakdown[]
+  endpoints: PublicAPIKeyUsageBreakdown[]
+  recent_logs: PublicAPIKeyUsageLog[]
+  recent_logs_total: number
+  recent_logs_page: number
+  recent_logs_page_size: number
+}
+
+export interface PublicAPIKeyUsageResponse {
+  key: PublicAPIKeyUsageKey
+  range: PublicAPIKeyUsageRange
+  usage: PublicAPIKeyUsageReport
 }
 
 export interface CreateAPIKeyResponse {

@@ -274,6 +274,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.GET("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
 	r.HEAD("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
 	r.GET("/api/branding", h.GetBranding)
+	keyUsage := r.Group("/api/key-usage")
+	keyUsage.GET("/summary", h.GetPublicAPIKeyUsageSummary)
+	keyUsage.GET("/me", h.GetPublicAPIKeyUsageSummary)
 
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
@@ -310,6 +313,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/invite", h.SendInvite)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
+	api.POST("/accounts/:id/usage/refresh", h.RefreshAccountUsage)
 	api.GET("/accounts/:id/auth-json", h.GetAccountAuthJSON)
 	api.PATCH("/accounts/:id/credit", h.UpdateAccountCredit)
 	api.POST("/accounts/batch-test", h.BatchTest)
@@ -354,6 +358,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/prompt-filter/logs/match", h.MatchPromptFilterLog)
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
 	api.POST("/prompt-filter/test", h.TestPromptFilter)
+	api.POST("/prompt-filter/rules/test", h.TestPromptFilterRulePattern)
 	api.GET("/prompt-filter/rules", h.GetPromptFilterRules)
 	api.GET("/models", h.ListModels)
 	api.POST("/models/sync", h.SyncModels)
@@ -564,6 +569,7 @@ type accountResponse struct {
 	CreditSkipUsageWindow          bool                       `json:"credit_skip_usage_window"`
 	SkipWarmTier                   bool                       `json:"skip_warm_tier"`
 	AccountType                    string                     `json:"account_type,omitempty"`
+	AccessTokenType                string                     `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI             bool                       `json:"openai_responses_api,omitempty"`
 	BaseURL                        string                     `json:"base_url,omitempty"`
 	Models                         []string                   `json:"models,omitempty"`
@@ -709,6 +715,16 @@ func normalizePositiveFloatPointer(value float64) (*float64, bool) {
 	return &value, true
 }
 
+func accountAccessTokenType(row *database.AccountRow) string {
+	if row == nil {
+		return ""
+	}
+	if tokenType := strings.TrimSpace(row.GetCredential("access_token_type")); tokenType != "" {
+		return tokenType
+	}
+	return accessTokenTypeForToken(row.GetCredential("access_token"))
+}
+
 type schedulerBreakdownResponse struct {
 	UnauthorizedPenalty float64 `json:"unauthorized_penalty"`
 	RateLimitPenalty    float64 `json:"rate_limit_penalty"`
@@ -776,6 +792,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
 			SkipWarmTier:             row.SkipWarmTier,
 			AccountType:              row.Type,
+			AccessTokenType:          accountAccessTokenType(row),
 			OpenAIResponsesAPI:       isOpenAIResponsesAccount,
 			BaseURL:                  baseURL,
 			Models:                   row.GetCredentialStringSlice("models"),
@@ -2003,40 +2020,13 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual_at")
 
-		// 解析 AT JWT 提取账号信息（email、plan_type、account_id、过期时间）
-		atInfo := auth.ParseAccessToken(at)
-
-		// 热加载到内存池（AT-only，无 RT）
-		newAcc := &auth.Account{
-			DBID:        id,
-			AccessToken: at,
-			ExpiresAt:   time.Now().Add(1 * time.Hour),
-			ProxyURL:    req.ProxyURL,
-		}
-		if atInfo != nil {
-			newAcc.Email = atInfo.Email
-			newAcc.AccountID = atInfo.ChatGPTAccountID
-			newAcc.PlanType = atInfo.PlanType
-			if !atInfo.ExpiresAt.IsZero() {
-				newAcc.ExpiresAt = atInfo.ExpiresAt
-			}
-			if !atInfo.SubscriptionExpiresAt.IsZero() {
-				newAcc.SubscriptionExpiresAt = atInfo.SubscriptionExpiresAt
-			}
-		}
+		// 热加载到内存池（AT-only，无 RT）。codex_at 不走 JWT 解码，
+		// 身份信息后续由 wham 用量查询补齐。
+		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
-		// 将解析到的信息持久化到数据库
-		if atInfo != nil {
-			creds := map[string]interface{}{
-				"email":      atInfo.Email,
-				"account_id": atInfo.ChatGPTAccountID,
-				"plan_type":  atInfo.PlanType,
-				"expires_at": newAcc.ExpiresAt.Format(time.RFC3339),
-			}
-			if !atInfo.SubscriptionExpiresAt.IsZero() {
-				creds["subscription_expires_at"] = atInfo.SubscriptionExpiresAt.Format(time.RFC3339)
-			}
+		// 将解析/识别到的信息持久化到数据库。
+		if creds := tokenCredentialMap(seed); len(creds) > 0 {
 			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
 				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
 			}
@@ -3397,6 +3387,46 @@ func (h *Handler) GetAccountUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, detail)
 }
 
+// RefreshAccountUsage 同步刷新单个账号的用量快照（优先走零成本的 wham 端点），
+// 完成后返回该账号最新的 5h/7d 用量字段，供前端用量列即时更新进度条。
+// POST /api/admin/accounts/:id/usage/refresh
+func (h *Handler) RefreshAccountUsage(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	account := h.store.FindByID(id)
+	if account == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+	defer cancel()
+
+	if err := h.ProbeUsageSnapshot(ctx, account); err != nil {
+		writeError(c, http.StatusBadGateway, fmt.Sprintf("刷新用量失败: %s", err.Error()))
+		return
+	}
+
+	resp := gin.H{"refreshed": true}
+	if pct, ok := account.GetUsagePercent5h(); ok {
+		resp["usage_percent_5h"] = pct
+	}
+	if pct, ok := account.GetUsagePercent7d(); ok {
+		resp["usage_percent_7d"] = pct
+	}
+	if t := account.GetReset5hAt(); !t.IsZero() {
+		resp["reset_5h_at"] = t.Format(time.RFC3339)
+	}
+	if t := account.GetReset7dAt(); !t.IsZero() {
+		resp["reset_7d_at"] = t.Format(time.RFC3339)
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
 type batchAccountIDsRequest struct {
 	IDs []int64 `json:"ids"`
 }
@@ -3448,6 +3478,7 @@ type recycleBinAccountResponse struct {
 	Email              string   `json:"email"`
 	PlanType           string   `json:"plan_type"`
 	ATOnly             bool     `json:"at_only"`
+	AccessTokenType    string   `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI bool     `json:"openai_responses_api"`
 	BaseURL            string   `json:"base_url,omitempty"`
 	Models             []string `json:"models,omitempty"`
@@ -3487,6 +3518,7 @@ func (h *Handler) ListRecycleBinAccounts(c *gin.Context) {
 			Email:              email,
 			PlanType:           planType,
 			ATOnly:             !isOpenAIResponsesAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			AccessTokenType:    accountAccessTokenType(row),
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
 			BaseURL:            baseURL,
 			Models:             row.GetCredentialStringSlice("models"),
@@ -4876,10 +4908,50 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 		return
 	}
 
+	// 检查是否有任何 key 配置了窗口 cost limit
+	var need5h, need7d, need30d bool
+	for _, k := range keys {
+		if k.Limits.CostLimit5h > 0 {
+			need5h = true
+		}
+		if k.Limits.CostLimit7d > 0 {
+			need7d = true
+		}
+		if k.Limits.CostLimit30d > 0 {
+			need30d = true
+		}
+	}
+
+	// 按需批量查询窗口用量
+	var cost5h, cost7d, cost30d map[int64]float64
+	if need5h {
+		cost5h, _ = h.db.GetAllAPIKeysWindowCost(ctx, 5*time.Hour)
+	}
+	if need7d {
+		cost7d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 7*24*time.Hour)
+	}
+	if need30d {
+		cost30d, _ = h.db.GetAllAPIKeysWindowCost(ctx, 30*24*time.Hour)
+	}
+
 	// 转换为脱敏响应
 	maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
 	for _, k := range keys {
-		maskedKeys = append(maskedKeys, NewMaskedAPIKeyRow(k))
+		mk := NewMaskedAPIKeyRow(k)
+		if k.Limits.CostLimit5h > 0 || k.Limits.CostLimit7d > 0 || k.Limits.CostLimit30d > 0 {
+			detail := &APIKeyWindowUsageDetail{}
+			if cost5h != nil {
+				detail.Cost5h = cost5h[k.ID]
+			}
+			if cost7d != nil {
+				detail.Cost7d = cost7d[k.ID]
+			}
+			if cost30d != nil {
+				detail.Cost30d = cost30d[k.ID]
+			}
+			mk.WindowUsage = detail
+		}
+		maskedKeys = append(maskedKeys, mk)
 	}
 
 	c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
@@ -5033,6 +5105,7 @@ type updateAPIKeyReq struct {
 	Name            *string                `json:"name"`
 	QuotaLimit      json.RawMessage        `json:"quota_limit"`
 	Quota           json.RawMessage        `json:"quota"`
+	ResetQuota      *bool                  `json:"reset_quota"`
 	ExpiresAt       json.RawMessage        `json:"expires_at"`
 	ExpiresInDays   *int                   `json:"expires_in_days"`
 	AllowedGroupIDs json.RawMessage        `json:"allowed_group_ids"`
@@ -5120,6 +5193,7 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 	update := database.APIKeyUpdate{
 		QuotaLimit:         quotaLimit,
 		QuotaLimitSet:      quotaLimitSet,
+		ResetQuota:         req.ResetQuota != nil && *req.ResetQuota,
 		ExpiresAt:          expiresAt,
 		ExpiresAtSet:       expiresAtSet,
 		AllowedGroupIDs:    allowedGroupValues,
@@ -5175,8 +5249,10 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		MaxConcurrency: maxInt(in.MaxConcurrency, 0),
 		CostLimit5h:    maxFloat(in.CostLimit5h, 0),
 		CostLimit7d:    maxFloat(in.CostLimit7d, 0),
+		CostLimit30d:   maxFloat(in.CostLimit30d, 0),
 		TokenLimit5h:   maxInt64(in.TokenLimit5h, 0),
 		TokenLimit7d:   maxInt64(in.TokenLimit7d, 0),
+		TokenLimit30d:  maxInt64(in.TokenLimit30d, 0),
 	}
 	return out
 }
@@ -5394,6 +5470,7 @@ type settingsResponse struct {
 	FirstTokenTimeoutSeconds           int     `json:"first_token_timeout_seconds"`
 	BillingTierPolicy                  string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               bool    `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled          bool    `json:"public_key_usage_page_enabled"`
 	ImageStorageBackend                string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    string  `json:"image_s3_endpoint"`
 	ImageS3Region                      string  `json:"image_s3_region"`
@@ -5404,6 +5481,8 @@ type settingsResponse struct {
 	ImageS3ForcePathStyle              bool    `json:"image_s3_force_path_style"`
 	AutoPause5hThreshold               float64 `json:"auto_pause_5h_threshold"`
 	AutoPause7dThreshold               float64 `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent        float64 `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency        int     `json:"auto_pause_5h_guard_concurrency"`
 }
 
 type updateSettingsReq struct {
@@ -5486,6 +5565,7 @@ type updateSettingsReq struct {
 	FirstTokenTimeoutSeconds           *int     `json:"first_token_timeout_seconds"`
 	BillingTierPolicy                  *string  `json:"billing_tier_policy"`
 	ShowFullUsageNumbers               *bool    `json:"show_full_usage_numbers"`
+	PublicKeyUsagePageEnabled          *bool    `json:"public_key_usage_page_enabled"`
 	ImageStorageBackend                *string  `json:"image_storage_backend"`
 	ImageS3Endpoint                    *string  `json:"image_s3_endpoint"`
 	ImageS3Region                      *string  `json:"image_s3_region"`
@@ -5496,6 +5576,8 @@ type updateSettingsReq struct {
 	ImageS3ForcePathStyle              *bool    `json:"image_s3_force_path_style"`
 	AutoPause5hThreshold               *float64 `json:"auto_pause_5h_threshold"`
 	AutoPause7dThreshold               *float64 `json:"auto_pause_7d_threshold"`
+	AutoPause5hGuardBandPercent        *float64 `json:"auto_pause_5h_guard_band_percent"`
+	AutoPause5hGuardConcurrency        *int     `json:"auto_pause_5h_guard_concurrency"`
 }
 
 type brandingResponse struct {
@@ -5970,6 +6052,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	var resinURL, resinPlatformName string
 	branding := brandingFromSettings(dbSettings)
 	showFullUsageNumbers := false
+	publicKeyUsagePageEnabled := true
 	if dbSettings != nil && adminAuthSource != "env" {
 		adminSecret = dbSettings.AdminSecret
 	}
@@ -5977,6 +6060,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		resinURL = dbSettings.ResinURL
 		resinPlatformName = dbSettings.ResinPlatformName
 		showFullUsageNumbers = dbSettings.ShowFullUsageNumbers
+		publicKeyUsagePageEnabled = dbSettings.PublicKeyUsagePageEnabled
 	}
 	promptFilterCfg := h.store.GetPromptFilterConfig()
 	runtimeCfg := proxy.CurrentRuntimeSettings()
@@ -6072,6 +6156,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
 		ImageStorageBackend:                imgCfg.Backend,
 		ImageS3Endpoint:                    imgCfg.Endpoint,
 		ImageS3Region:                      imgCfg.Region,
@@ -6082,6 +6167,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ImageS3ForcePathStyle:              imgCfg.ForcePathStyle,
 		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
 	})
 }
 
@@ -6112,11 +6199,25 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 	}
 
+	if req.AutoPause5hGuardBandPercent != nil {
+		if *req.AutoPause5hGuardBandPercent < 0 || *req.AutoPause5hGuardBandPercent > 100 {
+			writeError(c, http.StatusBadRequest, "auto_pause_5h_guard_band_percent 需在 0 到 100 之间")
+			return
+		}
+	}
+	if req.AutoPause5hGuardConcurrency != nil {
+		if *req.AutoPause5hGuardConcurrency < 0 || *req.AutoPause5hGuardConcurrency > 1000 {
+			writeError(c, http.StatusBadRequest, "auto_pause_5h_guard_concurrency 需在 0 到 1000 之间")
+			return
+		}
+	}
+
 	currentAdminSecret := ""
 	siteName := database.DefaultSiteName
 	siteLogo := ""
 	bgCfg := defaultBackgroundConfig()
 	showFullUsageNumbers := false
+	publicKeyUsagePageEnabled := true
 	existingSettings, _ := h.db.GetSystemSettings(c.Request.Context())
 	if existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
@@ -6124,6 +6225,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		siteLogo = strings.TrimSpace(existingSettings.SiteLogo)
 		bgCfg = decodeBackgroundConfig(existingSettings.BackgroundConfig)
 		showFullUsageNumbers = existingSettings.ShowFullUsageNumbers
+		publicKeyUsagePageEnabled = existingSettings.PublicKeyUsagePageEnabled
 	}
 	if req.AdminSecret != nil {
 		if h.adminSecretEnv == "" {
@@ -6559,6 +6661,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		showFullUsageNumbers = *req.ShowFullUsageNumbers
 		log.Printf("设置已更新: show_full_usage_numbers = %t", showFullUsageNumbers)
 	}
+	if req.PublicKeyUsagePageEnabled != nil {
+		publicKeyUsagePageEnabled = *req.PublicKeyUsagePageEnabled
+		log.Printf("设置已更新: public_key_usage_page_enabled = %t", publicKeyUsagePageEnabled)
+	}
 	if req.AutoPause5hThreshold != nil || req.AutoPause7dThreshold != nil {
 		t5h := h.store.GetGlobalAutoPause5hThreshold()
 		t7d := h.store.GetGlobalAutoPause7dThreshold()
@@ -6570,6 +6676,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.store.SetGlobalAutoPauseThresholds(t5h, t7d)
 		log.Printf("设置已更新: auto_pause thresholds 5h=%.4f 7d=%.4f", t5h, t7d)
+	}
+	if req.AutoPause5hGuardBandPercent != nil {
+		h.store.SetAutoPause5hGuardBandPercent(*req.AutoPause5hGuardBandPercent)
+		log.Printf("设置已更新: auto_pause_5h_guard_band_percent = %.2f", *req.AutoPause5hGuardBandPercent)
+	}
+	if req.AutoPause5hGuardConcurrency != nil {
+		h.store.SetAutoPause5hGuardConcurrency(*req.AutoPause5hGuardConcurrency)
+		log.Printf("设置已更新: auto_pause_5h_guard_concurrency = %d", *req.AutoPause5hGuardConcurrency)
 	}
 	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
 
@@ -6845,10 +6959,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
 		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
+		PublicKeyUsagePageEnabled:          publicKeyUsagePageEnabled,
 		ImageStorageConfig:                 imgConfigJSON,
 		BackgroundConfig:                   encodeBackgroundConfig(bgCfg),
 		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -6951,6 +7068,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		StreamFlushIntervalMS:              runtimeCfg.StreamFlushIntervalMS,
 		FirstTokenMode:                     runtimeCfg.FirstTokenMode,
 		FirstTokenTimeoutSeconds:           runtimeCfg.FirstTokenTimeoutSec,
+		BillingTierPolicy:                  runtimeCfg.BillingTierPolicy,
 		ShowFullUsageNumbers:               showFullUsageNumbers,
 		ImageStorageBackend:                imgCfg.Backend,
 		ImageS3Endpoint:                    imgCfg.Endpoint,
@@ -6962,6 +7080,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ImageS3ForcePathStyle:              imgCfg.ForcePathStyle,
 		AutoPause5hThreshold:               h.store.GetGlobalAutoPause5hThreshold(),
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
+		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
+		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
 	})
 }
 
