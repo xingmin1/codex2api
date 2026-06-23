@@ -736,6 +736,7 @@ export default function Accounts() {
   const [submitting, setSubmitting] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set());
+  const [copyingIds, setCopyingIds] = useState<Set<number>>(new Set());
   const [authJsonExportingIds, setAuthJsonExportingIds] = useState<Set<number>>(
     new Set(),
   );
@@ -2482,6 +2483,36 @@ export default function Accounts() {
     }
   };
 
+  const handleCloneAccount = async (account: AccountRow) => {
+    const confirmed = await confirm({
+      title: t("accounts.cloneTitle"),
+      description: t("accounts.cloneDesc", {
+        account: formatAccountName(account) || `ID ${account.id}`,
+      }),
+      confirmText: t("accounts.cloneConfirm"),
+      tone: "warning",
+    });
+    if (!confirmed) return;
+
+    setCopyingIds((prev) => new Set(prev).add(account.id));
+    try {
+      const result = await api.cloneAccount(account.id);
+      showToast(result.message || t("accounts.cloneSuccess"));
+      void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.cloneFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setCopyingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(account.id);
+        return next;
+      });
+    }
+  };
+
   const handleRefresh = async (account: AccountRow) => {
     setRefreshingIds((prev) => new Set(prev).add(account.id));
     try {
@@ -4032,6 +4063,7 @@ export default function Accounts() {
                           showEmailDomainTags={showEmailDomainTags}
                           healthBuckets={healthBars[String(account.id)]}
                           refreshing={refreshingIds.has(account.id)}
+                          copying={copyingIds.has(account.id)}
                           authJsonExporting={authJsonExportingIds.has(account.id)}
                           variant={isPersonalMode ? "personal" : "mobile"}
                           t={t}
@@ -4039,6 +4071,7 @@ export default function Accounts() {
                           onEdit={() => openSchedulerEditor(account)}
                           onUsage={() => setUsageAccount(account)}
                           onTest={() => setTestingAccount(account)}
+                          onClone={() => void handleCloneAccount(account)}
                           onRefresh={() => void handleRefresh(account)}
                           onGenerateAuthJson={() =>
                             void handleGenerateAuthJSON(account)
@@ -4426,6 +4459,18 @@ export default function Accounts() {
                                     title={t("accounts.editScheduler")}
                                   >
                                     <Pencil className="size-3.5" />
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    size="icon"
+                                    className="h-7 w-8 px-0"
+                                    disabled={copyingIds.has(account.id)}
+                                    onClick={() => void handleCloneAccount(account)}
+                                    title={t("accounts.cloneAccount")}
+                                  >
+                                    <Copy
+                                      className={`size-3.5 ${copyingIds.has(account.id) ? "animate-pulse" : ""}`}
+                                    />
                                   </Button>
                                   <Button
                                     variant="outline"
@@ -8634,6 +8679,7 @@ function AccountMobileCard({
   showEmailDomainTags,
   healthBuckets,
   refreshing,
+  copying,
   authJsonExporting,
   variant = "mobile",
   t,
@@ -8641,6 +8687,7 @@ function AccountMobileCard({
   onEdit,
   onUsage,
   onTest,
+  onClone,
   onRefresh,
   onGenerateAuthJson,
   onToggleEnabled,
@@ -8657,6 +8704,7 @@ function AccountMobileCard({
   showEmailDomainTags: boolean;
   healthBuckets: AccountHealthBucket[] | undefined;
   refreshing: boolean;
+  copying: boolean;
   authJsonExporting: boolean;
   variant?: "mobile" | "personal";
   t: ReturnType<typeof useTranslation>["t"];
@@ -8664,6 +8712,7 @@ function AccountMobileCard({
   onEdit: () => void;
   onUsage: () => void;
   onTest: () => void;
+  onClone: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
   onToggleEnabled: () => void;
@@ -8954,6 +9003,17 @@ function AccountMobileCard({
               label={t("accounts.testConnection")}
               onClick={onTest}
               icon={<Zap className="size-3.5" />}
+            />
+            <AccountMobileActionButton
+              title={t("accounts.cloneAccount")}
+              label={t("accounts.cloneAccount")}
+              disabled={copying}
+              onClick={onClone}
+              icon={
+                <Copy
+                  className={`size-3.5 ${copying ? "animate-pulse" : ""}`}
+                />
+              }
             />
             <AccountMobileActionButton
               title={
@@ -9252,6 +9312,14 @@ function AccountMobileCard({
           title={t("accounts.testConnection")}
           onClick={onTest}
           icon={<Zap className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={t("accounts.cloneAccount")}
+          disabled={copying}
+          onClick={onClone}
+          icon={
+            <Copy className={`size-3.5 ${copying ? "animate-pulse" : ""}`} />
+          }
         />
         <AccountMobileActionButton
           title={

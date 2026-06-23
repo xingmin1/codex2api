@@ -9,6 +9,7 @@ import type {
   APIKeyTokenStat,
   AccountsResponse,
   ChartAggregation,
+  CloneAccountRequest,
   CreateAccountResponse,
   CreateAPIKeyResponse,
   CreateAPIKeyRequest,
@@ -211,6 +212,8 @@ export const api = {
     request<FetchOpenAIResponsesModelsResponse>('/accounts/openai-responses/models', { method: 'POST', body: JSON.stringify(data) }),
   updateOpenAIResponsesAccount: (id: number, data: UpdateOpenAIResponsesAccountRequest) =>
     request<MessageResponse>(`/accounts/${id}/openai-responses`, { method: 'PATCH', body: JSON.stringify(data) }),
+  cloneAccount: (id: number, data: CloneAccountRequest = {}) =>
+    request<CreateAccountResponse>(`/accounts/${id}/clone`, { method: 'POST', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   getRecycleBinAccounts: () =>

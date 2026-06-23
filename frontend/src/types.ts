@@ -218,6 +218,10 @@ export interface FetchOpenAIResponsesModelsResponse {
   models: string[]
 }
 
+export interface CloneAccountRequest {
+  name?: string
+}
+
 export interface UpdateAccountSchedulerRequest {
   score_bias_override?: number | null
   base_concurrency_override?: number | null

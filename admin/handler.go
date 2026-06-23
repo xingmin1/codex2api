@@ -290,6 +290,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
+	api.POST("/accounts/:id/clone", h.CloneAccount)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
 	api.POST("/accounts/sub2api/import", h.ImportFromSub2API)
@@ -2323,6 +2324,61 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	h.db.InsertAccountEventAsync(id, "updated", "manual_openai_responses")
 
 	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
+}
+
+type cloneAccountReq struct {
+	Name string `json:"name"`
+}
+
+// CloneAccount 复制一个账号的凭据与用户配置，生成新的 active 账号。
+func (h *Handler) CloneAccount(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req cloneAccountReq
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	req.Name = security.SanitizeInput(req.Name)
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	newID, err := h.db.CloneAccount(ctx, id, database.CloneAccountOptions{Name: req.Name})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "复制账号失败: "+err.Error())
+		return
+	}
+	h.db.InsertAccountEventAsync(newID, "added", "manual_clone")
+	if h.store != nil {
+		if err := h.store.LoadAccountByID(ctx, newID); err != nil {
+			log.Printf("复制账号 %d 后热加载失败: %v", newID, err)
+		}
+	}
+
+	security.SecurityAuditLog("ACCOUNT_CLONED", fmt.Sprintf("source_id=%d new_id=%d ip=%s", id, newID, c.ClientIP()))
+	c.JSON(http.StatusOK, gin.H{
+		"message": "账号已复制",
+		"id":      newID,
+	})
 }
 
 func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {

@@ -1845,6 +1845,108 @@ func TestSoftDeleteAccountMarksDeletedStatus(t *testing.T) {
 	}
 }
 
+func TestCloneAccountCopiesConfigAndClearsRuntimeState(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertAccountWithCredentials(ctx, "source", map[string]interface{}{
+		"refresh_token":                      "rt-source",
+		"access_token":                       "at-source",
+		"email":                              "source@example.com",
+		"plan_type":                          "pro",
+		"allowed_api_key_ids":                []int64{7, 9},
+		"ignore_usage_limit_429_cooldown":    true,
+		"ignore_unauthorized_cooldown":       true,
+		"price_multiplier":                   0.25,
+		"cheap_probe_recovery_margin":        12.5,
+		"cheap_probe_bonus_duration_minutes": 30,
+	}, "http://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials 返回错误: %v", err)
+	}
+	groupID, err := db.CreateAccountGroup(ctx, "clone-group", "", "#2563eb", 0, 0, 0)
+	if err != nil {
+		t.Fatalf("CreateAccountGroup 返回错误: %v", err)
+	}
+	if err := db.SetAccountGroups(ctx, id, []int64{groupID}); err != nil {
+		t.Fatalf("SetAccountGroups 返回错误: %v", err)
+	}
+	if err := db.UpdateAccountSchedulerMetadata(ctx, id,
+		OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 42, Valid: true}},
+		OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 3, Valid: true}},
+		OptionalBool{Set: true, Value: true},
+		OptionalInt64Slice{},
+		OptionalStringSlice{Set: true, Values: []string{"cheap", "clone"}},
+		OptionalInt64Slice{},
+		OptionalString{},
+		nil,
+	); err != nil {
+		t.Fatalf("UpdateAccountSchedulerMetadata 返回错误: %v", err)
+	}
+	if err := db.SetCooldownWithError(ctx, id, "rate_limited", time.Now().Add(time.Hour), "source cooldown"); err != nil {
+		t.Fatalf("SetCooldownWithError 返回错误: %v", err)
+	}
+
+	clonedID, err := db.CloneAccount(ctx, id, CloneAccountOptions{Name: "copied"})
+	if err != nil {
+		t.Fatalf("CloneAccount 返回错误: %v", err)
+	}
+	if clonedID == id {
+		t.Fatal("CloneAccount 返回了源账号 ID")
+	}
+
+	row, err := db.GetAccountByID(ctx, clonedID)
+	if err != nil {
+		t.Fatalf("GetAccountByID 返回错误: %v", err)
+	}
+	if row.Name != "copied" {
+		t.Fatalf("name = %q, want copied", row.Name)
+	}
+	if row.Status != "active" || row.ErrorMessage != "" || row.CooldownReason != "" || row.CooldownUntil.Valid {
+		t.Fatalf("runtime state copied unexpectedly: status=%q error=%q cooldown=%q until=%v", row.Status, row.ErrorMessage, row.CooldownReason, row.CooldownUntil)
+	}
+	if row.ProxyURL != "http://127.0.0.1:8080" {
+		t.Fatalf("proxy_url = %q", row.ProxyURL)
+	}
+	if row.GetCredential("refresh_token") != "rt-source" || row.GetCredential("access_token") != "at-source" {
+		t.Fatalf("credentials not copied: %+v", row.Credentials)
+	}
+	if got := row.GetCredentialInt64Slice("allowed_api_key_ids"); len(got) != 2 || got[0] != 7 || got[1] != 9 {
+		t.Fatalf("allowed_api_key_ids = %+v", got)
+	}
+	if !row.GetCredentialBool("ignore_usage_limit_429_cooldown") || !row.GetCredentialBool("ignore_unauthorized_cooldown") {
+		t.Fatalf("ignore cooldown flags not copied: %+v", row.Credentials)
+	}
+	if got, ok := row.GetCredentialFloat64("price_multiplier"); !ok || got != 0.25 {
+		t.Fatalf("price_multiplier = %v ok=%v", got, ok)
+	}
+	if !row.ScoreBiasOverride.Valid || row.ScoreBiasOverride.Int64 != 42 {
+		t.Fatalf("score_bias_override = %+v", row.ScoreBiasOverride)
+	}
+	if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 3 {
+		t.Fatalf("base_concurrency_override = %+v", row.BaseConcurrencyOverride)
+	}
+	if !row.SkipWarmTier {
+		t.Fatal("skip_warm_tier not copied")
+	}
+	if len(row.Tags) != 2 || row.Tags[0] != "cheap" || row.Tags[1] != "clone" {
+		t.Fatalf("tags = %+v", row.Tags)
+	}
+	groups, err := db.GetAccountGroupIDs(ctx, clonedID)
+	if err != nil {
+		t.Fatalf("GetAccountGroupIDs 返回错误: %v", err)
+	}
+	if len(groups) != 1 || groups[0] != groupID {
+		t.Fatalf("groups = %+v, want [%d]", groups, groupID)
+	}
+}
+
 func TestSQLiteMigratesLegacyDeletedAccounts(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	ctx := context.Background()

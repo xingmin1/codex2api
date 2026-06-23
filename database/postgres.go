@@ -89,6 +89,11 @@ type BatchAccountMetadataUpdate struct {
 	CredentialUpdates       map[string]interface{}
 }
 
+// CloneAccountOptions 描述复制账号时可覆盖的用户输入。
+type CloneAccountOptions struct {
+	Name string
+}
+
 func (u BatchAccountMetadataUpdate) HasChanges() bool {
 	return u.Enabled.Set ||
 		u.Locked.Set ||
@@ -5221,6 +5226,179 @@ func (db *DB) InsertOpenAIResponsesAccount(ctx context.Context, name string, cre
 		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, 'openai', 'responses_api', $2, $3)`,
 		name, credJSON, proxyURL,
 	)
+}
+
+// CloneAccount 将一个未删除账号复制为新的 active 账号。
+//
+// 复制范围仅包含凭据、代理、启用/锁定、信用、调度覆盖、标签和分组等用户配置。
+// 冷却、错误、运行时状态、用量与请求日志属于源账号历史，不应带到新账号。
+func (db *DB) CloneAccount(ctx context.Context, sourceID int64, opts CloneAccountOptions) (int64, error) {
+	if sourceID <= 0 {
+		return 0, sql.ErrNoRows
+	}
+	var id int64
+	err := db.withSQLiteWriteLock(ctx, func() error {
+		var err error
+		id, err = db.cloneAccount(ctx, sourceID, opts)
+		return err
+	})
+	return id, err
+}
+
+func (db *DB) cloneAccount(ctx context.Context, sourceID int64, opts CloneAccountOptions) (int64, error) {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	query := `
+		SELECT name, platform, type, credentials, proxy_url,
+			COALESCE(enabled, true), COALESCE(locked, false),
+			COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false),
+			COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override,
+			COALESCE(tags, '[]')
+		FROM accounts
+		WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
+	`
+	if !db.isSQLite() {
+		query += " FOR UPDATE"
+	}
+
+	var sourceName, platform, accountType, proxyURL string
+	var credRaw interface{}
+	var enabled, locked, creditEnabled, creditSkipUsageWindow, skipWarmTier bool
+	var scoreBiasOverride, baseConcurrencyOverride sql.NullInt64
+	var tagsRaw interface{}
+	if err := tx.QueryRowContext(ctx, query, sourceID).Scan(
+		&sourceName,
+		&platform,
+		&accountType,
+		&credRaw,
+		&proxyURL,
+		&enabled,
+		&locked,
+		&creditEnabled,
+		&creditSkipUsageWindow,
+		&skipWarmTier,
+		&scoreBiasOverride,
+		&baseConcurrencyOverride,
+		&tagsRaw,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, sql.ErrNoRows
+		}
+		return 0, err
+	}
+
+	name := strings.TrimSpace(opts.Name)
+	if name == "" {
+		name = strings.TrimSpace(sourceName) + "-copy"
+	}
+	if name == "-copy" {
+		name = fmt.Sprintf("account-%d-copy", sourceID)
+	}
+
+	credJSON, err := json.Marshal(decodeCredentials(credRaw))
+	if err != nil {
+		return 0, fmt.Errorf("序列化 credentials 失败: %w", err)
+	}
+	tagsJSON := encodeTagsJSON(decodeTagsValue(tagsRaw))
+
+	insertQuery := `
+		INSERT INTO accounts (
+			name, platform, type, credentials, proxy_url,
+			status, error_message, cooldown_reason, cooldown_until,
+			enabled, locked, credit_enabled, credit_skip_usage_window,
+			skip_warm_tier, score_bias_override, base_concurrency_override,
+			tags, created_at, updated_at
+		)
+		VALUES (
+			$1, $2, $3, $4, $5,
+			'active', '', '', NULL,
+			$6, $7, $8, $9,
+			$10, $11, $12,
+			$13::jsonb, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		)
+		RETURNING id
+	`
+
+	var newID int64
+	if db.isSQLite() {
+		insertQuery = `
+			INSERT INTO accounts (
+				name, platform, type, credentials, proxy_url,
+				status, error_message, cooldown_reason, cooldown_until,
+				enabled, locked, credit_enabled, credit_skip_usage_window,
+				skip_warm_tier, score_bias_override, base_concurrency_override,
+				tags, created_at, updated_at
+			)
+			VALUES (
+				?, ?, ?, ?, ?,
+				'active', '', '', NULL,
+				?, ?, ?, ?,
+				?, ?, ?,
+				?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+			)
+		`
+		res, err := tx.ExecContext(ctx, insertQuery,
+			name, platform, accountType, credJSON, proxyURL,
+			enabled, locked, creditEnabled, creditSkipUsageWindow,
+			skipWarmTier, nullableInt64Value(scoreBiasOverride), nullableInt64Value(baseConcurrencyOverride),
+			tagsJSON,
+		)
+		if err != nil {
+			return 0, err
+		}
+		newID, err = res.LastInsertId()
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		err = tx.QueryRowContext(ctx, insertQuery,
+			name, platform, accountType, credJSON, proxyURL,
+			enabled, locked, creditEnabled, creditSkipUsageWindow,
+			skipWarmTier, nullableInt64Value(scoreBiasOverride), nullableInt64Value(baseConcurrencyOverride),
+			tagsJSON,
+		).Scan(&newID)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	groupQuery := "SELECT group_id FROM account_group_members WHERE account_id = $1 ORDER BY group_id"
+	groupInsertQuery := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
+	if db.isSQLite() {
+		groupQuery = "SELECT group_id FROM account_group_members WHERE account_id = ? ORDER BY group_id"
+		groupInsertQuery = "INSERT INTO account_group_members (account_id, group_id) VALUES (?, ?)"
+	}
+	rows, err := tx.QueryContext(ctx, groupQuery, sourceID)
+	if err != nil {
+		return 0, err
+	}
+	for rows.Next() {
+		var groupID int64
+		if err := rows.Scan(&groupID); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, groupInsertQuery, newID, groupID); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return newID, nil
 }
 
 // GetAllAccessTokens 获取所有已存在的 access_token（用于 AT 导入去重，排除已删除账号）
