@@ -1113,6 +1113,8 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		CodexWSHideUpstreamErrors:        true,
 		CodexWSSilentRetryEnabled:        true,
 		CodexWSSilentMaxRetries:          4,
+		CheapProbeMaxMultiplier:          0.25,
+		DispatchMaxMultiplier:            0.5,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1129,6 +1131,12 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.FirstTokenMode != "loose" {
 		t.Fatalf("FirstTokenMode = %q, want loose", settings.FirstTokenMode)
+	}
+	if settings.CheapProbeMaxMultiplier != 0.25 {
+		t.Fatalf("CheapProbeMaxMultiplier = %v, want 0.25", settings.CheapProbeMaxMultiplier)
+	}
+	if settings.DispatchMaxMultiplier != 0.5 {
+		t.Fatalf("DispatchMaxMultiplier = %v, want 0.5", settings.DispatchMaxMultiplier)
 	}
 	if !settings.ShowFullUsageNumbers {
 		t.Fatal("ShowFullUsageNumbers = false, want true")
@@ -1174,6 +1182,12 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.CodexWSSilentMaxRetries != 4 {
 		t.Fatalf("CodexWSSilentMaxRetries = %d, want 4", settings.CodexWSSilentMaxRetries)
+	}
+	if settings.CheapProbeMaxMultiplier != 0.25 {
+		t.Fatalf("CheapProbeMaxMultiplier = %v, want 0.25", settings.CheapProbeMaxMultiplier)
+	}
+	if settings.DispatchMaxMultiplier != 0.5 {
+		t.Fatalf("DispatchMaxMultiplier = %v, want 0.5", settings.DispatchMaxMultiplier)
 	}
 
 	settings.PublicKeyUsagePageEnabled = false
@@ -2323,6 +2337,78 @@ func TestSQLiteUsageLogsTimeRangeUsesUTCStorage(t *testing.T) {
 	}
 	if got := page.Logs[0].Model; got != "gpt-image-2" {
 		t.Fatalf("Model = %q, want gpt-image-2", got)
+	}
+}
+
+func TestUsageLogsReturnPriceMultiplierWithDefaultAndNameSuffix(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	explicitID, err := db.InsertAccountWithCredentials(ctx, "explicit", map[string]interface{}{"price_multiplier": 0.25}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials explicit 返回错误: %v", err)
+	}
+	nameSuffixID, err := db.InsertAccountWithCredentials(ctx, "name-suffix-0.050", map[string]interface{}{}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials suffix 返回错误: %v", err)
+	}
+	defaultID, err := db.InsertAccountWithCredentials(ctx, "default", map[string]interface{}{}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials default 返回错误: %v", err)
+	}
+	for _, accountID := range []int64{explicitID, nameSuffixID, defaultID} {
+		if err := db.InsertUsageLog(ctx, &UsageLogInput{
+			AccountID:  accountID,
+			Endpoint:   "/v1/responses",
+			Model:      "gpt-5.4",
+			StatusCode: 200,
+		}); err != nil {
+			t.Fatalf("InsertUsageLog account=%d 返回错误: %v", accountID, err)
+		}
+	}
+	db.flushLogs()
+
+	page, err := db.ListUsageLogsByTimeRangePaged(ctx, UsageLogFilter{
+		Start:    time.Now().Add(-1 * time.Hour),
+		End:      time.Now().Add(1 * time.Hour),
+		Page:     1,
+		PageSize: 10,
+		SortBy:   "price_multiplier",
+		SortDir:  "asc",
+	})
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged 返回错误: %v", err)
+	}
+	if page.Total != 3 || len(page.Logs) != 3 {
+		t.Fatalf("usage logs = total %d len %d, want 3", page.Total, len(page.Logs))
+	}
+	wantOrder := []int64{nameSuffixID, explicitID, defaultID}
+	for i, wantAccountID := range wantOrder {
+		if gotAccountID := page.Logs[i].AccountID; gotAccountID != wantAccountID {
+			t.Fatalf("sorted account[%d] = %d, want %d", i, gotAccountID, wantAccountID)
+		}
+	}
+	got := map[int64]float64{}
+	for _, usageLog := range page.Logs {
+		if usageLog.AccountPriceMultiplier == nil {
+			t.Fatalf("account %d multiplier is nil, want concrete value", usageLog.AccountID)
+		}
+		got[usageLog.AccountID] = *usageLog.AccountPriceMultiplier
+	}
+	if got[explicitID] != 0.25 {
+		t.Fatalf("explicit multiplier = %v, want 0.25", got[explicitID])
+	}
+	if got[nameSuffixID] != 0.05 {
+		t.Fatalf("name suffix multiplier = %v, want 0.05", got[nameSuffixID])
+	}
+	if got[defaultID] != 1 {
+		t.Fatalf("default multiplier = %v, want 1", got[defaultID])
 	}
 }
 

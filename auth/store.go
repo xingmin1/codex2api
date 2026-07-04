@@ -201,10 +201,12 @@ const (
 	defaultCheapProbeRankBase        = 180 * time.Second
 	defaultCheapProbeRankStep        = 30 * time.Second
 	defaultCheapProbeRankMin         = 30 * time.Second
+	defaultCheapProbeMaxMultiplier   = 0.0
+	defaultDispatchMaxMultiplier     = 0.0
 )
 
 var (
-	accountNamePriceMultiplierRe = regexp.MustCompile(`(?:^|[^0-9])([0-9]+\.[0-9]+)\s*$`)
+	accountNamePriceMultiplierRe = regexp.MustCompile(`(?:^|[^0-9])([0-9]*\.[0-9]+)\s*$`)
 )
 
 // SchedulerBreakdown 调度评分拆解
@@ -649,7 +651,28 @@ func normalizePriceMultiplier(value float64) (float64, bool) {
 	return value, true
 }
 
+func normalizeCheapProbeMaxMultiplier(value float64) float64 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return defaultCheapProbeMaxMultiplier
+	}
+	if value > 1000 {
+		return 1000
+	}
+	return value
+}
+
+func normalizeDispatchMaxMultiplier(value float64) float64 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return defaultDispatchMaxMultiplier
+	}
+	if value > 1000 {
+		return 1000
+	}
+	return value
+}
+
 // ParsePriceMultiplierFromName 从账号名末尾的小数后缀解析价格倍率。
+// 支持 "0.5" 以及 ".2" 这类写法；".2" 会归一为 0.2。
 func ParsePriceMultiplierFromName(name string) (float64, bool) {
 	matches := accountNamePriceMultiplierRe.FindStringSubmatch(strings.TrimSpace(name))
 	if len(matches) != 2 {
@@ -670,6 +693,9 @@ func resolveAccountRowPriceMultiplier(row *database.AccountRow) float64 {
 		if normalized, valid := normalizePriceMultiplier(value); valid {
 			return normalized
 		}
+	}
+	if value, ok := ParsePriceMultiplierFromName(row.Name); ok {
+		return value
 	}
 	return 0
 }
@@ -1945,6 +1971,16 @@ func (a *Account) GetPriceMultiplier() (float64, bool) {
 	return normalizePriceMultiplier(a.PriceMultiplier)
 }
 
+// PriceMultiplierForComparison 返回用于调度比较的价格倍率；未设置时按 1 处理。
+func (a *Account) PriceMultiplierForComparison() float64 {
+	if a == nil {
+		return 1
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return priceMultiplierForComparison(a.PriceMultiplier)
+}
+
 // CheapProbeRuntimeSnapshot 返回便宜账号探测相关运行时状态。
 func (a *Account) CheapProbeRuntimeSnapshot() (float64, time.Time, time.Time, string, float64, time.Time) {
 	a.mu.RLock()
@@ -1964,9 +2000,6 @@ func (a *Account) NeedsCheapProbe(now time.Time, interval time.Duration) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if a.cheapProbeInFlight {
-		return false
-	}
-	if _, ok := normalizePriceMultiplier(a.PriceMultiplier); !ok {
 		return false
 	}
 	if !a.CheapProbeBonusUntil.IsZero() && now.Before(a.CheapProbeBonusUntil) {
@@ -2200,6 +2233,8 @@ type Store struct {
 	cheapProbeRankBaseInterval         int64 // 倍率排名第 0 名的探测间隔（ns）
 	cheapProbeRankStepInterval         int64 // 排名每前进一档减少的探测间隔（ns）
 	cheapProbeRankMinInterval          int64 // 倍率排名探测间隔下限（ns）
+	cheapProbeMaxMultiplierBits        atomic.Uint64
+	dispatchMaxMultiplierBits          atomic.Uint64
 	cheapProbeTopologyVersion          atomic.Uint64
 	cheapProbeRescanRequested          atomic.Bool
 	cheapProbeWakeCh                   chan struct{}
@@ -2626,6 +2661,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			CheapProbeRankBaseIntervalSeconds:  int(defaultCheapProbeRankBase / time.Second),
 			CheapProbeRankStepSeconds:          int(defaultCheapProbeRankStep / time.Second),
 			CheapProbeRankMinIntervalSeconds:   int(defaultCheapProbeRankMin / time.Second),
+			CheapProbeMaxMultiplier:            defaultCheapProbeMaxMultiplier,
+			DispatchMaxMultiplier:              defaultDispatchMaxMultiplier,
 			LazyMode:                           false,
 			ProxyURL:                           "",
 			MaxRateLimitRetries:                1,
@@ -2665,7 +2702,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		settings.CheapProbeBonusDurationMinutes == 0 &&
 		settings.CheapProbeRankBaseIntervalSeconds == 0 &&
 		settings.CheapProbeRankStepSeconds == 0 &&
-		settings.CheapProbeRankMinIntervalSeconds == 0 {
+		settings.CheapProbeRankMinIntervalSeconds == 0 &&
+		settings.CheapProbeMaxMultiplier == 0 {
 		settings.CheapProbeEnabled = true
 		settings.CheapProbeScanIntervalSeconds = int(defaultCheapProbeScanInterval / time.Second)
 		settings.CheapProbeConcurrency = defaultCheapProbeConcurrency
@@ -2675,6 +2713,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		settings.CheapProbeRankBaseIntervalSeconds = int(defaultCheapProbeRankBase / time.Second)
 		settings.CheapProbeRankStepSeconds = int(defaultCheapProbeRankStep / time.Second)
 		settings.CheapProbeRankMinIntervalSeconds = int(defaultCheapProbeRankMin / time.Second)
+		settings.CheapProbeMaxMultiplier = defaultCheapProbeMaxMultiplier
 	}
 	s.setCheapProbeEnabled(settings.CheapProbeEnabled, false)
 	s.setCheapProbeScanInterval(time.Duration(settings.CheapProbeScanIntervalSeconds)*time.Second, false)
@@ -2687,6 +2726,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		time.Duration(settings.CheapProbeRankStepSeconds)*time.Second,
 		time.Duration(settings.CheapProbeRankMinIntervalSeconds)*time.Second,
 	)
+	s.setCheapProbeMaxMultiplier(settings.CheapProbeMaxMultiplier, false)
+	s.setDispatchMaxMultiplier(settings.DispatchMaxMultiplier, false)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
@@ -3390,6 +3431,118 @@ func (s *Store) getCheapProbeRankMinInterval() time.Duration {
 	return normalizeCheapProbeDuration(d, defaultCheapProbeRankMin, 5*time.Second, 24*time.Hour)
 }
 
+func cheapProbeMaxMultiplierFromBits(bits uint64) float64 {
+	return normalizeCheapProbeMaxMultiplier(math.Float64frombits(bits))
+}
+
+func dispatchMaxMultiplierFromBits(bits uint64) float64 {
+	return normalizeDispatchMaxMultiplier(math.Float64frombits(bits))
+}
+
+// SetCheapProbeMaxMultiplier 设置便宜账号探测最高价格倍率；0 表示不限制。
+func (s *Store) SetCheapProbeMaxMultiplier(value float64) {
+	s.setCheapProbeMaxMultiplier(value, true)
+}
+
+func (s *Store) setCheapProbeMaxMultiplier(value float64, wake bool) {
+	if s == nil {
+		return
+	}
+	normalized := normalizeCheapProbeMaxMultiplier(value)
+	old := cheapProbeMaxMultiplierFromBits(s.cheapProbeMaxMultiplierBits.Load())
+	s.cheapProbeMaxMultiplierBits.Store(math.Float64bits(normalized))
+	if old == normalized {
+		return
+	}
+	s.clearCheapProbeBonusesOutsideMaxMultiplier(normalized)
+	if wake {
+		s.markCheapProbeTopologyChanged()
+	}
+}
+
+// GetCheapProbeMaxMultiplier 返回便宜账号探测最高价格倍率；0 表示不限制。
+func (s *Store) GetCheapProbeMaxMultiplier() float64 {
+	if s == nil {
+		return defaultCheapProbeMaxMultiplier
+	}
+	return cheapProbeMaxMultiplierFromBits(s.cheapProbeMaxMultiplierBits.Load())
+}
+
+// SetDispatchMaxMultiplier 设置主调度最高价格倍率；0 表示不限制。
+func (s *Store) SetDispatchMaxMultiplier(value float64) {
+	s.setDispatchMaxMultiplier(value, true)
+}
+
+func (s *Store) setDispatchMaxMultiplier(value float64, rebuild bool) {
+	if s == nil {
+		return
+	}
+	normalized := normalizeDispatchMaxMultiplier(value)
+	old := dispatchMaxMultiplierFromBits(s.dispatchMaxMultiplierBits.Load())
+	s.dispatchMaxMultiplierBits.Store(math.Float64bits(normalized))
+	if rebuild && old != normalized && s.FastSchedulerEnabled() {
+		s.rebuildFastScheduler()
+	}
+}
+
+// GetDispatchMaxMultiplier 返回主调度最高价格倍率；0 表示不限制。
+func (s *Store) GetDispatchMaxMultiplier() float64 {
+	if s == nil {
+		return defaultDispatchMaxMultiplier
+	}
+	return dispatchMaxMultiplierFromBits(s.dispatchMaxMultiplierBits.Load())
+}
+
+func (s *Store) dispatchMultiplierAllowed(acc *Account) bool {
+	maxMultiplier := s.GetDispatchMaxMultiplier()
+	if maxMultiplier <= 0 || acc == nil {
+		return true
+	}
+	acc.mu.RLock()
+	priceMultiplier := priceMultiplierForComparison(acc.PriceMultiplier)
+	acc.mu.RUnlock()
+	return priceMultiplier <= maxMultiplier
+}
+
+func (s *Store) withDispatchMultiplierFilter(filter AccountFilter) AccountFilter {
+	maxMultiplier := s.GetDispatchMaxMultiplier()
+	if maxMultiplier <= 0 {
+		return filter
+	}
+	return func(acc *Account) bool {
+		if !s.dispatchMultiplierAllowed(acc) {
+			return false
+		}
+		return filter == nil || filter(acc)
+	}
+}
+
+func (s *Store) clearCheapProbeBonusesOutsideMaxMultiplier(maxMultiplier float64) {
+	if s == nil || maxMultiplier <= 0 {
+		return
+	}
+	baseLimit := atomic.LoadInt64(&s.maxConcurrency)
+	for _, acc := range s.Accounts() {
+		if acc == nil {
+			continue
+		}
+		changed := false
+		acc.mu.Lock()
+		priceMultiplier := priceMultiplierForComparison(acc.PriceMultiplier)
+		if priceMultiplier > maxMultiplier &&
+			(acc.CheapProbeRecoveryBonus != 0 || !acc.CheapProbeBonusUntil.IsZero()) {
+			acc.CheapProbeRecoveryBonus = 0
+			acc.CheapProbeBonusUntil = time.Time{}
+			acc.recomputeSchedulerLocked(baseLimit)
+			changed = true
+		}
+		acc.mu.Unlock()
+		if changed {
+			s.fastSchedulerUpdate(acc)
+		}
+	}
+}
+
 func (s *Store) cheapProbeIntervalForRank(rank int) time.Duration {
 	if rank < 0 {
 		rank = 0
@@ -3889,6 +4042,7 @@ func (s *Store) tryAcquireAccount(acc *Account, limit int64, updateSchedulerOnLi
 
 // NextExcludingWithFilter 获取下一个可用账号，并应用请求级账号过滤器。
 func (s *Store) NextExcludingWithFilter(apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
+	filter = s.withDispatchMultiplierFilter(filter)
 	if s.GetLazyMode() {
 		return s.nextExcludingWithFilterLazy(apiKeyID, exclude, filter)
 	}
@@ -4363,7 +4517,8 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 	if !s.accountAllowedForAPIKey(target, apiKeyID) {
 		return nil
 	}
-	if filter != nil && !filter(target) {
+	effectiveFilter := s.withDispatchMultiplierFilter(filter)
+	if effectiveFilter != nil && !effectiveFilter(target) {
 		return nil
 	}
 
@@ -4401,6 +4556,7 @@ func (s *Store) hasDispatchCandidateWithFilter(apiKeyID int64, exclude map[int64
 	if s == nil {
 		return false
 	}
+	filter = s.withDispatchMultiplierFilter(filter)
 
 	maxConcurrency := atomic.LoadInt64(&s.maxConcurrency)
 	s.mu.RLock()
@@ -6356,6 +6512,17 @@ func cheapProbeSelectable(acc *Account) bool {
 	return true
 }
 
+func cheapProbeEligibleForSuccess(acc *Account, maxMultiplier float64) (float64, bool) {
+	if !cheapProbeSelectable(acc) {
+		return 0, false
+	}
+	candidateMultiplier := acc.PriceMultiplierForComparison()
+	if maxMultiplier > 0 && candidateMultiplier > maxMultiplier {
+		return 0, false
+	}
+	return candidateMultiplier, true
+}
+
 func (s *Store) cheapProbeTopAccount(accounts []*Account, now time.Time) cheapProbeTopAccount {
 	baseLimit := atomic.LoadInt64(&s.maxConcurrency)
 	best := cheapProbeTopAccount{dispatchScore: -math.MaxFloat64}
@@ -6391,6 +6558,7 @@ func (s *Store) cheapProbeCandidates(accounts []*Account, now time.Time) ([]chea
 	if !top.found {
 		return nil, top
 	}
+	maxMultiplier := s.GetCheapProbeMaxMultiplier()
 	candidates := make([]*Account, 0)
 	for _, acc := range accounts {
 		if !cheapProbeSelectable(acc) || acc.DBID == top.dbID {
@@ -6400,15 +6568,18 @@ func (s *Store) cheapProbeCandidates(accounts []*Account, now time.Time) ([]chea
 		priceMultiplier := acc.PriceMultiplier
 		hasCredential := acc.hasDispatchCredentialLocked()
 		acc.mu.RUnlock()
-		normalized, ok := normalizePriceMultiplier(priceMultiplier)
-		if !ok || normalized >= top.priceMultiplier || !hasCredential {
+		normalized := priceMultiplierForComparison(priceMultiplier)
+		if normalized >= top.priceMultiplier || !hasCredential {
+			continue
+		}
+		if maxMultiplier > 0 && normalized > maxMultiplier {
 			continue
 		}
 		candidates = append(candidates, acc)
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
-		left, _ := candidates[i].GetPriceMultiplier()
-		right, _ := candidates[j].GetPriceMultiplier()
+		left := candidates[i].PriceMultiplierForComparison()
+		right := candidates[j].PriceMultiplierForComparison()
 		if left == right {
 			return candidates[i].DBID < candidates[j].DBID
 		}
@@ -6490,9 +6661,8 @@ func (s *Store) applyCheapProbeRecoveryBonus(acc *Account, top cheapProbeTopAcco
 	if s.cheapProbeTopologyVersion.Load() != batchVersion {
 		return false
 	}
-	acc.mu.RLock()
-	candidateMultiplier, ok := normalizePriceMultiplier(acc.PriceMultiplier)
-	acc.mu.RUnlock()
+	maxMultiplier := s.GetCheapProbeMaxMultiplier()
+	candidateMultiplier, ok := cheapProbeEligibleForSuccess(acc, maxMultiplier)
 	if !ok || !top.found || top.dbID == acc.DBID || candidateMultiplier >= top.priceMultiplier {
 		return false
 	}
@@ -6502,8 +6672,14 @@ func (s *Store) applyCheapProbeRecoveryBonus(acc *Account, top cheapProbeTopAcco
 	if s.cheapProbeTopologyVersion.Load() != batchVersion {
 		return false
 	}
-	candidateMultiplier, ok = normalizePriceMultiplier(acc.PriceMultiplier)
-	if !ok || candidateMultiplier >= top.priceMultiplier {
+	if atomic.LoadInt32(&acc.Disabled) != 0 || atomic.LoadInt32(&acc.DispatchPaused) != 0 {
+		return false
+	}
+	candidateMultiplier = priceMultiplierForComparison(acc.PriceMultiplier)
+	if candidateMultiplier >= top.priceMultiplier {
+		return false
+	}
+	if maxMultiplier > 0 && candidateMultiplier > maxMultiplier {
 		return false
 	}
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
@@ -6597,11 +6773,8 @@ func (s *Store) parallelCheapProbe(ctx context.Context) {
 	wg.Wait()
 
 	sort.SliceStable(successes, func(i, j int) bool {
-		left, leftOK := successes[i].GetPriceMultiplier()
-		right, rightOK := successes[j].GetPriceMultiplier()
-		if leftOK != rightOK {
-			return leftOK
-		}
+		left := successes[i].PriceMultiplierForComparison()
+		right := successes[j].PriceMultiplierForComparison()
 		if left != right {
 			return left < right
 		}
@@ -6609,7 +6782,12 @@ func (s *Store) parallelCheapProbe(ctx context.Context) {
 	})
 
 	if batchVersion != s.cheapProbeTopologyVersion.Load() {
+		maxMultiplier := s.GetCheapProbeMaxMultiplier()
 		for _, account := range successes {
+			if _, ok := cheapProbeEligibleForSuccess(account, maxMultiplier); !ok {
+				log.Printf("[账号 %d] 便宜账号探测成功，但当前已禁用调度或倍率不满足限制，本轮不清理状态或加分", account.DBID)
+				continue
+			}
 			if s.RecordCheapProbeSuccess(account) {
 				log.Printf("[账号 %d] 便宜账号探测成功，但账号池结构已变化，本轮仅清理状态", account.DBID)
 			}
@@ -6618,9 +6796,14 @@ func (s *Store) parallelCheapProbe(ctx context.Context) {
 	}
 
 	batchTop := top
+	maxMultiplier := s.GetCheapProbeMaxMultiplier()
 	for _, account := range successes {
+		candidateMultiplier, ok := cheapProbeEligibleForSuccess(account, maxMultiplier)
+		if !ok {
+			log.Printf("[账号 %d] 便宜账号探测成功，但当前已禁用调度或倍率不满足最高倍率限制，本轮不清理状态或加分", account.DBID)
+			continue
+		}
 		s.RecordCheapProbeSuccess(account)
-		candidateMultiplier, ok := account.GetPriceMultiplier()
 		if !ok || candidateMultiplier >= batchTop.priceMultiplier {
 			log.Printf("[账号 %d] 便宜账号探测成功，当前批次未满足加分条件，仅清理状态", account.DBID)
 			continue

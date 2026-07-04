@@ -237,7 +237,7 @@ func TestParseImportJSONTokensPreservesCPAFields(t *testing.T) {
 }
 
 func TestAccountFromCredentialSeedRestoresUsageSnapshots(t *testing.T) {
-	account := accountFromCredentialSeed(42, "", tokenCredentialSeed{
+	account := accountFromCredentialSeed(42, "", "", tokenCredentialSeed{
 		planType:              "free",
 		codex7DUsedPercent:    "3",
 		codex7DResetAt:        "2026-05-15T20:33:11+08:00",
@@ -270,7 +270,7 @@ func TestAccountFromCredentialSeedRestoresUsageSnapshots(t *testing.T) {
 }
 
 func TestAccountFromCredentialSeedDoesNotReuse7dFreshnessForMissing5hTimestamp(t *testing.T) {
-	account := accountFromCredentialSeed(42, "", tokenCredentialSeed{
+	account := accountFromCredentialSeed(42, "", "", tokenCredentialSeed{
 		codex7DUsedPercent:  "3",
 		codex5HUsedPercent:  "95",
 		codex5HResetAt:      time.Now().Add(time.Hour).Format(time.RFC3339),
@@ -1265,7 +1265,8 @@ func TestProbeImportedAccountUsageMergesAfterIdentityLearned(t *testing.T) {
 }
 
 // 勾选"允许重复添加"导入的 RT 账号刷新后不得被合并。
-func TestMergeRefreshedDuplicateSkipsAllowDuplicate(t *testing.T) {	gin.SetMode(gin.TestMode)
+func TestMergeRefreshedDuplicateSkipsAllowDuplicate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 
 	db := newTestAdminDB(t)
 	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})

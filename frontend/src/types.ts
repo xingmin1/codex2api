@@ -516,6 +516,8 @@ export interface RuntimeStatusResponse {
     cheap_probe_scan_interval_seconds: number
     cheap_probe_concurrency: number
     cheap_probe_recovery_margin: number
+    cheap_probe_max_multiplier: number
+    dispatch_max_multiplier: number
     usage_probe_running: boolean
     recovery_probe_running: boolean
     auto_cleanup_running: boolean
@@ -571,6 +573,8 @@ export interface SystemSettings {
   cheap_probe_rank_base_interval_seconds: number
   cheap_probe_rank_step_seconds: number
   cheap_probe_rank_min_interval_seconds: number
+  cheap_probe_max_multiplier: number
+  dispatch_max_multiplier: number
   lazy_mode: boolean
   proxy_url?: string
   pg_max_conns: number

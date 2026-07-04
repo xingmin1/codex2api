@@ -808,6 +808,8 @@ export default function Settings() {
     cheap_probe_rank_base_interval_seconds: 180,
     cheap_probe_rank_step_seconds: 30,
     cheap_probe_rank_min_interval_seconds: 30,
+    cheap_probe_max_multiplier: 0,
+    dispatch_max_multiplier: 0,
     lazy_mode: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
@@ -1522,6 +1524,24 @@ export default function Settings() {
                     max={86400}
                     value={settingsForm.cheap_probe_rank_min_interval_seconds}
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, cheap_probe_rank_min_interval_seconds: parseInt(e.target.value) || 5 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.cheapProbeMaxMultiplier')} description={t('settings.cheapProbeMaxMultiplierDesc')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    step="0.001"
+                    value={settingsForm.cheap_probe_max_multiplier}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, cheap_probe_max_multiplier: Number(e.target.value) || 0 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.dispatchMaxMultiplier')} description={t('settings.dispatchMaxMultiplierDesc')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    step="0.001"
+                    value={settingsForm.dispatch_max_multiplier}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, dispatch_max_multiplier: Number(e.target.value) || 0 }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.lazyMode')} description={t('settings.lazyModeDesc')}>

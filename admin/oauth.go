@@ -336,7 +336,7 @@ func (h *Handler) upsertOAuthIdentityAccount(ctx context.Context, name, proxyURL
 			return 0, false, err
 		}
 		h.db.InsertAccountEventAsync(id, "added", source)
-		h.loadInsertedTokenAccount(id, proxyURL, seed, source)
+		h.loadInsertedTokenAccount(id, name, proxyURL, seed, source)
 		return id, false, nil
 	}
 
@@ -374,7 +374,7 @@ func (h *Handler) upsertOAuthIdentityAccount(ctx context.Context, name, proxyURL
 		return 0, false, err
 	}
 	h.db.InsertAccountEventAsync(id, "added", source)
-	h.loadInsertedTokenAccount(id, proxyURL, seed, source)
+	h.loadInsertedTokenAccount(id, name, proxyURL, seed, source)
 	return id, false, nil
 }
 
@@ -391,11 +391,11 @@ func accountErrorStateNeedsReset(row *database.AccountRow) bool {
 	return strings.EqualFold(strings.TrimSpace(row.CooldownReason), "unauthorized")
 }
 
-func (h *Handler) loadInsertedTokenAccount(id int64, proxyURL string, seed tokenCredentialSeed, source string) {
+func (h *Handler) loadInsertedTokenAccount(id int64, name string, proxyURL string, seed tokenCredentialSeed, source string) {
 	if h == nil || h.store == nil {
 		return
 	}
-	newAcc := accountFromCredentialSeed(id, proxyURL, seed)
+	newAcc := accountFromCredentialSeed(id, name, proxyURL, seed)
 	h.store.AddAccount(newAcc)
 	h.triggerTokenAccountProbe(id, source)
 }

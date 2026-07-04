@@ -900,8 +900,6 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			}
 			if priceMultiplier, ok := acc.GetPriceMultiplier(); ok {
 				resp.PriceMultiplier = &priceMultiplier
-			} else {
-				resp.PriceMultiplier = nil
 			}
 			if margin, duration := acc.CheapProbeConfigSnapshot(); margin > 0 || duration > 0 {
 				resp.CheapProbeRecoveryMargin = normalizePositiveFloatPointer(margin)
@@ -1441,10 +1439,13 @@ func accountPriceMultiplier(row *database.AccountRow) *float64 {
 		return nil
 	}
 	value, ok := row.GetCredentialFloat64("price_multiplier")
-	if !ok || value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
-		return nil
+	if ok && value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
+		return &value
 	}
-	return &value
+	if inferred, ok := auth.ParsePriceMultiplierFromName(row.Name); ok {
+		return &inferred
+	}
+	return nil
 }
 
 func accountCheapProbeRecoveryMargin(row *database.AccountRow) *float64 {
@@ -2017,7 +2018,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 		h.db.InsertAccountEventAsync(id, "added", "manual")
 
 		// 热加载：直接加入内存池
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		newAcc := accountFromCredentialSeed(id, name, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
 		if newAcc.GetAccessToken() != "" {
@@ -2098,7 +2099,7 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual")
 
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		newAcc := accountFromCredentialSeed(id, name, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
 		if newAcc.GetAccessToken() != "" {
@@ -2257,7 +2258,7 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 
 		// 热加载到内存池（AT-only，无 RT）。codex_at 不走 JWT 解码，
 		// 身份信息后续由 wham 用量查询补齐。
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		newAcc := accountFromCredentialSeed(id, name, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 
 		// 将解析/识别到的信息持久化到数据库。
@@ -2373,7 +2374,7 @@ func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, token
 
 		successCount++
 		h.db.InsertAccountEventAsync(id, "added", "manual_at")
-		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		newAcc := accountFromCredentialSeed(id, name, req.ProxyURL, seed)
 		h.store.AddAccount(newAcc)
 		if creds := tokenCredentialMap(seed); len(creds) > 0 {
 			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
@@ -2654,6 +2655,12 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	}
 	if h.store != nil {
 		h.store.ApplyOpenAIResponsesConfig(id, baseURL, req.APIKey, models, req.ProxyURL)
+		runtimePriceMultiplierRow := &database.AccountRow{Name: name, Credentials: row.Credentials}
+		if priceMultiplier := accountPriceMultiplier(runtimePriceMultiplierRow); priceMultiplier != nil {
+			h.store.ApplyAccountPriceMultiplier(id, *priceMultiplier)
+		} else {
+			h.store.ApplyAccountPriceMultiplier(id, 0)
+		}
 	}
 	h.db.InsertAccountEventAsync(id, "updated", "manual_openai_responses")
 
@@ -3679,7 +3686,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				atomic.AddInt64(&current, 1)
 				h.db.InsertAccountEventAsync(id, "added", "import_at")
 
-				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
+				newAcc := accountFromCredentialSeed(id, name, proxyURL, seed)
 				if len(tokenCredentialMap(seed)) > 0 {
 					credCtx, credCancel := context.WithTimeout(context.Background(), 3*time.Second)
 					_ = h.db.UpdateCredentials(credCtx, id, tokenCredentialMap(seed))
@@ -3724,7 +3731,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					}
 					credCancel()
 				}
-				newAcc := accountFromCredentialSeed(id, proxyURL, seed)
+				newAcc := accountFromCredentialSeed(id, name, proxyURL, seed)
 				h.store.AddAccount(newAcc)
 				h.applyImportedAccountUsageState(newAcc, "import")
 
@@ -5890,6 +5897,8 @@ type settingsResponse struct {
 	CheapProbeRankBaseIntervalSeconds  int     `json:"cheap_probe_rank_base_interval_seconds"`
 	CheapProbeRankStepSeconds          int     `json:"cheap_probe_rank_step_seconds"`
 	CheapProbeRankMinIntervalSeconds   int     `json:"cheap_probe_rank_min_interval_seconds"`
+	CheapProbeMaxMultiplier            float64 `json:"cheap_probe_max_multiplier"`
+	DispatchMaxMultiplier              float64 `json:"dispatch_max_multiplier"`
 	LazyMode                           bool    `json:"lazy_mode"`
 	ProxyURL                           string  `json:"proxy_url"`
 	PgMaxConns                         int     `json:"pg_max_conns"`
@@ -5996,6 +6005,8 @@ type updateSettingsReq struct {
 	CheapProbeRankBaseIntervalSeconds  *int     `json:"cheap_probe_rank_base_interval_seconds"`
 	CheapProbeRankStepSeconds          *int     `json:"cheap_probe_rank_step_seconds"`
 	CheapProbeRankMinIntervalSeconds   *int     `json:"cheap_probe_rank_min_interval_seconds"`
+	CheapProbeMaxMultiplier            *float64 `json:"cheap_probe_max_multiplier"`
+	DispatchMaxMultiplier              *float64 `json:"dispatch_max_multiplier"`
 	LazyMode                           *bool    `json:"lazy_mode"`
 	ProxyURL                           *string  `json:"proxy_url"`
 	PgMaxConns                         *int     `json:"pg_max_conns"`
@@ -6586,6 +6597,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CheapProbeRankBaseIntervalSeconds:  cheapProbeRankBaseSeconds,
 		CheapProbeRankStepSeconds:          cheapProbeRankStepSeconds,
 		CheapProbeRankMinIntervalSeconds:   cheapProbeRankMinSeconds,
+		CheapProbeMaxMultiplier:            h.store.GetCheapProbeMaxMultiplier(),
+		DispatchMaxMultiplier:              h.store.GetDispatchMaxMultiplier(),
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,
@@ -6973,6 +6986,24 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			time.Duration(minSeconds)*time.Second,
 		)
 		log.Printf("设置已更新: cheap_probe_rank_policy = base:%ds step:%ds min:%ds", baseSeconds, stepSeconds, minSeconds)
+	}
+
+	if req.CheapProbeMaxMultiplier != nil {
+		v := *req.CheapProbeMaxMultiplier
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			v = 0
+		}
+		h.store.SetCheapProbeMaxMultiplier(v)
+		log.Printf("设置已更新: cheap_probe_max_multiplier = %.6f", v)
+	}
+
+	if req.DispatchMaxMultiplier != nil {
+		v := *req.DispatchMaxMultiplier
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			v = 0
+		}
+		h.store.SetDispatchMaxMultiplier(v)
+		log.Printf("设置已更新: dispatch_max_multiplier = %.6f", v)
 	}
 
 	if req.LazyMode != nil {
@@ -7458,6 +7489,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CheapProbeRankBaseIntervalSeconds:  cheapProbeRankBaseSeconds,
 		CheapProbeRankStepSeconds:          cheapProbeRankStepSeconds,
 		CheapProbeRankMinIntervalSeconds:   cheapProbeRankMinSeconds,
+		CheapProbeMaxMultiplier:            h.store.GetCheapProbeMaxMultiplier(),
+		DispatchMaxMultiplier:              h.store.GetDispatchMaxMultiplier(),
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,
@@ -7567,6 +7600,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CheapProbeRankBaseIntervalSeconds:  cheapProbeRankBaseSeconds,
 		CheapProbeRankStepSeconds:          cheapProbeRankStepSeconds,
 		CheapProbeRankMinIntervalSeconds:   cheapProbeRankMinSeconds,
+		CheapProbeMaxMultiplier:            h.store.GetCheapProbeMaxMultiplier(),
+		DispatchMaxMultiplier:              h.store.GetDispatchMaxMultiplier(),
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,

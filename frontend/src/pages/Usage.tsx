@@ -200,7 +200,7 @@ function safeNumber(value?: number | null): number {
 function formatUsagePriceMultiplier(value?: number | null): string {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
     ? `${value}x`
-    : '-'
+    : '1x'
 }
 
 function formatUSD(value?: number | null, digits = 6): string {

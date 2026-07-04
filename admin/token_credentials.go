@@ -191,7 +191,7 @@ func tokenCredentialMap(seed tokenCredentialSeed) map[string]interface{} {
 	return credentials
 }
 
-func accountFromCredentialSeed(id int64, proxyURL string, seed tokenCredentialSeed) *auth.Account {
+func accountFromCredentialSeed(id int64, name string, proxyURL string, seed tokenCredentialSeed) *auth.Account {
 	seed = normalizeTokenCredentialSeed(seed)
 	account := &auth.Account{
 		DBID:                  id,
@@ -205,6 +205,9 @@ func accountFromCredentialSeed(id int64, proxyURL string, seed tokenCredentialSe
 		ProxyURL:              proxyURL,
 		Status:                auth.StatusReady,
 		SubscriptionExpiresAt: seed.subscriptionExpiresAt,
+	}
+	if priceMultiplier, ok := auth.ParsePriceMultiplierFromName(name); ok {
+		account.PriceMultiplier = priceMultiplier
 	}
 	if pct, ok := parseSeedUsagePercent(seed.codex7DUsedPercent); ok {
 		updatedAt := parseSeedRFC3339(seed.codexUsageUpdatedAt)

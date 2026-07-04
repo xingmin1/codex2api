@@ -154,6 +154,8 @@ export default function RuntimeStatus() {
                   [t('runtime.cheapProbeScanInterval'), t('runtime.seconds', { count: status.probes.cheap_probe_scan_interval_seconds })],
                   [t('runtime.cheapProbeConcurrency'), formatNumber(status.probes.cheap_probe_concurrency)],
                   [t('runtime.cheapProbeRecoveryMargin'), formatNumber(status.probes.cheap_probe_recovery_margin)],
+                  [t('runtime.cheapProbeMaxMultiplier'), formatNumber(status.probes.cheap_probe_max_multiplier)],
+                  [t('runtime.dispatchMaxMultiplier'), formatNumber(status.probes.dispatch_max_multiplier)],
                   [t('runtime.runningJobs'), runningJobs(status, t)],
                 ]}
               />

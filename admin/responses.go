@@ -276,6 +276,8 @@ type runtimeProbesResponse struct {
 	CheapProbeScanIntervalSeconds      int     `json:"cheap_probe_scan_interval_seconds"`
 	CheapProbeConcurrency              int     `json:"cheap_probe_concurrency"`
 	CheapProbeRecoveryMargin           float64 `json:"cheap_probe_recovery_margin"`
+	CheapProbeMaxMultiplier            float64 `json:"cheap_probe_max_multiplier"`
+	DispatchMaxMultiplier              float64 `json:"dispatch_max_multiplier"`
 	UsageProbeRunning                  bool    `json:"usage_probe_running"`
 	RecoveryProbeRunning               bool    `json:"recovery_probe_running"`
 	AutoCleanupRunning                 bool    `json:"auto_cleanup_running"`

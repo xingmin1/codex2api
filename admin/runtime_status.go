@@ -258,6 +258,8 @@ func (h *Handler) runtimeProbesStatus() runtimeProbesResponse {
 	resp.CheapProbeScanIntervalSeconds = h.store.GetCheapProbeScanIntervalSeconds()
 	resp.CheapProbeConcurrency = h.store.GetCheapProbeConcurrency()
 	resp.CheapProbeRecoveryMargin = h.store.GetCheapProbeRecoveryMargin()
+	resp.CheapProbeMaxMultiplier = h.store.GetCheapProbeMaxMultiplier()
+	resp.DispatchMaxMultiplier = h.store.GetDispatchMaxMultiplier()
 	resp.UsageProbeRunning = h.store.UsageProbeRunning()
 	resp.RecoveryProbeRunning = h.store.RecoveryProbeRunning()
 	resp.AutoCleanupRunning = h.store.AutoCleanupRunning()

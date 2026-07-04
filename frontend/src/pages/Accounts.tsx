@@ -450,7 +450,7 @@ function formatPriceMultiplierInput(value?: number | null): string {
 
 function formatPriceMultiplierDisplay(value?: number | null): string {
   const input = formatPriceMultiplierInput(value);
-  return input ? `${input}x` : "-";
+  return input ? `${input}x` : "1x";
 }
 
 function isPriceMultiplierInputInvalid(value: string): boolean {
@@ -500,6 +500,10 @@ function accountSortNumber(value: number | null | undefined, direction: SortDire
     : sortMissingNumber(direction);
 }
 
+function accountPriceMultiplierForComparison(value: number | null | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 1;
+}
+
 function accountSortTime(value: string | undefined, direction: SortDirection): number {
   if (!value) return sortMissingNumber(direction);
   const timestamp = new Date(value).getTime();
@@ -534,7 +538,7 @@ function accountSortValue(
     case "usage5h":
       return accountRecentUsage(account);
     case "priceMultiplier":
-      return accountSortNumber(account.price_multiplier, direction);
+      return accountPriceMultiplierForComparison(account.price_multiplier);
     case "billed":
       return accountSortNumber(account.billed_7d ?? account.billed_5h, direction);
     case "lastUsed":

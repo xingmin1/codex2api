@@ -799,6 +799,8 @@ func TestParsePriceMultiplierFromName(t *testing.T) {
 		{name: "cheap-0.5", want: 0.5, ok: true},
 		{name: "proxy 0.25", want: 0.25, ok: true},
 		{name: "pool_a_0.8", want: 0.8, ok: true},
+		{name: "xmin.2", want: 0.2, ok: true},
+		{name: "cheap-.05", want: 0.05, ok: true},
 		{name: "plain", ok: false},
 		{name: "integer-2", ok: false},
 	}
@@ -818,13 +820,56 @@ func TestParsePriceMultiplierFromName(t *testing.T) {
 
 func TestResolveAccountRowPriceMultiplierRequiresExplicitCredential(t *testing.T) {
 	row := &database.AccountRow{Name: "cheap-0.5", Credentials: map[string]interface{}{}}
-	if got := resolveAccountRowPriceMultiplier(row); got != 0 {
-		t.Fatalf("multiplier inferred from name = %v, want 0", got)
+	if got := resolveAccountRowPriceMultiplier(row); got != 0.5 {
+		t.Fatalf("multiplier inferred from name = %v, want 0.5", got)
 	}
 
-	row.Credentials["price_multiplier"] = 0.5
-	if got := resolveAccountRowPriceMultiplier(row); got != 0.5 {
-		t.Fatalf("explicit multiplier = %v, want 0.5", got)
+	row.Credentials["price_multiplier"] = 0.25
+	if got := resolveAccountRowPriceMultiplier(row); got != 0.25 {
+		t.Fatalf("explicit multiplier = %v, want 0.25", got)
+	}
+}
+
+func TestDispatchMaxMultiplierFiltersDispatchCandidates(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:        2,
+		TestConcurrency:       1,
+		TestModel:             "gpt-5.4",
+		DispatchMaxMultiplier: 0.5,
+	})
+	cheap := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.5}
+	expensive := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.8}
+	unset := &Account{DBID: 3, AccessToken: "token", Status: StatusReady, PlanType: "plus"}
+	expensive.ScoreBiasOverride = int64Ptr(200)
+	unset.ScoreBiasOverride = int64Ptr(300)
+	for _, acc := range []*Account{cheap, expensive, unset} {
+		recomputeTestAccount(acc, 2)
+		store.AddAccount(acc)
+	}
+
+	got := store.NextExcludingWithFilter(0, nil, nil)
+	if got == nil {
+		t.Fatal("NextExcludingWithFilter returned nil")
+	}
+	if got.DBID != cheap.DBID {
+		t.Fatalf("picked account %d, want cheap account %d", got.DBID, cheap.DBID)
+	}
+}
+
+func TestDispatchMaxMultiplierTreatsUnsetAsOne(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:        2,
+		TestConcurrency:       1,
+		TestModel:             "gpt-5.4",
+		DispatchMaxMultiplier: 1,
+	})
+	unset := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus"}
+	recomputeTestAccount(unset, 2)
+	store.AddAccount(unset)
+
+	got := store.NextExcludingWithFilter(0, nil, nil)
+	if got == nil || got.DBID != unset.DBID {
+		t.Fatalf("picked account = %+v, want unset account treated as multiplier 1", got)
 	}
 }
 
@@ -868,6 +913,57 @@ func TestCheapProbeCandidatesUseMultiplierRanking(t *testing.T) {
 	}
 }
 
+func TestCheapProbeCandidatesTreatUnsetMultiplierAsOne(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	top := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.8}
+	unset := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus"}
+	cheap := &Account{DBID: 3, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.5}
+	top.ScoreBiasOverride = int64Ptr(60)
+	store.AddAccount(top)
+	store.AddAccount(unset)
+	store.AddAccount(cheap)
+
+	targets, probeTop := store.cheapProbeCandidates(store.Accounts(), time.Now())
+
+	if !probeTop.found || probeTop.dbID != top.DBID {
+		t.Fatalf("top = %+v, want dbID %d", probeTop, top.DBID)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("targets = %d, want only explicit cheap account", len(targets))
+	}
+	if targets[0].account.DBID != cheap.DBID {
+		t.Fatalf("target dbID = %d, want cheap account %d", targets[0].account.DBID, cheap.DBID)
+	}
+}
+
+func TestCheapProbeCandidatesRespectMaxMultiplier(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:          2,
+		TestConcurrency:         1,
+		TestModel:               "gpt-5.4",
+		CheapProbeMaxMultiplier: 0.3,
+	})
+	top := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 1}
+	tooExpensive := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.4}
+	cheap := &Account{DBID: 3, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.2}
+	top.ScoreBiasOverride = int64Ptr(60)
+	store.AddAccount(top)
+	store.AddAccount(tooExpensive)
+	store.AddAccount(cheap)
+
+	targets, probeTop := store.cheapProbeCandidates(store.Accounts(), time.Now())
+
+	if !probeTop.found || probeTop.dbID != top.DBID {
+		t.Fatalf("top = %+v, want dbID %d", probeTop, top.DBID)
+	}
+	if len(targets) != 1 {
+		t.Fatalf("targets = %d, want only account below max multiplier", len(targets))
+	}
+	if targets[0].account.DBID != cheap.DBID {
+		t.Fatalf("target dbID = %d, want cheap account %d", targets[0].account.DBID, cheap.DBID)
+	}
+}
+
 func TestCheapProbeCandidatesRespectDispatchSelectionState(t *testing.T) {
 	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	pausedHighScore := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.2}
@@ -875,16 +971,19 @@ func TestCheapProbeCandidatesRespectDispatchSelectionState(t *testing.T) {
 	top := &Account{DBID: 3, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.05}
 	expensive := &Account{DBID: 4, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.1}
 	cheap := &Account{DBID: 5, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.03}
+	disabledCheap := &Account{DBID: 6, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.01}
 	pausedHighScore.ScoreBiasOverride = int64Ptr(300)
 	lockedHighScore.ScoreBiasOverride = int64Ptr(80)
 	top.ScoreBiasOverride = int64Ptr(100)
 	atomic.StoreInt32(&pausedHighScore.DispatchPaused, 1)
+	atomic.StoreInt32(&disabledCheap.Disabled, 1)
 	atomic.StoreInt32(&lockedHighScore.Locked, 1)
 	store.AddAccount(pausedHighScore)
 	store.AddAccount(lockedHighScore)
 	store.AddAccount(top)
 	store.AddAccount(expensive)
 	store.AddAccount(cheap)
+	store.AddAccount(disabledCheap)
 
 	targets, probeTop := store.cheapProbeCandidates(store.Accounts(), time.Now())
 
@@ -1052,6 +1151,135 @@ func TestApplyCheapProbeRecoveryBonusSkipsBonusWhenCandidateNoLongerCheaperThanT
 	}
 }
 
+func TestApplyCheapProbeRecoveryBonusSkipsAboveMaxMultiplier(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                 2,
+		TestConcurrency:                1,
+		TestModel:                      "gpt-5.4",
+		CheapProbeEnabled:              true,
+		CheapProbeRecoveryMargin:       10,
+		CheapProbeBonusDurationMinutes: 10,
+		CheapProbeMaxMultiplier:        0.3,
+	})
+	top := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 1}
+	top.ScoreBiasOverride = int64Ptr(60)
+	aboveMax := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.4}
+	store.AddAccount(top)
+	store.AddAccount(aboveMax)
+
+	topSnapshot := cheapProbeTopAccount{
+		dbID:            top.DBID,
+		dispatchScore:   top.GetDispatchScore(),
+		priceMultiplier: 1,
+		found:           true,
+	}
+	batchVersion := store.cheapProbeTopologyVersion.Load()
+	if !store.RecordCheapProbeSuccess(aboveMax) {
+		t.Fatal("aboveMax state not cleared")
+	}
+	if store.applyCheapProbeRecoveryBonus(aboveMax, topSnapshot, time.Now(), batchVersion) {
+		t.Fatal("aboveMax bonus applied even though multiplier is above configured max")
+	}
+
+	aboveMax.mu.RLock()
+	bonus := aboveMax.CheapProbeRecoveryBonus
+	bonusUntil := aboveMax.CheapProbeBonusUntil
+	aboveMax.mu.RUnlock()
+	if bonus != 0 {
+		t.Fatalf("aboveMax bonus = %v, want 0", bonus)
+	}
+	if !bonusUntil.IsZero() {
+		t.Fatalf("aboveMax bonus until = %v, want zero", bonusUntil)
+	}
+}
+
+func TestSetCheapProbeMaxMultiplierClearsOutOfRangeBonus(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                 2,
+		TestConcurrency:                1,
+		TestModel:                      "gpt-5.4",
+		CheapProbeEnabled:              true,
+		CheapProbeRecoveryMargin:       10,
+		CheapProbeBonusDurationMinutes: 10,
+	})
+	inRange := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.03}
+	outOfRange := &Account{DBID: 2, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.08}
+	for _, acc := range []*Account{inRange, outOfRange} {
+		acc.CheapProbeRecoveryBonus = 50
+		acc.CheapProbeBonusUntil = time.Now().Add(time.Hour)
+		store.AddAccount(acc)
+	}
+
+	store.SetCheapProbeMaxMultiplier(0.05)
+
+	inRange.mu.RLock()
+	inRangeBonus := inRange.CheapProbeRecoveryBonus
+	inRangeUntil := inRange.CheapProbeBonusUntil
+	inRange.mu.RUnlock()
+	outOfRange.mu.RLock()
+	outOfRangeBonus := outOfRange.CheapProbeRecoveryBonus
+	outOfRangeUntil := outOfRange.CheapProbeBonusUntil
+	outOfRange.mu.RUnlock()
+
+	if inRangeBonus == 0 || inRangeUntil.IsZero() {
+		t.Fatal("in-range cheap probe bonus was unexpectedly cleared")
+	}
+	if outOfRangeBonus != 0 || !outOfRangeUntil.IsZero() {
+		t.Fatalf("out-of-range bonus = %v until=%v, want cleared", outOfRangeBonus, outOfRangeUntil)
+	}
+	expectCheapProbeWake(t, store)
+}
+
+func TestCheapProbeSuccessSkipsDispatchPausedBeforeStateClear(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                 2,
+		TestConcurrency:                1,
+		TestModel:                      "gpt-5.4",
+		CheapProbeEnabled:              true,
+		CheapProbeRecoveryMargin:       10,
+		CheapProbeBonusDurationMinutes: 10,
+	})
+	top := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 1}
+	top.ScoreBiasOverride = int64Ptr(60)
+	paused := &Account{
+		DBID:            2,
+		AccessToken:     "token",
+		Status:          StatusCooldown,
+		CooldownUtil:    time.Now().Add(time.Hour),
+		CooldownReason:  "manual-paused-before-success",
+		ErrorMsg:        "old cooldown",
+		PlanType:        "plus",
+		PriceMultiplier: 0.2,
+	}
+	store.AddAccount(top)
+	store.AddAccount(paused)
+
+	topSnapshot := cheapProbeTopAccount{
+		dbID:            top.DBID,
+		dispatchScore:   top.GetDispatchScore(),
+		priceMultiplier: 1,
+		found:           true,
+	}
+	batchVersion := store.cheapProbeTopologyVersion.Load()
+	atomic.StoreInt32(&paused.DispatchPaused, 1)
+
+	if _, ok := cheapProbeEligibleForSuccess(paused, store.GetCheapProbeMaxMultiplier()); ok {
+		t.Fatal("dispatch-paused account is eligible for cheap-probe success handling")
+	}
+	if store.applyCheapProbeRecoveryBonus(paused, topSnapshot, time.Now(), batchVersion) {
+		t.Fatal("dispatch-paused account received cheap-probe recovery bonus")
+	}
+
+	paused.mu.RLock()
+	defer paused.mu.RUnlock()
+	if paused.Status != StatusCooldown || paused.CooldownReason != "manual-paused-before-success" || paused.ErrorMsg != "old cooldown" {
+		t.Fatalf("paused account state was cleared: status=%v reason=%q error=%q", paused.Status, paused.CooldownReason, paused.ErrorMsg)
+	}
+	if atomic.LoadInt32(&paused.DispatchPaused) != 1 {
+		t.Fatal("dispatch-paused flag was cleared")
+	}
+}
+
 func expectCheapProbeWake(t *testing.T, store *Store) {
 	t.Helper()
 	if store.cheapProbeWakeCh == nil {
@@ -1090,6 +1318,9 @@ func TestCheapProbeConfigChangesWakeProbeLoop(t *testing.T) {
 	expectCheapProbeWake(t, store)
 
 	store.SetCheapProbeScanInterval(15 * time.Second)
+	expectCheapProbeWake(t, store)
+
+	store.SetCheapProbeMaxMultiplier(0.2)
 	expectCheapProbeWake(t, store)
 }
 
