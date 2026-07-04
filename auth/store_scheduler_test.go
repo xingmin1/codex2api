@@ -1052,6 +1052,47 @@ func TestApplyCheapProbeRecoveryBonusSkipsBonusWhenCandidateNoLongerCheaperThanT
 	}
 }
 
+func expectCheapProbeWake(t *testing.T, store *Store) {
+	t.Helper()
+	if store.cheapProbeWakeCh == nil {
+		t.Fatal("cheapProbeWakeCh is nil")
+	}
+	select {
+	case <-store.cheapProbeWakeCh:
+	case <-time.After(time.Second):
+		t.Fatal("cheapProbeWakeCh did not receive wake signal")
+	}
+}
+
+func expectNoCheapProbeWake(t *testing.T, store *Store) {
+	t.Helper()
+	if store.cheapProbeWakeCh == nil {
+		t.Fatal("cheapProbeWakeCh is nil")
+	}
+	select {
+	case <-store.cheapProbeWakeCh:
+		t.Fatal("cheapProbeWakeCh received unexpected wake signal")
+	default:
+	}
+}
+
+func TestCheapProbeConfigChangesWakeProbeLoop(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                2,
+		TestConcurrency:               1,
+		TestModel:                     "gpt-5.4",
+		CheapProbeEnabled:             false,
+		CheapProbeScanIntervalSeconds: 10,
+	})
+	expectNoCheapProbeWake(t, store)
+
+	store.SetCheapProbeEnabled(true)
+	expectCheapProbeWake(t, store)
+
+	store.SetCheapProbeScanInterval(15 * time.Second)
+	expectCheapProbeWake(t, store)
+}
+
 func TestCheapProbeTopologyChangesMarkRescanRequested(t *testing.T) {
 	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	acc := &Account{DBID: 1, AccessToken: "token", Status: StatusReady, PlanType: "plus", PriceMultiplier: 0.5}
@@ -1067,6 +1108,7 @@ func TestCheapProbeTopologyChangesMarkRescanRequested(t *testing.T) {
 	if !store.cheapProbeRescanRequested.Load() {
 		t.Fatal("cheapProbeRescanRequested is false after AddAccount, want true")
 	}
+	expectCheapProbeWake(t, store)
 
 	if !store.ApplyAccountPriceMultiplier(acc.DBID, 0.25) {
 		t.Fatal("ApplyAccountPriceMultiplier returned false")
@@ -1077,6 +1119,7 @@ func TestCheapProbeTopologyChangesMarkRescanRequested(t *testing.T) {
 	if !store.cheapProbeRescanRequested.Load() {
 		t.Fatal("cheapProbeRescanRequested is false after ApplyAccountPriceMultiplier, want true")
 	}
+	expectCheapProbeWake(t, store)
 }
 
 func TestRecordCheapProbeFailureDoesNotWriteCooldownOrError(t *testing.T) {

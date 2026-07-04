@@ -2202,6 +2202,7 @@ type Store struct {
 	cheapProbeRankMinInterval          int64 // 倍率排名探测间隔下限（ns）
 	cheapProbeTopologyVersion          atomic.Uint64
 	cheapProbeRescanRequested          atomic.Bool
+	cheapProbeWakeCh                   chan struct{}
 	backgroundRefreshWakeCh            chan struct{}
 	lazyRefreshInFlight                sync.Map
 	stopCh                             chan struct{}
@@ -2644,6 +2645,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		testConcurrency:         int64(settings.TestConcurrency),
 		db:                      db,
 		tokenCache:              tc,
+		cheapProbeWakeCh:        make(chan struct{}, 1),
 		backgroundRefreshWakeCh: make(chan struct{}, 1),
 		stopCh:                  make(chan struct{}),
 		proxyPoolEnabled:        settings.ProxyPoolEnabled,
@@ -2674,8 +2676,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 		settings.CheapProbeRankStepSeconds = int(defaultCheapProbeRankStep / time.Second)
 		settings.CheapProbeRankMinIntervalSeconds = int(defaultCheapProbeRankMin / time.Second)
 	}
-	s.SetCheapProbeEnabled(settings.CheapProbeEnabled)
-	s.SetCheapProbeScanInterval(time.Duration(settings.CheapProbeScanIntervalSeconds) * time.Second)
+	s.setCheapProbeEnabled(settings.CheapProbeEnabled, false)
+	s.setCheapProbeScanInterval(time.Duration(settings.CheapProbeScanIntervalSeconds)*time.Second, false)
 	s.SetCheapProbeConcurrency(settings.CheapProbeConcurrency)
 	s.SetCheapProbeTimeout(time.Duration(settings.CheapProbeTimeoutSeconds) * time.Second)
 	s.SetCheapProbeRecoveryMargin(settings.CheapProbeRecoveryMargin)
@@ -3142,6 +3144,16 @@ func (s *Store) SetBackgroundRefreshInterval(d time.Duration) {
 	}
 }
 
+func (s *Store) wakeCheapProbe() {
+	if s == nil || s.cheapProbeWakeCh == nil {
+		return
+	}
+	select {
+	case s.cheapProbeWakeCh <- struct{}{}:
+	default:
+	}
+}
+
 // GetBackgroundRefreshInterval 获取后台刷新/探针巡检间隔。
 func (s *Store) GetBackgroundRefreshInterval() time.Duration {
 	d := time.Duration(atomic.LoadInt64(&s.backgroundRefreshInterval))
@@ -3228,10 +3240,18 @@ func (s *Store) GetRecoveryProbeInterval() time.Duration {
 
 // SetCheapProbeEnabled 设置便宜账号探测是否启用。
 func (s *Store) SetCheapProbeEnabled(enabled bool) {
+	s.setCheapProbeEnabled(enabled, true)
+}
+
+func (s *Store) setCheapProbeEnabled(enabled bool, wake bool) {
 	if s == nil {
 		return
 	}
+	wasEnabled := s.cheapProbeEnabled.Load()
 	s.cheapProbeEnabled.Store(enabled)
+	if wake && enabled && !wasEnabled {
+		s.wakeCheapProbe()
+	}
 }
 
 // CheapProbeEnabled 返回便宜账号探测是否启用。
@@ -3244,8 +3264,19 @@ func (s *Store) CheapProbeEnabled() bool {
 
 // SetCheapProbeScanInterval 设置便宜账号探测扫描间隔。
 func (s *Store) SetCheapProbeScanInterval(d time.Duration) {
+	s.setCheapProbeScanInterval(d, true)
+}
+
+func (s *Store) setCheapProbeScanInterval(d time.Duration, wake bool) {
+	if s == nil {
+		return
+	}
 	d = normalizeCheapProbeDuration(d, defaultCheapProbeScanInterval, 5*time.Second, time.Hour)
+	old := time.Duration(atomic.LoadInt64(&s.cheapProbeScanInterval))
 	atomic.StoreInt64(&s.cheapProbeScanInterval, int64(d))
+	if wake && old != 0 && old != d {
+		s.wakeCheapProbe()
+	}
 }
 
 // GetCheapProbeScanInterval 获取便宜账号探测扫描间隔。
@@ -3656,12 +3687,15 @@ func (s *Store) StartBackgroundRefresh() {
 	go func() {
 		defer s.wg.Done()
 		refreshTimer := time.NewTimer(s.GetBackgroundRefreshInterval())
+		// 便宜账号探测必须有独立计时器；普通刷新 wake 只会重置刷新间隔，不会触发倍率候选扫描。
+		cheapProbeTimer := time.NewTimer(s.GetCheapProbeScanInterval())
 		autoCleanupTicker := time.NewTicker(30 * time.Second)
 		fullUsageCleanupTicker := time.NewTicker(5 * time.Minute)
 		expiredCleanupTicker := time.NewTicker(15 * time.Minute)
 		// 添加定时重建 FastScheduler 以优化性能
 		rebuildSchedulerTicker := time.NewTicker(10 * time.Minute)
 		defer refreshTimer.Stop()
+		defer cheapProbeTimer.Stop()
 		defer autoCleanupTicker.Stop()
 		defer fullUsageCleanupTicker.Stop()
 		defer expiredCleanupTicker.Stop()
@@ -3677,6 +3711,16 @@ func (s *Store) StartBackgroundRefresh() {
 			refreshTimer.Reset(s.GetBackgroundRefreshInterval())
 		}
 
+		resetCheapProbeTimer := func() {
+			if !cheapProbeTimer.Stop() {
+				select {
+				case <-cheapProbeTimer.C:
+				default:
+				}
+			}
+			cheapProbeTimer.Reset(s.GetCheapProbeScanInterval())
+		}
+
 		for {
 			select {
 			case <-refreshTimer.C:
@@ -3690,6 +3734,12 @@ func (s *Store) StartBackgroundRefresh() {
 				refreshTimer.Reset(s.GetBackgroundRefreshInterval())
 			case <-s.backgroundRefreshWakeCh:
 				resetRefreshTimer()
+			case <-cheapProbeTimer.C:
+				s.TriggerCheapProbeAsync()
+				cheapProbeTimer.Reset(s.GetCheapProbeScanInterval())
+			case <-s.cheapProbeWakeCh:
+				s.TriggerCheapProbeAsync()
+				resetCheapProbeTimer()
 			case <-autoCleanupTicker.C:
 				s.TriggerAutoCleanupAsync()
 			case <-fullUsageCleanupTicker.C:
@@ -4869,10 +4919,8 @@ func (s *Store) markCheapProbeTopologyChanged() {
 	}
 	s.cheapProbeTopologyVersion.Add(1)
 	s.cheapProbeRescanRequested.Store(true)
-	select {
-	case s.backgroundRefreshWakeCh <- struct{}{}:
-	default:
-	}
+	// 账号新增、倍率变化会改变候选集合，必须唤醒 cheap probe，而不是只唤醒普通后台刷新。
+	s.wakeCheapProbe()
 }
 
 // ApplyAccountSchedulerOverrides 更新运行时账号的调度 override 并立即重算。
