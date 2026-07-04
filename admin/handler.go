@@ -70,10 +70,6 @@ type Handler struct {
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
 
-	resetRadarHookMu     sync.Mutex
-	resetRadarHookState  resetRadarHookState
-	resetRadarHookRunner func(context.Context, string) resetRadarHookResult
-
 	// 「主动重置次数」消耗操作的账号级互斥锁（dbID -> *sync.Mutex），
 	// 串行化同一账号的并发重置，避免重复消耗与次数计数竞态。
 	resetCreditLocks sync.Map
@@ -165,7 +161,14 @@ func (h *Handler) probeImportedAccountUsage(ctx context.Context, accountID int64
 	defer cancel()
 	if err := probeFn(probeCtx, account); err != nil {
 		log.Printf("导入账号 %d 用量采样失败 (%s): %v", accountID, source, err)
+		return
 	}
+	// AT / codex_at 账号的 OAuth 身份（email + account_id）在插入时无法从
+	// JWT 解出，由上面的 wham 探针补齐并落库。身份既已可知，此刻回查是否与
+	// 已有账号同一身份：若重复则把凭证合并进旧账号并软删本账号——与 RT 路径
+	// refreshImportedAccountAndProbe 对称，补上 AT 导入/添加事后无法去重的缺口
+	// （codex_at 原文轮换 + 存量 account_id 被 user_id 污染都会导致插入期判重失配）。
+	h.mergeRefreshedDuplicateIntoExisting(accountID, source)
 }
 
 func (h *Handler) triggerImportedAccountUsageProbe(accountID int64, source string) {
@@ -190,7 +193,79 @@ func (h *Handler) refreshImportedAccountAndProbe(accountID int64, source string)
 		return
 	}
 	log.Printf("导入账号 %d 刷新成功", accountID)
+	// 裸 RT 导入时身份要等首次刷新后才可知：此刻回查身份重复，
+	// 若与已有账号同一身份则合并凭证并移除本账号（保留旧账号的用量统计）。
+	if h.mergeRefreshedDuplicateIntoExisting(accountID, source) {
+		return
+	}
 	h.probeImportedAccountUsage(context.Background(), accountID, source)
+}
+
+// mergeRefreshedDuplicateIntoExisting 检查刚刷新完的新导入账号是否与已有账号
+// 同一 OAuth 身份。若重复，把新凭证（refresh_token 优先级最高，可自动续期）
+// 合并进已有账号——codex_* 用量快照键不在更新集里，旧账号的用量统计与按
+// 账号 ID 关联的请求历史全部保留——然后软删新插入的账号。返回 true 表示已合并。
+func (h *Handler) mergeRefreshedDuplicateIntoExisting(newID int64, source string) bool {
+	if h == nil || h.db == nil || h.store == nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	newRow, err := h.db.GetAccountByID(ctx, newID)
+	if err != nil || newRow == nil {
+		return false
+	}
+	// 勾选"允许重复添加"导入的副本是用户故意保留的，不合并。
+	if strings.EqualFold(strings.TrimSpace(newRow.GetCredential("allow_duplicate")), "true") {
+		return false
+	}
+	email := strings.TrimSpace(newRow.GetCredential("email"))
+	identity := strings.TrimSpace(newRow.GetCredential("account_id"))
+	if identity == "" {
+		identity = strings.TrimSpace(newRow.GetCredential("chatgpt_account_id"))
+	}
+	if identity == "" {
+		identity = strings.TrimSpace(newRow.GetCredential("user_id"))
+	}
+	if email == "" || identity == "" {
+		return false
+	}
+	oldID, err := h.db.FindActiveAccountByOAuthIdentity(ctx, email, identity, newID)
+	if err != nil || oldID <= 0 {
+		return false
+	}
+
+	updates := make(map[string]interface{})
+	for _, key := range []string{"refresh_token", "session_token", "access_token", "access_token_type", "id_token", "expires_at", "email", "account_id", "user_id", "plan_type", "subscription_expires_at"} {
+		if v := strings.TrimSpace(newRow.GetCredential(key)); v != "" {
+			updates[key] = v
+		}
+	}
+	if len(updates) == 0 {
+		return false
+	}
+	proxyURL := strings.TrimSpace(newRow.ProxyURL)
+	if proxyURL == "" {
+		if oldRow, err := h.db.GetAccountByID(ctx, oldID); err == nil && oldRow != nil {
+			proxyURL = strings.TrimSpace(oldRow.ProxyURL)
+		}
+	}
+	if err := h.db.UpdateOAuthAccountCredentials(ctx, oldID, updates, proxyURL); err != nil {
+		log.Printf("合并导入账号 %d 凭证到已有账号 %d 失败: %v", newID, oldID, err)
+		return false
+	}
+	if err := h.reloadTokenAccount(ctx, oldID, source); err != nil {
+		log.Printf("合并后重载账号 %d 失败: %v", oldID, err)
+	}
+	if err := h.db.SoftDeleteAccount(ctx, newID); err != nil {
+		log.Printf("软删重复导入账号 %d 失败: %v", newID, err)
+	}
+	h.store.RemoveAccount(newID)
+	h.db.InsertAccountEventAsync(newID, "deleted", fmt.Sprintf("merged_into_%d", oldID))
+	h.db.InsertAccountEventAsync(oldID, "updated", "rt_upgrade_merge")
+	log.Printf("导入账号 %d 与已有账号 %d 同一 OAuth 身份，已合并凭证（RT 升级）并保留用量统计 (source=%s)", newID, oldID, source)
+	return true
 }
 
 func (h *Handler) deleteRuntimeCache(ctx context.Context, namespace, key string) {
@@ -253,7 +328,6 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 	handler.refreshAccount = handler.refreshSingleAccount
 	handler.probeUsage = handler.ProbeUsageSnapshot
 	handler.syncAccountPlanOnReset = handler.syncSingleAccountPlanOnReset
-	handler.resetRadarHookRunner = handler.runResetRadarSignalHook
 	if db != nil {
 		if err := db.MarkInterruptedImageJobs(context.Background()); err != nil {
 			log.Printf("标记中断生图任务失败: %v", err)
@@ -349,7 +423,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors", h.GetOpsErrorLogs)
 	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
-	api.GET("/reset-radar", h.GetResetRadar)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
@@ -596,20 +669,19 @@ type accountResponse struct {
 	UsagePercent7d                 *float64                   `json:"usage_percent_7d"`
 	UsagePercent5h                 *float64                   `json:"usage_percent_5h"`
 	RateLimitResetCredits          *int                       `json:"rate_limit_reset_credits"`
+	IgnoreUsageLimit429Cooldown    bool                       `json:"ignore_usage_limit_429_cooldown"`
+	IgnoreUnauthorizedCooldown     bool                       `json:"ignore_unauthorized_cooldown"`
+	PriceMultiplier                *float64                   `json:"price_multiplier,omitempty"`
+	CheapProbeRecoveryMargin       *float64                   `json:"cheap_probe_recovery_margin,omitempty"`
+	CheapProbeBonusDurationMinutes *int                       `json:"cheap_probe_bonus_duration_minutes,omitempty"`
 	AutoPause5hThreshold           *float64                   `json:"auto_pause_5h_threshold"`
 	AutoPause7dThreshold           *float64                   `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled            bool                       `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled            bool                       `json:"auto_pause_7d_disabled"`
-	IgnoreUsageLimit429Cooldown    bool                       `json:"ignore_usage_limit_429_cooldown"`
-	IgnoreUnauthorizedCooldown     bool                       `json:"ignore_unauthorized_cooldown"`
-	PriceMultiplier                *float64                   `json:"price_multiplier"`
-	CheapProbeRecoveryMargin       *float64                   `json:"cheap_probe_recovery_margin"`
-	CheapProbeBonusDurationMinutes *int                       `json:"cheap_probe_bonus_duration_minutes"`
-	LastCheapProbeAt               string                     `json:"last_cheap_probe_at,omitempty"`
-	LastCheapProbeSuccessAt        string                     `json:"last_cheap_probe_success_at,omitempty"`
-	LastCheapProbeError            string                     `json:"last_cheap_probe_error,omitempty"`
-	CheapProbeRecoveryBonus        float64                    `json:"cheap_probe_recovery_bonus,omitempty"`
-	CheapProbeBonusUntil           string                     `json:"cheap_probe_bonus_until,omitempty"`
+	DispatchCountLimit             *int64                     `json:"dispatch_count_limit"`
+	DispatchCountUsed              int64                      `json:"dispatch_count_used,omitempty"`
+	DispatchCountResetAt           string                     `json:"dispatch_count_reset_at,omitempty"`
+	DispatchCountLimited           bool                       `json:"dispatch_count_limited,omitempty"`
 	Usage5hDetail                  *accountUsageWindow        `json:"usage_5h_detail,omitempty"`
 	Usage7dDetail                  *accountUsageWindow        `json:"usage_7d_detail,omitempty"`
 	Reset5hAt                      string                     `json:"reset_5h_at,omitempty"`
@@ -621,6 +693,11 @@ type accountResponse struct {
 	LastRateLimitedAt              string                     `json:"last_rate_limited_at,omitempty"`
 	LastTimeoutAt                  string                     `json:"last_timeout_at,omitempty"`
 	LastServerErrorAt              string                     `json:"last_server_error_at,omitempty"`
+	LastCheapProbeAt               string                     `json:"last_cheap_probe_at,omitempty"`
+	LastCheapProbeSuccessAt        string                     `json:"last_cheap_probe_success_at,omitempty"`
+	LastCheapProbeError            string                     `json:"last_cheap_probe_error,omitempty"`
+	CheapProbeRecoveryBonus        float64                    `json:"cheap_probe_recovery_bonus,omitempty"`
+	CheapProbeBonusUntil           string                     `json:"cheap_probe_bonus_until,omitempty"`
 	CooldownReason                 string                     `json:"cooldown_reason,omitempty"`
 	CooldownUntil                  string                     `json:"cooldown_until,omitempty"`
 	ModelCooldowns                 []modelCooldownResponse    `json:"model_cooldowns,omitempty"`
@@ -666,55 +743,6 @@ func accountEmailDomain(email string) string {
 	return domain
 }
 
-func accountPriceMultiplier(row *database.AccountRow) *float64 {
-	if row == nil {
-		return nil
-	}
-	if value, ok := row.GetCredentialFloat64("price_multiplier"); ok {
-		if normalized, ok := normalizePositiveFloatPointer(value); ok {
-			return normalized
-		}
-	}
-	return nil
-}
-
-func accountCheapProbeRecoveryMargin(row *database.AccountRow) *float64 {
-	if row == nil {
-		return nil
-	}
-	if value, ok := row.GetCredentialFloat64("cheap_probe_recovery_margin"); ok {
-		if normalized, ok := normalizePositiveFloatPointer(value); ok {
-			return normalized
-		}
-	}
-	return nil
-}
-
-func accountCheapProbeBonusDurationMinutes(row *database.AccountRow) *int {
-	if row == nil {
-		return nil
-	}
-	value, ok := row.GetCredentialFloat64("cheap_probe_bonus_duration_minutes")
-	if !ok || value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
-		return nil
-	}
-	minutes := int(value)
-	if minutes < 1 {
-		return nil
-	}
-	if minutes > 1440 {
-		minutes = 1440
-	}
-	return &minutes
-}
-
-func normalizePositiveFloatPointer(value float64) (*float64, bool) {
-	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
-		return nil, false
-	}
-	return &value, true
-}
-
 func accountAccessTokenType(row *database.AccountRow) string {
 	if row == nil {
 		return ""
@@ -736,7 +764,6 @@ type schedulerBreakdownResponse struct {
 	UsageUrgencyBonus5h float64 `json:"usage_urgency_bonus_5h"`
 	UsageUrgencyBonus7d float64 `json:"usage_urgency_bonus_7d"`
 	ExpiryUrgencyBonus  float64 `json:"expiry_urgency_bonus"`
-	CheapProbeBonus     float64 `json:"cheap_probe_bonus"`
 	LatencyPenalty      float64 `json:"latency_penalty"`
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
@@ -810,15 +837,16 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			CodexUsageUpdatedAt:      row.GetCredential("codex_usage_updated_at"),
 			Codex5HUsageUpdatedAt:    row.GetCredential("codex_5h_usage_updated_at"),
 		}
-		resp.PriceMultiplier = accountPriceMultiplier(row)
-		resp.CheapProbeRecoveryMargin = accountCheapProbeRecoveryMargin(row)
-		resp.CheapProbeBonusDurationMinutes = accountCheapProbeBonusDurationMinutes(row)
 		resp.AutoPause5hThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_5h_threshold")
 		resp.AutoPause7dThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_7d_threshold")
 		resp.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 		resp.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
+		resp.DispatchCountLimit = accountDispatchCountLimit(row)
 		resp.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
 		resp.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
+		resp.PriceMultiplier = accountPriceMultiplier(row)
+		resp.CheapProbeRecoveryMargin = accountCheapProbeRecoveryMargin(row)
+		resp.CheapProbeBonusDurationMinutes = accountCheapProbeBonusDurationMinutes(row)
 		if acc, ok := accountMap[row.ID]; ok {
 			acc.Mu().RLock()
 			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
@@ -849,28 +877,9 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				UsageUrgencyBonus5h: debug.Breakdown.UsageUrgencyBonus5h,
 				UsageUrgencyBonus7d: debug.Breakdown.UsageUrgencyBonus7d,
 				ExpiryUrgencyBonus:  debug.Breakdown.ExpiryUrgencyBonus,
-				CheapProbeBonus:     debug.Breakdown.CheapProbeBonus,
 				LatencyPenalty:      debug.Breakdown.LatencyPenalty,
 				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
 			}
-			priceMultiplier, lastCheapProbeAt, lastCheapProbeSuccessAt, lastCheapProbeError, cheapProbeBonus, cheapProbeBonusUntil := acc.CheapProbeRuntimeSnapshot()
-			if normalized, ok := normalizePositiveFloatPointer(priceMultiplier); ok {
-				resp.PriceMultiplier = normalized
-			}
-			if margin, duration := acc.CheapProbeConfigSnapshot(); margin > 0 || duration > 0 {
-				if margin > 0 {
-					resp.CheapProbeRecoveryMargin = &margin
-				}
-				if duration > 0 {
-					minutes := int(duration / time.Minute)
-					resp.CheapProbeBonusDurationMinutes = &minutes
-				}
-			}
-			resp.LastCheapProbeAt = formatOptionalTime(lastCheapProbeAt)
-			resp.LastCheapProbeSuccessAt = formatOptionalTime(lastCheapProbeSuccessAt)
-			resp.LastCheapProbeError = lastCheapProbeError
-			resp.CheapProbeRecoveryBonus = cheapProbeBonus
-			resp.CheapProbeBonusUntil = formatOptionalTime(cheapProbeBonusUntil)
 			if usagePct, ok := acc.GetUsagePercent7d(); ok {
 				resp.UsagePercent7d = &usagePct
 			}
@@ -879,6 +888,41 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			}
 			if credits, ok := acc.GetRateLimitResetCredits(); ok {
 				resp.RateLimitResetCredits = &credits
+			}
+			if snapshot := acc.GetDispatchCountSnapshot(); snapshot.Limit > 0 {
+				limit := snapshot.Limit
+				resp.DispatchCountLimit = &limit
+				resp.DispatchCountUsed = snapshot.Used
+				resp.DispatchCountLimited = snapshot.Limited
+				if !snapshot.ResetAt.IsZero() {
+					resp.DispatchCountResetAt = snapshot.ResetAt.Format(time.RFC3339)
+				}
+			}
+			if priceMultiplier, ok := acc.GetPriceMultiplier(); ok {
+				resp.PriceMultiplier = &priceMultiplier
+			} else {
+				resp.PriceMultiplier = nil
+			}
+			if margin, duration := acc.CheapProbeConfigSnapshot(); margin > 0 || duration > 0 {
+				resp.CheapProbeRecoveryMargin = normalizePositiveFloatPointer(margin)
+				if duration > 0 {
+					minutes := int(duration / time.Minute)
+					resp.CheapProbeBonusDurationMinutes = &minutes
+				} else {
+					resp.CheapProbeBonusDurationMinutes = nil
+				}
+			}
+			_, lastCheapProbeAt, lastCheapProbeSuccessAt, lastCheapProbeError, cheapProbeRecoveryBonus, cheapProbeBonusUntil := acc.CheapProbeRuntimeSnapshot()
+			if !lastCheapProbeAt.IsZero() {
+				resp.LastCheapProbeAt = lastCheapProbeAt.Format(time.RFC3339)
+			}
+			if !lastCheapProbeSuccessAt.IsZero() {
+				resp.LastCheapProbeSuccessAt = lastCheapProbeSuccessAt.Format(time.RFC3339)
+			}
+			resp.LastCheapProbeError = lastCheapProbeError
+			resp.CheapProbeRecoveryBonus = cheapProbeRecoveryBonus
+			if !cheapProbeBonusUntil.IsZero() {
+				resp.CheapProbeBonusUntil = cheapProbeBonusUntil.Format(time.RFC3339)
 			}
 			if t := acc.GetReset5hAt(); !t.IsZero() {
 				resp.Reset5hAt = t.Format(time.RFC3339)
@@ -991,6 +1035,11 @@ type updateAccountSchedulerReq struct {
 	ScoreBiasOverride              json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride        json.RawMessage `json:"base_concurrency_override"`
 	SkipWarmTier                   json.RawMessage `json:"skip_warm_tier"`
+	IgnoreUsageLimit429Cooldown    json.RawMessage `json:"ignore_usage_limit_429_cooldown"`
+	IgnoreUnauthorizedCooldown     json.RawMessage `json:"ignore_unauthorized_cooldown"`
+	PriceMultiplier                json.RawMessage `json:"price_multiplier"`
+	CheapProbeRecoveryMargin       json.RawMessage `json:"cheap_probe_recovery_margin"`
+	CheapProbeBonusDurationMinutes json.RawMessage `json:"cheap_probe_bonus_duration_minutes"`
 	AllowedAPIKeyIDs               json.RawMessage `json:"allowed_api_key_ids"`
 	Tags                           json.RawMessage `json:"tags"`
 	GroupIDs                       json.RawMessage `json:"group_ids"`
@@ -998,11 +1047,7 @@ type updateAccountSchedulerReq struct {
 	AutoPause7dThreshold           json.RawMessage `json:"auto_pause_7d_threshold"`
 	AutoPause5hDisabled            json.RawMessage `json:"auto_pause_5h_disabled"`
 	AutoPause7dDisabled            json.RawMessage `json:"auto_pause_7d_disabled"`
-	IgnoreUsageLimit429Cooldown    json.RawMessage `json:"ignore_usage_limit_429_cooldown"`
-	IgnoreUnauthorizedCooldown     json.RawMessage `json:"ignore_unauthorized_cooldown"`
-	PriceMultiplier                json.RawMessage `json:"price_multiplier"`
-	CheapProbeRecoveryMargin       json.RawMessage `json:"cheap_probe_recovery_margin"`
-	CheapProbeBonusDurationMinutes json.RawMessage `json:"cheap_probe_bonus_duration_minutes"`
+	DispatchCountLimit             json.RawMessage `json:"dispatch_count_limit"`
 	ProxyURL                       json.RawMessage `json:"proxy_url"`
 }
 
@@ -1010,6 +1055,11 @@ type accountSchedulerUpdate struct {
 	ScoreBiasOverride              database.OptionalNullInt64
 	BaseConcurrencyOverride        database.OptionalNullInt64
 	SkipWarmTier                   database.OptionalBool
+	IgnoreUsageLimit429Cooldown    database.OptionalBool
+	IgnoreUnauthorizedCooldown     database.OptionalBool
+	PriceMultiplier                optionalFloat64
+	CheapProbeRecoveryMargin       optionalFloat64
+	CheapProbeBonusDurationMinutes database.OptionalNullInt64
 	AllowedAPIKeyIDs               database.OptionalInt64Slice
 	Tags                           optionalStringSlice
 	GroupIDs                       database.OptionalInt64Slice
@@ -1017,11 +1067,7 @@ type accountSchedulerUpdate struct {
 	AutoPause7dThreshold           optionalFloat64
 	AutoPause5hDisabled            database.OptionalBool
 	AutoPause7dDisabled            database.OptionalBool
-	IgnoreUsageLimit429Cooldown    database.OptionalBool
-	IgnoreUnauthorizedCooldown     database.OptionalBool
-	PriceMultiplier                optionalFloat64
-	CheapProbeRecoveryMargin       optionalFloat64
-	CheapProbeBonusDurationMinutes database.OptionalNullInt64
+	DispatchCountLimit             database.OptionalNullInt64
 	ProxyURL                       database.OptionalString
 	CredentialUpdates              map[string]interface{}
 }
@@ -1036,6 +1082,26 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	skipWarmTier, err := parseOptionalBoolField(req.SkipWarmTier, "skip_warm_tier")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	ignoreUsageLimit429Cooldown, err := parseOptionalBoolField(req.IgnoreUsageLimit429Cooldown, "ignore_usage_limit_429_cooldown")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	ignoreUnauthorizedCooldown, err := parseOptionalBoolField(req.IgnoreUnauthorizedCooldown, "ignore_unauthorized_cooldown")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	priceMultiplier, err := parseOptionalPositiveFloatField(req.PriceMultiplier, "price_multiplier", 0.01, 1000)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	cheapProbeRecoveryMargin, err := parseOptionalPositiveFloatField(req.CheapProbeRecoveryMargin, "cheap_probe_recovery_margin", 0, 10000)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	cheapProbeBonusDurationMinutes, err := parseOptionalIntegerField(req.CheapProbeBonusDurationMinutes, "cheap_probe_bonus_duration_minutes", 1, 1440)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1067,27 +1133,11 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	dispatchCountLimit, err := parseOptionalIntegerField(req.DispatchCountLimit, "dispatch_count_limit", 0, 1000000)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 
-	ignoreUsageLimit429Cooldown, err := parseOptionalBoolField(req.IgnoreUsageLimit429Cooldown, "ignore_usage_limit_429_cooldown")
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
-	ignoreUnauthorizedCooldown, err := parseOptionalBoolField(req.IgnoreUnauthorizedCooldown, "ignore_unauthorized_cooldown")
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
-	priceMultiplier, err := parseOptionalPositiveFloatField(req.PriceMultiplier, "price_multiplier", 0.000001, 1000)
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
-	cheapProbeRecoveryMargin, err := parseOptionalPositiveFloatField(req.CheapProbeRecoveryMargin, "cheap_probe_recovery_margin", 0.000001, 10000)
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
-	cheapProbeBonusDurationMinutes, err := parseOptionalIntegerField(req.CheapProbeBonusDurationMinutes, "cheap_probe_bonus_duration_minutes", 1, 1440)
-	if err != nil {
-		return accountSchedulerUpdate{}, err
-	}
 	proxyURL, err := parseOptionalStringField(req.ProxyURL, "proxy_url", security.ValidateProxyURL)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
@@ -1121,7 +1171,14 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		if cheapProbeBonusDurationMinutes.Value.Valid {
 			credentialUpdates["cheap_probe_bonus_duration_minutes"] = cheapProbeBonusDurationMinutes.Value.Int64
 		} else {
-			credentialUpdates["cheap_probe_bonus_duration_minutes"] = 0
+			credentialUpdates["cheap_probe_bonus_duration_minutes"] = nil
+		}
+	}
+	if dispatchCountLimit.Set {
+		if dispatchCountLimit.Value.Valid {
+			credentialUpdates["dispatch_count_limit"] = dispatchCountLimit.Value.Int64
+		} else {
+			credentialUpdates["dispatch_count_limit"] = int64(0)
 		}
 	}
 	if len(credentialUpdates) == 0 {
@@ -1132,6 +1189,11 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		ScoreBiasOverride:              scoreBiasOverride,
 		BaseConcurrencyOverride:        baseConcurrencyOverride,
 		SkipWarmTier:                   skipWarmTier,
+		IgnoreUsageLimit429Cooldown:    ignoreUsageLimit429Cooldown,
+		IgnoreUnauthorizedCooldown:     ignoreUnauthorizedCooldown,
+		PriceMultiplier:                priceMultiplier,
+		CheapProbeRecoveryMargin:       cheapProbeRecoveryMargin,
+		CheapProbeBonusDurationMinutes: cheapProbeBonusDurationMinutes,
 		AllowedAPIKeyIDs:               allowedAPIKeyIDs,
 		Tags:                           tags,
 		GroupIDs:                       groupIDs,
@@ -1139,11 +1201,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		AutoPause7dThreshold:           autoPause7dThreshold,
 		AutoPause5hDisabled:            autoPause5hDisabled,
 		AutoPause7dDisabled:            autoPause7dDisabled,
-		IgnoreUsageLimit429Cooldown:    ignoreUsageLimit429Cooldown,
-		IgnoreUnauthorizedCooldown:     ignoreUnauthorizedCooldown,
-		PriceMultiplier:                priceMultiplier,
-		CheapProbeRecoveryMargin:       cheapProbeRecoveryMargin,
-		CheapProbeBonusDurationMinutes: cheapProbeBonusDurationMinutes,
+		DispatchCountLimit:             dispatchCountLimit,
 		ProxyURL:                       proxyURL,
 		CredentialUpdates:              credentialUpdates,
 	}, nil
@@ -1153,6 +1211,11 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 	return u.ScoreBiasOverride.Set ||
 		u.BaseConcurrencyOverride.Set ||
 		u.SkipWarmTier.Set ||
+		u.IgnoreUsageLimit429Cooldown.Set ||
+		u.IgnoreUnauthorizedCooldown.Set ||
+		u.PriceMultiplier.Set ||
+		u.CheapProbeRecoveryMargin.Set ||
+		u.CheapProbeBonusDurationMinutes.Set ||
 		u.AllowedAPIKeyIDs.Set ||
 		u.Tags.Set ||
 		u.GroupIDs.Set ||
@@ -1160,11 +1223,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.AutoPause7dThreshold.Set ||
 		u.AutoPause5hDisabled.Set ||
 		u.AutoPause7dDisabled.Set ||
-		u.IgnoreUsageLimit429Cooldown.Set ||
-		u.IgnoreUnauthorizedCooldown.Set ||
-		u.PriceMultiplier.Set ||
-		u.CheapProbeRecoveryMargin.Set ||
-		u.CheapProbeBonusDurationMinutes.Set ||
+		u.DispatchCountLimit.Set ||
 		u.ProxyURL.Set
 }
 
@@ -1175,6 +1234,7 @@ func optionalBoolFromPtr(value *bool) database.OptionalBool {
 	return database.OptionalBool{Set: true, Value: *value}
 }
 
+// UpdateAccountScheduler 更新账号调度配置。
 // UpdateAccountCredit 更新账号信用设置
 func (h *Handler) UpdateAccountCredit(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -1214,7 +1274,6 @@ func (h *Handler) UpdateAccountCredit(c *gin.Context) {
 	}
 }
 
-// UpdateAccountScheduler 更新账号调度配置。
 func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil {
@@ -1297,6 +1356,28 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 			optionalBoolPtr(update.SkipWarmTier),
 		)
 	}
+	if update.IgnoreUsageLimit429Cooldown.Set {
+		h.store.ApplyAccountUsageLimit429CooldownConfig(id, update.IgnoreUsageLimit429Cooldown.Value)
+	}
+	if update.IgnoreUnauthorizedCooldown.Set {
+		h.store.ApplyAccountUnauthorizedCooldownConfig(id, update.IgnoreUnauthorizedCooldown.Value)
+	}
+	if update.PriceMultiplier.Set {
+		h.store.ApplyAccountPriceMultiplier(id, update.PriceMultiplier.Value)
+	}
+	if update.CheapProbeRecoveryMargin.Set || update.CheapProbeBonusDurationMinutes.Set {
+		durationMinutes := 0
+		if update.CheapProbeBonusDurationMinutes.Set && update.CheapProbeBonusDurationMinutes.Value.Valid {
+			durationMinutes = int(update.CheapProbeBonusDurationMinutes.Value.Int64)
+		}
+		h.store.ApplyAccountCheapProbeConfig(
+			id,
+			update.CheapProbeRecoveryMargin.Set,
+			update.CheapProbeRecoveryMargin.Value,
+			update.CheapProbeBonusDurationMinutes.Set,
+			durationMinutes,
+		)
+	}
 	if update.AllowedAPIKeyIDs.Set {
 		h.store.ApplyAccountAllowedAPIKeys(id, update.AllowedAPIKeyIDs.Values)
 	}
@@ -1309,27 +1390,8 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 			optionalBoolPtr(update.AutoPause7dDisabled),
 		)
 	}
-	if update.IgnoreUsageLimit429Cooldown.Set {
-		h.store.ApplyAccountUsageLimit429CooldownConfig(id, update.IgnoreUsageLimit429Cooldown.Value)
-	}
-	if update.IgnoreUnauthorizedCooldown.Set {
-		h.store.ApplyAccountUnauthorizedCooldownConfig(id, update.IgnoreUnauthorizedCooldown.Value)
-	}
-	if update.PriceMultiplier.Set {
-		h.store.ApplyAccountPriceMultiplier(id, update.PriceMultiplier.Value)
-	}
-	if update.CheapProbeRecoveryMargin.Set || update.CheapProbeBonusDurationMinutes.Set {
-		durationMinutes := 0
-		if update.CheapProbeBonusDurationMinutes.Value.Valid {
-			durationMinutes = int(update.CheapProbeBonusDurationMinutes.Value.Int64)
-		}
-		h.store.ApplyAccountCheapProbeConfig(
-			id,
-			update.CheapProbeRecoveryMargin.Set,
-			update.CheapProbeRecoveryMargin.Value,
-			update.CheapProbeBonusDurationMinutes.Set,
-			durationMinutes,
-		)
+	if update.DispatchCountLimit.Set {
+		h.store.ApplyAccountDispatchCountLimit(id, nullableInt64Pointer(update.DispatchCountLimit.Value))
 	}
 	if update.Tags.Set {
 		h.store.ApplyAccountTags(id, update.Tags.Values)
@@ -1359,6 +1421,61 @@ func accountQuotaAutoPauseThreshold(row *database.AccountRow, key string) *float
 	}
 	if value > 1 {
 		value = 1
+	}
+	return &value
+}
+
+func accountDispatchCountLimit(row *database.AccountRow) *int64 {
+	value, ok := row.GetCredentialInt64("dispatch_count_limit")
+	if !ok || value <= 0 {
+		return nil
+	}
+	if value > 1000000 {
+		value = 1000000
+	}
+	return &value
+}
+
+func accountPriceMultiplier(row *database.AccountRow) *float64 {
+	if row == nil {
+		return nil
+	}
+	value, ok := row.GetCredentialFloat64("price_multiplier")
+	if !ok || value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil
+	}
+	return &value
+}
+
+func accountCheapProbeRecoveryMargin(row *database.AccountRow) *float64 {
+	if row == nil {
+		return nil
+	}
+	value, ok := row.GetCredentialFloat64("cheap_probe_recovery_margin")
+	if !ok {
+		return nil
+	}
+	return normalizePositiveFloatPointer(value)
+}
+
+func accountCheapProbeBonusDurationMinutes(row *database.AccountRow) *int {
+	if row == nil {
+		return nil
+	}
+	value, ok := row.GetCredentialInt64("cheap_probe_bonus_duration_minutes")
+	if !ok || value <= 0 {
+		return nil
+	}
+	if value > 1440 {
+		value = 1440
+	}
+	minutes := int(value)
+	return &minutes
+}
+
+func normalizePositiveFloatPointer(value float64) *float64 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil
 	}
 	return &value
 }
@@ -1467,7 +1584,7 @@ func parseOptionalPositiveFloatField(raw json.RawMessage, field string, minValue
 		return optionalFloat64{}, nil
 	}
 	if string(raw) == "null" {
-		return optionalFloat64{Set: true, Value: 0}, nil
+		return optionalFloat64{Set: true}, nil
 	}
 
 	var number json.Number
@@ -1475,11 +1592,17 @@ func parseOptionalPositiveFloatField(raw json.RawMessage, field string, minValue
 		return optionalFloat64{}, fmt.Errorf("%s 必须是正数或 null", field)
 	}
 	value, err := number.Float64()
-	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
+	if err != nil {
 		return optionalFloat64{}, fmt.Errorf("%s 必须是正数或 null", field)
 	}
-	if value < minValue || value > maxValue {
-		return optionalFloat64{}, fmt.Errorf("%s 超出范围，必须在 %.6g..%.6g 之间", field, minValue, maxValue)
+	if math.IsNaN(value) || math.IsInf(value, 0) || value < minValue {
+		return optionalFloat64{}, fmt.Errorf("%s 超出范围，必须在 %g..%g 之间", field, minValue, maxValue)
+	}
+	if minValue > 0 && value == 0 {
+		return optionalFloat64{}, fmt.Errorf("%s 必须是正数或 null", field)
+	}
+	if value > maxValue {
+		return optionalFloat64{}, fmt.Errorf("%s 超出范围，必须在 %g..%g 之间", field, minValue, maxValue)
 	}
 	return optionalFloat64{Set: true, Value: value}, nil
 }
@@ -1592,8 +1715,9 @@ func effectiveScoreBias(planType string, override sql.NullInt64) int64 {
 	if override.Valid {
 		return override.Int64
 	}
-	switch strings.ToLower(strings.TrimSpace(planType)) {
-	case "pro", "plus", "team":
+	// 与 auth.defaultScoreBiasForPlan 保持一致；k12 是教育版 team (issue #282)
+	switch auth.NormalizePlanType(planType) {
+	case "pro", "plus", "team", "k12":
 		return 50
 	default:
 		return 0
@@ -1615,13 +1739,6 @@ func dispatchScoreFallback(schedulerScore float64, scoreBiasEffective int64, hea
 		return schedulerScore
 	}
 	return schedulerScore + float64(scoreBiasEffective)
-}
-
-func formatOptionalTime(value time.Time) string {
-	if value.IsZero() {
-		return ""
-	}
-	return value.Format(time.RFC3339)
 }
 
 func allowScoreBias(healthTier string, status string) bool {
@@ -1715,10 +1832,11 @@ func (h *Handler) getAccountUsageWindows(ctx context.Context) (map[int64]*databa
 }
 
 type addAccountReq struct {
-	Name         string `json:"name"`
-	RefreshToken string `json:"refresh_token"`
-	SessionToken string `json:"session_token"`
-	ProxyURL     string `json:"proxy_url"`
+	Name           string `json:"name"`
+	RefreshToken   string `json:"refresh_token"`
+	SessionToken   string `json:"session_token"`
+	ProxyURL       string `json:"proxy_url"`
+	AllowDuplicate bool   `json:"allow_duplicate"`
 }
 
 func splitAccountCredentialLines(raw string, sanitize bool) []string {
@@ -1734,6 +1852,54 @@ func splitAccountCredentialLines(raw string, sanitize bool) []string {
 		}
 	}
 	return tokens
+}
+
+// accountCredentialDedup 跟踪 RT/ST 原文去重（用于 RT/ST 单账号/批量添加路径）。
+// 身份型（OAuth）去重在文件导入与 AT 路径单独处理，这里只覆盖加入时无法解出身份的 RT/ST。
+type accountCredentialDedup struct {
+	existingRT map[string]bool
+	existingST map[string]bool
+	seenRT     map[string]bool
+	seenST     map[string]bool
+}
+
+func (h *Handler) newAccountCredentialDedup(ctx context.Context) *accountCredentialDedup {
+	d := &accountCredentialDedup{
+		seenRT: make(map[string]bool),
+		seenST: make(map[string]bool),
+	}
+	var err error
+	if d.existingRT, err = h.db.GetAllRefreshTokens(ctx); err != nil {
+		log.Printf("查询已有 RT 失败: %v", err)
+		d.existingRT = make(map[string]bool)
+	}
+	if d.existingST, err = h.db.GetAllSessionTokens(ctx); err != nil {
+		log.Printf("查询已有 ST 失败: %v", err)
+		d.existingST = make(map[string]bool)
+	}
+	return d
+}
+
+// checkAndMark 返回 true 表示该 seed 与已有库或本批次重复（应跳过）；非重复时记录其凭证。
+func (d *accountCredentialDedup) checkAndMark(seed tokenCredentialSeed) bool {
+	rt := strings.TrimSpace(seed.refreshToken)
+	st := strings.TrimSpace(seed.sessionToken)
+	if rt != "" {
+		if d.existingRT[rt] || d.seenRT[rt] {
+			return true
+		}
+	} else if st != "" {
+		if d.existingST[st] || d.seenST[st] {
+			return true
+		}
+	}
+	if rt != "" {
+		d.seenRT[rt] = true
+	}
+	if st != "" {
+		d.seenST[st] = true
+	}
+	return false
 }
 
 // AddAccount 添加新账号（支持批量：refresh_token/session_token 按行分割）
@@ -1786,7 +1952,7 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 	var seeds []tokenCredentialSeed
 	for i := 0; i < total; i++ {
-		seed := tokenCredentialSeed{}
+		seed := tokenCredentialSeed{allowDuplicate: req.AllowDuplicate}
 		if len(refreshTokens) > 0 {
 			seed.refreshToken = refreshTokens[i]
 		}
@@ -1819,6 +1985,12 @@ func (h *Handler) AddAccount(c *gin.Context) {
 
 	successCount := 0
 	failCount := 0
+	duplicateCount := 0
+
+	var dedup *accountCredentialDedup
+	if !req.AllowDuplicate {
+		dedup = h.newAccountCredentialDedup(ctx)
+	}
 
 	for i, seed := range seeds {
 		name := req.Name
@@ -1826,6 +1998,12 @@ func (h *Handler) AddAccount(c *gin.Context) {
 			name = fmt.Sprintf("account-%d", i+1)
 		} else if len(seeds) > 1 {
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		if dedup != nil && dedup.checkAndMark(seed) {
+			duplicateCount++
+			log.Printf("添加账号 %d 已存在（RT/ST 重复），跳过", i+1)
+			continue
 		}
 
 		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
@@ -1851,17 +2029,21 @@ func (h *Handler) AddAccount(c *gin.Context) {
 	}
 
 	// 记录安全审计日志
-	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 
 	msg := fmt.Sprintf("成功添加 %d 个账号", successCount)
+	if duplicateCount > 0 {
+		msg += fmt.Sprintf("，%d 个重复跳过", duplicateCount)
+	}
 	if failCount > 0 {
 		msg += fmt.Sprintf("，%d 个失败", failCount)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": msg,
-		"success": successCount,
-		"failed":  failCount,
+		"message":   msg,
+		"success":   successCount,
+		"duplicate": duplicateCount,
+		"failed":    failCount,
 	})
 }
 
@@ -1871,6 +2053,7 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 	total := len(seeds)
 	successCount := 0
 	failCount := 0
+	duplicateCount := 0
 	sendImportEvent(c, importEvent{
 		Type: "progress", Current: 0, Total: total,
 		Success: 0, Duplicate: 0, Failed: 0,
@@ -1878,6 +2061,11 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
+
+	var dedup *accountCredentialDedup
+	if !req.AllowDuplicate {
+		dedup = h.newAccountCredentialDedup(ctx)
+	}
 
 	for i, seed := range seeds {
 		name := req.Name
@@ -1887,13 +2075,22 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 			name = fmt.Sprintf("%s-%d", req.Name, i+1)
 		}
 
+		if dedup != nil && dedup.checkAndMark(seed) {
+			duplicateCount++
+			sendImportEvent(c, importEvent{
+				Type: "progress", Current: i + 1, Total: total,
+				Success: successCount, Duplicate: duplicateCount, Failed: failCount,
+			})
+			continue
+		}
+
 		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), req.ProxyURL)
 		if err != nil {
 			log.Printf("批量添加账号 %d 失败: %v", i+1, err)
 			failCount++
 			sendImportEvent(c, importEvent{
 				Type: "progress", Current: i + 1, Total: total,
-				Success: successCount, Duplicate: 0, Failed: failCount,
+				Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 			})
 			continue
 		}
@@ -1912,22 +2109,23 @@ func (h *Handler) streamAddAccounts(c *gin.Context, req addAccountReq, seeds []t
 
 		sendImportEvent(c, importEvent{
 			Type: "progress", Current: i + 1, Total: total,
-			Success: successCount, Duplicate: 0, Failed: failCount,
+			Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 		})
 	}
 
-	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	security.SecurityAuditLog("ACCOUNTS_ADDED", fmt.Sprintf("success=%d duplicate=%d failed=%d ip=%s", successCount, duplicateCount, failCount, c.ClientIP()))
 	sendImportEvent(c, importEvent{
 		Type: "complete", Current: total, Total: total,
-		Success: successCount, Duplicate: 0, Failed: failCount,
+		Success: successCount, Duplicate: duplicateCount, Failed: failCount,
 	})
 }
 
 // addATAccountReq AT 模式添加账号请求
 type addATAccountReq struct {
-	Name        string `json:"name"`
-	AccessToken string `json:"access_token"`
-	ProxyURL    string `json:"proxy_url"`
+	Name           string `json:"name"`
+	AccessToken    string `json:"access_token"`
+	ProxyURL       string `json:"proxy_url"`
+	AllowDuplicate bool   `json:"allow_duplicate"`
 }
 
 // AddATAccount 添加 AT-only 账号（支持批量：access_token 按行分割）
@@ -1981,11 +2179,32 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		return
 	}
 
+	if strings.EqualFold(c.Query("stream"), "true") {
+		h.streamAddATAccounts(c, req, tokens)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
 	successCount := 0
 	failCount := 0
+	updatedCount := 0
+	duplicateCount := 0
+
+	// AT 去重：非身份型 AT-only（无法从 JWT 解出 email + 工作区/用户 ID，如 codex_at）
+	// 按 access_token 原文去重；身份型 AT 由 upsertOAuthIdentityAccount 按 OAuth 身份
+	//（email + account_id/user_id）去重/更新——AT 会轮换，仅按原文去重会重复导入同一账号。
+	// 勾选"允许重复添加"时跳过全部去重，强制新建。
+	existingATs := make(map[string]bool)
+	seenAT := make(map[string]bool)
+	if !req.AllowDuplicate {
+		if got, err := h.db.GetAllAccessTokens(ctx); err != nil {
+			log.Printf("查询已有 AT 失败: %v", err)
+		} else {
+			existingATs = got
+		}
+	}
 
 	for i, at := range tokens {
 		name := req.Name
@@ -1996,18 +2215,34 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 		}
 
 		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{
-			accessToken: at,
+			accessToken:    at,
+			allowDuplicate: req.AllowDuplicate,
 		})
-		if seed.email != "" && seed.accountID != "" {
-			id, _, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+		if !req.AllowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
+			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
 			if err != nil {
 				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
 				failCount++
 				continue
 			}
-			successCount++
-			log.Printf("AT 账号 %d 已加入或更新号池 (id=%d)", i+1, id)
+			if updated {
+				// 已有账号只更新凭证，不计入"新增"。
+				updatedCount++
+				log.Printf("AT 账号 %d 命中已有身份并更新凭证 (id=%d)", i+1, id)
+			} else {
+				successCount++
+				log.Printf("AT 账号 %d 已加入号池 (id=%d)", i+1, id)
+			}
 			continue
+		}
+
+		if !req.AllowDuplicate {
+			if existingATs[at] || seenAT[at] {
+				duplicateCount++
+				log.Printf("AT 账号 %d 已存在（access_token 重复），跳过", i+1)
+				continue
+			}
+			seenAT[at] = true
 		}
 
 		id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
@@ -2031,20 +2266,129 @@ func (h *Handler) AddATAccount(c *gin.Context) {
 				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
 			}
 		}
+		// 触发 wham 用量探针：codex_at 的身份此刻未知，探针补齐身份后会回查
+		// 并合并同身份的已有账号（见 probeImportedAccountUsage）。
+		h.triggerImportedAccountUsageProbe(id, "manual_at")
 		log.Printf("AT 账号 %d 已加入号池 (id=%d, email=%s)", i+1, id, newAcc.Email)
 	}
 
-	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d failed=%d ip=%s", successCount, failCount, c.ClientIP()))
+	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
 
-	msg := fmt.Sprintf("成功添加 %d 个 AT 账号", successCount)
+	msg := fmt.Sprintf("成功新增 %d 个 AT 账号", successCount)
+	if updatedCount > 0 {
+		msg += fmt.Sprintf("，%d 个已有账号更新", updatedCount)
+	}
+	if duplicateCount > 0 {
+		msg += fmt.Sprintf("，%d 个重复跳过", duplicateCount)
+	}
 	if failCount > 0 {
 		msg += fmt.Sprintf("，%d 个失败", failCount)
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": msg,
-		"success": successCount,
-		"failed":  failCount,
+		"message":   msg,
+		"success":   successCount,
+		"updated":   updatedCount,
+		"duplicate": duplicateCount,
+		"failed":    failCount,
+	})
+}
+
+// streamAddATAccounts 以 SSE 流式推送 AT 批量添加进度（与 streamAddAccounts 对齐）。
+func (h *Handler) streamAddATAccounts(c *gin.Context, req addATAccountReq, tokens []string) {
+	setupSSE(c)
+
+	total := len(tokens)
+	successCount := 0
+	failCount := 0
+	updatedCount := 0
+	duplicateCount := 0
+	sendImportEvent(c, importEvent{
+		Type: "progress", Current: 0, Total: total,
+		Success: 0, Updated: 0, Duplicate: 0, Failed: 0,
+	})
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	existingATs := make(map[string]bool)
+	seenAT := make(map[string]bool)
+	if !req.AllowDuplicate {
+		if got, err := h.db.GetAllAccessTokens(ctx); err != nil {
+			log.Printf("查询已有 AT 失败: %v", err)
+		} else {
+			existingATs = got
+		}
+	}
+
+	progress := func(current int) {
+		sendImportEvent(c, importEvent{
+			Type: "progress", Current: current, Total: total,
+			Success: successCount, Updated: updatedCount, Duplicate: duplicateCount, Failed: failCount,
+		})
+	}
+
+	for i, at := range tokens {
+		name := req.Name
+		if name == "" {
+			name = fmt.Sprintf("at-account-%d", i+1)
+		} else if total > 1 {
+			name = fmt.Sprintf("%s-%d", req.Name, i+1)
+		}
+
+		seed := normalizeTokenCredentialSeed(tokenCredentialSeed{accessToken: at, allowDuplicate: req.AllowDuplicate})
+		if !req.AllowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
+			id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, req.ProxyURL, seed, "manual_at")
+			if err != nil {
+				log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
+				failCount++
+			} else if updated {
+				// 已有账号只更新凭证，不计入"新增"（重复添加时新增应为 0）。
+				updatedCount++
+				log.Printf("AT 账号 %d 命中已有身份并更新凭证 (id=%d)", i+1, id)
+			} else {
+				successCount++
+				log.Printf("AT 账号 %d 已加入号池 (id=%d)", i+1, id)
+			}
+			progress(i + 1)
+			continue
+		}
+
+		if !req.AllowDuplicate {
+			if existingATs[at] || seenAT[at] {
+				duplicateCount++
+				progress(i + 1)
+				continue
+			}
+			seenAT[at] = true
+		}
+
+		id, err := h.db.InsertATAccount(ctx, name, at, req.ProxyURL)
+		if err != nil {
+			log.Printf("添加 AT 账号 %d 失败: %v", i+1, err)
+			failCount++
+			progress(i + 1)
+			continue
+		}
+
+		successCount++
+		h.db.InsertAccountEventAsync(id, "added", "manual_at")
+		newAcc := accountFromCredentialSeed(id, req.ProxyURL, seed)
+		h.store.AddAccount(newAcc)
+		if creds := tokenCredentialMap(seed); len(creds) > 0 {
+			if err := h.db.UpdateCredentials(ctx, id, creds); err != nil {
+				log.Printf("AT 账号 %d 更新 credentials 失败: %v", id, err)
+			}
+		}
+		// 与非流式路径一致：探针补齐 codex_at 身份后回查合并同身份的已有账号。
+		h.triggerImportedAccountUsageProbe(id, "manual_at")
+		progress(i + 1)
+	}
+
+	security.SecurityAuditLog("AT_ACCOUNTS_ADDED", fmt.Sprintf("success=%d updated=%d duplicate=%d failed=%d ip=%s", successCount, updatedCount, duplicateCount, failCount, c.ClientIP()))
+	sendImportEvent(c, importEvent{
+		Type: "complete", Current: total, Total: total,
+		Success: successCount, Updated: updatedCount, Duplicate: duplicateCount, Failed: failCount,
 	})
 }
 
@@ -2453,20 +2797,38 @@ type jsonAccountEntry struct {
 	SessionToken          string                 `json:"session_token"`
 	SessionTokenCamel     string                 `json:"sessionToken"`
 	AccessToken           string                 `json:"access_token"`
+	AccessTokenCamel      string                 `json:"accessToken"`
 	IDToken               string                 `json:"id_token"`
+	IDTokenCamel          string                 `json:"idToken"`
 	AccountID             string                 `json:"account_id"`
 	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
 	Email                 string                 `json:"email"`
 	Name                  string                 `json:"name"`
 	PlanType              string                 `json:"plan_type"`
+	PlanTypeCamel         string                 `json:"planType"`
+	User                  jsonAccountUser        `json:"user"`
+	Account               jsonAccountAccount     `json:"account"`
+	Expired               importJSONScalarString `json:"expired"`
+	ExpiresAt             importJSONScalarString `json:"expires_at"`
+	Expires               importJSONScalarString `json:"expires"`
 	Codex7DUsedPercent    importJSONScalarString `json:"codex_7d_used_percent"`
 	Codex7DResetAt        string                 `json:"codex_7d_reset_at"`
 	Codex5HUsedPercent    importJSONScalarString `json:"codex_5h_used_percent"`
 	Codex5HResetAt        string                 `json:"codex_5h_reset_at"`
 	Codex5HUsageUpdatedAt string                 `json:"codex_5h_usage_updated_at"`
 	CodexUsageUpdatedAt   string                 `json:"codex_usage_updated_at"`
-	Expired               importJSONScalarString `json:"expired"`
-	ExpiresAt             importJSONScalarString `json:"expires_at"`
+}
+
+type jsonAccountUser struct {
+	Email string `json:"email"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+}
+
+type jsonAccountAccount struct {
+	PlanType      string `json:"plan_type"`
+	PlanTypeCamel string `json:"planType"`
+	ID            string `json:"id"`
 }
 
 type sub2apiImportPayload struct {
@@ -2483,19 +2845,25 @@ type sub2apiAccountCredentials struct {
 	SessionToken          string                 `json:"session_token"`
 	SessionTokenCamel     string                 `json:"sessionToken"`
 	AccessToken           string                 `json:"access_token"`
+	AccessTokenCamel      string                 `json:"accessToken"`
 	IDToken               string                 `json:"id_token"`
+	IDTokenCamel          string                 `json:"idToken"`
 	AccountID             string                 `json:"account_id"`
 	ChatGPTAccountID      string                 `json:"chatgpt_account_id"`
 	Email                 string                 `json:"email"`
 	PlanType              string                 `json:"plan_type"`
+	PlanTypeCamel         string                 `json:"planType"`
+	User                  jsonAccountUser        `json:"user"`
+	Account               jsonAccountAccount     `json:"account"`
+	ExpiresAt             importJSONScalarString `json:"expires_at"`
+	Expired               importJSONScalarString `json:"expired"`
+	Expires               importJSONScalarString `json:"expires"`
 	Codex7DUsedPercent    importJSONScalarString `json:"codex_7d_used_percent"`
 	Codex7DResetAt        string                 `json:"codex_7d_reset_at"`
 	Codex5HUsedPercent    importJSONScalarString `json:"codex_5h_used_percent"`
 	Codex5HResetAt        string                 `json:"codex_5h_reset_at"`
 	Codex5HUsageUpdatedAt string                 `json:"codex_5h_usage_updated_at"`
 	CodexUsageUpdatedAt   string                 `json:"codex_usage_updated_at"`
-	ExpiresAt             importJSONScalarString `json:"expires_at"`
-	Expired               importJSONScalarString `json:"expired"`
 }
 
 type importJSONScalarString string
@@ -2570,9 +2938,13 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 	for _, entry := range entries {
 		rt := strings.TrimSpace(entry.RefreshToken)
 		st := firstNonEmpty(entry.SessionToken, entry.SessionTokenCamel)
-		at := strings.TrimSpace(entry.AccessToken)
-		email := strings.TrimSpace(entry.Email)
-		name := firstNonEmpty(entry.Name, email)
+		at := firstNonEmpty(entry.AccessToken, entry.AccessTokenCamel)
+		idTok := firstNonEmpty(entry.IDToken, entry.IDTokenCamel)
+		email := firstNonEmpty(entry.Email, entry.User.Email)
+		name := firstNonEmpty(entry.Name, entry.User.Name, email)
+		planType := firstNonEmpty(entry.PlanType, entry.PlanTypeCamel, entry.Account.PlanType, entry.Account.PlanTypeCamel)
+		accID := firstNonEmpty(entry.AccountID, entry.User.ID, entry.Account.ID)
+		expiresAt := firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String(), entry.Expires.String())
 
 		if rt != "" || st != "" || at != "" {
 			tokens = append(tokens, importToken{
@@ -2581,11 +2953,11 @@ func jsonAccountEntriesToTokens(entries []jsonAccountEntry) []importToken {
 				accessToken:           at,
 				name:                  name,
 				email:                 email,
-				idToken:               strings.TrimSpace(entry.IDToken),
+				idToken:               idTok,
 				accountID:             strings.TrimSpace(entry.AccountID),
-				chatgptAccountID:      strings.TrimSpace(entry.ChatGPTAccountID),
-				planType:              strings.TrimSpace(entry.PlanType),
-				expiresAt:             firstNonEmpty(entry.ExpiresAt.String(), entry.Expired.String()),
+				chatgptAccountID:      firstNonEmpty(entry.ChatGPTAccountID, accID),
+				planType:              planType,
+				expiresAt:             expiresAt,
 				codex7DUsedPercent:    strings.TrimSpace(entry.Codex7DUsedPercent.String()),
 				codex7DResetAt:        strings.TrimSpace(entry.Codex7DResetAt),
 				codex5HUsedPercent:    strings.TrimSpace(entry.Codex5HUsedPercent.String()),
@@ -2606,15 +2978,20 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 
 	tokens := make([]importToken, 0, len(payload.Accounts))
 	for _, account := range payload.Accounts {
-		rt := strings.TrimSpace(account.Credentials.RefreshToken)
-		st := firstNonEmpty(account.Credentials.SessionToken, account.Credentials.SessionTokenCamel)
-		at := strings.TrimSpace(account.Credentials.AccessToken)
-		name := strings.TrimSpace(account.Name)
-		email := strings.TrimSpace(account.Credentials.Email)
+		c := account.Credentials
+		rt := strings.TrimSpace(c.RefreshToken)
+		st := firstNonEmpty(c.SessionToken, c.SessionTokenCamel)
+		at := firstNonEmpty(c.AccessToken, c.AccessTokenCamel)
+		idTok := firstNonEmpty(c.IDToken, c.IDTokenCamel)
+		name := firstNonEmpty(account.Name, c.User.Name)
+		email := firstNonEmpty(c.Email, c.User.Email)
 
 		if name == "" {
 			name = email
 		}
+		planType := firstNonEmpty(c.PlanType, c.PlanTypeCamel, c.Account.PlanType, c.Account.PlanTypeCamel)
+		accID := firstNonEmpty(c.AccountID, c.User.ID, c.Account.ID)
+		expiresAt := firstNonEmpty(c.ExpiresAt.String(), c.Expired.String(), c.Expires.String())
 
 		if rt != "" || st != "" || at != "" {
 			tokens = append(tokens, importToken{
@@ -2623,17 +3000,17 @@ func parseSub2APIJSONImportTokens(data []byte) []importToken {
 				accessToken:           at,
 				name:                  name,
 				email:                 email,
-				idToken:               strings.TrimSpace(account.Credentials.IDToken),
-				accountID:             strings.TrimSpace(account.Credentials.AccountID),
-				chatgptAccountID:      strings.TrimSpace(account.Credentials.ChatGPTAccountID),
-				planType:              strings.TrimSpace(account.Credentials.PlanType),
-				expiresAt:             firstNonEmpty(account.Credentials.ExpiresAt.String(), account.Credentials.Expired.String()),
-				codex7DUsedPercent:    strings.TrimSpace(account.Credentials.Codex7DUsedPercent.String()),
-				codex7DResetAt:        strings.TrimSpace(account.Credentials.Codex7DResetAt),
-				codex5HUsedPercent:    strings.TrimSpace(account.Credentials.Codex5HUsedPercent.String()),
-				codex5HResetAt:        strings.TrimSpace(account.Credentials.Codex5HResetAt),
-				codex5HUsageUpdatedAt: strings.TrimSpace(account.Credentials.Codex5HUsageUpdatedAt),
-				codexUsageUpdatedAt:   strings.TrimSpace(account.Credentials.CodexUsageUpdatedAt),
+				idToken:               idTok,
+				accountID:             strings.TrimSpace(c.AccountID),
+				chatgptAccountID:      firstNonEmpty(c.ChatGPTAccountID, accID),
+				planType:              planType,
+				expiresAt:             expiresAt,
+				codex7DUsedPercent:    strings.TrimSpace(c.Codex7DUsedPercent.String()),
+				codex7DResetAt:        strings.TrimSpace(c.Codex7DResetAt),
+				codex5HUsedPercent:    strings.TrimSpace(c.Codex5HUsedPercent.String()),
+				codex5HResetAt:        strings.TrimSpace(c.Codex5HResetAt),
+				codex5HUsageUpdatedAt: strings.TrimSpace(c.Codex5HUsageUpdatedAt),
+				codexUsageUpdatedAt:   strings.TrimSpace(c.CodexUsageUpdatedAt),
 			})
 		}
 	}
@@ -2743,6 +3120,11 @@ func importTokenOAuthIdentityKey(t importToken, conflicts map[string]bool) strin
 	if accountID == "" && strings.TrimSpace(t.accountID) == "" {
 		accountID = strings.TrimSpace(t.chatgptAccountID)
 	}
+	// 个人账号可能只有 user_id（无工作区 account_id），用它兜底做身份键，
+	// 否则文件导入会退化为凭证原文比对，AT 轮换后重复导入。
+	if accountID == "" {
+		accountID = strings.TrimSpace(seed.userID)
+	}
 	if email == "" || accountID == "" {
 		return ""
 	}
@@ -2753,16 +3135,27 @@ func importTokenOAuthIdentityKey(t importToken, conflicts map[string]bool) strin
 func (h *Handler) ImportAccounts(c *gin.Context) {
 	format := c.DefaultPostForm("format", "txt")
 	proxyURL := c.PostForm("proxy_url")
+	allowDuplicate := parseBoolForm(c.PostForm("allow_duplicate"))
 
 	switch format {
 	case "json":
-		h.importAccountsJSON(c, proxyURL)
+		h.importAccountsJSON(c, proxyURL, allowDuplicate)
 	case "json_at":
-		h.importAccountsJSONPreferAT(c, proxyURL)
+		h.importAccountsJSONPreferAT(c, proxyURL, allowDuplicate)
 	case "at_txt":
-		h.importAccountsATTXT(c, proxyURL)
+		h.importAccountsATTXT(c, proxyURL, allowDuplicate)
 	default:
-		h.importAccountsTXT(c, proxyURL)
+		h.importAccountsTXT(c, proxyURL, allowDuplicate)
+	}
+}
+
+// parseBoolForm 解析表单中的布尔开关（1/true/yes/on 视为真）。
+func parseBoolForm(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2822,7 +3215,7 @@ func importTokensFromTextFiles(files []uploadedImportFile, makeToken func(string
 }
 
 // importAccountsTXT 通过 TXT 文件导入（每行一个 RT）
-func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string, allowDuplicate bool) {
 	files, err := readUploadedImportFiles(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -2837,11 +3230,11 @@ func (h *Handler) importAccountsTXT(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	h.importAccountsCommon(c, tokens, proxyURL)
+	h.importAccountsCommon(c, tokens, proxyURL, allowDuplicate)
 }
 
 // importAccountsJSON 通过 JSON 文件导入（兼容 CLIProxyAPI 凭证格式）
-func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string, allowDuplicate bool) {
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		writeError(c, http.StatusBadRequest, "解析表单失败")
 		return
@@ -2887,12 +3280,12 @@ func (h *Handler) importAccountsJSON(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	h.importAccountsCommon(c, allTokens, proxyURL)
+	h.importAccountsCommon(c, allTokens, proxyURL, allowDuplicate)
 }
 
 // importAccountsJSONPreferAT 通过 JSON 文件导入，但只信任 access_token，
 // 用于一些导出工具中 refresh_token / session_token 是占位/重复值的场景。
-func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string, allowDuplicate bool) {
 	if err := c.Request.ParseMultipartForm(32 << 20); err != nil {
 		writeError(c, http.StatusBadRequest, "解析表单失败")
 		return
@@ -2945,7 +3338,7 @@ func (h *Handler) importAccountsJSONPreferAT(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	h.importAccountsCommon(c, allTokens, proxyURL)
+	h.importAccountsCommon(c, allTokens, proxyURL, allowDuplicate)
 }
 
 // importEvent SSE 导入进度事件
@@ -2954,6 +3347,7 @@ type importEvent struct {
 	Current   int    `json:"current"`
 	Total     int    `json:"total"`
 	Success   int    `json:"success"`
+	Updated   int    `json:"updated"`
 	Duplicate int    `json:"duplicate"`
 	Failed    int    `json:"failed"`
 }
@@ -2984,7 +3378,7 @@ func sendSSEJSON(c *gin.Context, event any) {
 }
 
 // importAccountsCommon 公共的去重、并发插入、SSE 进度推送逻辑（支持 RT 和 AT-only 混合导入）
-func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string) {
+func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, proxyURL string, allowDuplicate bool) {
 	// 文件内去重：
 	// 1) 当条目可解析出 email + account_id 时，以它作为 OAuth 身份键；
 	//    同身份同 RT/ST/AT 折叠，同身份不同 RT/ST/AT 整组跳过，避免任选一个覆盖。
@@ -3081,81 +3475,91 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	}
 	log.Printf("导入解析: 文件内 %d 条, 去重后 %d 条（%d 条文件内重复，%d 条 OAuth 身份冲突跳过）", len(tokens), len(unique), fileDuplicateCount, ambiguousOAuthIdentityCount)
 
-	existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
-	if err != nil {
-		log.Printf("查询已有 RT 失败: %v", err)
-		existingRTs = make(map[string]bool)
-	}
-
-	// 存在 AT-only token 时额外查询已有 AT
-	hasAT := len(seenAT) > 0
-	var existingATs map[string]bool
-	if hasAT {
-		existingATs, err = h.db.GetAllAccessTokens(dedupeCtx)
-		if err != nil {
-			log.Printf("查询已有 AT 失败: %v", err)
-			existingATs = make(map[string]bool)
-		}
-	}
-	hasST := len(seenST) > 0
-	var existingSTs map[string]bool
-	if hasST {
-		existingSTs, err = h.db.GetAllSessionTokens(dedupeCtx)
-		if err != nil {
-			log.Printf("查询已有 ST 失败: %v", err)
-			existingSTs = make(map[string]bool)
-		}
-	}
-
 	var newTokens []importToken
 	duplicateCount := ambiguousOAuthIdentityCount
-	for _, t := range unique {
-		oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
-		if oauthIdentity != "" {
-			seed := importTokenSeed(t, conflictingChatGPTIDs)
-			if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
-				log.Printf("查询已有 OAuth 身份失败: %v", err)
-			} else if duplicateID > 0 {
-				row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
-				if err != nil {
-					log.Printf("查询已有 OAuth 账号 %d 失败: %v", duplicateID, err)
-				} else if importAccountCredentialFingerprint(row) == importTokenCredentialFingerprint(t, conflictingChatGPTIDs) {
-					duplicateCount++
-					continue
-				}
-			}
-			newTokens = append(newTokens, t)
-			continue
+
+	if allowDuplicate {
+		// 允许重复添加：跳过数据库去重，所有解析出的 token 均作为新账号导入。
+		newTokens = tokens
+		duplicateCount = 0
+	} else {
+		existingRTs, err := h.db.GetAllRefreshTokens(dedupeCtx)
+		if err != nil {
+			log.Printf("查询已有 RT 失败: %v", err)
+			existingRTs = make(map[string]bool)
 		}
-		switch {
-		case t.refreshToken != "":
-			if existingRTs[t.refreshToken] {
-				duplicateCount++
-			} else if t.sessionToken != "" && existingSTs[t.sessionToken] {
-				duplicateCount++
-			} else if t.accessToken != "" && existingATs[t.accessToken] {
-				duplicateCount++
-			} else {
-				newTokens = append(newTokens, t)
+
+		// 存在 AT-only token 时额外查询已有 AT
+		hasAT := len(seenAT) > 0
+		var existingATs map[string]bool
+		if hasAT {
+			existingATs, err = h.db.GetAllAccessTokens(dedupeCtx)
+			if err != nil {
+				log.Printf("查询已有 AT 失败: %v", err)
+				existingATs = make(map[string]bool)
 			}
-		case t.sessionToken != "":
-			if existingSTs[t.sessionToken] {
-				duplicateCount++
-			} else if t.accessToken != "" && existingATs[t.accessToken] {
-				duplicateCount++
-			} else {
-				newTokens = append(newTokens, t)
+		}
+		hasST := len(seenST) > 0
+		var existingSTs map[string]bool
+		if hasST {
+			existingSTs, err = h.db.GetAllSessionTokens(dedupeCtx)
+			if err != nil {
+				log.Printf("查询已有 ST 失败: %v", err)
+				existingSTs = make(map[string]bool)
 			}
-		case t.accessToken != "":
-			if existingATs[t.accessToken] {
-				duplicateCount++
-			} else {
+		}
+
+		for _, t := range unique {
+			oauthIdentity := importTokenOAuthIdentityKey(t, conflictingChatGPTIDs)
+			if oauthIdentity != "" {
+				seed := importTokenSeed(t, conflictingChatGPTIDs)
+				if duplicateID, err := h.findOAuthIdentityDuplicate(dedupeCtx, seed, 0); err != nil {
+					log.Printf("查询已有 OAuth 身份失败: %v", err)
+				} else if duplicateID > 0 {
+					row, err := h.db.GetAccountByID(dedupeCtx, duplicateID)
+					if err != nil {
+						log.Printf("查询已有 OAuth 账号 %d 失败: %v", duplicateID, err)
+					} else if importAccountCredentialFingerprint(row) == importTokenCredentialFingerprint(t, conflictingChatGPTIDs) {
+						duplicateCount++
+						continue
+					}
+				}
 				newTokens = append(newTokens, t)
+				continue
+			}
+			switch {
+			case t.refreshToken != "":
+				if existingRTs[t.refreshToken] {
+					duplicateCount++
+				} else if t.sessionToken != "" && existingSTs[t.sessionToken] {
+					duplicateCount++
+				} else if t.accessToken != "" && existingATs[t.accessToken] {
+					duplicateCount++
+				} else {
+					newTokens = append(newTokens, t)
+				}
+			case t.sessionToken != "":
+				if existingSTs[t.sessionToken] {
+					duplicateCount++
+				} else if t.accessToken != "" && existingATs[t.accessToken] {
+					duplicateCount++
+				} else {
+					newTokens = append(newTokens, t)
+				}
+			case t.accessToken != "":
+				if existingATs[t.accessToken] {
+					duplicateCount++
+				} else {
+					newTokens = append(newTokens, t)
+				}
 			}
 		}
 	}
 
 	total := len(unique) + ambiguousOAuthIdentityCount
+	if allowDuplicate {
+		total = len(tokens)
+	}
 
 	log.Printf("导入去重: 总计 %d 条, 数据库已存在 %d 条, 待导入 %d 条", total, duplicateCount, len(newTokens))
 
@@ -3174,6 +3578,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 	setupSSE(c)
 
 	var successCount int64
+	var updatedCount int64
 	var failCount int64
 	var current int64
 	sem := make(chan struct{}, 20) // 并发插入上限
@@ -3189,10 +3594,11 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			case <-ticker.C:
 				cur := int(atomic.LoadInt64(&current))
 				suc := int(atomic.LoadInt64(&successCount))
+				upd := int(atomic.LoadInt64(&updatedCount))
 				fai := int(atomic.LoadInt64(&failCount))
 				sendImportEvent(c, importEvent{
 					Type: "progress", Current: cur + duplicateCount, Total: total,
-					Success: suc, Duplicate: duplicateCount, Failed: fai,
+					Success: suc, Updated: upd, Duplicate: duplicateCount, Failed: fai,
 				})
 			case <-done:
 				return
@@ -3210,11 +3616,12 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 			name := tok.name
 
 			seed := importTokenSeed(tok, conflictingChatGPTIDs)
+			seed.allowDuplicate = allowDuplicate
 			importSource := "import"
 			if tok.accessToken != "" && tok.refreshToken == "" {
 				importSource = "import_at"
 			}
-			if seed.email != "" && seed.accountID != "" {
+			if !allowDuplicate && seed.email != "" && (seed.accountID != "" || seed.userID != "") {
 				if name == "" {
 					if importSource == "import_at" {
 						name = fmt.Sprintf("at-import-%d", idx+1)
@@ -3224,7 +3631,7 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 				}
 
 				upsertCtx, upsertCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				id, _, err := h.upsertOAuthIdentityAccount(upsertCtx, name, proxyURL, seed, importSource)
+				id, updated, err := h.upsertOAuthIdentityAccount(upsertCtx, name, proxyURL, seed, importSource)
 				upsertCancel()
 				if err != nil {
 					log.Printf("导入账号 %d/%d 更新或写入失败: %v", idx+1, len(newTokens), err)
@@ -3233,7 +3640,12 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 					return
 				}
 
-				atomic.AddInt64(&successCount, 1)
+				if updated {
+					// 已有账号只更新凭证，不计入"新增"。
+					atomic.AddInt64(&updatedCount, 1)
+				} else {
+					atomic.AddInt64(&successCount, 1)
+				}
 				atomic.AddInt64(&current, 1)
 				if h.store != nil {
 					if acc := h.store.FindByID(id); acc != nil {
@@ -3331,17 +3743,18 @@ func (h *Handler) importAccountsCommon(c *gin.Context, tokens []importToken, pro
 
 	// 发送完成事件
 	suc := int(atomic.LoadInt64(&successCount))
+	upd := int(atomic.LoadInt64(&updatedCount))
 	fai := int(atomic.LoadInt64(&failCount))
 	sendImportEvent(c, importEvent{
 		Type: "complete", Current: total, Total: total,
-		Success: suc, Duplicate: duplicateCount, Failed: fai,
+		Success: suc, Updated: upd, Duplicate: duplicateCount, Failed: fai,
 	})
 
-	log.Printf("导入完成: success=%d, duplicate=%d, failed=%d, total=%d", suc, duplicateCount, fai, total)
+	log.Printf("导入完成: success=%d, updated=%d, duplicate=%d, failed=%d, total=%d", suc, upd, duplicateCount, fai, total)
 }
 
 // importAccountsATTXT 通过 TXT 文件导入 AT-only 账号（每行一个 Access Token）
-func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
+func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string, allowDuplicate bool) {
 	files, err := readUploadedImportFiles(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
@@ -3356,7 +3769,7 @@ func (h *Handler) importAccountsATTXT(c *gin.Context, proxyURL string) {
 		return
 	}
 
-	h.importAccountsCommon(c, tokens, proxyURL)
+	h.importAccountsCommon(c, tokens, proxyURL, allowDuplicate)
 }
 
 // GetAccountUsage 查询单个账号的用量统计
@@ -3866,7 +4279,13 @@ func (h *Handler) BatchUpdateAccounts(c *gin.Context) {
 				h.store.ApplyAccountEnabled(id, enabled.Value)
 			}
 			if locked.Set {
-				h.store.ApplyAccountLocked(id, locked.Value)
+				if acc := h.store.FindByID(id); acc != nil {
+					if locked.Value {
+						atomic.StoreInt32(&acc.Locked, 1)
+					} else {
+						atomic.StoreInt32(&acc.Locked, 0)
+					}
+				}
 			}
 			h.applyAccountSchedulerRuntimeUpdate(id, schedulerUpdate)
 		}
@@ -3937,7 +4356,24 @@ func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
 	if refreshFn == nil {
 		refreshFn = h.refreshSingleAccount
 	}
-	return refreshFn(refreshCtx, id)
+	if err := refreshFn(refreshCtx, id); err != nil {
+		return err
+	}
+
+	// 刷新成功后顺带做一次零成本 wham 用量探针，从服务端权威数据同步订阅到期时间与用量。
+	// 续费后 access/id token 里的 chatgpt_subscription_active_until 不一定立即更新（会滞后），
+	// 仅靠 token 刷新会让"有效期"长期停留在旧值；wham/usage 返回的是服务端当前订阅到期时间。
+	// （issue #300）
+	if probe := h.usageProbeFunc(); probe != nil && h.store != nil {
+		if acc := h.store.FindByID(id); acc != nil {
+			probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
+			if err := probe(probeCtx, acc); err != nil {
+				log.Printf("[账号 %d] 刷新后用量/订阅到期探针失败（忽略）: %v", id, err)
+			}
+			probeCancel()
+		}
+	}
+	return nil
 }
 
 func (h *Handler) streamBatchRefreshAccounts(c *gin.Context, ids []int64) {
@@ -4110,8 +4546,12 @@ func (h *Handler) ToggleAccountLock(c *gin.Context) {
 	}
 
 	// 同步更新内存中的状态
-	if h.store != nil {
-		h.store.ApplyAccountLocked(id, req.Locked)
+	if acc := h.store.FindByID(id); acc != nil {
+		if req.Locked {
+			atomic.StoreInt32(&acc.Locked, 1)
+		} else {
+			atomic.StoreInt32(&acc.Locked, 0)
+		}
 	}
 
 	if req.Locked {
@@ -5080,6 +5520,9 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 			h.store.SetAPIKeyAllowedGroups(id, values)
 		}
 	}
+	if h.store != nil {
+		h.store.SetAPIKeyAllowedPlans(id, limits.PlanAllow)
+	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, key)
 
 	// 记录安全审计日志
@@ -5214,6 +5657,9 @@ func (h *Handler) UpdateAPIKey(c *gin.Context) {
 	if allowedGroupIDs.Set && h.store != nil {
 		h.store.SetAPIKeyAllowedGroups(id, allowedGroupValues)
 	}
+	if update.LimitsSet && h.store != nil {
+		h.store.SetAPIKeyAllowedPlans(id, update.Limits.PlanAllow)
+	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, row.Key)
 	writeMessage(c, http.StatusOK, "API Key 已更新")
 }
@@ -5244,6 +5690,7 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 	out := database.APIKeyLimits{
 		ModelAllow:     clean(in.ModelAllow),
 		ModelDeny:      clean(in.ModelDeny),
+		PlanAllow:      cleanPlanAllow(in.PlanAllow),
 		RPM:            maxInt(in.RPM, 0),
 		RPD:            maxInt(in.RPD, 0),
 		MaxConcurrency: maxInt(in.MaxConcurrency, 0),
@@ -5253,6 +5700,38 @@ func sanitizeAPIKeyLimits(in database.APIKeyLimits) database.APIKeyLimits {
 		TokenLimit5h:   maxInt64(in.TokenLimit5h, 0),
 		TokenLimit7d:   maxInt64(in.TokenLimit7d, 0),
 		TokenLimit30d:  maxInt64(in.TokenLimit30d, 0),
+	}
+	return out
+}
+
+// knownAPIKeyPlanFilters 是账号套餐白名单允许的取值集合。与前端 PlanMultiSelect 的
+// 选项、以及 Accounts 页的套餐筛选保持一致(按原始 plan_type 精确匹配,pro 与 prolite
+// 相互独立)。未知值在 cleanPlanAllow 中被丢弃,避免把打字错误写进过滤条件后导致该
+// Key 永远选不到账号。
+var knownAPIKeyPlanFilters = map[string]struct{}{
+	"free": {}, "plus": {}, "pro": {}, "prolite": {}, "team": {}, "k12": {}, "go": {},
+}
+
+// cleanPlanAllow 归一账号套餐白名单:小写去空白、丢弃未知值并去重。
+func cleanPlanAllow(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		plan := strings.ToLower(strings.TrimSpace(item))
+		if plan == "" {
+			continue
+		}
+		if _, ok := knownAPIKeyPlanFilters[plan]; !ok {
+			continue
+		}
+		if _, ok := seen[plan]; ok {
+			continue
+		}
+		seen[plan] = struct{}{}
+		out = append(out, plan)
 	}
 	return out
 }
@@ -5377,6 +5856,7 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 	}
 	if h.store != nil {
 		h.store.SetAPIKeyAllowedGroups(id, nil)
+		h.store.SetAPIKeyAllowedPlans(id, nil)
 	}
 	h.invalidateAPIKeyRuntimeCaches(ctx, keyToInvalidate)
 	writeMessage(c, http.StatusOK, "已删除")
@@ -5455,12 +5935,14 @@ type settingsResponse struct {
 	PromptFilterDisabledPatterns       string  `json:"prompt_filter_disabled_patterns"`
 	PromptFilterReviewEnabled          bool    `json:"prompt_filter_review_enabled"`
 	PromptFilterReviewAPIKeyConfigured bool    `json:"prompt_filter_review_api_key_configured"`
+	PromptFilterReviewAPIKeyCount      int     `json:"prompt_filter_review_api_key_count"`
 	PromptFilterReviewBaseURL          string  `json:"prompt_filter_review_base_url"`
 	PromptFilterReviewModel            string  `json:"prompt_filter_review_model"`
 	PromptFilterReviewTimeoutSeconds   int     `json:"prompt_filter_review_timeout_seconds"`
 	PromptFilterReviewFailClosed       bool    `json:"prompt_filter_review_fail_closed"`
 	ClientCompatMode                   string  `json:"client_compat_mode"`
 	CodexMinCLIVersion                 string  `json:"codex_min_cli_version"`
+	CodexUserAgentConfig               string  `json:"codex_user_agent_config"`
 	UsageLogMode                       string  `json:"usage_log_mode"`
 	UsageLogBatchSize                  int     `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds       int     `json:"usage_log_flush_interval_seconds"`
@@ -5483,6 +5965,9 @@ type settingsResponse struct {
 	AutoPause7dThreshold               float64 `json:"auto_pause_7d_threshold"`
 	AutoPause5hGuardBandPercent        float64 `json:"auto_pause_5h_guard_band_percent"`
 	AutoPause5hGuardConcurrency        int     `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled                 bool    `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency          int     `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows                 string  `json:"smart_pacing_windows"`
 }
 
 type updateSettingsReq struct {
@@ -5556,6 +6041,7 @@ type updateSettingsReq struct {
 	PromptFilterReviewFailClosed       *bool    `json:"prompt_filter_review_fail_closed"`
 	ClientCompatMode                   *string  `json:"client_compat_mode"`
 	CodexMinCLIVersion                 *string  `json:"codex_min_cli_version"`
+	CodexUserAgentConfig               *string  `json:"codex_user_agent_config"`
 	UsageLogMode                       *string  `json:"usage_log_mode"`
 	UsageLogBatchSize                  *int     `json:"usage_log_batch_size"`
 	UsageLogFlushIntervalSeconds       *int     `json:"usage_log_flush_interval_seconds"`
@@ -5578,6 +6064,9 @@ type updateSettingsReq struct {
 	AutoPause7dThreshold               *float64 `json:"auto_pause_7d_threshold"`
 	AutoPause5hGuardBandPercent        *float64 `json:"auto_pause_5h_guard_band_percent"`
 	AutoPause5hGuardConcurrency        *int     `json:"auto_pause_5h_guard_concurrency"`
+	SmartPacingEnabled                 *bool    `json:"smart_pacing_enabled"`
+	SmartPacingMinConcurrency          *int     `json:"smart_pacing_min_concurrency"`
+	SmartPacingWindows                 *string  `json:"smart_pacing_windows"`
 }
 
 type brandingResponse struct {
@@ -6070,7 +6559,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	if dbSettings != nil {
 		bgCfg = decodeBackgroundConfig(dbSettings.BackgroundConfig)
 	}
-	cheapRankBase, cheapRankStep, cheapRankMin := h.store.GetCheapProbeRankPolicySeconds()
+	cheapProbeRankBaseSeconds, cheapProbeRankStepSeconds, cheapProbeRankMinSeconds := h.store.GetCheapProbeRankPolicySeconds()
 	c.JSON(http.StatusOK, settingsResponse{
 		SiteName:                           branding.SiteName,
 		SiteLogo:                           branding.SiteLogo,
@@ -6094,9 +6583,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CheapProbeTimeoutSeconds:           h.store.GetCheapProbeTimeoutSeconds(),
 		CheapProbeRecoveryMargin:           h.store.GetCheapProbeRecoveryMargin(),
 		CheapProbeBonusDurationMinutes:     h.store.GetCheapProbeBonusDurationMinutes(),
-		CheapProbeRankBaseIntervalSeconds:  cheapRankBase,
-		CheapProbeRankStepSeconds:          cheapRankStep,
-		CheapProbeRankMinIntervalSeconds:   cheapRankMin,
+		CheapProbeRankBaseIntervalSeconds:  cheapProbeRankBaseSeconds,
+		CheapProbeRankStepSeconds:          cheapProbeRankStepSeconds,
+		CheapProbeRankMinIntervalSeconds:   cheapProbeRankMinSeconds,
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,
@@ -6141,12 +6630,14 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		PromptFilterDisabledPatterns:       promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 		PromptFilterReviewEnabled:          promptFilterCfg.Review.Enabled,
 		PromptFilterReviewAPIKeyConfigured: promptFilterCfg.Review.APIKey != "",
+		PromptFilterReviewAPIKeyCount:      len(promptFilterCfg.Review.APIKeyList()),
 		PromptFilterReviewBaseURL:          promptFilterCfg.Review.BaseURL,
 		PromptFilterReviewModel:            promptFilterCfg.Review.Model,
 		PromptFilterReviewTimeoutSeconds:   promptFilterCfg.Review.TimeoutSeconds,
 		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
 		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:               runtimeCfg.CodexUserAgentConfig,
 		UsageLogMode:                       h.db.GetUsageLogMode(),
 		UsageLogBatchSize:                  h.db.GetUsageLogBatchSize(),
 		UsageLogFlushIntervalSeconds:       h.db.GetUsageLogFlushIntervalSeconds(),
@@ -6169,6 +6660,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
 		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
 	})
 }
 
@@ -6191,13 +6685,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			return
 		}
 	}
-	if req.CheapProbeRecoveryMargin != nil {
-		value := *req.CheapProbeRecoveryMargin
-		if value < 0 || math.IsNaN(value) || math.IsInf(value, 0) || value > 10000 {
-			writeError(c, http.StatusBadRequest, "cheap_probe_recovery_margin 超出范围，必须在 0..10000 之间")
-			return
-		}
-	}
 
 	if req.AutoPause5hGuardBandPercent != nil {
 		if *req.AutoPause5hGuardBandPercent < 0 || *req.AutoPause5hGuardBandPercent > 100 {
@@ -6208,6 +6695,20 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.AutoPause5hGuardConcurrency != nil {
 		if *req.AutoPause5hGuardConcurrency < 0 || *req.AutoPause5hGuardConcurrency > 1000 {
 			writeError(c, http.StatusBadRequest, "auto_pause_5h_guard_concurrency 需在 0 到 1000 之间")
+			return
+		}
+	}
+	if req.SmartPacingMinConcurrency != nil {
+		if *req.SmartPacingMinConcurrency < 1 || *req.SmartPacingMinConcurrency > 1000 {
+			writeError(c, http.StatusBadRequest, "smart_pacing_min_concurrency 需在 1 到 1000 之间")
+			return
+		}
+	}
+	if req.SmartPacingWindows != nil {
+		switch strings.ToLower(strings.TrimSpace(*req.SmartPacingWindows)) {
+		case "5h,7d", "7d,5h", "5h", "7d", "":
+		default:
+			writeError(c, http.StatusBadRequest, "smart_pacing_windows 仅支持 5h,7d / 5h / 7d")
 			return
 		}
 	}
@@ -6412,8 +6913,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	if req.CheapProbeRecoveryMargin != nil {
-		h.store.SetCheapProbeRecoveryMargin(*req.CheapProbeRecoveryMargin)
-		log.Printf("设置已更新: cheap_probe_recovery_margin = %.2f", *req.CheapProbeRecoveryMargin)
+		v := *req.CheapProbeRecoveryMargin
+		if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+			v = 0
+		}
+		if v > 10000 {
+			v = 10000
+		}
+		h.store.SetCheapProbeRecoveryMargin(v)
+		log.Printf("设置已更新: cheap_probe_recovery_margin = %.2f", v)
 	}
 
 	if req.CheapProbeBonusDurationMinutes != nil {
@@ -6428,19 +6936,43 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: cheap_probe_bonus_duration_minutes = %d", v)
 	}
 
-	if req.CheapProbeRankBaseIntervalSeconds != nil || req.CheapProbeRankStepSeconds != nil || req.CheapProbeRankMinIntervalSeconds != nil {
-		base, step, minInterval := h.store.GetCheapProbeRankPolicySeconds()
+	if req.CheapProbeRankBaseIntervalSeconds != nil ||
+		req.CheapProbeRankStepSeconds != nil ||
+		req.CheapProbeRankMinIntervalSeconds != nil {
+		baseSeconds, stepSeconds, minSeconds := h.store.GetCheapProbeRankPolicySeconds()
 		if req.CheapProbeRankBaseIntervalSeconds != nil {
-			base = *req.CheapProbeRankBaseIntervalSeconds
+			baseSeconds = *req.CheapProbeRankBaseIntervalSeconds
+			if baseSeconds < 10 {
+				baseSeconds = 10
+			}
+			if baseSeconds > 86400 {
+				baseSeconds = 86400
+			}
 		}
 		if req.CheapProbeRankStepSeconds != nil {
-			step = *req.CheapProbeRankStepSeconds
+			stepSeconds = *req.CheapProbeRankStepSeconds
+			if stepSeconds < 1 {
+				stepSeconds = 1
+			}
+			if stepSeconds > 3600 {
+				stepSeconds = 3600
+			}
 		}
 		if req.CheapProbeRankMinIntervalSeconds != nil {
-			minInterval = *req.CheapProbeRankMinIntervalSeconds
+			minSeconds = *req.CheapProbeRankMinIntervalSeconds
+			if minSeconds < 5 {
+				minSeconds = 5
+			}
+			if minSeconds > 86400 {
+				minSeconds = 86400
+			}
 		}
-		h.store.SetCheapProbeRankPolicy(time.Duration(base)*time.Second, time.Duration(step)*time.Second, time.Duration(minInterval)*time.Second)
-		log.Printf("设置已更新: cheap_probe_rank_policy = base:%d step:%d min:%d", base, step, minInterval)
+		h.store.SetCheapProbeRankPolicy(
+			time.Duration(baseSeconds)*time.Second,
+			time.Duration(stepSeconds)*time.Second,
+			time.Duration(minSeconds)*time.Second,
+		)
+		log.Printf("设置已更新: cheap_probe_rank_policy = base:%ds step:%ds min:%ds", baseSeconds, stepSeconds, minSeconds)
 	}
 
 	if req.LazyMode != nil {
@@ -6637,6 +7169,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		runtimeCfg.CodexMinCLIVersion = strings.TrimSpace(*req.CodexMinCLIVersion)
 		log.Printf("设置已更新: codex_min_cli_version = %s", runtimeCfg.CodexMinCLIVersion)
 	}
+	if req.CodexUserAgentConfig != nil {
+		normalized, err := proxy.NormalizeCodexUserAgentConfigJSON(*req.CodexUserAgentConfig)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		runtimeCfg.CodexUserAgentConfig = normalized
+		log.Printf("设置已更新: codex_user_agent_config")
+	}
 	if req.StreamFlushPolicy != nil {
 		runtimeCfg.StreamFlushPolicy = proxy.NormalizeStreamFlushPolicy(*req.StreamFlushPolicy)
 		log.Printf("设置已更新: stream_flush_policy = %s", runtimeCfg.StreamFlushPolicy)
@@ -6684,6 +7225,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.AutoPause5hGuardConcurrency != nil {
 		h.store.SetAutoPause5hGuardConcurrency(*req.AutoPause5hGuardConcurrency)
 		log.Printf("设置已更新: auto_pause_5h_guard_concurrency = %d", *req.AutoPause5hGuardConcurrency)
+	}
+	if req.SmartPacingEnabled != nil {
+		h.store.SetSmartPacingEnabled(*req.SmartPacingEnabled)
+		log.Printf("设置已更新: smart_pacing_enabled = %t", *req.SmartPacingEnabled)
+	}
+	if req.SmartPacingMinConcurrency != nil {
+		h.store.SetSmartPacingMinConcurrency(*req.SmartPacingMinConcurrency)
+		log.Printf("设置已更新: smart_pacing_min_concurrency = %d", *req.SmartPacingMinConcurrency)
+	}
+	if req.SmartPacingWindows != nil {
+		h.store.SetSmartPacingWindows(*req.SmartPacingWindows)
+		log.Printf("设置已更新: smart_pacing_windows = %s", h.store.GetSmartPacingWindows())
 	}
 	runtimeCfg = proxy.ApplyRuntimeSettings(runtimeCfg)
 
@@ -6881,7 +7434,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("图片存储配置序列化失败: %v", encodeErr)
 		imgConfigJSON = "{}"
 	}
-	cheapRankBase, cheapRankStep, cheapRankMin := h.store.GetCheapProbeRankPolicySeconds()
+	cheapProbeRankBaseSeconds, cheapProbeRankStepSeconds, cheapProbeRankMinSeconds := h.store.GetCheapProbeRankPolicySeconds()
 
 	// 持久化保存到数据库
 	err := h.db.UpdateSystemSettings(c.Request.Context(), &database.SystemSettings{
@@ -6902,9 +7455,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CheapProbeTimeoutSeconds:           h.store.GetCheapProbeTimeoutSeconds(),
 		CheapProbeRecoveryMargin:           h.store.GetCheapProbeRecoveryMargin(),
 		CheapProbeBonusDurationMinutes:     h.store.GetCheapProbeBonusDurationMinutes(),
-		CheapProbeRankBaseIntervalSeconds:  cheapRankBase,
-		CheapProbeRankStepSeconds:          cheapRankStep,
-		CheapProbeRankMinIntervalSeconds:   cheapRankMin,
+		CheapProbeRankBaseIntervalSeconds:  cheapProbeRankBaseSeconds,
+		CheapProbeRankStepSeconds:          cheapProbeRankStepSeconds,
+		CheapProbeRankMinIntervalSeconds:   cheapProbeRankMinSeconds,
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,
@@ -6950,6 +7503,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
 		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:               runtimeCfg.CodexUserAgentConfig,
 		UsageLogMode:                       usageLogMode,
 		UsageLogBatchSize:                  usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:       usageLogFlushIntervalSeconds,
@@ -6966,6 +7520,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
 		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -7007,9 +7564,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CheapProbeTimeoutSeconds:           h.store.GetCheapProbeTimeoutSeconds(),
 		CheapProbeRecoveryMargin:           h.store.GetCheapProbeRecoveryMargin(),
 		CheapProbeBonusDurationMinutes:     h.store.GetCheapProbeBonusDurationMinutes(),
-		CheapProbeRankBaseIntervalSeconds:  cheapRankBase,
-		CheapProbeRankStepSeconds:          cheapRankStep,
-		CheapProbeRankMinIntervalSeconds:   cheapRankMin,
+		CheapProbeRankBaseIntervalSeconds:  cheapProbeRankBaseSeconds,
+		CheapProbeRankStepSeconds:          cheapProbeRankStepSeconds,
+		CheapProbeRankMinIntervalSeconds:   cheapProbeRankMinSeconds,
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,
@@ -7055,12 +7612,14 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		PromptFilterDisabledPatterns:       promptfilter.MarshalDisabledPatterns(promptFilterCfg.DisabledPatterns),
 		PromptFilterReviewEnabled:          promptFilterCfg.Review.Enabled,
 		PromptFilterReviewAPIKeyConfigured: promptFilterCfg.Review.APIKey != "",
+		PromptFilterReviewAPIKeyCount:      len(promptFilterCfg.Review.APIKeyList()),
 		PromptFilterReviewBaseURL:          promptFilterCfg.Review.BaseURL,
 		PromptFilterReviewModel:            promptFilterCfg.Review.Model,
 		PromptFilterReviewTimeoutSeconds:   promptFilterCfg.Review.TimeoutSeconds,
 		PromptFilterReviewFailClosed:       promptFilterCfg.Review.FailClosed,
 		ClientCompatMode:                   runtimeCfg.ClientCompatMode,
 		CodexMinCLIVersion:                 runtimeCfg.CodexMinCLIVersion,
+		CodexUserAgentConfig:               runtimeCfg.CodexUserAgentConfig,
 		UsageLogMode:                       usageLogMode,
 		UsageLogBatchSize:                  usageLogBatchSize,
 		UsageLogFlushIntervalSeconds:       usageLogFlushIntervalSeconds,
@@ -7082,6 +7641,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		AutoPause7dThreshold:               h.store.GetGlobalAutoPause7dThreshold(),
 		AutoPause5hGuardBandPercent:        h.store.GetAutoPause5hGuardBandPercent(),
 		AutoPause5hGuardConcurrency:        h.store.GetAutoPause5hGuardConcurrency(),
+		SmartPacingEnabled:                 h.store.GetSmartPacingEnabled(),
+		SmartPacingMinConcurrency:          h.store.GetSmartPacingMinConcurrency(),
+		SmartPacingWindows:                 h.store.GetSmartPacingWindows(),
 	})
 }
 
@@ -7417,7 +7979,7 @@ func (h *Handler) MigrateAccounts(c *gin.Context) {
 	}
 
 	log.Printf("远程迁移: 从 %s 拉取到 %d 个账号，开始导入", remoteURL, len(tokens))
-	h.importAccountsCommon(c, tokens, "")
+	h.importAccountsCommon(c, tokens, "", false)
 }
 
 // ==================== Models ====================

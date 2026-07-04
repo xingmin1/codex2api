@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -143,6 +144,35 @@ func (a *AccountRow) GetCredentialInt64Slice(key string) []int64 {
 		return []int64{}
 	}
 	return int64SliceFromValue(value)
+}
+
+func (a *AccountRow) GetCredentialInt64(key string) (int64, bool) {
+	if a.Credentials == nil {
+		return 0, false
+	}
+	value, ok := a.Credentials[key]
+	if !ok || value == nil {
+		return 0, false
+	}
+	switch typed := value.(type) {
+	case int64:
+		return typed, true
+	case int:
+		return int64(typed), true
+	case float64:
+		if math.Trunc(typed) != typed {
+			return 0, false
+		}
+		return int64(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		return parsed, err == nil
+	case string:
+		parsed, err := strconv.ParseInt(strings.TrimSpace(typed), 10, 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func (a *AccountRow) GetCredentialStringSlice(key string) []string {
@@ -715,15 +745,6 @@ func (db *DB) migrate(ctx context.Context) error {
 				usage_probe_concurrency INT DEFAULT 16,
 				usage_probe_responses_fallback_enabled BOOLEAN DEFAULT TRUE,
 				recovery_probe_interval_minutes INT DEFAULT 30,
-				cheap_probe_enabled BOOLEAN DEFAULT TRUE,
-				cheap_probe_scan_interval_seconds INT DEFAULT 10,
-				cheap_probe_concurrency INT DEFAULT 2,
-				cheap_probe_timeout_seconds INT DEFAULT 30,
-				cheap_probe_recovery_margin DOUBLE PRECISION DEFAULT 10,
-				cheap_probe_bonus_duration_minutes INT DEFAULT 10,
-				cheap_probe_rank_base_interval_seconds INT DEFAULT 180,
-				cheap_probe_rank_step_seconds INT DEFAULT 30,
-				cheap_probe_rank_min_interval_seconds INT DEFAULT 30,
 			scheduler_mode VARCHAR(20) DEFAULT 'round_robin'
 		);
 	CREATE TABLE IF NOT EXISTS account_model_cooldowns (
@@ -790,6 +811,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS prompt_filter_review_fail_closed BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_compat_mode VARCHAR(20) DEFAULT 'preserve';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_min_cli_version VARCHAR(32) DEFAULT '0.118.0';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_user_agent_config TEXT DEFAULT '{}';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_mode VARCHAR(20) DEFAULT 'full';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_batch_size INT DEFAULT 200;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_log_flush_interval_seconds INT DEFAULT 5;
@@ -811,6 +833,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_band_percent DOUBLE PRECISION DEFAULT 5;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_concurrency INT DEFAULT 1;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_enabled BOOLEAN DEFAULT FALSE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_min_concurrency INT DEFAULT 1;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_windows TEXT DEFAULT '5h,7d';
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -996,15 +1021,18 @@ type APIKeyRow struct {
 // APIKeyLimits 是 API Key 级别的细粒度限流/配额配置。
 // 0 或空字段表示该项不限。落库为 JSON,允许平滑扩展字段。
 //
-// - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
-// - RPM: 每分钟请求数 (滑动 60s 窗口)。
-// - RPD: 每天请求数 (滑动 24h 窗口)。
-// - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
-// - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
-// - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
+//   - ModelAllow / ModelDeny: 模型白/黑名单。同时配置时白名单生效,黑名单忽略。
+//   - RPM: 每分钟请求数 (滑动 60s 窗口)。
+//   - RPD: 每天请求数 (滑动 24h 窗口)。
+//   - MaxConcurrency: 同一 API Key 在当前实例内允许的最大并发请求数。
+//   - CostLimit5h / CostLimit7d: 美元成本上限,滑动 5h / 7d 窗口,与账号侧窗口语义一致。
+//   - TokenLimit5h / TokenLimit7d: token 上限,滑动 5h / 7d 窗口。
+//   - PlanAllow: 账号套餐白名单(plus/pro/team/...)。非空时该 Key 仅调度命中其一的账号,
+//     语义与 AllowedGroupIDs 类似,均在账号选择阶段过滤。空表示不限套餐。
 type APIKeyLimits struct {
 	ModelAllow     []string `json:"model_allow,omitempty"`
 	ModelDeny      []string `json:"model_deny,omitempty"`
+	PlanAllow      []string `json:"plan_allow,omitempty"`
 	RPM            int      `json:"rpm,omitempty"`
 	RPD            int      `json:"rpd,omitempty"`
 	MaxConcurrency int      `json:"max_concurrency,omitempty"`
@@ -1018,7 +1046,7 @@ type APIKeyLimits struct {
 
 // IsZero 判断是否为空 limits(全部字段都未配置)
 func (l APIKeyLimits) IsZero() bool {
-	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 &&
+	return len(l.ModelAllow) == 0 && len(l.ModelDeny) == 0 && len(l.PlanAllow) == 0 &&
 		l.RPM == 0 && l.RPD == 0 && l.MaxConcurrency == 0 &&
 		l.CostLimit5h == 0 && l.CostLimit7d == 0 && l.CostLimit30d == 0 &&
 		l.TokenLimit5h == 0 && l.TokenLimit7d == 0 && l.TokenLimit30d == 0
@@ -1408,6 +1436,7 @@ type SystemSettings struct {
 	PromptFilterReviewFailClosed       bool
 	ClientCompatMode                   string
 	CodexMinCLIVersion                 string
+	CodexUserAgentConfig               string
 	UsageLogMode                       string
 	UsageLogBatchSize                  int
 	UsageLogFlushIntervalSeconds       int
@@ -1429,6 +1458,9 @@ type SystemSettings struct {
 	AutoPause7dThreshold               float64
 	AutoPause5hGuardBandPercent        float64
 	AutoPause5hGuardConcurrency        int
+	SmartPacingEnabled                 bool   // issue #312 智能配速总开关
+	SmartPacingMinConcurrency          int    // 配速并发下限
+	SmartPacingWindows                 string // "5h,7d" / "5h" / "7d"
 }
 
 func normalizeBillingTierPolicy(policy string) string {
@@ -1446,6 +1478,40 @@ func normalizeFirstTokenMode(mode string) string {
 		return "loose"
 	default:
 		return "strict"
+	}
+}
+
+// normalizeSmartPacingMinConcurrencyDB 归一化智能配速并发下限（1..1000，默认 1）。
+func normalizeSmartPacingMinConcurrencyDB(value int) int {
+	if value < 1 {
+		return 1
+	}
+	if value > 1000 {
+		return 1000
+	}
+	return value
+}
+
+// normalizeSmartPacingWindowsDB 归一化配速窗口为 "5h,7d" / "5h" / "7d"，非法回退 "5h,7d"。
+func normalizeSmartPacingWindowsDB(raw string) string {
+	var w5h, w7d bool
+	for _, part := range strings.Split(strings.ToLower(strings.TrimSpace(raw)), ",") {
+		switch strings.TrimSpace(part) {
+		case "5h":
+			w5h = true
+		case "7d":
+			w7d = true
+		}
+	}
+	switch {
+	case w5h && w7d:
+		return "5h,7d"
+	case w5h:
+		return "5h"
+	case w7d:
+		return "7d"
+	default:
+		return "5h,7d"
 	}
 }
 
@@ -1501,6 +1567,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(prompt_filter_review_fail_closed, true),
 		       COALESCE(client_compat_mode, 'preserve'),
 		       COALESCE(codex_min_cli_version, '0.118.0'),
+		       COALESCE(codex_user_agent_config, '{}'),
 		       COALESCE(usage_log_mode, 'full'),
 		       COALESCE(usage_log_batch_size, 200),
 		       COALESCE(usage_log_flush_interval_seconds, 5),
@@ -1523,7 +1590,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(auto_pause_5h_threshold, 0),
 			       COALESCE(auto_pause_7d_threshold, 0),
 			       COALESCE(auto_pause_5h_guard_band_percent, 5),
-			       COALESCE(auto_pause_5h_guard_concurrency, 1)
+			       COALESCE(auto_pause_5h_guard_concurrency, 1),
+			       COALESCE(smart_pacing_enabled, false),
+			       COALESCE(smart_pacing_min_concurrency, 1),
+			       COALESCE(smart_pacing_windows, '5h,7d')
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1533,8 +1603,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.LazyMode, &s.ModelMapping, &s.CodexModelMapping,
 		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.UsageProbeConcurrency, &s.UsageProbeResponsesFallbackEnabled, &s.RecoveryProbeIntervalMinutes,
 		&s.CheapProbeEnabled, &s.CheapProbeScanIntervalSeconds, &s.CheapProbeConcurrency, &s.CheapProbeTimeoutSeconds,
-		&s.CheapProbeRecoveryMargin, &s.CheapProbeBonusDurationMinutes, &s.CheapProbeRankBaseIntervalSeconds,
-		&s.CheapProbeRankStepSeconds, &s.CheapProbeRankMinIntervalSeconds,
+		&s.CheapProbeRecoveryMargin, &s.CheapProbeBonusDurationMinutes,
+		&s.CheapProbeRankBaseIntervalSeconds, &s.CheapProbeRankStepSeconds, &s.CheapProbeRankMinIntervalSeconds,
 		&s.SchedulerMode,
 		&s.AffinityMode,
 		&s.ResinURL, &s.ResinPlatformName,
@@ -1543,7 +1613,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.PromptFilterCustomPatterns, &s.PromptFilterDisabledPatterns,
 		&s.PromptFilterReviewEnabled, &s.PromptFilterReviewAPIKey, &s.PromptFilterReviewBaseURL,
 		&s.PromptFilterReviewModel, &s.PromptFilterReviewTimeoutSeconds, &s.PromptFilterReviewFailClosed,
-		&s.ClientCompatMode, &s.CodexMinCLIVersion, &s.UsageLogMode, &s.UsageLogBatchSize,
+		&s.ClientCompatMode, &s.CodexMinCLIVersion, &s.CodexUserAgentConfig, &s.UsageLogMode, &s.UsageLogBatchSize,
 		&s.UsageLogFlushIntervalSeconds, &s.StreamFlushPolicy, &s.StreamFlushIntervalMS,
 		&s.FirstTokenMode,
 		&s.FirstTokenTimeoutSeconds,
@@ -1563,6 +1633,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.AutoPause7dThreshold,
 		&s.AutoPause5hGuardBandPercent,
 		&s.AutoPause5hGuardConcurrency,
+		&s.SmartPacingEnabled,
+		&s.SmartPacingMinConcurrency,
+		&s.SmartPacingWindows,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1571,6 +1644,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.SiteLogo = strings.TrimSpace(s.SiteLogo)
 	if strings.TrimSpace(s.ReasoningEffortModels) == "" {
 		s.ReasoningEffortModels = "[]"
+	}
+	if strings.TrimSpace(s.CodexUserAgentConfig) == "" {
+		s.CodexUserAgentConfig = "{}"
 	}
 	s.FirstTokenMode = normalizeFirstTokenMode(s.FirstTokenMode)
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
@@ -1583,6 +1659,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	if reasoningEffortModels == "" {
 		reasoningEffortModels = "[]"
 	}
+	codexUserAgentConfig := strings.TrimSpace(s.CodexUserAgentConfig)
+	if codexUserAgentConfig == "" {
+		codexUserAgentConfig = "{}"
+	}
 	firstTokenMode := normalizeFirstTokenMode(s.FirstTokenMode)
 	billingTierPolicy := normalizeBillingTierPolicy(s.BillingTierPolicy)
 	_, err := db.conn.ExecContext(ctx, `
@@ -1591,16 +1671,16 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
 				fast_scheduler_enabled, max_retries, max_rate_limit_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, lazy_mode, model_mapping, codex_model_mapping,
 					background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
-					usage_probe_concurrency, usage_probe_responses_fallback_enabled,
-					cheap_probe_enabled, cheap_probe_scan_interval_seconds, cheap_probe_concurrency,
-					cheap_probe_timeout_seconds, cheap_probe_recovery_margin, cheap_probe_bonus_duration_minutes,
+					cheap_probe_enabled, cheap_probe_scan_interval_seconds, cheap_probe_concurrency, cheap_probe_timeout_seconds,
+					cheap_probe_recovery_margin, cheap_probe_bonus_duration_minutes,
 					cheap_probe_rank_base_interval_seconds, cheap_probe_rank_step_seconds, cheap_probe_rank_min_interval_seconds,
+					usage_probe_concurrency, usage_probe_responses_fallback_enabled,
 				resin_url, resin_platform_name, prompt_filter_enabled, prompt_filter_mode, prompt_filter_threshold,
 				prompt_filter_strict_threshold, prompt_filter_log_matches, prompt_filter_max_text_length,
 				prompt_filter_sensitive_words, prompt_filter_custom_patterns, prompt_filter_disabled_patterns,
 				prompt_filter_review_enabled, prompt_filter_review_api_key, prompt_filter_review_base_url,
 				prompt_filter_review_model, prompt_filter_review_timeout_seconds, prompt_filter_review_fail_closed,
-				client_compat_mode, codex_min_cli_version, usage_log_mode, usage_log_batch_size,
+				client_compat_mode, codex_min_cli_version, codex_user_agent_config, usage_log_mode, usage_log_batch_size,
 					usage_log_flush_interval_seconds, stream_flush_policy, stream_flush_interval_ms,
 					first_token_timeout_seconds,
 					first_token_mode,
@@ -1621,9 +1701,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					auto_pause_5h_threshold,
 					auto_pause_7d_threshold,
 					auto_pause_5h_guard_band_percent,
-					auto_pause_5h_guard_concurrency
+					auto_pause_5h_guard_concurrency,
+					smart_pacing_enabled,
+					smart_pacing_min_concurrency,
+					smart_pacing_windows
 					)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81)
+							VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1650,9 +1733,6 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				codex_model_mapping     = EXCLUDED.codex_model_mapping,
 					background_refresh_interval_minutes = EXCLUDED.background_refresh_interval_minutes,
 					usage_probe_max_age_minutes = EXCLUDED.usage_probe_max_age_minutes,
-					usage_probe_concurrency = EXCLUDED.usage_probe_concurrency,
-					usage_probe_responses_fallback_enabled = EXCLUDED.usage_probe_responses_fallback_enabled,
-					recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
 					cheap_probe_enabled = EXCLUDED.cheap_probe_enabled,
 					cheap_probe_scan_interval_seconds = EXCLUDED.cheap_probe_scan_interval_seconds,
 					cheap_probe_concurrency = EXCLUDED.cheap_probe_concurrency,
@@ -1662,6 +1742,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					cheap_probe_rank_base_interval_seconds = EXCLUDED.cheap_probe_rank_base_interval_seconds,
 					cheap_probe_rank_step_seconds = EXCLUDED.cheap_probe_rank_step_seconds,
 					cheap_probe_rank_min_interval_seconds = EXCLUDED.cheap_probe_rank_min_interval_seconds,
+					usage_probe_concurrency = EXCLUDED.usage_probe_concurrency,
+					usage_probe_responses_fallback_enabled = EXCLUDED.usage_probe_responses_fallback_enabled,
+					recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
 				resin_url               = EXCLUDED.resin_url,
 				resin_platform_name     = EXCLUDED.resin_platform_name,
 				prompt_filter_enabled   = EXCLUDED.prompt_filter_enabled,
@@ -1681,6 +1764,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				prompt_filter_review_fail_closed = EXCLUDED.prompt_filter_review_fail_closed,
 				client_compat_mode = EXCLUDED.client_compat_mode,
 				codex_min_cli_version = EXCLUDED.codex_min_cli_version,
+				codex_user_agent_config = EXCLUDED.codex_user_agent_config,
 				usage_log_mode = EXCLUDED.usage_log_mode,
 				usage_log_batch_size = EXCLUDED.usage_log_batch_size,
 				usage_log_flush_interval_seconds = EXCLUDED.usage_log_flush_interval_seconds,
@@ -1705,27 +1789,31 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					auto_pause_5h_threshold = EXCLUDED.auto_pause_5h_threshold,
 					auto_pause_7d_threshold = EXCLUDED.auto_pause_7d_threshold,
 					auto_pause_5h_guard_band_percent = EXCLUDED.auto_pause_5h_guard_band_percent,
-					auto_pause_5h_guard_concurrency = EXCLUDED.auto_pause_5h_guard_concurrency
+					auto_pause_5h_guard_concurrency = EXCLUDED.auto_pause_5h_guard_concurrency,
+					smart_pacing_enabled = EXCLUDED.smart_pacing_enabled,
+					smart_pacing_min_concurrency = EXCLUDED.smart_pacing_min_concurrency,
+					smart_pacing_windows = EXCLUDED.smart_pacing_windows
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.LazyMode, s.ModelMapping, s.CodexModelMapping,
 		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
-		s.UsageProbeConcurrency, s.UsageProbeResponsesFallbackEnabled,
-		s.CheapProbeEnabled, s.CheapProbeScanIntervalSeconds, s.CheapProbeConcurrency,
-		s.CheapProbeTimeoutSeconds, s.CheapProbeRecoveryMargin, s.CheapProbeBonusDurationMinutes,
+		s.CheapProbeEnabled, s.CheapProbeScanIntervalSeconds, s.CheapProbeConcurrency, s.CheapProbeTimeoutSeconds,
+		s.CheapProbeRecoveryMargin, s.CheapProbeBonusDurationMinutes,
 		s.CheapProbeRankBaseIntervalSeconds, s.CheapProbeRankStepSeconds, s.CheapProbeRankMinIntervalSeconds,
+		s.UsageProbeConcurrency, s.UsageProbeResponsesFallbackEnabled,
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
 		s.PromptFilterStrictThreshold, s.PromptFilterLogMatches, s.PromptFilterMaxTextLength,
 		s.PromptFilterSensitiveWords, s.PromptFilterCustomPatterns, s.PromptFilterDisabledPatterns,
 		s.PromptFilterReviewEnabled, s.PromptFilterReviewAPIKey, s.PromptFilterReviewBaseURL,
 		s.PromptFilterReviewModel, s.PromptFilterReviewTimeoutSeconds, s.PromptFilterReviewFailClosed,
-		s.ClientCompatMode, s.CodexMinCLIVersion, s.UsageLogMode, s.UsageLogBatchSize,
+		s.ClientCompatMode, s.CodexMinCLIVersion, codexUserAgentConfig, s.UsageLogMode, s.UsageLogBatchSize,
 		s.UsageLogFlushIntervalSeconds, s.StreamFlushPolicy, s.StreamFlushIntervalMS,
 		s.FirstTokenTimeoutSeconds, firstTokenMode, billingTierPolicy, s.ImageStorageConfig, s.SchedulerMode, normalizeAffinityMode(s.AffinityMode), s.BackgroundConfig, s.ShowFullUsageNumbers, s.PublicKeyUsagePageEnabled, reasoningEffortModels,
 		s.CodexForceWebsocket, s.CodexWSKeepaliveEnabled, normalizeCodexWSKeepaliveInterval(s.CodexWSKeepaliveIntervalSec),
 		s.CodexWSHideUpstreamErrors, s.CodexWSSilentRetryEnabled, normalizeCodexWSSilentMaxRetries(s.CodexWSSilentMaxRetries),
-		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency)
+		s.AutoPause5hThreshold, s.AutoPause7dThreshold, s.AutoPause5hGuardBandPercent, s.AutoPause5hGuardConcurrency,
+		s.SmartPacingEnabled, normalizeSmartPacingMinConcurrencyDB(s.SmartPacingMinConcurrency), normalizeSmartPacingWindowsDB(s.SmartPacingWindows))
 	return err
 }
 
@@ -3038,14 +3126,12 @@ func (db *DB) GetChartAggregation(ctx context.Context, start, end time.Time, buc
 
 	// 时间轴聚合：按 bucketMinutes 分桶
 	timelineQuery := `
-		SELECT
-			TO_CHAR(
-				TO_TIMESTAMP(
-					FLOOR(EXTRACT(EPOCH FROM created_at) / ($3::double precision * 60))
-					* ($3::double precision * 60)
-				) AT TIME ZONE 'UTC',
-				'YYYY-MM-DD"T"HH24:MI:SS"Z"'
-			) AS bucket,
+	SELECT
+		TO_CHAR(
+			date_trunc('minute', created_at)
+			- (EXTRACT(MINUTE FROM created_at)::int % $3) * INTERVAL '1 minute',
+			'YYYY-MM-DD"T"HH24:MI:SS'
+		) AS bucket,
 		COUNT(*)                              AS requests,
 		COALESCE(AVG(duration_ms), 0)         AS avg_latency,
 		COALESCE(SUM(input_tokens), 0)        AS input_tokens,
@@ -3654,7 +3740,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		            COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 			            COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 			            COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
-			            COALESCE(a.name, ''), %[1]s, COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
+			            COALESCE(a.name, ''), %s, COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at,
 	            COUNT(*) OVER() AS total_count
 	           FROM usage_logs u
 	           LEFT JOIN accounts a ON u.account_id = a.id
@@ -3700,8 +3786,9 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*UsageLog, error) {
 	where, args := db.buildUsageLogWhere(f)
 	where += ` ORDER BY u.created_at DESC`
+	priceMultiplierExpr := db.usageLogPriceMultiplierExpr()
 
-	query := `SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
+	query := fmt.Sprintf(`SELECT u.id, u.account_id, COALESCE(u.client_ip, ''), u.endpoint, u.model, COALESCE(u.effective_model, ''), u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
 			COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
 			COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
 			COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.compact, false), COALESCE(u.via_websocket, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
@@ -3711,10 +3798,10 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 			COALESCE(u.image_format, ''), COALESCE(u.image_size, ''),
 			COALESCE(u.account_billed, 0), COALESCE(u.user_billed, 0),
 			COALESCE(u.is_retry_attempt, false), COALESCE(u.attempt_index, 0), COALESCE(u.upstream_error_kind, ''), COALESCE(u.error_message, ''),
-			COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
+			COALESCE(a.name, ''), %s, COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
 		FROM usage_logs u
 		LEFT JOIN accounts a ON u.account_id = a.id
-		WHERE ` + where
+		WHERE `+where, priceMultiplierExpr)
 
 	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -3727,11 +3814,16 @@ func (db *DB) ListUsageLogsByFilter(ctx context.Context, f UsageLogFilter) ([]*U
 		l := &UsageLog{}
 		var credentialRaw interface{}
 		var createdAtRaw interface{}
+		var priceMultiplier sql.NullFloat64
 		if err := rows.Scan(&l.ID, &l.AccountID, &l.ClientIP, &l.Endpoint, &l.Model, &l.EffectiveModel, &l.PromptTokens, &l.CompletionTokens, &l.TotalTokens, &l.StatusCode, &l.DurationMs,
 			&l.InputTokens, &l.OutputTokens, &l.ReasoningTokens, &l.FirstTokenMs, &l.ReasoningEffort, &l.InboundEndpoint, &l.UpstreamEndpoint, &l.Stream, &l.Compact, &l.ViaWebsocket, &l.CachedTokens,
 			&l.ServiceTier, &l.RequestedServiceTier, &l.ActualServiceTier, &l.BillingServiceTier, &l.APIKeyID, &l.APIKeyName, &l.APIKeyMasked, &l.ImageCount, &l.ImageWidth, &l.ImageHeight, &l.ImageBytes, &l.ImageFormat, &l.ImageSize,
-			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &credentialRaw, &createdAtRaw); err != nil {
+			&l.AccountBilled, &l.UserBilled, &l.IsRetryAttempt, &l.AttemptIndex, &l.UpstreamErrorKind, &l.ErrorMessage, &l.AccountName, &priceMultiplier, &credentialRaw, &createdAtRaw); err != nil {
 			return nil, err
+		}
+		if priceMultiplier.Valid && priceMultiplier.Float64 > 0 {
+			value := priceMultiplier.Float64
+			l.AccountPriceMultiplier = &value
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
 		l.CreatedAt, err = parseDBTimeValue(createdAtRaw)
@@ -5505,8 +5597,13 @@ func (db *DB) GetAllChatGPTAccountIDs(ctx context.Context) (map[string]bool, err
 }
 
 // FindActiveAccountByOAuthIdentity returns the first non-deleted account with
-// the same email and ChatGPT account id. It accepts both historical credential
-// key names: account_id and chatgpt_account_id.
+// the same email and OAuth identity. The identity matches when either the
+// ChatGPT workspace id (credential keys account_id / chatgpt_account_id) or
+// the OpenAI user id (credential key user_id, "user-...") equals accountID —
+// personal-plan JWTs may lack a workspace id, and legacy rows may have had
+// account_id polluted with a user_id by the old wham backfill, so matching
+// user_id against account_id keys (and vice versa) keeps dedup working for
+// both shapes.
 func (db *DB) FindActiveAccountByOAuthIdentity(ctx context.Context, email, accountID string, excludeIDs ...int64) (int64, error) {
 	email = strings.ToLower(strings.TrimSpace(email))
 	accountID = strings.TrimSpace(accountID)
@@ -5535,11 +5632,17 @@ func (db *DB) FindActiveAccountByOAuthIdentity(ctx context.Context, email, accou
 		if _, ok := excluded[id]; ok {
 			continue
 		}
+		// 勾选"允许重复添加"强制导入的副本不作为判重锚点：后续正常导入
+		// 应命中/更新主账号，而不是把凭证写进用户故意保留的副本。
+		if strings.EqualFold(strings.TrimSpace(credentialString(raw, "allow_duplicate")), "true") {
+			continue
+		}
 		if strings.ToLower(strings.TrimSpace(credentialString(raw, "email"))) != email {
 			continue
 		}
 		if strings.TrimSpace(credentialString(raw, "account_id")) == accountID ||
-			strings.TrimSpace(credentialString(raw, "chatgpt_account_id")) == accountID {
+			strings.TrimSpace(credentialString(raw, "chatgpt_account_id")) == accountID ||
+			strings.TrimSpace(credentialString(raw, "user_id")) == accountID {
 			return id, nil
 		}
 	}
@@ -5634,14 +5737,12 @@ func (db *DB) GetAccountEventTrend(ctx context.Context, start, end time.Time, bu
 	}
 
 	query := `
-		SELECT
-			TO_CHAR(
-				TO_TIMESTAMP(
-					FLOOR(EXTRACT(EPOCH FROM created_at) / ($3::double precision * 60))
-					* ($3::double precision * 60)
-				) AT TIME ZONE 'UTC',
-				'YYYY-MM-DD"T"HH24:MI:SS"Z"'
-			) AS bucket,
+	SELECT
+		TO_CHAR(
+			date_trunc('minute', created_at)
+			- (EXTRACT(MINUTE FROM created_at)::int % $3) * INTERVAL '1 minute',
+			'YYYY-MM-DD"T"HH24:MI:SS'
+		) AS bucket,
 		COALESCE(SUM(CASE WHEN event_type = 'added' THEN 1 ELSE 0 END), 0) AS added,
 		COALESCE(SUM(CASE WHEN event_type = 'deleted' AND source = 'manual' THEN 1 ELSE 0 END), 0) AS deleted
 	FROM account_events

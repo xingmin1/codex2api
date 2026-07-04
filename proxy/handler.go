@@ -554,6 +554,7 @@ func (h *Handler) syncAPIKeyAllowedGroups(row *database.APIKeyRow) {
 		return
 	}
 	h.store.SetAPIKeyAllowedGroups(row.ID, row.AllowedGroupIDs)
+	h.store.SetAPIKeyAllowedPlans(row.ID, row.Limits.PlanAllow)
 }
 
 // isValidKey 检查 key 是否有效（配置文件 + DB）
@@ -882,6 +883,16 @@ type streamOutcome struct {
 	failureKind    string
 	failureMessage string
 	penalize       bool
+	// verifyAccountAuth 标记这是一次 WS 上游读流失败（如 close 1008 policy violation）。
+	// WS 通道下 token 失效表现为上游主动关闭而非 401，需异步跑一次探针确认账号鉴权状态，
+	// 命中 401 才按 unauthorized 冷却，避免失效账号不被封、反复被调度。
+	verifyAccountAuth bool
+}
+
+// isWebsocketUpstreamClose 判断读流错误是否来自 WS 上游异常关闭/读失败。
+// wsrelay 的读错误统一以 "websocket read error:" 前缀包裹（见 wsrelay/executor.go）。
+func isWebsocketUpstreamClose(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "websocket read error")
 }
 
 func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) streamOutcome {
@@ -911,10 +922,11 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 			kind = "transport"
 		}
 		return streamOutcome{
-			logStatusCode:  logStatusUpstreamStreamBreak,
-			failureKind:    kind,
-			failureMessage: fmt.Sprintf("上游流读取失败: %v", readErr),
-			penalize:       true,
+			logStatusCode:     logStatusUpstreamStreamBreak,
+			failureKind:       kind,
+			failureMessage:    fmt.Sprintf("上游流读取失败: %v", readErr),
+			penalize:          true,
+			verifyAccountAuth: isWebsocketUpstreamClose(readErr),
 		}
 	}
 
@@ -1026,6 +1038,15 @@ func responseFailedStatusCode(payload []byte) int {
 		return http.StatusPaymentRequired
 	case strings.Contains(codeOrType, "forbidden"):
 		return http.StatusForbidden
+	// 确定性客户端错误：输入超上下文窗口/字段超长/模型不存在等，换号重试
+	// 也必然失败。归为 400，避免落入 default 500 触发透明重试并惩罚账号
+	// 健康度 (issue #310)。
+	case strings.Contains(codeOrType, "context_length") ||
+		strings.Contains(codeOrType, "context_window") ||
+		strings.Contains(codeOrType, "above_max_length") ||
+		strings.Contains(codeOrType, "model_not_found") ||
+		strings.Contains(codeOrType, "unsupported"):
+		return http.StatusBadRequest
 	case strings.Contains(codeOrType, "invalid") || strings.Contains(codeOrType, "bad_request"):
 		return http.StatusBadRequest
 	default:
@@ -1950,8 +1971,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
-		// 显式生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
-		if useWebsocket && explicitlyRequestsImageGeneration(rawBody) {
+		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
+		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
+		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
 			useWebsocket = false
 		}
 
@@ -2240,6 +2262,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 			}
 			ttftGuard.Stop()
+			if outcome.verifyAccountAuth {
+				h.store.VerifyAccountAuthAsync(account)
+			}
 			var responseFailedDecision codex429Decision
 			if len(terminalFailurePayload) > 0 {
 				outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
@@ -2670,6 +2695,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
 		ttftGuard.Stop()
+		if outcome.verifyAccountAuth {
+			h.store.VerifyAccountAuthAsync(account)
+		}
 		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
@@ -2799,6 +2827,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
+	// newapi 等聚合网关会给 compact 请求追加 -openai-compact 后缀（如 gpt-5.4-openai-compact）。
+	// 在映射与校验之前剥除后缀，让 newapi 渠道保持该命名，而内部按基础模型 gpt-5.4 处理并转发上游。
+	rawBody, _, _ = stripCompactModelSuffixFromBody(rawBody)
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 	setRawRequestBody(c, rawBody)
 
@@ -3596,8 +3627,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		isRelayAccount := account.IsOpenAIResponsesAPI()
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig && !isRelayAccount
-		// 显式生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
-		if useWebsocket && explicitlyRequestsImageGeneration(codexBody) {
+		// 真实生图意图强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
+		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
+		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(codexBody) {
 			useWebsocket = false
 		}
 		upstreamEndpoint := "/v1/responses"
@@ -3913,6 +3945,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
 		ttftGuard.Stop()
+		if outcome.verifyAccountAuth {
+			h.store.VerifyAccountAuthAsync(account)
+		}
 		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
@@ -4497,8 +4532,8 @@ func compute429Cooldown(account *auth.Account, body []byte, resp *http.Response)
 		// Free 只有 7d 窗口，429 = 额度耗尽，冷却 7 天
 		return 7 * 24 * time.Hour
 
-	case "team", "teamplus", "pro", "plus", "enterprise":
-		// Team/Pro/Plus 有 5h + 7d 双窗口，需要判断是哪个窗口触发了限制
+	case "team", "teamplus", "pro", "plus", "enterprise", "k12", "edu", "education":
+		// Team/Pro/Plus 及教育版(k12/edu)有 5h + 7d 双窗口，需要判断是哪个窗口触发了限制
 		return detectTeamCooldownWindow(resp)
 
 	default:
@@ -4582,7 +4617,7 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 	}
 
 	result.UsagePct5h, result.Reset5hAt, result.HasUsage5h = account.GetUsageSnapshot5h()
-	if result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 {
+	if result.Used5hHeaders && account.IsPremium5hPlan() && result.HasUsage5h && result.UsagePct5h >= 100 && !account.SkipsUsageWindowLimits() {
 		if store != nil {
 			store.MarkPremium5hRateLimited(account, result.Reset5hAt)
 		}

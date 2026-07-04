@@ -1,16 +1,97 @@
 # Changelog
 
-## v2.3.8-xmin.1 - 2026-06-23
+## v2.4.3-xmin.1 - 2026-07-04
 
 ### Features
 
-- **合并官方 v2.3.8。** 包含官方 v2.3.6-v2.3.8 的 API key 自助用量页、单账号用量刷新、Prompt Filter 额外规则编辑、5h 保护带降速并发、Codex `codex_at` 账号身份识别等更新。
-- **复制账号。** 账号管理页新增复制账号入口，可复制凭据、代理、标签、分组、调度覆盖、价格倍率和便宜账号探测等用户配置，生成新的正常账号。
+- **合并官方 v2.4.3，并保留本地 fork 的调度、压缩与发布打包能力。** 该版本在官方 v2.4.3 基础上继续保留便宜账号倍率探测、长压缩账号池、失败冷却忽略、账号排序、请求记录账号信息、Nix flake 打包和 GitHub release 构建链路。
+- **新增复制账号功能。** 账号管理页可复制已有账号，后端会复制凭据、代理、启用/锁定状态、标签、分组和调度配置，并重置请求统计、用量、冷却、错误和运行态，避免新副本继承旧账号的失败状态。
+- **补齐账号页倍率与排序入口。** 账号表格增加价格倍率列，号池模式和自用模式都可设置默认排序并按账号名、请求数、近期用量、倍率、成本、最近使用、导入时间和更新时间排序。
+- **使用统计请求记录显示账号信息。** 请求记录增加用户名和价格倍率列，并支持相关排序，方便追踪某次请求实际落到哪个账号及其成本倍率。
+- **便宜账号探测支持全局与账号级恢复配置。** 用户可配置探测频率策略、恢复加分高出最高分多少、加分持续时间等参数；账号级配置可覆盖全局默认值。
 
 ### Fixes
 
-- **保留 fork 调度与 compact 语义。** 合并官方 5h guard-band 调度惩罚时，继续保留便宜账号探测恢复加分、长压缩账号附加能力、compact transient retry 和 encrypted_content 降级重试等 fork 行为。
-- **保留 fork 发布与 Nix 包装。** 官方已删除 `VERSION`/flake 包装文件，本版本继续保留 Home Manager release-tarball 部署路径所需的版本文件和 Nix 构建入口。
+- **失败冷却忽略扩展为忽略所有失败冷却。** 开启后，上游失败只记录失败请求，不写入账号冷却、模型冷却或用量耗尽状态。
+- **修正便宜账号探测拓扑更新。** 新增账号、倍率变化、关闭调度状态变化等会触发便宜账号探测候选重算；探测成功只对比当前最高分账号倍率更低的候选加临时恢复分。
+- **宽容处理 `encrypted_content` 重试。** 普通 Responses 和 compact 请求在连续失败后才剥离加密 reasoning 内容并优先用当前账号重试；进入长压缩账号池前会移除加密内容，避免跨真实上游身份复用导致持续失败。
+- **保持 compact 调度语义。** 未触发长压缩回退前，compact 请求仍按普通请求调度；只有遇到长耗时/连接关闭类场景时才切换到带长压缩标签的账号池。
+
+## v2.4.3 - 2026-07-04
+
+### Features
+
+- **API keys can restrict which account plans they dispatch to (multi-select).** Each API key's advanced limits gain an "Account plans" allowlist: pick one or more of `free` / `plus` / `pro` / `prolite` / `team` / `k12` / `go`, and the key will only ever be scheduled onto accounts whose plan matches one of them (e.g. a key limited to `plus` + `team` never touches free-tier accounts). Empty means no plan restriction. The filter is applied at the account-selection stage — the same layer as the existing group allowlist, with which it combines using AND (an account must satisfy both the plan and group constraints when both are set) — rather than rejecting the request after a pick, so a plan-restricted key simply behaves as if only the matching accounts exist. Matching is by raw lowercased `plan_type`, identical to the Accounts page plan filter, so `pro` and `prolite` stay distinct. Stored in the existing `limits` JSON column (no database migration), and because a plan-only restriction now counts as an access constraint, such keys always resolve their full metadata from the database and stay in sync on each request. The scheduler is only rebuilt when the allowlist actually changes, so the auth hot path isn't disturbed.
+
+## v2.4.2 - 2026-07-04
+
+### Features
+
+- **Import accounts by pasting a full ChatGPT Session JSON (#314, #315).** The Add Account dialog gains a "ChatGPT Session" tab and the Import dialog gains a "paste text" button, so you can paste the raw JSON from `chatgpt.com/api/auth/session` and import in one step instead of manually splitting out `accessToken`/`email`. JSON parsing now accepts camelCase keys (`accessToken`/`idToken`/`planType`), flattens nested `user`/`account` objects (`user.email`→email, `user.name`→name, `user.id`/`account.id`→identity, `account.plan_type`→plan), and reads `expires`/`expired`/`expires_at` as either a numeric or string timestamp. Existing TXT/JSON/sub2api formats are unaffected — the new fallbacks only add information where a field was previously empty — and session imports flow through the normal importer, so they inherit identity dedup and the new/updated counting below.
+- **Optional smart pacing spreads remaining quota evenly across a usage window (issue #312).** When enabled, if an account is burning a 5h/7d window faster than an even pace (used% running ahead of elapsed-time%), its dynamic concurrency is scaled down to a sustainable rate so the remaining quota lasts until the window reset instead of hitting the limit early. Pacing is per-account (each account paces on its own window, so the pool is smoothed as a whole), reuses the existing guard-band concurrency machinery (no new background task — it rides the usage snapshots already being refreshed), takes the stricter of the 5h/7d ratios, and never drops below a configurable floor. Off by default; Settings adds an enable toggle, a window selector (5h+7d / 5h / 7d), and a minimum-concurrency floor. Only engages when a valid usage+reset signal exists.
+
+### Fixes
+
+- **Credit accounts skip 5h/7d usage-window rate limiting (#313).** `credit_enabled + credit_skip_usage_window` accounts are meant to bypass usage-window limits, but response-header sync and the WHAM probe still marked them `rate_limited` whenever a 5h/7d window hit 100%, so a credit account was excluded from local scheduling despite the flag. A shared `SkipsUsageWindowLimits()` gate now records the usage snapshot but skips the local rate-limit marking (`MarkUsage7dRateLimited` / premium 5h) for such accounts, while real cooldown/error paths (401, existing cooldowns, genuine upstream failures) are preserved.
+- **codex_at accounts merge into an existing same-identity account after the identity probe; import progress separates new vs updated.** codex_at tokens (`at-...`) carry no decodable JWT, so their OAuth identity is unknown at insert and only backfilled later by the WHAM probe — the post-probe merge the RT path already performs was missing here, so re-adding a codex_at could leave a duplicate. Manual codex_at adds now trigger a probe, and once it backfills email+account_id the importer re-checks for a same-identity account and merges into it (soft-deleting the new row, preserving usage stats). Separately, import/add now counts an "updated" bucket distinct from "new": hitting an existing identity only refreshes its credentials and no longer counts as a new add (fixing the success+duplicate double-count where re-importing the same accounts showed a nonzero "new"), and a single pasted access token now streams a progress bar too.
+- **A 5h/7d window reset now triggers an immediate verification probe.** After a window's reset time passes an account looks "available" again, but it may actually be banned upstream — and the post-reset refresh was gated behind the usage `maxAge`, leaving up to ~10 minutes in which a bad account kept getting scheduled and failing. `NeedsUsageProbe` now fires a probe promptly when the reset boundary is crossed and the snapshot predates it (no `maxAge` delay), probing once per boundary; a real 401 then marks the account unauthorized.
+- **A WebSocket upstream `close 1008 (policy violation)` now triggers async auth verification.** On the forced-WS transport a token that is actually invalid is rejected by the upstream as a `close 1008` rather than an HTTP 401, so it was classified as a generic transport failure — the account only lost health points, was never cooled down, and kept being scheduled and failing (the real `Unauthorized` was visible only on the HTTP transport). A WS upstream close now asynchronously runs a zero-cost WHAM probe for that account: a real 401 marks it `unauthorized` (matching the HTTP path), while a content-policy/transient 1008 leaves a healthy account untouched. Throttled to once per 30s per account.
+
+## v2.4.1 - 2026-07-03
+
+### Features
+
+- **Bare RT imports now auto-merge into an existing same-identity account, preserving usage stats.** Scenario: an account was first imported via AT, then its bare RT was imported later. A bare RT carries no identity (it is not a JWT), so import-time dedup necessarily lets it through, and the identity only becomes known after the first refresh exchanges it for an AT — previously the flow stopped there, leaving two accounts (AT + RT) for the same identity in the pool. After a successful refresh the importer now re-checks for an identity duplicate: on a hit, the new credentials are merged into the existing account (writing the refresh token upgrades it to auto-renewable — RT takes highest priority) and the newly inserted row is soft-deleted. The merge only updates credential/identity keys — `codex_*` usage snapshots are untouched and the surviving account keeps its ID, so usage statistics and per-account request history are fully preserved. Copies imported with "allow duplicate add" are skipped.
+- **AT batch add gains a progress bar.** `POST /accounts/at?stream=true` streams per-token SSE progress (aligned with the RT/ST path); the frontend automatically switches to streaming when more than one AT is pasted.
+
+### Fixes
+
+- **AT imports dedup by `user_id` identity — duplicate accounts no longer pile up.** Two stacked holes let the same account enter the pool repeatedly: (1) a personal-plan AT's JWT may carry no workspace `chatgpt_account_id`, only a `user_id` — identity dedup required email+account_id, so it fell back to raw access-token comparison, and since ATs rotate, a re-imported newer AT never matched the stored one; (2) the wham probe used to backfill `user_id` into the `account_id` field when the workspace id was missing, polluting the dedup key so even workspace-bearing JWTs never matched. JWT parsing now extracts `user_id` (with `chatgpt_user_id` fallback), the identity key is email + (account_id or user_id), the wham backfill no longer writes user_id into account_id, and `FindActiveAccountByOAuthIdentity` matches the `user_id` key as well as legacy polluted `account_id` values. Covers both the add dialog and TXT/JSON file imports.
+- **Data migration v2 merges existing user_id-shaped duplicate accounts on startup.** The identity aliases now include the `user_id` key, and the dedupe migration reruns once to merge stock duplicates (both correctly-keyed `user_id` rows and rows whose `account_id` was polluted by the old wham backfill) — no manual cleanup needed; losers are soft-deleted into the recycle bin with audit events.
+- **Copies imported via "allow duplicate add" are exempt from identity dedup and migration merges.** Forced duplicates (e.g. the same account with different proxies) were indistinguishable from accidental ones, so the dedupe migration would have merged away copies the user kept on purpose. Forced imports are now tagged `allow_duplicate=true` in credentials across all four add/import paths; the dedupe migrations skip tagged rows, and identity matching skips them too so a later normal import updates the primary account instead of writing new credentials into a forced copy. Note: only copies imported after this version carry the tag — force-imported duplicates from v2.3.9/v2.4.0 will still be merged by the v2 migration.
+- **`context_length_exceeded` no longer triggers account-rotation retries (#310).** When the upstream returned `context_length_exceeded` as a `response.failed` frame (no explicit status code), the error-code string matcher didn't recognize it, fell through to the default 500 classification, and the request was transparently retried across up to 3 accounts — each attempt necessarily failing again while charging an innocent account a server-failure health penalty. Deterministic client errors (`context_length`/`context_window`, `string_above_max_length`, `model_not_found`, `unsupported_*`) are now classified as 400: no retry, no account penalty, and the error passes through to the client (which is the party that must shorten the input). The HTTP and WebSocket pre-first-token retry decisions share this classification.
+
+## v2.4.0 - 2026-07-02
+
+### Features
+
+- **K12 plan classification and badge in the account list (#307).** The plan filter gains a K12 tab and k12 accounts get a green plan badge. The three separately hard-coded premium-plan checks on the frontend (accounts page, quota distribution chart, rate-limit recovery chart) are unified into a single `isPremiumUsagePlan` aligned with the Go side (including k12/edu/education/go), so k12 accounts now render the 5h usage bar and participate in the 5h quota distribution / rate-limit recovery charts.
+
+### Fixes
+
+- **WebSocket relay no longer reuses a connection whose stream was cut short — eliminating cross-session response mixing (#308).** When the downstream write failed (broken pipe / client disconnect) or the request context was canceled mid-stream, the read loop treated it as a normal end and `Close()` returned the connection to the pool — while the upstream was still pushing the remainder of that response on the same connection. The next request that reused it received the previous user's response frames. The release decision is now a whitelist: a connection is returned to the pool only when the stream was consumed to an explicit terminal boundary (`response.completed` / `response.failed` / upstream error frame) with no anomaly; any early exit (downstream write failure, context cancellation, upstream close, handshake failure with an unread stream) discards the connection. The ctx-cancel watcher also closes the pipe before tearing down the WS response so the client sees the cancellation instead of a spurious read error.
+- **k12/edu and other paid plans are now covered by premium 5h rate-limit semantics (#306, #309).** `isPremium5hPlan` only recognized plus/pro/team, so after a k12 account hit 429 and was put on cooldown, the periodic wham usage probe judged it "not a premium plan" and proactively cleared the cooldown — the account flipped back to "available" while still being rate-limited upstream (the "shows available but still 429" report). All paid plans that carry a rolling 5h window (k12/edu/education/go, falling back to `IsPlusOrHigherPlan`) are now included; the plan gate errs broad on purpose since the rate-limit state additionally requires an observed 5h window at 100%.
+- **k12 plans fully aligned with team semantics (#282).** k12 is an education team workspace whose quota applies per workspace, but several plan checks missed it: k12 accounts got no scheduler score bias (+50 like team) and effectively sank to the bottom of the pool ordering; 429 cooldown inference fell into the unknown-plan conservative default instead of team's 5h/7d dual-window detection; and the frontend "unsampled" check only looked at 7d usage, so k12-style workspaces that report only a 5h window were stuck showing "unsampled" forever — it now treats data in either window as sampled.
+- **First-run setup no longer rejects Docker bridge sources (#199).** The bootstrap endpoint's IP allowlist (introduced in v2.1.4) only accepted loopback or `BOOTSTRAP_ALLOWED_CIDR`, but with Docker port mapping the host browser's source IP is the bridge address (e.g. `172.17.0.1`), so the most common local Docker deployment was blocked from the initialization page with a 403. Private and link-local sources are now allowed by default when `BOOTSTRAP_ALLOWED_CIDR` is unset (public IPs are still rejected; the endpoint remains rate-limited, audited, and only active while no admin secret is configured). Setting `BOOTSTRAP_ALLOWED_CIDR` makes the configured CIDRs authoritative (loopback always allowed), and the new `none` value restores the strict loopback-only mode. The 403 message now includes self-service guidance, and `.env.example` documents the variable.
+
+## v2.3.9 - 2026-07-01
+
+### Features
+
+- **Prompt-filter review supports multiple Moderations API keys (#289).** Low-tier OpenAI accounts only get 50,000 TPM on the Moderations endpoint, so a single key can't keep up with high volume. The prompt-filter review key is upgraded from a single value to a key pool: multiple keys separated by newlines/commas are round-robined (package-level atomic cursor) to spread the quota, and on a `429`/`401`/`403`/`5xx`/network error the call automatically switches to the next key, only handing off to `FailClosed` once every key has failed. Reuses the existing TEXT column to store multiple lines (no DB migration), and the frontend becomes a multi-line textarea showing the configured key count. Single-key configuration behavior is unchanged.
+- **Compact endpoint auto-strips the `-openai-compact` model suffix.** Aggregating gateways like newapi append an `-openai-compact` suffix to `/responses/compact` requests (e.g. `gpt-5.4-openai-compact`). The suffix is now stripped before compact model mapping and validation, so the newapi channel keeps that naming while codex2api treats it as the base model (`gpt-5.4`) internally and forwards upstream, avoiding an "unsupported model" rejection. Only applies to `/v1/responses/compact` — plain `/responses` and the global model mapping are untouched.
+- **Per-account request count limit.** Added a per-account cumulative request-count cap; accounts that reach the limit drop out of scheduling.
+- **Stronger account import/add dedup with optional force-duplicate.** AT imports are deduplicated by OAuth identity, and re-importing valid credentials clears an error/banned (401) state to auto-unban the account; single-account RT/ST adds — which previously had no dedup at all — now dedup by raw credential too. Added an "allow duplicate add" toggle (off by default) that skips dedup and forces a new record, wired through both single-add and batch-import paths. The batch-import dialog gains a unified proxy input (the backend already accepted `proxy_url`; the frontend now sends it).
+- **Hardened Codex client identification strategy.** Added strict official-client identification so a UA merely carrying a codex token no longer triggers an automatic compatibility upgrade; improved Codex client version parsing to cover more official UAs and trailer scenarios; added an engine-fingerprint signal model plus client allow/deny-list data structures and validation logic, with unit tests covering strict/legacy behavior, version boundaries, and policy validation.
+- **Improved Codex custom tool event compatibility.** Extended compatibility handling for Codex custom tool incremental events (including custom deltas).
+- **Removed the usage-reset radar module (`/admin/subscriptions`).** Deleted the Codex Reset Radar implementation on both ends, including the backend `admin/reset_radar.go` with its tests/routes/handler status fields and the frontend Subscriptions page, route, nav item, API, types, and copy.
+
+### Fixes
+
+- **Support socks5/http proxies with special characters in the password (#293).** When a proxy password contained URL-reserved characters like `#` or `?`, both the frontend `new URL` and the backend `url.Parse` failed to parse it, so adding `socks5://user:pass@ip:port` reported "please enter a valid proxy address" and couldn't dial even if added. Added `security.ParseProxyURL` (standard parse first, IPv6-compatible; on failure, percent-encodes the userinfo and retries, then uniformly validates scheme/host/port range), wired into all three dialer parse sites; the frontend validation switches to `new URL` with a lenient regex fallback so special-character passwords are no longer wrongly rejected.
+- **Injected image tool no longer forces plain requests off WebSocket (#304, #288).** The WS→HTTP downgrade decision changed from "does `tools[]` contain an `image_generation` tool" to "is there real image-generation intent": HTTP is only forced for image-only models, `tool_choice=image_generation`, top-level image params, or natural-language image-generation intent, while ordinary requests stay on WS and the injected tool is stripped on the WS path via `stripResponsesImageGenerationTool`. The `chat/completions` path uses the same decision, gaining natural-language intent detection along the way.
+- **Sync subscription expiry after a manual account refresh (#300).** After a renewal, the token JWT's `chatgpt_subscription_active_until` lags, so relying on token refresh alone kept an account's validity stuck at its stale creation-time value. A successful refresh now also fires a zero-cost wham probe to sync the subscription expiry and usage from the server's authoritative data, so both single and batch refreshes update the validity immediately.
+- **Rate-limit cooldown and usage snapshot now track official window resets automatically.** Fixed two opposite-direction state desyncs: after usage is reset early upstream the cooldown wasn't cleared (`probeUsageViaWham` now re-evaluates against wham's authoritative window data even while rate-limited and proactively calls `ClearCooldown` when no longer limited); and after a rate limit expired the usage bar stayed at its old value (`NeedsUsageProbe` now fires a single zero-cost wham refresh when the 5h window reset time has passed but the snapshot still shows pre-reset high usage, guarded by `maxAge` to prevent repeated probing).
+- **Fixed engine-fingerprint signal matching boundaries.** The fingerprint signal type is now trimmed before matching so a valid config with surrounding whitespace still hits; `header_exact` now iterates the original header keys with case-insensitive matching; added regression tests for signal types and non-canonical header keys.
+- **Prevent Codex User-Agent from falling back to the Go default (#299).** Guards against the upstream Codex request's User-Agent unexpectedly reverting to Go's default value.
+
+### Security
+
+- **Bumped `golang.org/x/image` to v0.43.0.** Clears a security-scan alert.
+
+### Build
+
+- **Container `go mod download` uses the goproxy.cn mirror.** Speeds up dependency fetching during container builds.
 
 ## v2.3.8 - 2026-06-20
 
@@ -40,29 +121,6 @@
 - **API key self-service usage portal `/key-usage` (#271).** Added a public, login-free `/key-usage` page where a carpool/shared-key user can paste their own API key and view that key's usage (totals, model breakdown, recent logs) without admin access. The API key management page now surfaces the portal address with copy and open shortcuts, and each key has a shareable direct link, backed by a dedicated public usage endpoint that only exposes the data for the presented key.
 - **Per-key usage reset (#271).** A single API key's accumulated usage can now be reset (`reset_quota`) when editing the key, zeroing just that key's counters without minting a new key — so monthly re-accounting for shared/carpool keys no longer requires recreating keys.
 - **5h guard-band slowdown concurrency (#270).** Added a configurable "guard band" before the 5h usage auto-pause threshold: as an account's remaining 5h quota enters the band (default 5 percentage points), its scheduler dispatch score is progressively penalized and its dynamic concurrency is capped to a configured ceiling (default 1), giving accounts a soft landing instead of slamming into the hard auto-pause. Both the band width and the guard concurrency are configurable from Settings (with global defaults), and disabling either turns the slowdown off.
-
-## v2.3.5-xmin.2 - 2026-06-18
-
-### Features
-
-- **便宜账号倍率探测。** 账号可配置 `price_multiplier` 价格倍率；未显式配置时会从账号名末尾的小数后缀自动推断，例如 `cheap-0.35`。倍率越小代表越便宜，调度分不会直接乘倍率。
-- **低倍率账号主动探活。** 后台会以当前最高调度分账号的价格倍率为基准，探测所有倍率更低的账号；候选账号按倍率从高到低排列，倍率越低探测越频繁。
-- **探测成功短期恢复加分。** 便宜账号探测成功后会清理旧错误、冷却和旧用量阻塞状态，并临时加分到高于当前最高调度分默认 10 分，让恢复的低价账号快速参与调度。
-
-### Fixes
-
-- **探测失败不污染调度状态。** 便宜账号探测失败只记录最近探测错误和探测时间，不写账号冷却、不写用量耗尽、不降低调度分，也不基于上游错误类型做语义特判。
-
-## v2.3.5-xmin.1 - 2026-06-17
-
-### Features
-
-- **Upstream v2.3.5 merge.** Merged the official v2.3.5 changes, including per-request upstream isolation, account in-flight indicators, `chatgpt_account_id` display, reset-credit hardening, `TRUSTED_PROXIES`, reset error localization, 1h metric granularity, and account card layout refinements.
-- **Fork release packaging preserved.** Kept the fork release workflow, `VERSION`, and Nix packaging files used by the Home Manager release-tarball deployment path.
-
-### Fixes
-
-- **Fork behavior reconciliation.** Preserved the long compact account pool fallback, persistent compact transient retry, encrypted-content downgrade retry, and "Ignore all failure cooldowns" semantics while applying official v2.3.5 changes.
 
 ## v2.3.5 - 2026-06-17
 
@@ -107,29 +165,6 @@
 - **`/v1/messages` cached-token double billing (#253).** Anthropic usage now deducts cache-hit tokens to avoid double-billing the cached portion.
 - **Claude Code tool argument sanitization correction (#251).** Fixed compatibility issues caused by overly broad tool argument sanitization.
 - **Upgraded vite to fix npm audit high severity (#261).** Frontend dependency upgrade fixing an npm audit high vulnerability.
-
-## v2.3.4-xmin.1 - 2026-06-16
-
-### Features
-
-- **Long compact account pool fallback.** Compact requests can fall back to accounts tagged `long-compact` after Cloudflare 524 / origin response timeout failures, keeping long-running compact sessions out of the regular account pool once that path is known to be healthier.
-- **Ignore all failure cooldowns.** The existing per-account `ignore_usage_limit_429_cooldown` setting is now exposed as "Ignore all failure cooldowns" and consistently skips failure-induced account cooldown, model cooldown, usage-exhausted state, premium 5h cooldown, 401 cooldown, and unauthorized auto-cleanup writes.
-
-### Fixes
-
-- **Persistent compact transient retry.** Compact 502 / 5xx / relay `bad_response_status_code` failures keep retrying after the ordinary account-switch retry budget is exhausted, with encrypted reasoning content stripped only after repeated transient failures.
-- **Upstream merge reconciliation.** Reconciled the local compact retry and cooldown behavior with upstream reset-credit, 5h usage freshness, account update, read-error retry, and locale changes.
-- **Frontend dependency hash.** Updated the fixed npm dependency hash used by the Nix build after upstream frontend dependency changes.
-
-## v2.3.0-xmin.3 - 2026-06-11
-
-### Features
-
-- **Per-account 401 handling override.** Added an account-level option to treat upstream HTTP 401 responses as ordinary client errors. When enabled, 401 responses no longer mark the account as banned, set unauthorized cooldowns, trigger unauthorized auto-cleanup, or consume 401 retry budget; streaming `response.failed` frames inferred as 401 follow the same behavior.
-
-### Fixes
-
-- **Release latest ref ordering.** The release workflow now updates the `latest` branch only after GitHub Actions has created the release and uploaded all release assets successfully.
 
 ## v2.3.3 - 2026-06-13
 

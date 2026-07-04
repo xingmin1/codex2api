@@ -30,7 +30,7 @@ in
     inherit version;
 
     src = ./.;
-    vendorHash = "sha256-TwKuujpzOn1xhWZt0HNZil16aV7m+PzzB081ugacfPk=";
+    vendorHash = "sha256-KRYNXBPTrOHCm+XTdvCSOLyaZEh3Vr4O7F55IjyMUN4=";
     subPackages = ["."];
 
     # 当前 nixpkgs 的 go_1_26 还是 1.26.3；只在 Nix 构建副本里放宽补丁级 toolchain 要求。

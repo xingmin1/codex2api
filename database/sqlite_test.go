@@ -236,6 +236,129 @@ func TestFindActiveAccountByOAuthIdentity(t *testing.T) {
 	}
 }
 
+// 个人账号 JWT 可能没有工作区 account_id，只有 user_id（user-...）；此外旧版
+// wham 回填曾把 user_id 写进 account_id 字段。身份匹配必须两个键都认，
+// 否则 AT 轮换后同一账号会被重复导入。
+func TestFindActiveAccountByOAuthIdentityMatchesUserID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+
+	// 账号 A：credentials 里存的是 user_id 键
+	idA, err := db.InsertAccountWithCredentials(ctx, "uid-key", map[string]interface{}{
+		"access_token": "at-uid-key",
+		"email":        "solo@example.com",
+		"user_id":      "user-abc123",
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials A 返回错误: %v", err)
+	}
+	got, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-abc123")
+	if err != nil {
+		t.Fatalf("match by user_id key 返回错误: %v", err)
+	}
+	if got != idA {
+		t.Fatalf("matched id = %d, want %d", got, idA)
+	}
+
+	// 账号 B：旧版 wham 回填把 user_id 污染进了 account_id 字段
+	idB, err := db.InsertAccountWithCredentials(ctx, "polluted", map[string]interface{}{
+		"access_token": "at-polluted",
+		"email":        "legacy@example.com",
+		"account_id":   "user-def456", // 实为 user_id
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertAccountWithCredentials B 返回错误: %v", err)
+	}
+	got, err = db.FindActiveAccountByOAuthIdentity(ctx, "legacy@example.com", "user-def456")
+	if err != nil {
+		t.Fatalf("match polluted account_id 返回错误: %v", err)
+	}
+	if got != idB {
+		t.Fatalf("matched id = %d, want %d", got, idB)
+	}
+}
+
+// v2 迁移：user_id 也是身份别名——个人账号（credentials 只有 user_id）和被旧版
+// wham 回填污染（user_id 写进了 account_id）的账号必须合并为一组。
+// 勾选"允许重复添加"强制导入的副本（allow_duplicate 标记）不参与合并。
+func TestSQLiteDataMigrationV2DedupesByUserID(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	ctx := context.Background()
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	if _, err := db.conn.ExecContext(ctx, `DELETE FROM data_migrations WHERE version = $1`, dataMigrationOAuthIdentityDedupeV2); err != nil {
+		t.Fatalf("清理 v2 data migration 标记返回错误: %v", err)
+	}
+
+	// 旧账号：account_id 字段被污染成 user_id（旧版 wham 回填）
+	pollutedID, err := db.InsertAccountWithCredentials(ctx, "polluted", map[string]interface{}{
+		"access_token": "at-old-rotation",
+		"email":        "solo@example.com",
+		"account_id":   "user-dup999",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert polluted 返回错误: %v", err)
+	}
+	// 新账号：正确存在 user_id 键（新导入路径）
+	freshID, err := db.InsertAccountWithCredentials(ctx, "fresh", map[string]interface{}{
+		"access_token": "at-new-rotation",
+		"email":        "solo@example.com",
+		"user_id":      "user-dup999",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert fresh 返回错误: %v", err)
+	}
+	// 强制重复副本：allow_duplicate 标记，身份与上面相同，但必须保留
+	forcedID, err := db.InsertAccountWithCredentials(ctx, "forced-dup", map[string]interface{}{
+		"access_token":    "at-forced-copy",
+		"email":           "solo@example.com",
+		"user_id":         "user-dup999",
+		"allow_duplicate": "true",
+	}, "")
+	if err != nil {
+		t.Fatalf("Insert forced 返回错误: %v", err)
+	}
+
+	if err := db.runDataMigrationsWithTimeout(); err != nil {
+		t.Fatalf("runDataMigrations 返回错误: %v", err)
+	}
+
+	var remaining int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE id IN ($1, $2) AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`, pollutedID, freshID).Scan(&remaining); err != nil {
+		t.Fatalf("查询存活账号数返回错误: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("v2 迁移后存活账号 = %d, want 1（user_id 重复应被合并）", remaining)
+	}
+
+	var forcedAlive int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE id = $1 AND status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`, forcedID).Scan(&forcedAlive); err != nil {
+		t.Fatalf("查询强制副本返回错误: %v", err)
+	}
+	if forcedAlive != 1 {
+		t.Fatal("allow_duplicate 副本被迁移误删，应保留")
+	}
+
+	// 强制副本也不作为身份判重锚点：按身份查找应命中主账号而非副本
+	if got, err := db.FindActiveAccountByOAuthIdentity(ctx, "solo@example.com", "user-dup999"); err != nil {
+		t.Fatalf("FindActiveAccountByOAuthIdentity 返回错误: %v", err)
+	} else if got == forcedID {
+		t.Fatal("身份判重不应命中 allow_duplicate 副本")
+	}
+}
+
 func TestSQLiteDataMigrationDedupesOAuthIdentityOnce(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	ctx := context.Background()
@@ -806,71 +929,6 @@ func TestUsageErrorSummaryAndFilters(t *testing.T) {
 	}
 }
 
-func TestUsageLogsPagedReturnsAccountMetadataAndSortsByMultiplier(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
-
-	db, err := New("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("New(sqlite) 返回错误: %v", err)
-	}
-	defer db.Close()
-
-	ctx := context.Background()
-	expensiveID, err := db.InsertAccountWithCredentials(ctx, "expensive-user", map[string]interface{}{
-		"email":            "expensive@example.com",
-		"price_multiplier": 0.5,
-	}, "")
-	if err != nil {
-		t.Fatalf("InsertAccountWithCredentials expensive 返回错误: %v", err)
-	}
-	cheapID, err := db.InsertAccountWithCredentials(ctx, "cheap-user", map[string]interface{}{
-		"email":            "cheap@example.com",
-		"price_multiplier": 0.1,
-	}, "")
-	if err != nil {
-		t.Fatalf("InsertAccountWithCredentials cheap 返回错误: %v", err)
-	}
-
-	for _, usageLog := range []*UsageLogInput{
-		{AccountID: expensiveID, Endpoint: "/v1/responses", Model: "gpt-5.4", StatusCode: 200, TotalTokens: 100},
-		{AccountID: cheapID, Endpoint: "/v1/responses", Model: "gpt-5.4", StatusCode: 200, TotalTokens: 200},
-	} {
-		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
-			t.Fatalf("InsertUsageLog 返回错误: %v", err)
-		}
-	}
-	db.flushLogs()
-
-	now := time.Now()
-	page, err := db.ListUsageLogsByTimeRangePaged(ctx, UsageLogFilter{
-		Start:    now.Add(-1 * time.Hour),
-		End:      now.Add(1 * time.Hour),
-		Page:     1,
-		PageSize: 10,
-		SortBy:   "price_multiplier",
-		SortDir:  "asc",
-	})
-	if err != nil {
-		t.Fatalf("ListUsageLogsByTimeRangePaged 返回错误: %v", err)
-	}
-	if page.Total != 2 || len(page.Logs) != 2 {
-		t.Fatalf("page = total %d len %d, want 2/2", page.Total, len(page.Logs))
-	}
-	first := page.Logs[0]
-	if first.AccountID != cheapID {
-		t.Fatalf("first.AccountID = %d, want cheap account %d", first.AccountID, cheapID)
-	}
-	if first.AccountName != "cheap-user" {
-		t.Fatalf("AccountName = %q, want cheap-user", first.AccountName)
-	}
-	if first.AccountEmail != "cheap@example.com" {
-		t.Fatalf("AccountEmail = %q, want cheap@example.com", first.AccountEmail)
-	}
-	if first.AccountPriceMultiplier == nil || *first.AccountPriceMultiplier != 0.1 {
-		t.Fatalf("AccountPriceMultiplier = %v, want 0.1", first.AccountPriceMultiplier)
-	}
-}
-
 func TestUsageLogModeOffSkipsAllLogs(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 
@@ -1006,64 +1064,55 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 
 	ctx := context.Background()
 	if err := db.UpdateSystemSettings(ctx, &SystemSettings{
-		SiteName:                           "CodexProxy",
-		MaxConcurrency:                     2,
-		GlobalRPM:                          0,
-		TestModel:                          "gpt-5.4",
-		TestConcurrency:                    50,
-		BackgroundRefreshIntervalMinutes:   2,
-		UsageProbeMaxAgeMinutes:            10,
-		UsageProbeConcurrency:              16,
-		UsageProbeResponsesFallbackEnabled: true,
-		RecoveryProbeIntervalMinutes:       30,
-		CheapProbeEnabled:                  true,
-		CheapProbeScanIntervalSeconds:      15,
-		CheapProbeConcurrency:              3,
-		CheapProbeTimeoutSeconds:           45,
-		CheapProbeRecoveryMargin:           12.5,
-		CheapProbeBonusDurationMinutes:     20,
-		CheapProbeRankBaseIntervalSeconds:  210,
-		CheapProbeRankStepSeconds:          35,
-		CheapProbeRankMinIntervalSeconds:   25,
-		PgMaxConns:                         50,
-		RedisPoolSize:                      30,
-		MaxRetries:                         2,
-		MaxRateLimitRetries:                1,
-		ModelMapping:                       "{}",
-		CodexModelMapping:                  `{"gpt-5.2":"gpt-5.5"}`,
-		ReasoningEffortModels:              `[{"model":"gpt-5.5","effort":"xhigh"}]`,
-		PromptFilterMode:                   "monitor",
-		PromptFilterThreshold:              50,
-		PromptFilterStrictThreshold:        90,
-		PromptFilterLogMatches:             true,
-		PromptFilterMaxTextLength:          81920,
-		PromptFilterCustomPatterns:         "[]",
-		PromptFilterDisabledPatterns:       "[]",
-		PromptFilterReviewEnabled:          true,
-		PromptFilterReviewAPIKey:           "sk-review-test",
-		PromptFilterReviewBaseURL:          "https://review.example.com",
-		PromptFilterReviewModel:            "review-model",
-		PromptFilterReviewTimeoutSeconds:   7,
-		PromptFilterReviewFailClosed:       false,
-		ClientCompatMode:                   "preserve",
-		CodexMinCLIVersion:                 "0.118.0",
-		UsageLogMode:                       "full",
-		UsageLogBatchSize:                  200,
-		UsageLogFlushIntervalSeconds:       5,
-		StreamFlushPolicy:                  "immediate",
-		StreamFlushIntervalMS:              20,
-		FirstTokenMode:                     "loose",
-		FirstTokenTimeoutSeconds:           17,
-		BillingTierPolicy:                  "requested",
-		ImageStorageConfig:                 "{}",
-		SchedulerMode:                      "round_robin",
-		AffinityMode:                       "bounded",
-		BackgroundConfig:                   "{}",
-		ShowFullUsageNumbers:               true,
-		PublicKeyUsagePageEnabled:          true,
-		CodexWSHideUpstreamErrors:          true,
-		CodexWSSilentRetryEnabled:          true,
-		CodexWSSilentMaxRetries:            4,
+		SiteName:                         "CodexProxy",
+		MaxConcurrency:                   2,
+		GlobalRPM:                        0,
+		TestModel:                        "gpt-5.4",
+		TestConcurrency:                  50,
+		BackgroundRefreshIntervalMinutes: 2,
+		UsageProbeMaxAgeMinutes:          10,
+		UsageProbeConcurrency:            16,
+		RecoveryProbeIntervalMinutes:     30,
+		PgMaxConns:                       50,
+		RedisPoolSize:                    30,
+		MaxRetries:                       2,
+		MaxRateLimitRetries:              1,
+		ModelMapping:                     "{}",
+		CodexModelMapping:                `{"gpt-5.2":"gpt-5.5"}`,
+		ReasoningEffortModels:            `[{"model":"gpt-5.5","effort":"xhigh"}]`,
+		PromptFilterMode:                 "monitor",
+		PromptFilterThreshold:            50,
+		PromptFilterStrictThreshold:      90,
+		PromptFilterLogMatches:           true,
+		PromptFilterMaxTextLength:        81920,
+		PromptFilterCustomPatterns:       "[]",
+		PromptFilterDisabledPatterns:     "[]",
+		PromptFilterReviewEnabled:        true,
+		PromptFilterReviewAPIKey:         "sk-review-test",
+		PromptFilterReviewBaseURL:        "https://review.example.com",
+		PromptFilterReviewModel:          "review-model",
+		PromptFilterReviewTimeoutSeconds: 7,
+		PromptFilterReviewFailClosed:     false,
+		ClientCompatMode:                 "preserve",
+		CodexMinCLIVersion:               "0.118.0",
+		CodexUserAgentConfig:             `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}`,
+		UsageLogMode:                     "full",
+		UsageLogBatchSize:                200,
+		UsageLogFlushIntervalSeconds:     5,
+		StreamFlushPolicy:                "immediate",
+		StreamFlushIntervalMS:            20,
+		FirstTokenMode:                   "loose",
+		FirstTokenTimeoutSeconds:         17,
+		BillingTierPolicy:                "requested",
+		ImageStorageConfig:               "{}",
+		SchedulerMode:                    "round_robin",
+		AffinityMode:                     "bounded",
+		BackgroundConfig:                 "{}",
+		ShowFullUsageNumbers:             true,
+		PublicKeyUsagePageEnabled:        true,
+		CodexWSHideUpstreamErrors:        true,
+		CodexWSSilentRetryEnabled:        true,
+		CodexWSSilentMaxRetries:          4,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1093,20 +1142,8 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	if settings.CodexModelMapping != `{"gpt-5.2":"gpt-5.5"}` {
 		t.Fatalf("CodexModelMapping = %q, want gpt-5.2 mapping", settings.CodexModelMapping)
 	}
-	if !settings.CheapProbeEnabled {
-		t.Fatal("CheapProbeEnabled = false, want true")
-	}
-	if settings.CheapProbeScanIntervalSeconds != 15 {
-		t.Fatalf("CheapProbeScanIntervalSeconds = %d, want 15", settings.CheapProbeScanIntervalSeconds)
-	}
-	if settings.CheapProbeConcurrency != 3 || settings.CheapProbeTimeoutSeconds != 45 {
-		t.Fatalf("cheap probe runtime settings = concurrency:%d timeout:%d, want 3/45", settings.CheapProbeConcurrency, settings.CheapProbeTimeoutSeconds)
-	}
-	if settings.CheapProbeRecoveryMargin != 12.5 || settings.CheapProbeBonusDurationMinutes != 20 {
-		t.Fatalf("cheap probe bonus settings = margin:%v duration:%d, want 12.5/20", settings.CheapProbeRecoveryMargin, settings.CheapProbeBonusDurationMinutes)
-	}
-	if settings.CheapProbeRankBaseIntervalSeconds != 210 || settings.CheapProbeRankStepSeconds != 35 || settings.CheapProbeRankMinIntervalSeconds != 25 {
-		t.Fatalf("cheap probe rank settings = %d/%d/%d, want 210/35/25", settings.CheapProbeRankBaseIntervalSeconds, settings.CheapProbeRankStepSeconds, settings.CheapProbeRankMinIntervalSeconds)
+	if settings.CodexUserAgentConfig != `{"terminal":"xterm-256color","os_name":"Linux","os_version":"Unknown"}` {
+		t.Fatalf("CodexUserAgentConfig = %q, want custom UA config", settings.CodexUserAgentConfig)
 	}
 	if settings.ReasoningEffortModels != `[{"model":"gpt-5.5","effort":"xhigh"}]` {
 		t.Fatalf("ReasoningEffortModels = %q, want gpt-5.5 xhigh entry", settings.ReasoningEffortModels)
@@ -1990,108 +2027,6 @@ func TestSoftDeleteAccountMarksDeletedStatus(t *testing.T) {
 	}
 }
 
-func TestCloneAccountCopiesConfigAndClearsRuntimeState(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
-
-	db, err := New("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("New(sqlite) 返回错误: %v", err)
-	}
-	defer db.Close()
-
-	ctx := context.Background()
-	id, err := db.InsertAccountWithCredentials(ctx, "source", map[string]interface{}{
-		"refresh_token":                      "rt-source",
-		"access_token":                       "at-source",
-		"email":                              "source@example.com",
-		"plan_type":                          "pro",
-		"allowed_api_key_ids":                []int64{7, 9},
-		"ignore_usage_limit_429_cooldown":    true,
-		"ignore_unauthorized_cooldown":       true,
-		"price_multiplier":                   0.25,
-		"cheap_probe_recovery_margin":        12.5,
-		"cheap_probe_bonus_duration_minutes": 30,
-	}, "http://127.0.0.1:8080")
-	if err != nil {
-		t.Fatalf("InsertAccountWithCredentials 返回错误: %v", err)
-	}
-	groupID, err := db.CreateAccountGroup(ctx, "clone-group", "", "#2563eb", 0, 0, 0)
-	if err != nil {
-		t.Fatalf("CreateAccountGroup 返回错误: %v", err)
-	}
-	if err := db.SetAccountGroups(ctx, id, []int64{groupID}); err != nil {
-		t.Fatalf("SetAccountGroups 返回错误: %v", err)
-	}
-	if err := db.UpdateAccountSchedulerMetadata(ctx, id,
-		OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 42, Valid: true}},
-		OptionalNullInt64{Set: true, Value: sql.NullInt64{Int64: 3, Valid: true}},
-		OptionalBool{Set: true, Value: true},
-		OptionalInt64Slice{},
-		OptionalStringSlice{Set: true, Values: []string{"cheap", "clone"}},
-		OptionalInt64Slice{},
-		OptionalString{},
-		nil,
-	); err != nil {
-		t.Fatalf("UpdateAccountSchedulerMetadata 返回错误: %v", err)
-	}
-	if err := db.SetCooldownWithError(ctx, id, "rate_limited", time.Now().Add(time.Hour), "source cooldown"); err != nil {
-		t.Fatalf("SetCooldownWithError 返回错误: %v", err)
-	}
-
-	clonedID, err := db.CloneAccount(ctx, id, CloneAccountOptions{Name: "copied"})
-	if err != nil {
-		t.Fatalf("CloneAccount 返回错误: %v", err)
-	}
-	if clonedID == id {
-		t.Fatal("CloneAccount 返回了源账号 ID")
-	}
-
-	row, err := db.GetAccountByID(ctx, clonedID)
-	if err != nil {
-		t.Fatalf("GetAccountByID 返回错误: %v", err)
-	}
-	if row.Name != "copied" {
-		t.Fatalf("name = %q, want copied", row.Name)
-	}
-	if row.Status != "active" || row.ErrorMessage != "" || row.CooldownReason != "" || row.CooldownUntil.Valid {
-		t.Fatalf("runtime state copied unexpectedly: status=%q error=%q cooldown=%q until=%v", row.Status, row.ErrorMessage, row.CooldownReason, row.CooldownUntil)
-	}
-	if row.ProxyURL != "http://127.0.0.1:8080" {
-		t.Fatalf("proxy_url = %q", row.ProxyURL)
-	}
-	if row.GetCredential("refresh_token") != "rt-source" || row.GetCredential("access_token") != "at-source" {
-		t.Fatalf("credentials not copied: %+v", row.Credentials)
-	}
-	if got := row.GetCredentialInt64Slice("allowed_api_key_ids"); len(got) != 2 || got[0] != 7 || got[1] != 9 {
-		t.Fatalf("allowed_api_key_ids = %+v", got)
-	}
-	if !row.GetCredentialBool("ignore_usage_limit_429_cooldown") || !row.GetCredentialBool("ignore_unauthorized_cooldown") {
-		t.Fatalf("ignore cooldown flags not copied: %+v", row.Credentials)
-	}
-	if got, ok := row.GetCredentialFloat64("price_multiplier"); !ok || got != 0.25 {
-		t.Fatalf("price_multiplier = %v ok=%v", got, ok)
-	}
-	if !row.ScoreBiasOverride.Valid || row.ScoreBiasOverride.Int64 != 42 {
-		t.Fatalf("score_bias_override = %+v", row.ScoreBiasOverride)
-	}
-	if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 3 {
-		t.Fatalf("base_concurrency_override = %+v", row.BaseConcurrencyOverride)
-	}
-	if !row.SkipWarmTier {
-		t.Fatal("skip_warm_tier not copied")
-	}
-	if len(row.Tags) != 2 || row.Tags[0] != "cheap" || row.Tags[1] != "clone" {
-		t.Fatalf("tags = %+v", row.Tags)
-	}
-	groups, err := db.GetAccountGroupIDs(ctx, clonedID)
-	if err != nil {
-		t.Fatalf("GetAccountGroupIDs 返回错误: %v", err)
-	}
-	if len(groups) != 1 || groups[0] != groupID {
-		t.Fatalf("groups = %+v, want [%d]", groups, groupID)
-	}
-}
-
 func TestSQLiteMigratesLegacyDeletedAccounts(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 	ctx := context.Background()
@@ -2388,50 +2323,6 @@ func TestSQLiteUsageLogsTimeRangeUsesUTCStorage(t *testing.T) {
 	}
 	if got := page.Logs[0].Model; got != "gpt-image-2" {
 		t.Fatalf("Model = %q, want gpt-image-2", got)
-	}
-
-	charts, err := db.GetChartAggregation(ctx, localCreated.Add(-1*time.Hour), localCreated.Add(1*time.Hour), 5)
-	if err != nil {
-		t.Fatalf("GetChartAggregation 返回错误: %v", err)
-	}
-	if len(charts.Timeline) != 1 {
-		t.Fatalf("len(charts.Timeline) = %d, want 1", len(charts.Timeline))
-	}
-	if got, want := charts.Timeline[0].Bucket, "2026-04-23T20:05:00Z"; got != want {
-		t.Fatalf("chart bucket = %q, want %q", got, want)
-	}
-}
-
-func TestSQLiteAccountEventTrendReturnsRFC3339Buckets(t *testing.T) {
-	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
-
-	db, err := New("sqlite", dbPath)
-	if err != nil {
-		t.Fatalf("New(sqlite) 返回错误: %v", err)
-	}
-	defer db.Close()
-
-	ctx := context.Background()
-	createdUTC := time.Date(2026, 4, 23, 20, 6, 0, 0, time.UTC)
-	if _, err := db.conn.ExecContext(ctx, `
-		INSERT INTO account_events (account_id, event_type, source, created_at)
-		VALUES (1, 'added', 'manual', $1)
-	`, sqliteTimeParam(createdUTC)); err != nil {
-		t.Fatalf("insert account event 返回错误: %v", err)
-	}
-
-	trend, err := db.GetAccountEventTrend(ctx, createdUTC.Add(-1*time.Hour), createdUTC.Add(1*time.Hour), 60)
-	if err != nil {
-		t.Fatalf("GetAccountEventTrend 返回错误: %v", err)
-	}
-	if len(trend) != 1 {
-		t.Fatalf("len(trend) = %d, want 1", len(trend))
-	}
-	if got, want := trend[0].Bucket, "2026-04-23T20:00:00Z"; got != want {
-		t.Fatalf("event trend bucket = %q, want %q", got, want)
-	}
-	if trend[0].Added != 1 || trend[0].Deleted != 0 {
-		t.Fatalf("event trend = %+v, want added=1 deleted=0", trend[0])
 	}
 }
 

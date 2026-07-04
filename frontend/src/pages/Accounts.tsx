@@ -2,7 +2,8 @@ import type { ChangeEvent, DragEvent, ReactNode } from "react";
 import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { api, getAdminKey, resetAdminAuthState } from "../api";
 import Modal from "../components/Modal";
-import PageHeader from "../components/PageHeader";import Pagination from "../components/Pagination";
+import PageHeader from "../components/PageHeader";
+import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import StatusBadge from "../components/StatusBadge";
 import { useDataLoader, type LoadOptions } from "../hooks/useDataLoader";
@@ -29,7 +30,7 @@ import type {
   RecycleBinAccountRow,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
-import { formatRelativeTime, formatBeijingTime, formatDateOnly } from "../utils/time";
+import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -315,90 +316,6 @@ function formatAccountListEmail(account: AccountRow): string {
   return account.email?.trim() || account.name || `ID ${account.id}`;
 }
 
-function sortMissingNumber(direction: SortDirection): number {
-  return direction === "asc" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
-}
-
-function accountSortNumber(
-  value: number | null | undefined,
-  direction: SortDirection,
-): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? value
-    : sortMissingNumber(direction);
-}
-
-function accountSortTime(value: string | undefined, direction: SortDirection): number {
-  if (!value) return sortMissingNumber(direction);
-  const timestamp = new Date(value).getTime();
-  return Number.isFinite(timestamp) ? timestamp : sortMissingNumber(direction);
-}
-
-function accountTotalRequests(account: AccountRow): number {
-  return (
-    account.total_requests ??
-    (account.success_requests ?? 0) + (account.error_requests ?? 0)
-  );
-}
-
-function accountRecentUsage(account: AccountRow): number {
-  const tokens = account.usage_5h_detail?.tokens ?? 0;
-  if (tokens > 0) return tokens;
-  return account.usage_5h_detail?.requests ?? 0;
-}
-
-function accountSortValue(
-  account: AccountRow,
-  key: AccountSortKey,
-  direction: SortDirection,
-): number | string {
-  switch (key) {
-    case "name":
-      return formatAccountName(account).toLowerCase();
-    case "requests":
-      return accountTotalRequests(account);
-    case "usage":
-      return accountSortNumber(account.usage_percent_7d, direction);
-    case "usage5h":
-      return accountRecentUsage(account);
-    case "priceMultiplier":
-      return accountSortNumber(account.price_multiplier, direction);
-    case "billed":
-      return accountSortNumber(account.billed_7d ?? account.billed_5h, direction);
-    case "lastUsed":
-      return accountSortTime(account.last_used_at, direction);
-    case "importTime":
-      return accountSortTime(account.created_at, direction);
-    case "updatedAt":
-      return accountSortTime(account.updated_at, direction);
-  }
-}
-
-function compareAccountsBySort(
-  left: AccountRow,
-  right: AccountRow,
-  key: AccountSortKey,
-  direction: SortDirection,
-): number {
-  const leftValue = accountSortValue(left, key, direction);
-  const rightValue = accountSortValue(right, key, direction);
-  let diff = 0;
-
-  if (typeof leftValue === "string" || typeof rightValue === "string") {
-    diff = String(leftValue).localeCompare(String(rightValue), undefined, {
-      sensitivity: "base",
-      numeric: true,
-    });
-  } else {
-    diff = leftValue - rightValue;
-  }
-
-  if (diff === 0) {
-    diff = left.id - right.id;
-  }
-  return direction === "asc" ? diff : -diff;
-}
-
 function formatAccessTokenBadge(account: AccountRow): string {
   return account.access_token_type === "codex_at" ? "codex_at" : "AT";
 }
@@ -551,37 +468,103 @@ function priceMultiplierInputToNumber(value: string): number | null {
   return parsed;
 }
 
-function formatOptionalPositiveNumberInput(value?: number | null): string {
-  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
-    return "";
-  }
-  return String(value);
+function formatDispatchCountLimitInput(value?: number | null): string {
+  if (typeof value !== "number" || value <= 0) return "";
+  return String(Math.trunc(value));
 }
 
-function isOptionalPositiveNumberInputInvalid(
-  value: string,
-  maxValue: number,
-): boolean {
+function isDispatchCountLimitInputInvalid(value: string): boolean {
   const trimmed = value.trim();
   if (!trimmed) return false;
-  const parsed = Number(trimmed);
-  return !Number.isFinite(parsed) || parsed <= 0 || parsed > maxValue;
+  if (!/^\d+$/.test(trimmed)) return true;
+  const parsed = Number.parseInt(trimmed, 10);
+  return parsed < 0 || parsed > 1000000;
 }
 
-function optionalPositiveNumberInputToNumber(value: string): number | null {
+function dispatchCountLimitInputToValue(value: string): number | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
-  const parsed = Number(trimmed);
+  const parsed = Number.parseInt(trimmed, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   return parsed;
 }
 
-function optionalPositiveIntegerInputToNumber(value: string): number | null {
-  const trimmed = value.trim();
-  if (!trimmed) return null;
-  const parsed = Number(trimmed);
-  if (!Number.isInteger(parsed) || parsed <= 0) return null;
-  return parsed;
+
+function sortMissingNumber(direction: SortDirection): number {
+  return direction === "asc" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
+}
+
+function accountSortNumber(value: number | null | undefined, direction: SortDirection): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : sortMissingNumber(direction);
+}
+
+function accountSortTime(value: string | undefined, direction: SortDirection): number {
+  if (!value) return sortMissingNumber(direction);
+  const timestamp = new Date(value).getTime();
+  return Number.isFinite(timestamp) ? timestamp : sortMissingNumber(direction);
+}
+
+function accountTotalRequests(account: AccountRow): number {
+  return (
+    account.total_requests ??
+    (account.success_requests ?? 0) + (account.error_requests ?? 0)
+  );
+}
+
+function accountRecentUsage(account: AccountRow): number {
+  const tokens = account.usage_5h_detail?.tokens ?? 0;
+  if (tokens > 0) return tokens;
+  return account.usage_5h_detail?.requests ?? 0;
+}
+
+function accountSortValue(
+  account: AccountRow,
+  key: AccountSortKey,
+  direction: SortDirection,
+): number | string {
+  switch (key) {
+    case "name":
+      return formatAccountName(account).toLowerCase();
+    case "requests":
+      return accountTotalRequests(account);
+    case "usage":
+      return accountSortNumber(account.usage_percent_7d, direction);
+    case "usage5h":
+      return accountRecentUsage(account);
+    case "priceMultiplier":
+      return accountSortNumber(account.price_multiplier, direction);
+    case "billed":
+      return accountSortNumber(account.billed_7d ?? account.billed_5h, direction);
+    case "lastUsed":
+      return accountSortTime(account.last_used_at, direction);
+    case "importTime":
+      return accountSortTime(account.created_at, direction);
+    case "updatedAt":
+      return accountSortTime(account.updated_at, direction);
+  }
+}
+
+function compareAccountsBySort(
+  left: AccountRow,
+  right: AccountRow,
+  key: AccountSortKey,
+  direction: SortDirection,
+): number {
+  const leftValue = accountSortValue(left, key, direction);
+  const rightValue = accountSortValue(right, key, direction);
+  let diff = 0;
+  if (typeof leftValue === "string" || typeof rightValue === "string") {
+    diff = String(leftValue).localeCompare(String(rightValue), undefined, {
+      numeric: true,
+      sensitivity: "base",
+    });
+  } else {
+    diff = leftValue - rightValue;
+  }
+  if (diff === 0) diff = left.id - right.id;
+  return direction === "asc" ? diff : -diff;
 }
 
 function getMediaQueryMatch(query: string): boolean {
@@ -720,17 +703,14 @@ export default function Accounts() {
   >("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [planFilter, setPlanFilter] = useState<
-    "all" | "pro" | "prolite" | "plus" | "team" | "free"
+    "all" | "pro" | "prolite" | "plus" | "team" | "k12" | "free"
   >("all");
-  const initialSortPreference = useRef<AccountSortPreference | null>(null);
-  if (initialSortPreference.current === null) {
-    initialSortPreference.current = getInitialAccountSortPreference();
-  }
+  const initialSortPreference = useMemo(getInitialAccountSortPreference, []);
   const [sortKey, setSortKey] = useState<AccountSortKey | null>(
-    initialSortPreference.current.key,
+    initialSortPreference.key,
   );
   const [sortDir, setSortDir] = useState<SortDirection>(
-    initialSortPreference.current.direction,
+    initialSortPreference.direction,
   );
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: "",
@@ -740,10 +720,10 @@ export default function Accounts() {
   const [submitting, setSubmitting] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set());
-  const [copyingIds, setCopyingIds] = useState<Set<number>>(new Set());
   const [authJsonExportingIds, setAuthJsonExportingIds] = useState<Set<number>>(
     new Set(),
   );
+  const [copyingIds, setCopyingIds] = useState<Set<number>>(new Set());
   const [authJsonModal, setAuthJsonModal] = useState<{
     account: AccountRow;
     json: string;
@@ -786,26 +766,12 @@ export default function Accounts() {
     useState(false);
   const [editAutoPause7dDisabled, setEditAutoPause7dDisabled] =
     useState(false);
-  const [
-    editIgnoreUsageLimit429Cooldown,
-    setEditIgnoreUsageLimit429Cooldown,
-  ] = useState(false);
-	const [
-		editIgnoreUnauthorizedCooldown,
-		setEditIgnoreUnauthorizedCooldown,
-	] = useState(false);
-	const [editPriceMultiplierInput, setEditPriceMultiplierInput] = useState("");
-  const [
-    editCheapProbeRecoveryMarginInput,
-    setEditCheapProbeRecoveryMarginInput,
-  ] = useState("");
-  const [
-    editCheapProbeBonusDurationInput,
-    setEditCheapProbeBonusDurationInput,
-  ] = useState("");
-	const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
-		number[]
-	>([]);
+  const [editDispatchCountLimitInput, setEditDispatchCountLimitInput] =
+    useState("");
+  const [editPriceMultiplierInput, setEditPriceMultiplierInput] = useState("");
+  const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
+    number[]
+  >([]);
   const [editProxyUrl, setEditProxyUrl] = useState("");
   const [testingProxyKey, setTestingProxyKey] = useState<string | null>(null);
   const [editOpenAIForm, setEditOpenAIForm] =
@@ -821,7 +787,10 @@ export default function Accounts() {
   const [editOpenAIModelsLoading, setEditOpenAIModelsLoading] = useState(false);
   const [importing, setImporting] = useState(false);
   const [showImportPicker, setShowImportPicker] = useState(false);
+  const [importProxyUrl, setImportProxyUrl] = useState("");
   const [showSub2APIImport, setShowSub2APIImport] = useState(false);
+  const [showPasteImport, setShowPasteImport] = useState(false);
+  const [pasteImportText, setPasteImportText] = useState("");
   const [dragging, setDragging] = useState(false);
   const dragCounter = useRef(0);
   const [showExportPicker, setShowExportPicker] = useState(false);
@@ -843,6 +812,7 @@ export default function Accounts() {
     current: number;
     total: number;
     success: number;
+    updated: number;
     duplicate: number;
     failed: number;
     done: boolean;
@@ -851,17 +821,22 @@ export default function Accounts() {
     current: 0,
     total: 0,
     success: 0,
+    updated: 0,
     duplicate: 0,
     failed: 0,
     done: false,
   });
   const [addMethod, setAddMethod] = useState<
-    "rt" | "st" | "at" | "openai" | "oauth"
+    "rt" | "st" | "at" | "session" | "openai" | "oauth"
   >("oauth");
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
     proxy_url: "",
   });
+  const [sessionJson, setSessionJson] = useState("");
+  const [sessionProxyUrl, setSessionProxyUrl] = useState("");
+  // 允许重复添加：勾选后本次添加/导入跳过去重，强制新建（添加弹窗与导入弹窗共用）。
+  const [allowDuplicate, setAllowDuplicate] = useState(false);
   const [openAIForm, setOpenAIForm] =
     useState<AddOpenAIResponsesAccountRequest>({
       base_url: "https://api.openai.com",
@@ -1291,11 +1266,7 @@ export default function Accounts() {
       // 与 UsageCell 的显示判定保持一致:plan_type 可能滞后于真实订阅状态,
       // 看到 5h 重置时间就当订阅账号处理,触发拉取 5h 数据。
       const looksLikeSubscription =
-        plan === "pro" ||
-        plan === "team" ||
-        plan === "plus" ||
-        plan === "teamplus" ||
-        !!account.reset_5h_at;
+        isPremiumUsagePlan(plan) || !!account.reset_5h_at;
 
       if (looksLikeSubscription) {
         return !has5h || !has7d;
@@ -1529,12 +1500,14 @@ export default function Accounts() {
     [t],
   );
 
+  const updateAccountSort = useCallback((key: AccountSortKey | null) => {
+    setSortKey(key);
+    setSortDir(defaultAccountSortDirection(key));
+    setPage(1);
+  }, []);
+
   const renderSortableAccountHead = useCallback(
-    (
-      key: AccountSortKey,
-      label: string,
-      className = "text-[13px] font-semibold",
-    ) => (
+    (key: AccountSortKey, label: string, className = "text-[13px] font-semibold") => (
       <TableHead
         className={`${className} cursor-pointer select-none hover:text-primary transition-colors`}
         onClick={() => {
@@ -1637,8 +1610,8 @@ export default function Accounts() {
   const handleAdd = async (credential: "rt" | "st" = "rt") => {
     const payload: AddAccountRequest =
       credential === "st"
-        ? { ...addForm, refresh_token: "" }
-        : { ...addForm, session_token: "" };
+        ? { ...addForm, refresh_token: "", allow_duplicate: allowDuplicate }
+        : { ...addForm, session_token: "", allow_duplicate: allowDuplicate };
     if (
       !payload.refresh_token?.trim() &&
       !payload.session_token?.trim()
@@ -1682,11 +1655,16 @@ export default function Accounts() {
     if (!atForm.access_token.trim()) return;
     setSubmitting(true);
     try {
-      await api.addATAccount(atForm);
-      showToast(t("accounts.addSuccess"));
+      // 始终走流式：即使只添加一个 access_token 也展示进度条，并能反映
+      // 身份去重/合并结果（已有账号更新、重复跳过）。
+      const res = await postAdminSSE("/accounts/at?stream=true", {
+        ...atForm,
+        allow_duplicate: allowDuplicate,
+      });
       setShowAdd(false);
+      await readImportSSE(res);
+      showToast(t("accounts.addSuccess"));
       setAtForm({ access_token: "", proxy_url: "" });
-      void reload();
     } catch (error) {
       showToast(
         t("accounts.addFailed", { error: getErrorMessage(error) }),
@@ -1761,6 +1739,33 @@ export default function Accounts() {
     }
   };
 
+  const handleAddSession = async () => {
+    if (!sessionJson.trim() || importing) return;
+    setSubmitting(true);
+    try {
+      // 解析 session JSON，构造为文件导入
+      const trimmed = sessionJson.trim();
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      // 支持单个对象或数组
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      const blob = new Blob([JSON.stringify(items)], { type: "application/json" });
+      const file = new File([blob], "session.json", { type: "application/json" });
+      await importFiles([file], "json", sessionProxyUrl);
+      setShowAdd(false);
+      setSessionJson("");
+    } catch (error) {
+      if (error instanceof SyntaxError) {
+        showToast(t("accounts.sessionJsonInvalid"), "error");
+      } else {
+        showToast(
+          t("accounts.addFailed", { error: getErrorMessage(error) }),
+          "error",
+        );
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
   const handleAddOpenAIResponses = async () => {
     const models = openAIForm.models;
     if (!openAIForm.api_key.trim() || models.length === 0) return;
@@ -2028,6 +2033,7 @@ export default function Accounts() {
       current: 0,
       total: 0,
       success: 0,
+      updated: 0,
       duplicate: 0,
       failed: 0,
       done: false,
@@ -2053,6 +2059,7 @@ export default function Accounts() {
             current: number;
             total: number;
             success: number;
+            updated: number;
             duplicate: number;
             failed: number;
           };
@@ -2061,6 +2068,7 @@ export default function Accounts() {
             current: event.current,
             total: event.total,
             success: event.success,
+            updated: event.updated ?? 0,
             duplicate: event.duplicate,
             failed: event.failed,
             done: event.type === "complete",
@@ -2076,6 +2084,7 @@ export default function Accounts() {
   const importFiles = async (
     files: File[],
     format: "txt" | "json" | "json_at" | "at_txt",
+    proxyOverride?: string,
   ) => {
     setImporting(true);
     setImportProgress({
@@ -2083,6 +2092,7 @@ export default function Accounts() {
       current: 0,
       total: 0,
       success: 0,
+      updated: 0,
       duplicate: 0,
       failed: 0,
       done: false,
@@ -2090,6 +2100,9 @@ export default function Accounts() {
     try {
       const formData = new FormData();
       if (format !== "txt") formData.append("format", format);
+      const trimmedImportProxy = (proxyOverride ?? importProxyUrl).trim();
+      if (trimmedImportProxy) formData.append("proxy_url", trimmedImportProxy);
+      if (allowDuplicate) formData.append("allow_duplicate", "true");
       for (const f of files) formData.append("file", f);
       const res = await fetch("/api/admin/accounts/import", {
         method: "POST",
@@ -2114,6 +2127,7 @@ export default function Accounts() {
             current: data.total ?? 0,
             total: data.total ?? 0,
             success: data.success ?? 0,
+            updated: data.updated ?? 0,
             duplicate: data.duplicate ?? 0,
             failed: data.failed ?? 0,
             done: true,
@@ -2128,6 +2142,7 @@ export default function Accounts() {
         current: 1,
         total: 1,
         success: 0,
+        updated: 0,
         duplicate: 0,
         failed: 1,
         done: true,
@@ -2343,6 +2358,24 @@ export default function Accounts() {
     }
 
     if (folderInputRef.current) folderInputRef.current.value = "";
+  };
+
+  const handlePasteImport = async () => {
+    if (!pasteImportText.trim() || importing) return;
+    const trimmed = pasteImportText.trim();
+    let items: unknown[];
+    try {
+      const parsed = JSON.parse(trimmed);
+      items = Array.isArray(parsed) ? parsed : [parsed];
+    } catch {
+      showToast(t("accounts.sessionJsonInvalid"), "error");
+      return;
+    }
+    const blob = new Blob([JSON.stringify(items)], { type: "application/json" });
+    const file = new File([blob], "paste.json", { type: "application/json" });
+    await importFiles([file], "json");
+    setShowPasteImport(false);
+    setPasteImportText("");
   };
 
   const handleExport = async (
@@ -3004,23 +3037,12 @@ export default function Accounts() {
     );
     setEditAutoPause5hDisabled(account.auto_pause_5h_disabled ?? false);
     setEditAutoPause7dDisabled(account.auto_pause_7d_disabled ?? false);
-    setEditIgnoreUsageLimit429Cooldown(
-      account.ignore_usage_limit_429_cooldown ?? false,
+    setEditDispatchCountLimitInput(
+      formatDispatchCountLimitInput(account.dispatch_count_limit),
     );
-	setEditIgnoreUnauthorizedCooldown(
-		account.ignore_unauthorized_cooldown ?? false,
-	);
-	setEditPriceMultiplierInput(
-		formatPriceMultiplierInput(account.price_multiplier),
-	);
-  setEditCheapProbeRecoveryMarginInput(
-    formatOptionalPositiveNumberInput(account.cheap_probe_recovery_margin),
-  );
-  setEditCheapProbeBonusDurationInput(
-    formatOptionalPositiveNumberInput(account.cheap_probe_bonus_duration_minutes),
-  );
-	setAllowedAPIKeySelection(
-		filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
+    setEditPriceMultiplierInput(formatPriceMultiplierInput(account.price_multiplier));
+    setAllowedAPIKeySelection(
+      filterExistingAPIKeyIDs(account.allowed_api_key_ids ?? [], apiKeys),
     );
     setEditProxyUrl(account.proxy_url ?? "");
     setEditTags(account.tags ?? []);
@@ -3053,13 +3075,10 @@ export default function Accounts() {
     setEditAutoPause5hThresholdInput("");
     setEditAutoPause7dThresholdInput("");
     setEditAutoPause5hDisabled(false);
-	setEditAutoPause7dDisabled(false);
-	setEditIgnoreUsageLimit429Cooldown(false);
-	setEditIgnoreUnauthorizedCooldown(false);
-	setEditPriceMultiplierInput("");
-  setEditCheapProbeRecoveryMarginInput("");
-  setEditCheapProbeBonusDurationInput("");
-	setAllowedAPIKeySelection([]);
+    setEditAutoPause7dDisabled(false);
+    setEditDispatchCountLimitInput("");
+    setEditPriceMultiplierInput("");
+    setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
     setEditTags([]);
     setEditGroupIds([]);
@@ -3096,21 +3115,26 @@ export default function Accounts() {
   const editAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
     editAutoPause5hThresholdInput,
   );
-	const editAutoPause7dThresholdInvalid = isPercentThresholdInputInvalid(
-		editAutoPause7dThresholdInput,
-	);
-	const editPriceMultiplierInvalid = isPriceMultiplierInputInvalid(
-		editPriceMultiplierInput,
-	);
-  const editCheapProbeRecoveryMarginInvalid =
-    isOptionalPositiveNumberInputInvalid(editCheapProbeRecoveryMarginInput, 10000);
-  const editCheapProbeBonusDurationInvalid =
-    isOptionalPositiveNumberInputInvalid(editCheapProbeBonusDurationInput, 1440) ||
-    (editCheapProbeBonusDurationInput.trim() !== "" &&
-      optionalPositiveIntegerInputToNumber(editCheapProbeBonusDurationInput) === null);
-	const batchAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
-		batchAutoPause5hThresholdInput,
-	);
+  const editAutoPause7dThresholdInvalid = isPercentThresholdInputInvalid(
+    editAutoPause7dThresholdInput,
+  );
+  const editDispatchCountLimitInvalid = isDispatchCountLimitInputInvalid(
+    editDispatchCountLimitInput,
+  );
+  const editPriceMultiplierInvalid = isPriceMultiplierInputInvalid(
+    editPriceMultiplierInput,
+  );
+  const editDispatchCountLimitPreview =
+    editDispatchCountLimitInvalid
+      ? null
+      : dispatchCountLimitInputToValue(editDispatchCountLimitInput);
+  const editDispatchCountResetTime =
+    editDispatchCountLimitPreview && editingAccount
+      ? formatResetAt(editingAccount.dispatch_count_reset_at)
+      : null;
+  const batchAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
+    batchAutoPause5hThresholdInput,
+  );
   const batchAutoPause7dThresholdInvalid = isPercentThresholdInputInvalid(
     batchAutoPause7dThresholdInput,
   );
@@ -3163,15 +3187,14 @@ export default function Accounts() {
     if (!editingAccount) return;
     if (
       scoreInputInvalid ||
-		concurrencyInputInvalid ||
-		editAutoPause5hThresholdInvalid ||
-		editAutoPause7dThresholdInvalid ||
-		editPriceMultiplierInvalid ||
-    editCheapProbeRecoveryMarginInvalid ||
-    editCheapProbeBonusDurationInvalid
-	) {
-		showToast(t("accounts.schedulerInvalidInput"), "error");
-		return;
+      concurrencyInputInvalid ||
+      editAutoPause5hThresholdInvalid ||
+      editAutoPause7dThresholdInvalid ||
+      editDispatchCountLimitInvalid ||
+      editPriceMultiplierInvalid
+    ) {
+      showToast(t("accounts.schedulerInvalidInput"), "error");
+      return;
     }
 
     setEditSubmitting(true);
@@ -3192,17 +3215,12 @@ export default function Accounts() {
           editAutoPause7dThresholdInput,
         ),
         auto_pause_5h_disabled: editAutoPause5hDisabled,
-		auto_pause_7d_disabled: editAutoPause7dDisabled,
-		ignore_usage_limit_429_cooldown: editIgnoreUsageLimit429Cooldown,
-		ignore_unauthorized_cooldown: editIgnoreUnauthorizedCooldown,
-		price_multiplier: priceMultiplierInputToNumber(editPriceMultiplierInput),
-    cheap_probe_recovery_margin: optionalPositiveNumberInputToNumber(
-      editCheapProbeRecoveryMarginInput,
-    ),
-    cheap_probe_bonus_duration_minutes: optionalPositiveIntegerInputToNumber(
-      editCheapProbeBonusDurationInput,
-    ),
-	};
+        auto_pause_7d_disabled: editAutoPause7dDisabled,
+        dispatch_count_limit: dispatchCountLimitInputToValue(
+          editDispatchCountLimitInput,
+        ),
+        price_multiplier: priceMultiplierInputToNumber(editPriceMultiplierInput),
+      };
       await api.updateAccountScheduler(editingAccount.id, payload);
       showToast(t("accounts.schedulerSaveSuccess"));
       await Promise.all([reload(), reloadGroups()]);
@@ -3744,7 +3762,9 @@ export default function Accounts() {
               />
             </div>
             <div className="flex shrink-0 items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5 max-sm:w-full max-sm:flex-wrap">
-              {(["all", "pro", "prolite", "plus", "team", "free"] as const).map(
+              {(
+                ["all", "pro", "prolite", "plus", "team", "k12", "free"] as const
+              ).map(
                 (key) => (
                   <button
                     key={key}
@@ -3762,7 +3782,9 @@ export default function Accounts() {
                       ? t("accounts.filterAll")
                       : key === "prolite"
                         ? "ProLite"
-                        : key.charAt(0).toUpperCase() + key.slice(1)}
+                        : key === "k12"
+                          ? "K12"
+                          : key.charAt(0).toUpperCase() + key.slice(1)}
                   </button>
                 ),
               )}
@@ -3837,104 +3859,97 @@ export default function Accounts() {
               <FolderOpen className="size-3.5" />
               {t("accounts.groupManage")}
             </Button>
+            <Select
+              className="w-44 shrink-0"
+              compact
+              value={sortKey ?? ""}
+              onValueChange={(value) =>
+                updateAccountSort(value === "" ? null : (value as AccountSortKey))
+              }
+              options={accountSortOptions}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="w-9 shrink-0 px-0"
+              disabled={!sortKey}
+              title={t("accounts.sortDirection")}
+              aria-label={t("accounts.sortDirection")}
+              onClick={() => {
+                setSortDir((direction) =>
+                  direction === "asc" ? "desc" : "asc",
+                );
+                setPage(1);
+              }}
+            >
+              {sortDir === "asc" ? "↑" : "↓"}
+            </Button>
+            {!isPersonalMode && (
             <div className="flex w-full shrink-0 items-center gap-1.5 @min-[1600px]/accounts:ml-auto @min-[1600px]/accounts:w-auto">
-              <div className="flex min-w-0 items-center gap-1.5">
-                <Select
-                  compact
-                  className="w-[170px]"
-                  value={sortKey ?? ""}
-                  onValueChange={(value) => {
-                    const nextKey = value ? (value as AccountSortKey) : null;
-                    setSortKey(nextKey);
-                    setSortDir(defaultAccountSortDirection(nextKey));
-                    setPage(1);
-                  }}
-                  options={accountSortOptions}
-                  placeholder={t("accounts.sortDefault")}
-                />
-                <Button
+              <div className="hidden lg:inline-flex items-center rounded-md border border-border bg-muted/50 p-0.5">
+                <button
                   type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    setSortDir((direction) =>
-                      direction === "asc" ? "desc" : "asc",
-                    );
-                    setPage(1);
-                  }}
-                  title={t("accounts.sortDirection")}
-                  aria-label={t("accounts.sortDirection")}
-                  className="px-2"
+                  onClick={() => setViewMode("table")}
+                  title={t("accounts.viewModeTable")}
+                  aria-label={t("accounts.viewModeTable")}
+                  aria-pressed={viewMode === "table"}
+                  className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] font-medium transition-colors ${
+                    viewMode === "table"
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
                 >
-                  {sortDir === "desc" ? "↓" : "↑"}
-                </Button>
+                  <Rows3 className="size-3.5" />
+                  {t("accounts.viewModeTable")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode("grid")}
+                  title={t("accounts.viewModeGrid")}
+                  aria-label={t("accounts.viewModeGrid")}
+                  aria-pressed={viewMode === "grid"}
+                  className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] font-medium transition-colors ${
+                    viewMode === "grid"
+                      ? "bg-background text-foreground shadow-sm"
+                      : "text-muted-foreground hover:text-foreground"
+                  }`}
+                >
+                  <LayoutGrid className="size-3.5" />
+                  {t("accounts.viewModeGrid")}
+                </button>
               </div>
-              {!isPersonalMode && (
-                <>
-                  <div className="hidden lg:inline-flex items-center rounded-md border border-border bg-muted/50 p-0.5">
-                    <button
-                      type="button"
-                      onClick={() => setViewMode("table")}
-                      title={t("accounts.viewModeTable")}
-                      aria-label={t("accounts.viewModeTable")}
-                      aria-pressed={viewMode === "table"}
-                      className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] font-medium transition-colors ${
-                        viewMode === "table"
-                          ? "bg-background text-foreground shadow-sm"
-                          : "text-muted-foreground hover:text-foreground"
-                      }`}
-                    >
-                      <Rows3 className="size-3.5" />
-                      {t("accounts.viewModeTable")}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setViewMode("grid")}
-                      title={t("accounts.viewModeGrid")}
-                      aria-label={t("accounts.viewModeGrid")}
-                      aria-pressed={viewMode === "grid"}
-                      className={`inline-flex items-center gap-1 rounded-sm px-2 py-1 text-[12px] font-medium transition-colors ${
-                        viewMode === "grid"
-                          ? "bg-background text-foreground shadow-sm"
-                          : "text-muted-foreground hover:text-foreground"
-                      }`}
-                    >
-                      <LayoutGrid className="size-3.5" />
-                      {t("accounts.viewModeGrid")}
-                    </button>
-                  </div>
-                  <ColumnSettingsMenu
-                    columns={visibleColumns}
-                    onToggle={(column) =>
-                      setVisibleColumns((current) => ({
-                        ...current,
-                        [column]: !current[column],
-                      }))
-                    }
-                    onReset={() =>
-                      setVisibleColumns(getDefaultAccountVisibleColumns())
-                    }
-                    resetTitle={t("accounts.columnReset")}
-                    labels={{
-                      sequence: t("accounts.sequence"),
-                      email: t("accounts.email"),
-                      plan: t("accounts.plan"),
-                      tags: t("accounts.tagsLabel"),
-                      groups: t("accounts.groupsLabel"),
-                      status: t("accounts.status"),
-                      requests: t("accounts.requests"),
-                      usage: t("accounts.usage"),
-                      priceMultiplier: t("accounts.priceMultiplierShort"),
-                      billed: t("accounts.billed"),
-                      importTime: t("accounts.importTime"),
-                      updatedAt: t("accounts.updatedAt"),
-                      actions: t("accounts.actions"),
-                    }}
-                    title={t("accounts.columnSettings")}
-                  />
-                </>
-              )}
+              <ColumnSettingsMenu
+                columns={visibleColumns}
+                onToggle={(column) =>
+                  setVisibleColumns((current) => ({
+                    ...current,
+                    [column]: !current[column],
+                  }))
+                }
+                onReset={() =>
+                  setVisibleColumns(getDefaultAccountVisibleColumns())
+                }
+                resetTitle={t("accounts.columnReset")}
+                labels={{
+                  sequence: t("accounts.sequence"),
+                  email: t("accounts.email"),
+                  plan: t("accounts.plan"),
+                  tags: t("accounts.tagsLabel"),
+                  groups: t("accounts.groupsLabel"),
+                  status: t("accounts.status"),
+                  requests: t("accounts.requests"),
+                  usage: t("accounts.usage"),
+                  priceMultiplier: t("accounts.priceMultiplierShort"),
+                  billed: t("accounts.billed"),
+                  importTime: t("accounts.importTime"),
+                  updatedAt: t("accounts.updatedAt"),
+                  actions: t("accounts.actions"),
+                }}
+                title={t("accounts.columnSettings")}
+              />
             </div>
+            )}
           </div>
 
           {selected.size > 0 && (
@@ -4081,8 +4096,8 @@ export default function Accounts() {
                           showEmailDomainTags={showEmailDomainTags}
                           healthBuckets={healthBars[String(account.id)]}
                           refreshing={refreshingIds.has(account.id)}
-                          copying={copyingIds.has(account.id)}
                           authJsonExporting={authJsonExportingIds.has(account.id)}
+                          copying={copyingIds.has(account.id)}
                           variant={isPersonalMode ? "personal" : "mobile"}
                           t={t}
                           onToggleSelect={() => toggleSelect(account.id)}
@@ -4134,7 +4149,9 @@ export default function Accounts() {
                           </TableHead>
                         )}
                         {visibleColumns.email && (
-                          renderSortableAccountHead("name", t("accounts.email"))
+                          <TableHead className="text-[13px] font-semibold">
+                            {t("accounts.email")}
+                          </TableHead>
                         )}
                         {visibleColumns.tags && (
                           <TableHead className="text-[13px] font-semibold">
@@ -4157,25 +4174,88 @@ export default function Accounts() {
                           </TableHead>
                         )}
                         {visibleColumns.requests && (
-                          renderSortableAccountHead("requests", t("accounts.requests"))
+                          <TableHead
+                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
+                            onClick={() => {
+                              if (sortKey === "requests") {
+                                setSortDir((d) =>
+                                  d === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("requests");
+                                setSortDir("desc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.requests")}{" "}
+                            {sortKey === "requests"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
+                          </TableHead>
                         )}
                         {visibleColumns.usage && (
-                          renderSortableAccountHead("usage", t("accounts.usage"))
+                          <TableHead
+                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
+                            onClick={() => {
+                              if (sortKey === "usage") {
+                                setSortDir((d) =>
+                                  d === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("usage");
+                                setSortDir("desc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.usage")}{" "}
+                            {sortKey === "usage"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
+                          </TableHead>
                         )}
-                        {visibleColumns.priceMultiplier && (
+                        {visibleColumns.priceMultiplier &&
                           renderSortableAccountHead(
                             "priceMultiplier",
                             t("accounts.priceMultiplierShort"),
-                          )
-                        )}
+                          )}
                         {visibleColumns.billed && (
-                          renderSortableAccountHead("billed", t("accounts.billed"))
+                          <TableHead className="text-[13px] font-semibold">
+                            {t("accounts.billed")}
+                          </TableHead>
                         )}
                         {visibleColumns.importTime && (
-                          renderSortableAccountHead("importTime", t("accounts.importTime"))
+                          <TableHead
+                            className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
+                            onClick={() => {
+                              if (sortKey === "importTime") {
+                                setSortDir((d) =>
+                                  d === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("importTime");
+                                setSortDir("desc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.importTime")}{" "}
+                            {sortKey === "importTime"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
+                          </TableHead>
                         )}
                         {visibleColumns.updatedAt && (
-                          renderSortableAccountHead("updatedAt", t("accounts.updatedAt"))
+                          <TableHead className="text-[13px] font-semibold">
+                            {t("accounts.updatedAt")}
+                          </TableHead>
                         )}
                         {visibleColumns.actions && (
                           <TableHead className="text-[13px] font-semibold text-right">
@@ -4486,18 +4566,6 @@ export default function Accounts() {
                                     variant="outline"
                                     size="icon"
                                     className="h-7 w-8 px-0"
-                                    disabled={copyingIds.has(account.id)}
-                                    onClick={() => void handleCloneAccount(account)}
-                                    title={t("accounts.cloneAccount")}
-                                  >
-                                    <Copy
-                                      className={`size-3.5 ${copyingIds.has(account.id) ? "animate-pulse" : ""}`}
-                                    />
-                                  </Button>
-                                  <Button
-                                    variant="outline"
-                                    size="icon"
-                                    className="h-7 w-8 px-0"
                                     onClick={() => setUsageAccount(account)}
                                     title={t("accounts.usageDetail")}
                                   >
@@ -4511,6 +4579,18 @@ export default function Accounts() {
                                     title={t("accounts.testConnection")}
                                   >
                                     <Zap className="size-3.5" />
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    size="icon"
+                                    className="h-7 w-8 px-0"
+                                    disabled={copyingIds.has(account.id)}
+                                    onClick={() => void handleCloneAccount(account)}
+                                    title={t("accounts.cloneAccount")}
+                                  >
+                                    <Copy
+                                      className={`size-3.5 ${copyingIds.has(account.id) ? "animate-pulse" : ""}`}
+                                    />
                                   </Button>
                                   <Button
                                     variant="outline"
@@ -4665,6 +4745,7 @@ export default function Accounts() {
             contentClassName="sm:max-w-[780px]"
             onClose={() => {
               setShowAdd(false);
+              setAllowDuplicate(false);
               setAddMethod("oauth");
               setOauthStep("generate");
               setOauthSession(null);
@@ -4677,13 +4758,30 @@ export default function Accounts() {
                 proxy_url: "",
               });
               setOpenAIModelDraft("");
+              setSessionJson("");
+              setSessionProxyUrl("");
             }}
             footer={
               <>
+                {(addMethod === "rt" ||
+                  addMethod === "st" ||
+                  addMethod === "at" ||
+                  addMethod === "session") && (
+                  <label className="mr-auto flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      className="size-3.5"
+                      checked={allowDuplicate}
+                      onChange={(e) => setAllowDuplicate(e.target.checked)}
+                    />
+                    {t("accounts.allowDuplicate")}
+                  </label>
+                )}
                 <Button
                   variant="outline"
                   onClick={() => {
                     setShowAdd(false);
+                    setAllowDuplicate(false);
                     setAddMethod("oauth");
                     setOauthStep("generate");
                     setOauthSession(null);
@@ -4696,6 +4794,8 @@ export default function Accounts() {
                       proxy_url: "",
                     });
                     setOpenAIModelDraft("");
+                    setSessionJson("");
+                    setSessionProxyUrl("");
                   }}
                 >
                   {t("common.cancel")}
@@ -4718,6 +4818,13 @@ export default function Accounts() {
                   <Button
                     onClick={() => void handleAddAT()}
                     disabled={submitting || !atForm.access_token.trim()}
+                  >
+                    {submitting ? t("accounts.adding") : t("accounts.submit")}
+                  </Button>
+                ) : addMethod === "session" ? (
+                  <Button
+                    onClick={() => void handleAddSession()}
+                    disabled={importing || submitting || !sessionJson.trim()}
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
@@ -4755,7 +4862,7 @@ export default function Accounts() {
             }
           >
             {/* Tab switcher */}
-            <div className="grid grid-cols-2 sm:grid-cols-5 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
+            <div className="grid grid-cols-3 sm:grid-cols-6 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
               <button
                 onClick={() => {
                   setAddMethod("oauth");
@@ -4804,6 +4911,17 @@ export default function Accounts() {
               >
                 <Fingerprint className="size-3.5" />
                 {t("accounts.addMethodAT")}
+              </button>
+              <button
+                onClick={() => setAddMethod("session")}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "session"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <ExternalLink className="size-3.5" />
+                {t("accounts.addMethodSession")}
               </button>
               <button
                 onClick={() => setAddMethod("openai")}
@@ -4906,6 +5024,32 @@ export default function Accounts() {
                       ...form,
                       proxy_url: value,
                     })),
+                })}
+              </div>
+            ) : addMethod === "session" ? (
+              <div className="space-y-4">
+                <div className="rounded-xl border border-teal-200 bg-teal-50 px-4 py-3 text-sm text-teal-800 dark:border-teal-800 dark:bg-teal-950/50 dark:text-teal-300">
+                  {t("accounts.sessionHint")}
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.sessionJsonLabel")} *
+                  </label>
+                  <textarea
+                    className="w-full min-h-[260px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+                    placeholder={t("accounts.sessionJsonPlaceholder")}
+                    value={sessionJson}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                      setSessionJson(event.target.value)
+                    }
+                    rows={10}
+                  />
+                </div>
+                {renderProxyInput({
+                  value: sessionProxyUrl,
+                  testKey: "add-session-json",
+                  label: t("accounts.importProxyLabel"),
+                  onChange: setSessionProxyUrl,
                 })}
               </div>
             ) : addMethod === "openai" ? (
@@ -5139,8 +5283,32 @@ export default function Accounts() {
             show={showImportPicker}
             title={t("accounts.importTitle")}
             contentClassName="sm:max-w-[640px]"
-            onClose={() => setShowImportPicker(false)}
+            onClose={() => {
+              setShowImportPicker(false);
+              setShowPasteImport(false);
+              setPasteImportText('');
+            }}
           >
+            <div className="mb-4 space-y-1.5">
+              {renderProxyInput({
+                value: importProxyUrl,
+                testKey: "import-batch",
+                label: t("accounts.importProxyLabel"),
+                onChange: setImportProxyUrl,
+              })}
+              <p className="text-[11px] text-muted-foreground">
+                {t("accounts.importProxyHint")}
+              </p>
+              <label className="flex cursor-pointer items-center gap-2 pt-1 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  className="size-3.5"
+                  checked={allowDuplicate}
+                  onChange={(e) => setAllowDuplicate(e.target.checked)}
+                />
+                {t("accounts.allowDuplicate")}
+              </label>
+            </div>
             <div className="grid grid-cols-2 gap-3">
               <button
                 className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
@@ -5227,7 +5395,53 @@ export default function Accounts() {
                   </div>
                 </div>
               </button>
+              <button
+                className="flex items-center gap-3 rounded-xl border border-border px-4 py-3 text-left hover:bg-muted/50 transition-colors"
+                onClick={() => {
+                  setShowPasteImport(true);
+                  setPasteImportText("");
+                }}
+              >
+                <Copy className="size-5 shrink-0 text-muted-foreground" />
+                <div>
+                  <div className="text-sm font-medium">
+                    {t("accounts.importPasteText")}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {t("accounts.importPasteTextDesc")}
+                  </div>
+                </div>
+              </button>
             </div>
+
+            {showPasteImport && (
+              <div className="mt-4 space-y-3">
+                <textarea
+                  className="w-full min-h-[240px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+                  placeholder={t("accounts.sessionJsonPlaceholder")}
+                  value={pasteImportText}
+                  onChange={(e) => setPasteImportText(e.target.value)}
+                  rows={10}
+                />
+                <div className="flex justify-end gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={() => {
+                      setShowPasteImport(false);
+                      setPasteImportText("");
+                    }}
+                  >
+                    {t("common.cancel")}
+                  </Button>
+                  <Button
+                    onClick={() => void handlePasteImport()}
+                    disabled={importing || !pasteImportText.trim()}
+                  >
+                    {t("accounts.submit")}
+                  </Button>
+                </div>
+              </div>
+            )}
           </Modal>
           <Sub2APIImportModal
             show={showSub2APIImport}
@@ -5505,7 +5719,8 @@ export default function Accounts() {
                         (scoreInputInvalid ||
                           concurrencyInputInvalid ||
                           editAutoPause5hThresholdInvalid ||
-                          editAutoPause7dThresholdInvalid)) ||
+                          editAutoPause7dThresholdInvalid ||
+                          editDispatchCountLimitInvalid)) ||
                       openAIAccountInputInvalid
                     }
                   >
@@ -5885,10 +6100,9 @@ export default function Accounts() {
                                         editingAccount,
                                       ),
                                   })}
-                              </div>
                             </div>
-                          )}
-                        </div>
+                          </div>
+                        )}
                       </div>
 
                       <div className="rounded-xl border border-border p-4">
@@ -5915,6 +6129,78 @@ export default function Accounts() {
                               className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${skipWarmTier ? "translate-x-4" : "translate-x-0"}`}
                             />
                           </button>
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4">
+                        <label className="text-sm font-semibold text-foreground">
+                          {t("accounts.priceMultiplierLabel")}
+                        </label>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.priceMultiplierHint")}
+                        </div>
+                        <Input
+                          className="mt-3"
+                          inputMode="decimal"
+                          value={editPriceMultiplierInput}
+                          placeholder={t("accounts.priceMultiplierPlaceholder")}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            setEditPriceMultiplierInput(event.target.value)
+                          }
+                        />
+                        <div
+                          className={`mt-1.5 text-xs ${editPriceMultiplierInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                        >
+                          {editPriceMultiplierInvalid
+                            ? t("accounts.priceMultiplierRange")
+                            : t("accounts.priceMultiplierEmptyHint")}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.dispatchCountLimitTitle")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.dispatchCountLimitHint")}
+                        </div>
+                        <div className="mt-3">
+                          <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
+                            {t("accounts.dispatchCountLimitLabel")}
+                          </label>
+                          <Input
+                            inputMode="numeric"
+                            value={editDispatchCountLimitInput}
+                            placeholder={t(
+                              "accounts.dispatchCountLimitPlaceholder",
+                            )}
+                            onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                              setEditDispatchCountLimitInput(event.target.value)
+                            }
+                          />
+                          <div
+                            className={`mt-1.5 text-xs ${editDispatchCountLimitInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                          >
+                            {editDispatchCountLimitInvalid
+                              ? t("accounts.dispatchCountLimitRange")
+                              : editDispatchCountLimitPreview
+                                ? t("accounts.dispatchCountLimitStatus", {
+                                    used:
+                                      editingAccount.dispatch_count_used ?? 0,
+                                    limit: editDispatchCountLimitPreview,
+                                  })
+                                : t("accounts.dispatchCountLimitDisabled")}
+                          </div>
+                          {editDispatchCountResetTime ? (
+                            <div
+                              className="mt-1 text-xs text-muted-foreground"
+                              title={editDispatchCountResetTime.title}
+                            >
+                              {t("accounts.dispatchCountLimitResetAt", {
+                                time: editDispatchCountResetTime.label,
+                              })}
+                            </div>
+                          ) : null}
                         </div>
                       </div>
 
@@ -5961,166 +6247,6 @@ export default function Accounts() {
                             onDisabledChange={setEditAutoPause7dDisabled}
                           />
                         </div>
-                        <div className="mt-4 rounded-lg border border-border bg-muted/10 p-3">
-                          <div className="flex items-start justify-between gap-4">
-                            <div>
-                              <div className="text-sm font-semibold text-foreground">
-                                {t(
-                                  "accounts.ignoreUsageLimit429Cooldown",
-                                )}
-                              </div>
-                              <div className="mt-1 text-xs text-muted-foreground">
-                                {t(
-                                  "accounts.ignoreUsageLimit429CooldownHint",
-                                )}
-                              </div>
-                            </div>
-                            <button
-                              type="button"
-                              role="switch"
-                              aria-label={t(
-                                "accounts.ignoreUsageLimit429Cooldown",
-                              )}
-                              aria-checked={
-                                editIgnoreUsageLimit429Cooldown
-                              }
-                              onClick={() =>
-                                setEditIgnoreUsageLimit429Cooldown(
-                                  (current) => !current,
-                                )
-                              }
-                              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 ${editIgnoreUsageLimit429Cooldown ? "bg-primary" : "bg-muted"}`}
-                            >
-                              <span
-                                className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${editIgnoreUsageLimit429Cooldown ? "translate-x-4" : "translate-x-0"}`}
-                              />
-                            </button>
-                          </div>
-                        </div>
-                        <div className="mt-3 rounded-lg border border-border bg-muted/10 p-3">
-                          <div className="flex items-start justify-between gap-4">
-                            <div>
-                              <div className="text-sm font-semibold text-foreground">
-                                {t("accounts.ignoreUnauthorizedCooldown")}
-                              </div>
-                              <div className="mt-1 text-xs text-muted-foreground">
-                                {t("accounts.ignoreUnauthorizedCooldownHint")}
-                              </div>
-                            </div>
-                            <button
-                              type="button"
-                              role="switch"
-                              aria-label={t(
-                                "accounts.ignoreUnauthorizedCooldown",
-                              )}
-                              aria-checked={editIgnoreUnauthorizedCooldown}
-                              onClick={() =>
-                                setEditIgnoreUnauthorizedCooldown(
-                                  (current) => !current,
-                                )
-                              }
-                              className={`relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full border-2 border-transparent transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60 focus-visible:ring-offset-2 ${editIgnoreUnauthorizedCooldown ? "bg-primary" : "bg-muted"}`}
-                            >
-                              <span
-                                className={`pointer-events-none block size-4 rounded-full bg-white shadow transition-transform ${editIgnoreUnauthorizedCooldown ? "translate-x-4" : "translate-x-0"}`}
-                              />
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="rounded-xl border border-border p-4">
-                        <label className="text-sm font-semibold text-foreground">
-                          {t("accounts.priceMultiplierLabel")}
-                        </label>
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          {t("accounts.priceMultiplierHint")}
-                        </div>
-                        <Input
-                          className="mt-3"
-                          value={editPriceMultiplierInput}
-                          onChange={(event) =>
-                            setEditPriceMultiplierInput(event.target.value)
-                          }
-                          placeholder={t(
-                            "accounts.priceMultiplierPlaceholder",
-                          )}
-                          inputMode="decimal"
-                        />
-                        <div
-                          className={`mt-1.5 text-xs ${editPriceMultiplierInvalid ? "text-red-500" : "text-muted-foreground"}`}
-                        >
-                          {editPriceMultiplierInvalid
-                            ? t("accounts.priceMultiplierRange")
-                            : t("accounts.priceMultiplierEmptyHint")}
-                        </div>
-                      </div>
-
-                      <div className="rounded-xl border border-border p-4">
-                        <div className="text-sm font-semibold text-foreground">
-                          {t("accounts.cheapProbeAccountOverrides")}
-                        </div>
-                        <div className="mt-1 text-xs text-muted-foreground">
-                          {t("accounts.cheapProbeAccountOverridesHint")}
-                        </div>
-                        <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                          <div>
-                            <label className="text-xs font-medium text-muted-foreground">
-                              {t("accounts.cheapProbeRecoveryMarginLabel")}
-                            </label>
-                            <Input
-                              className="mt-1.5"
-                              type="number"
-                              min={0}
-                              max={10000}
-                              value={editCheapProbeRecoveryMarginInput}
-                              onChange={(event) =>
-                                setEditCheapProbeRecoveryMarginInput(
-                                  event.target.value,
-                                )
-                              }
-                              placeholder={t(
-                                "accounts.cheapProbeRecoveryMarginPlaceholder",
-                              )}
-                              inputMode="decimal"
-                            />
-                            <div
-                              className={`mt-1.5 text-xs ${editCheapProbeRecoveryMarginInvalid ? "text-red-500" : "text-muted-foreground"}`}
-                            >
-                              {editCheapProbeRecoveryMarginInvalid
-                                ? t("accounts.cheapProbeRecoveryMarginRange")
-                                : t("accounts.cheapProbeOverrideEmptyHint")}
-                            </div>
-                          </div>
-                          <div>
-                            <label className="text-xs font-medium text-muted-foreground">
-                              {t("accounts.cheapProbeBonusDurationLabel")}
-                            </label>
-                            <Input
-                              className="mt-1.5"
-                              type="number"
-                              min={1}
-                              max={1440}
-                              value={editCheapProbeBonusDurationInput}
-                              onChange={(event) =>
-                                setEditCheapProbeBonusDurationInput(
-                                  event.target.value,
-                                )
-                              }
-                              placeholder={t(
-                                "accounts.cheapProbeBonusDurationPlaceholder",
-                              )}
-                              inputMode="numeric"
-                            />
-                            <div
-                              className={`mt-1.5 text-xs ${editCheapProbeBonusDurationInvalid ? "text-red-500" : "text-muted-foreground"}`}
-                            >
-                              {editCheapProbeBonusDurationInvalid
-                                ? t("accounts.cheapProbeBonusDurationRange")
-                                : t("accounts.cheapProbeOverrideEmptyHint")}
-                            </div>
-                          </div>
-                        </div>
                       </div>
 
                       <div className="rounded-xl border border-border p-4">
@@ -6157,86 +6283,87 @@ export default function Accounts() {
                           onChange: setEditProxyUrl,
                         })}
                       </div>
+                    </div>
 
-                      <div className="grid gap-4 md:grid-cols-2">
-                        <div className="rounded-xl border border-border p-4">
-                          <div className="text-sm font-semibold text-foreground">
-                            {t("accounts.tagsLabel")}
-                          </div>
-                          <div className="mt-1 text-xs text-muted-foreground">
-                            {t("accounts.tagsHint")}
-                          </div>
-                          <ChipInput
-                            className="mt-3"
-                            value={editTags}
-                            onChange={setEditTags}
-                            placeholder={t("accounts.tagsPlaceholder")}
-                            maxVisible={3}
-                          />
-                        </div>
-
-                        <div className="rounded-xl border border-border p-4">
-                          <div className="flex items-start justify-between gap-3">
-                            <div>
-                              <div className="text-sm font-semibold text-foreground">
-                                {t("accounts.groupsLabel")}
-                              </div>
-                              <div className="mt-1 text-xs text-muted-foreground">
-                                {t("accounts.groupsHint")}
-                              </div>
-                            </div>
-                            <Button
-                              type="button"
-                              variant="outline"
-                              size="xs"
-                              onClick={() => setShowGroupManager(true)}
-                            >
-                              <FolderOpen className="size-3" />
-                              {t("accounts.groupManage")}
-                            </Button>
-                          </div>
-                          <div className="mt-3">
-                            <AccountGroupMultiSelect
-                              groups={allGroups}
-                              value={editGroupIds}
-                              onChange={setEditGroupIds}
-                              allLabel={t("accounts.groupsUnbound")}
-                              selectedLabel={t("accounts.groupsSelected", {
-                                count: editGroupIds.length,
-                              })}
-                              placeholder={t("accounts.groupsPlaceholder")}
-                              emptyLabel={t("accounts.groupsNone")}
-                              emptyHint={t("accounts.groupsSelectHint")}
-                            />
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="rounded-xl border border-border bg-white/60 px-4 py-4 dark:bg-white/5">
+                    <div className="grid gap-4 md:grid-cols-2">
+                      <div className="rounded-xl border border-border p-4">
                         <div className="text-sm font-semibold text-foreground">
-                          {t("accounts.schedulerPreviewTitle")}
+                          {t("accounts.tagsLabel")}
                         </div>
-                        <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-                          <PreviewItem
-                            label={t("accounts.schedulerPreviewRawScore")}
-                            value={String(editPreview.rawScore)}
-                          />
-                          <PreviewItem
-                            label={t("accounts.schedulerPreviewDispatchScore")}
-                            value={String(editPreview.dispatchScore)}
-                          />
-                          <PreviewItem
-                            label={t("accounts.schedulerPreviewHealthTier")}
-                            value={formatHealthTier(editPreview.healthTier, t)}
-                          />
-                          <PreviewItem
-                            label={t(
-                              "accounts.schedulerPreviewDynamicConcurrency",
-                            )}
-                            value={String(editPreview.dynamicConcurrency)}
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.tagsHint")}
+                        </div>
+                        <ChipInput
+                          className="mt-3"
+                          value={editTags}
+                          onChange={setEditTags}
+                          placeholder={t("accounts.tagsPlaceholder")}
+                          maxVisible={3}
+                        />
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4">
+                        <div className="flex items-start justify-between gap-3">
+                          <div>
+                            <div className="text-sm font-semibold text-foreground">
+                              {t("accounts.groupsLabel")}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {t("accounts.groupsHint")}
+                            </div>
+                          </div>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="xs"
+                            onClick={() => setShowGroupManager(true)}
+                          >
+                            <FolderOpen className="size-3" />
+                            {t("accounts.groupManage")}
+                          </Button>
+                        </div>
+                        <div className="mt-3">
+                          <AccountGroupMultiSelect
+                            groups={allGroups}
+                            value={editGroupIds}
+                            onChange={setEditGroupIds}
+                            allLabel={t("accounts.groupsUnbound")}
+                            selectedLabel={t("accounts.groupsSelected", {
+                              count: editGroupIds.length,
+                            })}
+                            placeholder={t("accounts.groupsPlaceholder")}
+                            emptyLabel={t("accounts.groupsNone")}
+                            emptyHint={t("accounts.groupsSelectHint")}
                           />
                         </div>
                       </div>
+                    </div>
+
+                    <div className="rounded-xl border border-border bg-white/60 px-4 py-4 dark:bg-white/5">
+                      <div className="text-sm font-semibold text-foreground">
+                        {t("accounts.schedulerPreviewTitle")}
+                      </div>
+                      <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                        <PreviewItem
+                          label={t("accounts.schedulerPreviewRawScore")}
+                          value={String(editPreview.rawScore)}
+                        />
+                        <PreviewItem
+                          label={t("accounts.schedulerPreviewDispatchScore")}
+                          value={String(editPreview.dispatchScore)}
+                        />
+                        <PreviewItem
+                          label={t("accounts.schedulerPreviewHealthTier")}
+                          value={formatHealthTier(editPreview.healthTier, t)}
+                        />
+                        <PreviewItem
+                          label={t(
+                            "accounts.schedulerPreviewDynamicConcurrency",
+                          )}
+                          value={String(editPreview.dynamicConcurrency)}
+                        />
+                      </div>
+                    </div>
                   </>
                 )}
               </div>
@@ -6669,8 +6796,8 @@ export default function Accounts() {
                   ? `${importProgress.current} / ${importProgress.total}  (${Math.round((importProgress.current / importProgress.total) * 100)}%)`
                   : t("accounts.importPreparing")}
               </div>
-              <div className="grid grid-cols-3 gap-3 text-center">
-                <div className="rounded-xl bg-emerald-500/10 px-3 py-2">
+              <div className="grid grid-cols-4 gap-2 text-center">
+                <div className="rounded-xl bg-emerald-500/10 px-2 py-2">
                   <div className="text-lg font-bold text-emerald-600">
                     {importProgress.success}
                   </div>
@@ -6678,7 +6805,15 @@ export default function Accounts() {
                     {t("accounts.importSuccess")}
                   </div>
                 </div>
-                <div className="rounded-xl bg-amber-500/10 px-3 py-2">
+                <div className="rounded-xl bg-sky-500/10 px-2 py-2">
+                  <div className="text-lg font-bold text-sky-600">
+                    {importProgress.updated}
+                  </div>
+                  <div className="text-[11px] text-muted-foreground">
+                    {t("accounts.importUpdated")}
+                  </div>
+                </div>
+                <div className="rounded-xl bg-amber-500/10 px-2 py-2">
                   <div className="text-lg font-bold text-amber-600">
                     {importProgress.duplicate}
                   </div>
@@ -6686,7 +6821,7 @@ export default function Accounts() {
                     {t("accounts.importDuplicate")}
                   </div>
                 </div>
-                <div className="rounded-xl bg-red-500/10 px-3 py-2">
+                <div className="rounded-xl bg-red-500/10 px-2 py-2">
                   <div className="text-lg font-bold text-red-600">
                     {importProgress.failed}
                   </div>
@@ -7898,10 +8033,19 @@ function isActiveAutoPauseWindowReached(
   return value / 100 >= threshold;
 }
 
+// Plans that carry a rolling 5h usage window (mirrors Go isPremium5hPlan).
+// k12/edu are paid education workspaces with 5h limits (issue #307/#309).
 function isPremiumUsagePlan(planType?: string): boolean {
-  return ["plus", "pro", "team", "teamplus"].includes(
-    normalizePlanType(planType),
-  );
+  return [
+    "plus",
+    "pro",
+    "team",
+    "teamplus",
+    "k12",
+    "edu",
+    "education",
+    "go",
+  ].includes(normalizePlanType(planType));
 }
 
 type RateLimitWindow = "5h" | "7d";
@@ -7915,8 +8059,15 @@ function isUnsampledQuotaAccount(account: AccountRow): boolean {
   if (status === "unauthorized" || account.openai_responses_api) {
     return false;
   }
-  const value = account.usage_percent_7d;
-  return typeof value !== "number" || !Number.isFinite(value);
+  // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样，
+  // 否则这类账号会永远显示"未采样" (issue #282)。
+  const has7d =
+    typeof account.usage_percent_7d === "number" &&
+    Number.isFinite(account.usage_percent_7d);
+  const has5h =
+    typeof account.usage_percent_5h === "number" &&
+    Number.isFinite(account.usage_percent_5h);
+  return !has7d && !has5h;
 }
 
 function getAccountRateLimitWindow(
@@ -8017,6 +8168,8 @@ function isSubscriptionPlan(planType?: string): boolean {
       "business",
       "edu",
       "education",
+      "k12",
+      "go",
     ].includes(normalized)
   ) {
     return true;
@@ -8264,7 +8417,7 @@ function ExpiryBadge({ expiresAt, planType }: { expiresAt?: string; planType?: s
   if (Number.isNaN(timestamp)) return null;
 
   const days = Math.floor((timestamp - Date.now()) / 86_400_000);
-  const localDate = formatDateOnly(timestamp, i18n.language);
+  const localDate = new Date(timestamp).toLocaleDateString(i18n.language);
 
   if (days < 0) {
     return (
@@ -8312,6 +8465,7 @@ function PlanBadge({ planType }: { planType?: string }) {
       "bg-purple-50 text-purple-600 ring-purple-400/25 dark:bg-purple-500/15 dark:text-purple-300 dark:ring-purple-400/25",
     plus: "bg-blue-100 text-blue-700 ring-blue-500/30 dark:bg-blue-500/20 dark:text-blue-300 dark:ring-blue-400/30",
     team: "bg-amber-100 text-amber-700 ring-amber-500/30 dark:bg-amber-500/20 dark:text-amber-300 dark:ring-amber-400/30",
+    k12: "bg-emerald-100 text-emerald-700 ring-emerald-500/30 dark:bg-emerald-500/20 dark:text-emerald-300 dark:ring-emerald-400/30",
     free: "bg-zinc-100 text-zinc-500 ring-zinc-400/20 dark:bg-zinc-500/10 dark:text-zinc-400 dark:ring-zinc-400/15",
   };
 
@@ -8337,6 +8491,7 @@ function getDefaultScoreBias(planType?: string): number {
     case "pro":
     case "plus":
     case "team":
+    case "k12":
       return 50;
     default:
       return 0;
@@ -8704,8 +8859,8 @@ function AccountMobileCard({
   showEmailDomainTags,
   healthBuckets,
   refreshing,
-  copying,
   authJsonExporting,
+  copying,
   variant = "mobile",
   t,
   onToggleSelect,
@@ -8730,8 +8885,8 @@ function AccountMobileCard({
   showEmailDomainTags: boolean;
   healthBuckets: AccountHealthBucket[] | undefined;
   refreshing: boolean;
-  copying: boolean;
   authJsonExporting: boolean;
+  copying: boolean;
   variant?: "mobile" | "personal";
   t: ReturnType<typeof useTranslation>["t"];
   onToggleSelect: () => void;
@@ -9037,9 +9192,7 @@ function AccountMobileCard({
               disabled={copying}
               onClick={onClone}
               icon={
-                <Copy
-                  className={`size-3.5 ${copying ? "animate-pulse" : ""}`}
-                />
+                <Copy className={`size-3.5 ${copying ? "animate-pulse" : ""}`} />
               }
             />
             <AccountMobileActionButton
@@ -9344,9 +9497,7 @@ function AccountMobileCard({
           title={t("accounts.cloneAccount")}
           disabled={copying}
           onClick={onClone}
-          icon={
-            <Copy className={`size-3.5 ${copying ? "animate-pulse" : ""}`} />
-          }
+          icon={<Copy className={`size-3.5 ${copying ? "animate-pulse" : ""}`} />}
         />
         <AccountMobileActionButton
           title={
@@ -10210,11 +10361,7 @@ function UsageCell({
   const fiveHourPresent = has5h || has5hDetail || has5hReset;
   const sevenDayPresent = has7d || has7dDetail || has7dReset;
   // plan 表明是订阅型时,即使数据暂未拉到也按订阅布局占位,避免抖动
-  const planSuggestsPremium =
-    plan === "pro" ||
-    plan === "team" ||
-    plan === "plus" ||
-    plan === "teamplus";
+  const planSuggestsPremium = isPremiumUsagePlan(plan);
   const showFiveHour = fiveHourPresent || planSuggestsPremium;
 
   if (showFiveHour) {
