@@ -9,6 +9,7 @@
 
 ### Fixes
 
+- **修正 remote compaction v2 在纯中转账号池中被错误降级到旧 compact 链路的问题。** 撤销上游 v2.4.7 将带 `compaction_trigger` 的普通 `/v1/responses` 请求提升到 `/v1/responses/compact` 的兼容逻辑；现在官方账号和 OpenAI Responses 中转账号都会保留原始请求路径、`stream=true` 与 `compaction` SSE 输出项，不再派生或请求 `gpt-5.5-openai-compact`。只有客户端显式调用 `/v1/responses/compact` 时才进入旧压缩链路。
 - **修正“忽略所有失败冷却”可能长期反复选择故障账号的问题。** 原开关改为有界连续失败容错，不再永久屏蔽冷却；在保留不稳定低价账号容错能力的同时，持续故障达到阈值后仍会正常进入冷却。
 - **保持失败请求自动换号。** 容错阈值只延迟调度惩罚和跨请求持久冷却，不影响请求内排除、重试和账号轮换。
 
