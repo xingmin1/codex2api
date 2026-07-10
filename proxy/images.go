@@ -1271,13 +1271,46 @@ func imagePreferredAccountFilter(account *auth.Account) bool {
 	return auth.IsPlusOrHigherPlan(account.GetPlanType())
 }
 
+func resolveImageAccountModel(account *auth.Account, model string) (string, bool) {
+	if account == nil {
+		return "", false
+	}
+	if !account.IsOpenAIResponsesAPI() {
+		return model, true
+	}
+	toolModel, _ := normalizeImageToolModelForPrompt(model, "")
+	for _, candidate := range []string{model, toolModel} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if mappedModel, ok := resolveAccountModelMapping(account, candidate); ok {
+			return mappedModel, true
+		}
+		if account.SupportsOpenAIResponsesModel(candidate) {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func imageAccountSupportsModel(account *auth.Account, model string) bool {
+	_, ok := resolveImageAccountModel(account, model)
+	return ok
+}
+
 func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool, model string) (*auth.Account, string) {
-	preferredFilter := h.withModelCooldownFilter(model, imagePreferredAccountFilter)
+	eligibleFilter := func(account *auth.Account) bool {
+		return imageAccountSupportsModel(account, model)
+	}
+	preferredFilter := h.withModelCooldownFilter(model, func(account *auth.Account) bool {
+		return eligibleFilter(account) && (account.IsOpenAIResponsesAPI() || imagePreferredAccountFilter(account))
+	})
 	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, preferredFilter)
 	if account != nil {
 		return account, stickyProxyURL
 	}
-	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, nil))
+	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, eligibleFilter))
 }
 
 func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel, logModel, logEffectiveModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
@@ -1296,6 +1329,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
+	var lastRequestErr error
 	excludeAccounts := make(map[int64]bool)
 
 	// 仅在 response_format=url 且配置了云存储时启用：上传图片到对象存储、
@@ -1312,10 +1346,17 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts, requestModel)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.withModelCooldownFilter(requestModel, nil))
+			eligibleFilter := func(candidate *auth.Account) bool {
+				return imageAccountSupportsModel(candidate, requestModel)
+			}
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.withModelCooldownFilter(requestModel, eligibleFilter))
 			if account == nil {
-				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+				if lastStatusCode > 0 && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
+				if lastRequestErr != nil {
+					ErrorToGinResponse(c, lastRequestErr)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
@@ -1331,9 +1372,29 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 		}
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), false)
+		downstreamHeaders := c.Request.Header.Clone()
+		attemptLogEffectiveModel := logEffectiveModel
+		upstreamEndpoint := "/v1/responses"
+		var resp *http.Response
+		var reqErr error
+		if account.IsOpenAIResponsesAPI() {
+			baseURL, _ := account.OpenAIResponsesCredentials()
+			upstreamEndpoint = auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
+			upstreamBody := PrepareOpenAIResponsesBody(responsesBody)
+			if relayModel, ok := resolveImageAccountModel(account, requestModel); ok {
+				if mappedBody, err := sjson.SetBytes(upstreamBody, "model", relayModel); err == nil {
+					upstreamBody = mappedBody
+					attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, relayModel, !strings.EqualFold(logModel, relayModel))
+				}
+			}
+			resp, reqErr = ExecuteOpenAIResponsesRequest(c.Request.Context(), account, upstreamBody, proxyURL, downstreamHeaders)
+		} else {
+			resp, reqErr = ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, downstreamHeaders, false)
+		}
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
+			lastRequestErr = reqErr
+			log.Printf("图像请求上游连接失败: endpoint=%s model=%s account=%d relay=%t error=%v", inboundEndpoint, logModel, account.ID(), account.IsOpenAIResponsesAPI(), reqErr)
 			if kind := classifyTransportFailure(reqErr); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -1351,6 +1412,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			lastRequestErr = nil
 			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -1371,11 +1433,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				AccountID:         account.ID(),
 				Endpoint:          inboundEndpoint,
 				Model:             logModel,
-				EffectiveModel:    logEffectiveModel,
+				EffectiveModel:    attemptLogEffectiveModel,
 				StatusCode:        resp.StatusCode,
 				DurationMs:        durationMs,
 				InboundEndpoint:   inboundEndpoint,
-				UpstreamEndpoint:  "/v1/responses",
+				UpstreamEndpoint:  upstreamEndpoint,
 				Stream:            stream,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
@@ -1419,7 +1481,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts)
 				// Always record the failed attempt so it appears in usage stats,
 				// matching the chat completions error path.
-				h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
+				h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, attemptLogEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
 				if willRetry {
 					lastStatusCode = http.StatusBadGateway
 					lastBody = []byte(readErr.Error())
@@ -1442,7 +1504,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			// Only retry when nothing has been written to the client yet.
 			willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) && !c.Writer.Written()
 			// Always record the failed attempt so it appears in usage stats.
-			h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
+			h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, attemptLogEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
 			if willRetry {
 				lastStatusCode = statusCode
 				lastBody = []byte(readErr.Error())
@@ -1458,12 +1520,12 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			AccountID:        account.ID(),
 			Endpoint:         inboundEndpoint,
 			Model:            logModel,
-			EffectiveModel:   logEffectiveModel,
+			EffectiveModel:   attemptLogEffectiveModel,
 			StatusCode:       statusCode,
 			DurationMs:       int(time.Since(start).Milliseconds()),
 			FirstTokenMs:     firstTokenMs,
 			InboundEndpoint:  inboundEndpoint,
-			UpstreamEndpoint: "/v1/responses",
+			UpstreamEndpoint: upstreamEndpoint,
 			Stream:           stream,
 		}
 		if usage != nil {
@@ -1493,6 +1555,10 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	// Exhausted all attempts.
 	if lastStatusCode > 0 && len(lastBody) > 0 {
 		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+		return
+	}
+	if lastRequestErr != nil {
+		ErrorToGinResponse(c, lastRequestErr)
 		return
 	}
 	c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))

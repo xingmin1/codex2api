@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -400,6 +401,133 @@ func TestNextImageAccountFallsBackToFreeWhenNoPaidAccountAvailable(t *testing.T)
 
 	if account.DBID != 1 {
 		t.Fatalf("nextImageAccount picked account %d, want fallback free account 1", account.DBID)
+	}
+}
+
+func TestNextImageAccountSkipsRelayWithoutImageModel(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://text.example.com",
+		APIKey:       "text-token",
+		Models:       []string{"gpt-5.4"},
+		PlanType:     "api",
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         2,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://image.example.com",
+		APIKey:       "image-token",
+		Models:       []string{"gpt-image-2"},
+		PlanType:     "api",
+	})
+	handler := &Handler{store: store}
+
+	account, _ := handler.nextImageAccount(0, nil, "gpt-image-2-2k")
+	if account == nil {
+		t.Fatal("nextImageAccount returned nil")
+	}
+	defer store.Release(account)
+
+	if account.DBID != 2 {
+		t.Fatalf("nextImageAccount picked account %d, want image relay account 2", account.DBID)
+	}
+}
+
+func TestImagesGenerationsUsesOpenAIResponsesAPIAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenPath string
+	var seenAuth string
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenAuth = r.Header.Get("Authorization")
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"created_at":1710000000,"usage":{"input_tokens":5,"output_tokens":9},"tool_usage":{"image_gen":{"images":1,"input_tokens":34,"output_tokens":1756}},"tools":[{"type":"image_generation","model":"gpt-image-2","output_format":"png","quality":"high","size":"1024x1024"}],"output":[{"type":"image_generation_call","result":"`+tinyPNGBase64+`","revised_prompt":"draw a cat","output_format":"png"}]}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          0,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "relay-image-token",
+		Models:       []string{"gpt-image-2"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw a cat","response_format":"b64_json"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Request.Header.Set("Authorization", "Bearer downstream-token")
+
+	handler.ImagesGenerations(c)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses", seenPath)
+	}
+	if seenAuth != "Bearer relay-image-token" {
+		t.Fatalf("upstream authorization = %q", seenAuth)
+	}
+	if got := gjson.GetBytes(seenBody, "model").String(); got != "gpt-image-2" {
+		t.Fatalf("upstream model = %q, want gpt-image-2; body=%s", got, seenBody)
+	}
+	if got := gjson.GetBytes(seenBody, "tools.0.model").String(); got != "gpt-image-2" {
+		t.Fatalf("image tool model = %q, want gpt-image-2; body=%s", got, seenBody)
+	}
+	if got := gjson.Get(recorder.Body.String(), "data.0.b64_json").String(); got != tinyPNGBase64 {
+		t.Fatalf("response image = %q, want tiny PNG", got)
+	}
+}
+
+func TestImagesGenerationsPreservesOpenAIResponsesUpstreamError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"error":{"message":"relay image unavailable","type":"upstream_error"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          5,
+		MaxRateLimitRetries: 5,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "relay-image-token",
+		Models:       []string{"gpt-image-2"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"draw a cat"}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	handler.ImagesGenerations(c)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "relay image unavailable") {
+		t.Fatalf("body = %s, want real upstream error", recorder.Body.String())
 	}
 }
 
