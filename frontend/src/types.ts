@@ -1,4 +1,4 @@
-export type ToastType = 'success' | 'error'
+export type ToastType = 'success' | 'error' | 'warning' | 'info'
 export type ISODateString = string
 
 export interface ToastState {
@@ -39,6 +39,8 @@ export interface AccountRow {
   openai_responses_api?: boolean
   base_url?: string
   models?: string[]
+  model_mapping?: string
+  custom_headers?: Record<string, string> | null
   health_tier?: string
   scheduler_score?: number
   dispatch_score?: number
@@ -90,6 +92,11 @@ export interface AccountRow {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
+  failure_score_threshold?: number | null
+  failure_cooldown_threshold?: number | null
+  failure_score_threshold_effective?: number
+  failure_cooldown_threshold_effective?: number
+  consecutive_failure_count?: number
   price_multiplier?: number | null
   cheap_probe_recovery_margin?: number | null
   cheap_probe_bonus_duration_minutes?: number | null
@@ -106,6 +113,10 @@ export interface AccountRow {
   usage_7d_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
+  // 长窗口(7d 槽)真实类型: "monthly"(free/team 月窗)/"weekly"/未知。
+  // free/team plan 的长窗口实为约 30 天,标签应显示 30d 而非 7d (issue #324)。
+  usage_window_7d_kind?: 'monthly' | 'weekly' | ''
+  usage_window_7d_seconds?: number
   billed_5h?: number
   billed_7d?: number
   cooldown_until?: ISODateString
@@ -128,6 +139,18 @@ export interface AccountRow {
 }
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
+
+// 单张「主动重置次数」券的有效期明细（issue #322）。
+export interface ResetCreditItem {
+  id: string
+  granted_at?: ISODateString
+  expires_at: ISODateString
+}
+
+export interface ResetCreditsDetailResponse {
+  available_count: number
+  credits: ResetCreditItem[]
+}
 
 // AccountHealthBucket 是「健康状态」条单个时间窗口内的请求成败计数。
 export interface AccountHealthBucket {
@@ -189,6 +212,7 @@ export interface AddAccountRequest {
   session_token?: string
   proxy_url: string
   allow_duplicate?: boolean
+  custom_headers?: Record<string, string> | null
 }
 
 export interface AddATAccountRequest {
@@ -196,6 +220,7 @@ export interface AddATAccountRequest {
   access_token: string
   proxy_url: string
   allow_duplicate?: boolean
+  custom_headers?: Record<string, string> | null
 }
 
 export interface AddOpenAIResponsesAccountRequest {
@@ -203,7 +228,9 @@ export interface AddOpenAIResponsesAccountRequest {
   base_url: string
   api_key: string
   models: string[]
+  model_mapping?: string
   proxy_url: string
+  custom_headers?: Record<string, string> | null
 }
 
 export interface UpdateOpenAIResponsesAccountRequest {
@@ -211,7 +238,9 @@ export interface UpdateOpenAIResponsesAccountRequest {
   base_url: string
   api_key?: string
   models: string[]
+  model_mapping?: string
   proxy_url: string
+  custom_headers?: Record<string, string> | null
 }
 
 export interface FetchOpenAIResponsesModelsRequest {
@@ -244,10 +273,13 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
+  failure_score_threshold?: number | null
+  failure_cooldown_threshold?: number | null
   price_multiplier?: number | null
   cheap_probe_recovery_margin?: number | null
   cheap_probe_bonus_duration_minutes?: number | null
   dispatch_count_limit?: number | null
+  custom_headers?: Record<string, string> | null
 }
 
 export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
@@ -348,6 +380,30 @@ export interface AccountUsageDetail {
 
 export interface MessageResponse {
   message: string
+}
+
+export interface SystemUpdateInfo {
+  current_version: string
+  latest_version: string
+  has_update: boolean
+  supported: boolean
+  unsupported_reason?: string
+  runtime_os: string
+  runtime_arch: string
+  mode: string
+  release_url?: string
+  asset_name?: string
+  published_at?: string
+  warning?: string
+}
+
+export interface SystemUpdateResult extends MessageResponse {
+  current_version: string
+  latest_version: string
+  need_restart: boolean
+  restarting: boolean
+  mode: string
+  backup_path?: string
 }
 
 export interface CreateAccountResponse extends MessageResponse {
@@ -558,6 +614,7 @@ export interface SystemSettings {
   max_concurrency: number
   global_rpm: number
   test_model: string
+  test_content: string
   test_concurrency: number
   background_refresh_interval_minutes: number
   usage_probe_max_age_minutes: number
@@ -575,6 +632,8 @@ export interface SystemSettings {
   cheap_probe_rank_min_interval_seconds: number
   cheap_probe_max_multiplier: number
   dispatch_max_multiplier: number
+  failure_score_threshold: number
+  failure_cooldown_threshold: number
   lazy_mode: boolean
   proxy_url?: string
   pg_max_conns: number
@@ -595,10 +654,14 @@ export interface SystemSettings {
   codex_ws_hide_upstream_errors: boolean
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
+  codex_continue_thinking_enabled: boolean
+  codex_continue_max_rounds: number
   scheduler_mode: string
   affinity_mode?: string
   max_retries: number
   max_rate_limit_retries: number
+  retry_interval_ms: number
+  transport_retry_policy: string
   allow_remote_migration: boolean
   database_driver: string
   database_label: string
@@ -1029,6 +1092,7 @@ export interface APIKeyRow {
   allowed_group_ids?: number[]
   limits?: APIKeyLimits
   window_usage?: APIKeyWindowUsage
+  last_used_at?: ISODateString | null
   created_at: ISODateString
 }
 

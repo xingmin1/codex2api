@@ -30,13 +30,14 @@ in
     inherit version;
 
     src = ./.;
-    vendorHash = "sha256-KRYNXBPTrOHCm+XTdvCSOLyaZEh3Vr4O7F55IjyMUN4=";
+    vendorHash = "sha256-y1pBdd3V8LVXoootXyWCvm78p+H00H+tEAlFqMYDfrI=";
     subPackages = ["."];
 
-    # 当前 nixpkgs 的 go_1_26 还是 1.26.3；只在 Nix 构建副本里放宽补丁级 toolchain 要求。
-    postPatch = lib.optionalString (lib.versionOlder go.version "1.26.4") ''
+    # nixpkgs 的 Go 补丁版本可能暂时落后于上游 go.mod；仅在 Nix 构建副本中
+    # 对齐到实际构建器版本，避免发布源代码的 toolchain 声明被本地打包需求反向修改。
+    postPatch = lib.optionalString (lib.versionOlder go.version "1.26.5") ''
       substituteInPlace go.mod \
-        --replace-fail 'go 1.26.4' 'go 1.26.3'
+        --replace-fail 'go 1.26.5' 'go ${go.version}'
     '';
 
     ldflags = [

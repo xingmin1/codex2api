@@ -128,6 +128,9 @@ func newCodexStandardTransport(proxyURL string) http.RoundTripper {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConnsPerHost = 4
 	transport.IdleConnTimeout = 90 * time.Second
+	// 兜住"连接建立后上游迟迟不回响应头"的假死场景。响应头（含 SSE 的
+	// 200 头）在正常情况下远早于首 token 到达，5 分钟已非常宽裕。
+	transport.ResponseHeaderTimeout = 5 * time.Minute
 	if transport.TLSClientConfig == nil {
 		transport.TLSClientConfig = &tls.Config{}
 	}
@@ -210,7 +213,12 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 	entry := &poolEntry{
 		client: &http.Client{
 			Transport: transport,
-			Timeout:   10 * time.Minute,
+			// 不设整体超时：http.Client.Timeout 覆盖包括读响应体在内的完整
+			// 生命周期，流式回答超过上限会在数据正常传输中被切断（issue #287，
+			// 复杂任务单回合可超过 10 分钟）。生命周期由请求 context 控制
+			// （下游断开即取消），假死场景由拨号超时 + ResponseHeaderTimeout
+			// + 流层断流检测兜底，与 uTLS 路径(NewUTLSHttpClient)语义一致。
+			Timeout: 0,
 		},
 	}
 	entry.touch()
@@ -655,6 +663,19 @@ func applyCodexAllowedForwardHeaders(req *http.Request, downstreamHeaders http.H
 	}
 }
 
+func applyAccountCustomHeaders(req *http.Request, account *auth.Account) {
+	if req == nil || account == nil {
+		return
+	}
+	for name, value := range account.GetCustomHeaders() {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		req.Header.Set(name, value)
+	}
+}
+
 func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessToken, cacheKey, apiKey string, deviceCfg *DeviceProfileConfig, downstreamHeaders http.Header) {
 	if req == nil {
 		return
@@ -690,6 +711,7 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 		req.Header.Set("Session_id", cacheKey)
 		req.Header.Del("Conversation_id")
 	}
+	applyAccountCustomHeaders(req, account)
 }
 
 func applyOpenAIResponsesRequestHeaders(req *http.Request, account *auth.Account, apiKey string, headers http.Header) {
@@ -711,6 +733,7 @@ func applyOpenAIResponsesRequestHeaders(req *http.Request, account *auth.Account
 			}
 		}
 	}
+	applyAccountCustomHeaders(req, account)
 }
 
 // ResolveSessionID 从下游请求提取或生成 session ID
@@ -719,10 +742,20 @@ func applyOpenAIResponsesRequestHeaders(req *http.Request, account *auth.Account
 //  2. Header: Conversation_id
 //  3. Header: Idempotency-Key
 //  4. Body:   prompt_cache_key
-//  5. 基于 Bearer API Key 的确定性 UUID
+//  5. Body:   内容派生种子（model+instructions+system+首条 user 消息，见
+//     deriveContentSessionSeed；带 previous_response_id 的续链请求跳过）
+//  6. 基于 Bearer API Key 的确定性 UUID
+//
+// 第 5 级让"同一段对话的多轮请求"收敛到同一账号粘性键：单 API Key 供多终端
+// 用户共用时，粘性粒度从"整个 Key 挤一个账号"细化为"每段对话独立粘定"。
+// 该值只参与本地路由（affinityKey），默认隔离模式下不发往上游。
 func ResolveSessionID(headers http.Header, body []byte) string {
 	if explicit := ResolveExplicitSessionID(headers, body); explicit != "" {
 		return explicit
+	}
+
+	if seed := deriveContentSessionSeed(body); seed != "" {
+		return seed
 	}
 
 	// 基于下游用户的 API Key 生成确定性 cache key（参考 CLIProxyAPI codex_executor.go:621）
