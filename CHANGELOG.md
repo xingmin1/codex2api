@@ -1,5 +1,35 @@
 # Changelog
 
+## v2.4.9-xmin.1 - 2026-07-10
+
+### Features
+
+- **合并官方 v2.4.9 及后续主线更新。** 纳入 Codex CLI 版本自动同步、`gpt-5.6` 的 `max` 思考强度、API Key 禁止生图、模型清单过滤、Sol/Terra/Luna 独立计费和 WebSocket 50 分钟主动轮转，同时保留便宜账号探测、失败双阈值容错、长压缩账号池、账号排序复制和 Nix 发布链路。
+
+### Fixes
+
+- **修正 remote compaction v2 在中转账号池中被错误降级的问题。** 带 `compaction_trigger` 的普通 `/v1/responses` 请求现在保持原始路径、`stream=true`、`client_metadata` 和 compaction SSE 输出；只有客户端显式调用 `/v1/responses/compact` 时才进入旧压缩链路。
+- **保留 collaboration 工具和新输入类型。** 上游新增的 `collaboration.*` 工具透传、`agent_message` 输入支持以及显式 compact 的 `client_metadata` 清理均与本地 compact 语义兼容。
+
+## v2.4.9 - 2026-07-10
+
+### Fixes
+
+- **保留 `collaboration.*` 工具定义原样透传。** 避免通用 schema 清洗改写保留工具并导致 gpt-5.6 多代理请求被上游拒绝。
+
+## v2.4.8 - 2026-07-10
+
+### Features
+
+- **Codex 客户端模拟版本自动同步。** 支持手动同步、定时同步和可配置同步间隔。
+- **`gpt-5.6+` 支持 `reasoning.effort=max`。** 旧模型仍回落到 `xhigh`。
+
+### Fixes
+
+- **内置 Codex CLI 指纹升级到 `0.144.1`。**
+- **允许 `agent_message` 输入项。**
+- **显式 compact 请求剥除不受支持的 `client_metadata`。**
+
 ## v2.4.7-xmin.1 - 2026-07-10
 
 ### Features
@@ -9,7 +39,6 @@
 
 ### Fixes
 
-- **修正 remote compaction v2 在纯中转账号池中被错误降级到旧 compact 链路的问题。** 撤销上游 v2.4.7 将带 `compaction_trigger` 的普通 `/v1/responses` 请求提升到 `/v1/responses/compact` 的兼容逻辑；现在官方账号和 OpenAI Responses 中转账号都会保留原始请求路径、`stream=true` 与 `compaction` SSE 输出项，不再派生或请求 `gpt-5.5-openai-compact`。只有客户端显式调用 `/v1/responses/compact` 时才进入旧压缩链路。
 - **修正“忽略所有失败冷却”可能长期反复选择故障账号的问题。** 原开关改为有界连续失败容错，不再永久屏蔽冷却；在保留不稳定低价账号容错能力的同时，持续故障达到阈值后仍会正常进入冷却。
 - **保持失败请求自动换号。** 容错阈值只延迟调度惩罚和跨请求持久冷却，不影响请求内排除、重试和账号轮换。
 

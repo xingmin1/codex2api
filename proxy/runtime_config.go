@@ -69,6 +69,13 @@ type RuntimeSettings struct {
 	CodexContinueMaxRounds int // 单次请求最大续想轮数，含首轮（默认 8，范围 1-32）
 	// RequestIsolationMode 控制无显式会话请求的上游身份隔离粒度（isolated|per-api-key，默认 isolated）。
 	RequestIsolationMode string
+	// CodexSyncedCLIVersion 是从 openai/codex releases 同步到的最新 Codex CLI 版本；
+	// 用于抬升出站 UA / manifest 的模拟版本，绝不低于内置常量，空表示未同步。
+	CodexSyncedCLIVersion string
+	// CodexCLIVersionSyncEnabled 控制后台定时同步 Codex CLI 版本（默认 true）。
+	CodexCLIVersionSyncEnabled bool
+	// CodexCLIVersionSyncIntervalHours 定时同步间隔（小时，默认 12，范围 1-720）。
+	CodexCLIVersionSyncIntervalHours int
 }
 
 // IsolateRequestsByDefault 返回是否对无显式会话的请求默认按每请求隔离上游身份。
@@ -98,6 +105,8 @@ func DefaultRuntimeSettings() RuntimeSettings {
 		CodexWSSilentRetries:   defaultCodexWSSilentRetries,
 		CodexContinueMaxRounds: defaultCodexContinueMaxRounds,
 		RequestIsolationMode:   defaultRequestIsolationMode(),
+		CodexCLIVersionSyncEnabled:       true,
+		CodexCLIVersionSyncIntervalHours: 12,
 	}
 }
 
@@ -225,6 +234,9 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.CodexWSSilentRetries = settings.CodexWSSilentMaxRetries
 		next.CodexContinueThinking = settings.CodexContinueThinkingEnabled
 		next.CodexContinueMaxRounds = settings.CodexContinueMaxRounds
+		next.CodexSyncedCLIVersion = settings.CodexSyncedCLIVersion
+		next.CodexCLIVersionSyncEnabled = settings.CodexCLIVersionSyncEnabled
+		next.CodexCLIVersionSyncIntervalHours = settings.CodexCLIVersionSyncIntervalHours
 	}
 	next = NormalizeRuntimeSettings(next)
 	runtimeSettings.Store(next)

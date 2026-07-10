@@ -692,6 +692,9 @@ export interface SystemSettings {
   prompt_filter_review_fail_closed: boolean
   client_compat_mode: 'preserve' | 'auto' | 'force' | string
   codex_min_cli_version: string
+  codex_cli_version_sync_enabled: boolean
+  codex_cli_version_sync_interval_hours: number
+  codex_synced_cli_version?: string
   codex_user_agent_config: string
   usage_log_mode: 'full' | 'errors' | 'off' | string
   usage_log_batch_size: number
@@ -1066,6 +1069,7 @@ export interface APIKeyLimits {
   token_limit_5h?: number
   token_limit_7d?: number
   token_limit_30d?: number
+  disable_image_generation?: boolean
 }
 
 export interface APIKeyWindowUsage {
