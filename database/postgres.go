@@ -868,6 +868,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_synced_cli_version TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_cli_version_sync_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS codex_cli_version_sync_interval_hours INT DEFAULT 12;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_pricing_overrides TEXT DEFAULT '{}';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS model_pricing_sync_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_pause_5h_guard_band_percent DOUBLE PRECISION DEFAULT 5;
@@ -877,6 +879,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_windows TEXT DEFAULT '5h,7d';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS retry_interval_ms INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'rotate';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_5h_threshold DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS auto_pause_7d_threshold DOUBLE PRECISION DEFAULT 0;
@@ -1513,6 +1516,7 @@ type SystemSettings struct {
 	SmartPacingEnabled                 bool   // issue #312 智能配速总开关
 	SmartPacingMinConcurrency          int    // 配速并发下限
 	SmartPacingWindows                 string // "5h,7d" / "5h" / "7d"
+	IgnoreUsageLimitStatus             bool   // 用量窗口仅作参考，以 Responses 成功/usage_limit_reached 判定可用性
 	RetryIntervalMS                    int    // 重试间隔毫秒（0 = 立即重试，保持旧行为）
 	TransportRetryPolicy               string // 传输错误重试策略: rotate（换号，旧行为）/ sticky（同号延迟重试）
 	// CodexSyncedCLIVersion 是从 openai/codex releases 同步到的最新 Codex CLI 版本缓存，
@@ -1522,6 +1526,11 @@ type SystemSettings struct {
 	CodexCLIVersionSyncEnabled bool
 	// CodexCLIVersionSyncIntervalHours 是定时同步间隔（小时，默认 12，范围 1-720）。
 	CodexCLIVersionSyncIntervalHours int
+	// ModelPricingOverrides 是模型定价覆盖 JSON（model → ModelPricingOverride），
+	// custom/synced 覆盖代码默认；空为 "{}"。
+	ModelPricingOverrides string
+	// ModelPricingSyncURL 是「从 JSON URL 同步定价」的来源地址，空时用内置默认。
+	ModelPricingSyncURL string
 }
 
 func normalizeBillingTierPolicy(policy string) string {
@@ -1665,7 +1674,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(failure_cooldown_threshold, 10),
 			       COALESCE(codex_synced_cli_version, ''),
 			       COALESCE(codex_cli_version_sync_enabled, true),
-			       COALESCE(codex_cli_version_sync_interval_hours, 12)
+			       COALESCE(codex_cli_version_sync_interval_hours, 12),
+			       COALESCE(model_pricing_overrides, '{}'),
+			       COALESCE(model_pricing_sync_url, ''),
+			       COALESCE(ignore_usage_limit_status, false)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1717,6 +1729,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexSyncedCLIVersion,
 		&s.CodexCLIVersionSyncEnabled,
 		&s.CodexCLIVersionSyncIntervalHours,
+		&s.ModelPricingOverrides,
+		&s.ModelPricingSyncURL,
+		&s.IgnoreUsageLimitStatus,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1732,6 +1747,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	}
 	if strings.TrimSpace(s.CodexUserAgentConfig) == "" {
 		s.CodexUserAgentConfig = "{}"
+	}
+	if strings.TrimSpace(s.ModelPricingOverrides) == "" {
+		s.ModelPricingOverrides = "{}"
 	}
 	s.FirstTokenMode = normalizeFirstTokenMode(s.FirstTokenMode)
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
@@ -1805,9 +1823,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					failure_cooldown_threshold,
 					codex_synced_cli_version,
 					codex_cli_version_sync_enabled,
-					codex_cli_version_sync_interval_hours
+					codex_cli_version_sync_interval_hours,
+					model_pricing_overrides,
+					model_pricing_sync_url,
+					ignore_usage_limit_status
 					)
-					VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97)
+					VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1905,7 +1926,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					failure_cooldown_threshold = EXCLUDED.failure_cooldown_threshold,
 					codex_synced_cli_version = EXCLUDED.codex_synced_cli_version,
 					codex_cli_version_sync_enabled = EXCLUDED.codex_cli_version_sync_enabled,
-					codex_cli_version_sync_interval_hours = EXCLUDED.codex_cli_version_sync_interval_hours
+					codex_cli_version_sync_interval_hours = EXCLUDED.codex_cli_version_sync_interval_hours,
+					model_pricing_overrides = EXCLUDED.model_pricing_overrides,
+					model_pricing_sync_url = EXCLUDED.model_pricing_sync_url,
+					ignore_usage_limit_status = EXCLUDED.ignore_usage_limit_status
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1932,7 +1956,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		normalizeFailureToleranceThresholdDB(s.FailureScoreThreshold, 3),
 		normalizeFailureToleranceThresholdDB(s.FailureCooldownThreshold, 10),
 		strings.TrimSpace(s.CodexSyncedCLIVersion),
-		s.CodexCLIVersionSyncEnabled, NormalizeCodexCLIVersionSyncIntervalHours(s.CodexCLIVersionSyncIntervalHours))
+		s.CodexCLIVersionSyncEnabled, NormalizeCodexCLIVersionSyncIntervalHours(s.CodexCLIVersionSyncIntervalHours),
+		normalizeModelPricingOverridesJSON(s.ModelPricingOverrides), strings.TrimSpace(s.ModelPricingSyncURL),
+		s.IgnoreUsageLimitStatus)
 	return err
 }
 
@@ -1949,7 +1975,19 @@ func normalizeFailureToleranceThresholdDB(value, fallback int) int {
 	return value
 }
 
-// NormalizeCodexCLIVersionSyncIntervalHours 把定时同步间隔（小时）限制在 1-720，非正值回落到默认值 12。
+// normalizeModelPricingOverridesJSON 空/非法 JSON 归一为 "{}"。
+func normalizeModelPricingOverridesJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "{}"
+	}
+	if _, err := ParseModelPricingOverridesJSON(s); err != nil {
+		return "{}"
+	}
+	return s
+}
+
+// NormalizeCodexCLIVersionSyncIntervalHours 把定时同步间隔(小时)限制在 1-720，非正值回落默认 12。
 func NormalizeCodexCLIVersionSyncIntervalHours(hours int) int {
 	if hours <= 0 {
 		return 12

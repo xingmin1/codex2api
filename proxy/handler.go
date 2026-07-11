@@ -151,15 +151,16 @@ type usageLimitDetails struct {
 }
 
 type CodexUsageSyncResult struct {
-	UsagePct7d           float64
-	HasUsage7d           bool
-	Usage7dRateLimited   bool
-	UsagePct5h           float64
-	Reset5hAt            time.Time
-	HasUsage5h           bool
-	Used5hHeaders        bool
-	Persisted5hOnly      bool
-	Premium5hRateLimited bool
+	UsagePct7d               float64
+	HasUsage7d               bool
+	Usage7dRateLimited       bool
+	UsagePct5h               float64
+	Reset5hAt                time.Time
+	HasUsage5h               bool
+	Used5hHeaders            bool
+	Persisted5hOnly          bool
+	Premium5hRateLimited     bool
+	UsageWindowLimitsIgnored bool
 }
 
 type codexRateLimitWindow string
@@ -253,7 +254,14 @@ func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.
 }
 
 func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
-	originalModel = strings.TrimSpace(originalModel)
+	return accountFilterForResponsesModelCandidates([]string{originalModel, effectiveModel}, effectiveModel, allowCodexAccounts)
+}
+
+func accountFilterForCompactResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
+	return accountFilterForResponsesModelCandidates(compactModelMappingCandidates(originalModel, effectiveModel), effectiveModel, allowCodexAccounts)
+}
+
+func accountFilterForResponsesModelCandidates(modelCandidates []string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
 	effectiveModel = strings.TrimSpace(effectiveModel)
 	codexFilter := accountFilterForModel(effectiveModel)
 	return func(account *auth.Account) bool {
@@ -262,7 +270,7 @@ func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveM
 		}
 		if account.IsOpenAIResponsesAPI() {
 			routedModel := effectiveModel
-			if mappedModel, ok := resolveAccountModelMappingForCandidates(account, originalModel, effectiveModel); ok && mappedModel != "" {
+			if mappedModel, ok := resolveAccountModelMappingForCandidates(account, modelCandidates...); ok && mappedModel != "" {
 				routedModel = mappedModel
 			}
 			return account.SupportsOpenAIResponsesModel(routedModel) && (routedModel == "" || !account.IsModelRateLimited(routedModel))
@@ -795,7 +803,7 @@ func populateCompactUsageMetaFromRequest(c *gin.Context, input *database.UsageLo
 	if c == nil {
 		return
 	}
-	if body, ok := rawRequestBodyFromContext(c); ok && requestBodyHasCompactionInput(body) {
+	if body, ok := rawRequestBodyFromContext(c); ok && requestBodyHasCompactionTrigger(body) {
 		input.Compact = true
 	}
 }
@@ -851,31 +859,31 @@ func setRawRequestBody(c *gin.Context, body []byte) {
 	}
 }
 
-func requestBodyHasCompactionInput(body []byte) bool {
+// requestBodyHasCompactionTrigger reports whether input itself, or one of the direct input array
+// items, is the Codex compaction request control. Durable compaction history items and nested tool
+// output data are conversation content, not new compaction requests.
+func requestBodyHasCompactionTrigger(body []byte) bool {
 	input := gjson.GetBytes(body, "input")
-	return gjsonResultHasCompactionInput(input)
-}
+	if !input.Exists() {
+		return false
+	}
+	if !input.IsArray() {
+		return gjsonResultIsCompactionTrigger(input)
+	}
 
-func gjsonResultHasCompactionInput(result gjson.Result) bool {
-	if !result.Exists() {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(result.Get("type").String())) {
-	case "compaction", "compaction_trigger", "context_compaction":
-		return true
-	}
-	if !result.IsArray() && !result.IsObject() {
-		return false
-	}
 	found := false
-	result.ForEach(func(_, value gjson.Result) bool {
-		if gjsonResultHasCompactionInput(value) {
+	input.ForEach(func(_, item gjson.Result) bool {
+		if gjsonResultIsCompactionTrigger(item) {
 			found = true
 			return false
 		}
 		return true
 	})
 	return found
+}
+
+func gjsonResultIsCompactionTrigger(result gjson.Result) bool {
+	return result.IsObject() && strings.EqualFold(strings.TrimSpace(result.Get("type").String()), "compaction_trigger")
 }
 
 // extractReasoningEffort 从请求体提取推理强度
@@ -1963,8 +1971,8 @@ func (h *Handler) Responses(c *gin.Context) {
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 	setRawRequestBody(c, rawBody)
 
-	// remote compaction v2 把 compaction_trigger 放在普通 /responses 请求中。
-	// 必须保持该协议形态透传；只有显式 /responses/compact 请求才进入旧压缩链路。
+	// compaction_trigger 是普通 Responses 协议中的输入项；只有显式
+	// /v1/responses/compact 才进入专用长压缩与账号轮转链路。
 
 	// Validate request
 	validator := api.NewValidator(rawBody)
@@ -2583,6 +2591,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			} else if outcome.logStatusCode == http.StatusOK {
 				h.store.ClearModelCooldown(account, attemptEffectiveModel)
+				h.store.ConfirmResponsesAvailable(account)
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			h.store.Release(account)
@@ -3136,6 +3145,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, effectiveModel)
+			h.store.ConfirmResponsesAvailable(account)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
@@ -3153,10 +3163,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
-	// newapi 等聚合网关会给 compact 请求追加 -openai-compact 后缀（如 gpt-5.4-openai-compact）。
-	// 在映射与校验之前剥除后缀，让 newapi 渠道保持该命名，而内部按基础模型 gpt-5.4 处理并转发上游。
-	rawBody, _, _ = stripCompactModelSuffixFromBody(rawBody)
-	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
+	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
+	// 没有命中映射时，再按兼容规则剥离后缀。
+	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
 	setRawRequestBody(c, rawBody)
 
 	// Validate request
@@ -3236,7 +3245,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	}
 	// compact 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
-	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	accountFilter := accountFilterForCompactResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	longCompactFilter := longCompactAccountFilter(accountFilter)
 	longCompactPreferenceKey := longCompactFallbackPreferenceKey(apiKeyID, sessionID)
@@ -3365,7 +3374,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			baseURL, _ := account.OpenAIResponsesCredentials()
 			upstreamEndpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses/compact")
 			upstreamBody := openAIResponsesBody
-			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel); ok {
+			if mappedBody, mappedModel, ok := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, compactModelMappingCandidates(logModel, effectiveModel)...); ok {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
@@ -4989,6 +4998,7 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 	if store != nil {
 		store.UpdateAccountPlanType(account, resp.Header.Get("x-codex-plan-type"))
 	}
+	result.UsageWindowLimitsIgnored = account.SkipsUsageWindowLimits()
 
 	result.Used5hHeaders = responseHasCodex5hHeaders(resp)
 	result.UsagePct7d, result.HasUsage7d = parseCodexUsageHeaders(resp, account)
