@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -2839,6 +2840,141 @@ func TestResponses_BodySignalCompactPassesThroughRelay(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), `"type":"compaction"`) {
 		t.Fatalf("response must preserve compaction output item; body=%s", recorder.Body.String())
+	}
+}
+
+func TestResponses_V2CompactionRetriesAfterPartialUpstreamStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_attempt"}}`+"\n\n")
+		marker := "discarded-first-attempt"
+		if attempts > 1 {
+			marker = "accepted-second-attempt"
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"`+marker+`"}}`+"\n\n")
+		if attempts == 1 {
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_attempt","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.6-sol"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"role":"user","content":"compact"},{"type":"compaction_trigger"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if attempts != 2 {
+		t.Fatalf("upstream attempts = %d, want 2", attempts)
+	}
+	responseBody := recorder.Body.String()
+	if strings.Contains(responseBody, "discarded-first-attempt") {
+		t.Fatalf("下游不应看到断流尝试的部分压缩结果: %s", responseBody)
+	}
+	if !strings.Contains(responseBody, "accepted-second-attempt") ||
+		!strings.Contains(responseBody, `"type":"response.completed"`) {
+		t.Fatalf("下游必须收到完整的第二次压缩结果: %s", responseBody)
+	}
+}
+
+func TestResponses_V2CompactionStripsEncryptedHistoryAfterRepeatedStreamBreaks(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenBodies [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBodies = append(seenBodies, append([]byte(nil), body...))
+		attempt := len(seenBodies)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"attempt-`+fmt.Sprint(attempt)+`"}}`+"\n\n")
+		if attempt < 3 {
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_stripped","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          2,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.6-sol"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"input":[
+			{"role":"user","content":"compact"},
+			{"type":"reasoning","id":"rs_stale","encrypted_content":"old-account-bound-state"},
+			{"type":"compaction_trigger"}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(seenBodies) != 3 {
+		t.Fatalf("upstream attempts = %d, want 3", len(seenBodies))
+	}
+	for i := 0; i < 2; i++ {
+		if !strings.Contains(string(seenBodies[i]), "old-account-bound-state") {
+			t.Fatalf("第 %d 次请求应先保留 encrypted content 以容忍瞬时波动: %s", i+1, seenBodies[i])
+		}
+	}
+	if strings.Contains(string(seenBodies[2]), "encrypted_content") ||
+		strings.Contains(string(seenBodies[2]), "old-account-bound-state") {
+		t.Fatalf("第三次请求应移除不可跨上游复用的 encrypted content: %s", seenBodies[2])
+	}
+	if got := gjson.GetBytes(seenBodies[2], "input.#(type==\"compaction_trigger\").type").String(); got != "compaction_trigger" {
+		t.Fatalf("移除 encrypted content 后仍应保留 compaction_trigger: %s", seenBodies[2])
+	}
+	if strings.Contains(recorder.Body.String(), "attempt-1") || strings.Contains(recorder.Body.String(), "attempt-2") {
+		t.Fatalf("下游不应看到前两次断流结果: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "attempt-3") {
+		t.Fatalf("下游应收到第三次完整压缩结果: %s", recorder.Body.String())
 	}
 }
 

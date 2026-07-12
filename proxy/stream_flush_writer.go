@@ -7,7 +7,10 @@ import (
 	"time"
 )
 
-const pendingFirstTokenFlushBytes = 1024 * 1024
+const (
+	pendingFirstTokenFlushBytes   = 1024 * 1024
+	completionBufferedSSEMaxBytes = 64 * 1024 * 1024
+)
 
 var (
 	sseDataPrefix = []byte("data: ")
@@ -21,6 +24,11 @@ type streamFlushWriter struct {
 	interval  time.Duration
 	lastFlush time.Time
 	buffer    bytes.Buffer
+}
+
+type completionBufferedSSEWriter struct {
+	buffer      bytes.Buffer
+	passthrough bool
 }
 
 func newStreamFlushWriter(writer io.Writer, flusher http.Flusher) *streamFlushWriter {
@@ -69,6 +77,44 @@ func writeDeferredSSEData(streamWriter *streamFlushWriter, pending *bytes.Buffer
 		return false, err
 	}
 	return true, nil
+}
+
+func newCompletionBufferedSSEWriter(enabled bool) *completionBufferedSSEWriter {
+	if !enabled {
+		return nil
+	}
+	return &completionBufferedSSEWriter{}
+}
+
+func (w *completionBufferedSSEWriter) writeEvent(streamWriter *streamFlushWriter, pending *bytes.Buffer, data []byte, eventType string, shouldDefer bool) (bool, error) {
+	if w == nil {
+		return writeDeferredSSEData(streamWriter, pending, data, shouldDefer)
+	}
+	if w.passthrough {
+		return writeDeferredSSEData(streamWriter, nil, data, false)
+	}
+
+	appendSSEData(&w.buffer, data)
+	if eventType != "response.completed" && w.buffer.Len() <= completionBufferedSSEMaxBytes {
+		return false, nil
+	}
+
+	// v2 压缩只有在 compaction 输出和 response.completed 同时到齐时才有效。
+	// 完整终态前不提交下游响应，断流后才能透明换号；极端超大响应超过上限时
+	// 退化为普通透传，避免并发压缩占用无界内存。
+	w.passthrough = true
+	if err := streamWriter.WriteBytes(w.buffer.Bytes()); err != nil {
+		return false, err
+	}
+	w.buffer.Reset()
+	return true, nil
+}
+
+func (w *completionBufferedSSEWriter) discard() {
+	if w == nil {
+		return
+	}
+	w.buffer.Reset()
 }
 
 func (w *streamFlushWriter) WriteString(data string) error {

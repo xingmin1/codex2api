@@ -1,5 +1,17 @@
 # Changelog
 
+## v2.5.2-xmin.3 - 2026-07-12
+
+### Fixes
+
+- **修复 Responses v2 压缩断流后无法换号重试。** `compaction_trigger` 仍严格走普通
+  `/v1/responses`；在收到 `response.completed` 前暂存压缩 SSE，只有完整终态才向下游
+  提交，避免压缩项已写出后上游超时或断流导致后续账号只能返回不完整响应。重试耗尽且
+  尚未产生下游内容时现在返回明确的 502，而不是空的 200 SSE。
+- **修复部分 Responses 中转拒绝历史工具调用 `namespace`。** relay 请求中的
+  `input[].type=function_call` 只移除中转不接受的 `namespace`，保留 `name`、`call_id`
+  和 `arguments`；官方 Codex/OAuth 请求不受影响。
+
 ## v2.5.2-xmin.1 - 2026-07-12
 
 ### Features

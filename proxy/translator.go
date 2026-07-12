@@ -885,6 +885,31 @@ func normalizeResponsesToolCallArgumentTypes(body map[string]any) bool {
 	return modified
 }
 
+// stripRelayUnsupportedFunctionCallNamespaces 仅清理历史 function_call 项上的
+// namespace。部分 OpenAI Responses 中转会把它视为未知参数；历史调用仍通过
+// call_id 与 function_call_output 配对，移除 namespace 不会改变工具执行结果。
+// 顶层 namespace 工具声明不在清理范围内，官方 Codex/OAuth 请求体也不调用本函数。
+func stripRelayUnsupportedFunctionCallNamespaces(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		item, ok := raw.(map[string]any)
+		if !ok || firstNonEmptyAnyString(item["type"]) != "function_call" {
+			continue
+		}
+		if _, exists := item["namespace"]; !exists {
+			continue
+		}
+		delete(item, "namespace")
+		modified = true
+	}
+	return modified
+}
+
 func normalizeResponsesInputMessageContent(body map[string]any) bool {
 	inputItems, ok := body["input"].([]any)
 	if !ok {
@@ -1860,6 +1885,7 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 	normalizeResponsesToolChoice(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
+	stripRelayUnsupportedFunctionCallNamespaces(body)
 	if shouldInjectOpenAIResponsesImageGenerationTool(body) {
 		ensureResponsesImageGenerationTool(body)
 	}

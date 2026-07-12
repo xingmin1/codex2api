@@ -1196,6 +1196,14 @@ func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries
 	return true
 }
 
+func streamFailureClientStatus(outcome streamOutcome) int {
+	statusCode := outcome.logStatusCode
+	if statusCode == logStatusUpstreamStreamBreak || statusCode < 400 || statusCode > 599 {
+		return http.StatusBadGateway
+	}
+	return statusCode
+}
+
 func shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType string, terminalFailurePayload []byte, ttftRecorded bool, wroteAnyBody bool, attempt int, maxRetries int, ctxErr, writeErr error) bool {
 	if eventType != "response.failed" {
 		return false
@@ -2033,6 +2041,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
+	isV2CompactionRequest := requestBodyHasCompactionTrigger(rawBody)
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
@@ -2420,6 +2429,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				streamWriter := newStreamFlushWriter(c.Writer, flusher)
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
+				completionBuffer := newCompletionBufferedSSEWriter(isV2CompactionRequest)
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
@@ -2443,14 +2453,17 @@ func (h *Handler) Responses(c *gin.Context) {
 						terminalFailurePayload = append([]byte(nil), data...)
 						gotTerminal = true
 					}
-					if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, ttftRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+					downstreamTTFTRecorded := ttftRecorded && !isV2CompactionRequest
+					if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, downstreamTTFTRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
 						pendingFirstTokenEvents.Reset()
+						completionBuffer.discard()
 						return false
 					}
 					// 首 token 前的 response.failed 不写进下游流:不可重试(如 context_length_exceeded)
 					// 或已达重试上限时,交由循环外按真实错误码返回,而不是 200 流让中转层误计费。
-					if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, clientGone) {
+					if shouldReturnHTTPErrorForResponseFailed(eventType, downstreamTTFTRecorded, wroteAnyBody, clientGone) {
 						pendingFirstTokenEvents.Reset()
+						completionBuffer.discard()
 						abortedForHTTPError = true
 						return false
 					}
@@ -2459,7 +2472,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 					if !clientGone {
 						shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
-						wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, data, shouldDefer)
+						wrote, err := completionBuffer.writeEvent(streamWriter, &pendingFirstTokenEvents, data, eventType, shouldDefer)
 						if err != nil {
 							writeErr = err
 							clientGone = true
@@ -2532,12 +2545,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				continue
 			}
-			if isStream && abortedForHTTPError && !wroteAnyBody {
+			if isStream && !wroteAnyBody && c.Request.Context().Err() == nil &&
+				(abortedForHTTPError || (isV2CompactionRequest && outcome.logStatusCode != http.StatusOK)) {
 				// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 				// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
 				// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
 				c.Header("Content-Type", "application/json; charset=utf-8")
-				c.JSON(outcome.logStatusCode, gin.H{
+				c.JSON(streamFailureClientStatus(outcome), gin.H{
 					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
 				})
 			}
@@ -2841,6 +2855,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 但继续读上游直到 response.completed/failed，以拿到准确 usage。
 			clientGone := false
 			var pendingFirstTokenEvents bytes.Buffer
+			completionBuffer := newCompletionBufferedSSEWriter(isV2CompactionRequest)
 			forward := func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
@@ -2876,22 +2891,25 @@ func (h *Handler) Responses(c *gin.Context) {
 					gotTerminal = true
 				}
 
-				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, ttftRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
+				downstreamTTFTRecorded := ttftRecorded && !isV2CompactionRequest
+				if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, downstreamTTFTRecorded, wroteAnyBody, attempt, maxRetries, c.Request.Context().Err(), writeErr) {
 					pendingFirstTokenEvents.Reset()
+					completionBuffer.discard()
 					return false
 				}
 
 				// 首 token 前的 response.failed 不写进下游流:不可重试(如 context_length_exceeded)
 				// 或已达重试上限时,交由循环外按真实错误码返回,而不是 200 + [DONE] 让中转层误计费。
-				if shouldReturnHTTPErrorForResponseFailed(eventType, ttftRecorded, wroteAnyBody, clientGone) {
+				if shouldReturnHTTPErrorForResponseFailed(eventType, downstreamTTFTRecorded, wroteAnyBody, clientGone) {
 					pendingFirstTokenEvents.Reset()
+					completionBuffer.discard()
 					abortedForHTTPError = true
 					return false
 				}
 
 				if !clientGone {
 					shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
-					wrote, err := writeDeferredSSEData(streamWriter, &pendingFirstTokenEvents, data, shouldDefer)
+					wrote, err := completionBuffer.writeEvent(streamWriter, &pendingFirstTokenEvents, data, eventType, shouldDefer)
 					if err != nil {
 						writeErr = err
 						clientGone = true
@@ -2906,7 +2924,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 命中 518n-2 截断指纹则用同一账号续发上游并折叠成单响应；
 			// 关闭时保持原有逐事件透传路径，字节级零变化。
 			contEnabled, contMaxRounds := codexContinueThinkingSettings()
-			if contEnabled {
+			if contEnabled && !isV2CompactionRequest {
 				fold := &continueFold{
 					baseBody:  upstreamBody,
 					maxRounds: contMaxRounds,
@@ -3092,12 +3110,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 		}
-		if isStream && abortedForHTTPError && !wroteAnyBody {
+		if isStream && !wroteAnyBody && c.Request.Context().Err() == nil &&
+			(abortedForHTTPError || (isV2CompactionRequest && outcome.logStatusCode != http.StatusOK)) {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
 			// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
 			c.Header("Content-Type", "application/json; charset=utf-8")
-			c.JSON(logStatusCode, gin.H{
+			c.JSON(streamFailureClientStatus(outcome), gin.H{
 				"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
 			})
 		} else if !isStream {

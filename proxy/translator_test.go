@@ -1827,6 +1827,42 @@ func TestPrepareOpenAIResponsesBodyNormalizesChatStyleFunctionToolChoice(t *test
 	}
 }
 
+func TestPrepareOpenAIResponsesBodyStripsHistoricalFunctionCallNamespace(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":[
+			{"type":"function_call","call_id":"call_1","name":"spawn_agent","namespace":"collaboration","arguments":"{\"task\":\"inspect\"}"},
+			{"type":"function_call_output","call_id":"call_1","output":"done"}
+		],
+		"tools":[{"type":"namespace","name":"collaboration","description":"agent tools","tools":[]}]
+	}`)
+
+	relayBody := PrepareOpenAIResponsesBody(raw)
+	if gjson.GetBytes(relayBody, "input.0.namespace").Exists() {
+		t.Fatalf("relay 历史 function_call 不应保留 namespace: %s", relayBody)
+	}
+	if got := gjson.GetBytes(relayBody, "input.0.name").String(); got != "spawn_agent" {
+		t.Fatalf("function_call.name = %q, want spawn_agent; body=%s", got, relayBody)
+	}
+	if got := gjson.GetBytes(relayBody, "input.0.call_id").String(); got != "call_1" {
+		t.Fatalf("function_call.call_id = %q, want call_1; body=%s", got, relayBody)
+	}
+	if got := gjson.GetBytes(relayBody, "input.1.call_id").String(); got != "call_1" {
+		t.Fatalf("function_call_output.call_id = %q, want call_1; body=%s", got, relayBody)
+	}
+	if got := gjson.GetBytes(relayBody, "tools.0.namespace").String(); got != "" {
+		t.Fatalf("namespace 工具声明不应被改写为历史字段: %s", relayBody)
+	}
+	if got := gjson.GetBytes(relayBody, "tools.0.type").String(); got != "namespace" {
+		t.Fatalf("顶层 namespace 工具声明必须保留: %s", relayBody)
+	}
+
+	codexBody, _ := PrepareResponsesBody(raw)
+	if got := gjson.GetBytes(codexBody, "input.0.namespace").String(); got != "collaboration" {
+		t.Fatalf("官方 Codex/OAuth 请求必须保留 namespace，got %q; body=%s", got, codexBody)
+	}
+}
+
 func TestPrepareResponsesBody_DefaultsNullMessageContent(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
