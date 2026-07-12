@@ -180,6 +180,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		_ = writeResponsesWSError(conn, apiErr)
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, err)
 	}
+	isV2CompactionRequest := requestBodyHasCompactionTrigger(rawBody)
 
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
 	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, rawBody)
@@ -440,7 +441,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, apiErr)
 		}
 
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, isV2CompactionRequest); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
@@ -498,6 +499,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	silentRetryEnabled bool,
 	hideUpstreamErrors bool,
 	viaWebsocket bool,
+	isV2CompactionRequest bool,
 ) error {
 	SyncCodexUsageState(h.store, account, resp)
 
@@ -707,6 +709,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		h.store.ClearModelCooldown(account, effectiveModel)
 		h.store.ConfirmResponsesAvailable(account)
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+		h.clearAffinityAfterSuccessfulCompact(affinityKey, account.ID(), isV2CompactionRequest)
 	}
 	h.store.Release(account)
 

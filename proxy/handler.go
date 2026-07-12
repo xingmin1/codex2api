@@ -92,6 +92,17 @@ func (h *Handler) nextAccountForSession(sessionID string, apiKeyID int64, exclud
 	return h.nextAccountForSessionWithFilter(sessionID, apiKeyID, exclude, nil)
 }
 
+// clearAffinityAfterSuccessfulCompact 在 bounded 粘滞会话完成 compact 后解除账号绑定。
+//
+// compact 请求本身仍需复用旧账号，以尽量保留压缩前大上下文的缓存；只有完整成功后，
+// 压缩结果才构成新的上下文边界，下一条普通请求才重新按当前调度状态选择账号。
+func (h *Handler) clearAffinityAfterSuccessfulCompact(affinityKey string, accountID int64, compact bool) {
+	if !compact || h == nil || h.store == nil || h.store.GetAffinityMode() != auth.AffinityModeBounded {
+		return
+	}
+	h.store.UnbindSessionAffinity(affinityKey, accountID)
+}
+
 func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
@@ -3173,6 +3184,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.ClearModelCooldown(account, effectiveModel)
 			h.store.ConfirmResponsesAvailable(account)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+			h.clearAffinityAfterSuccessfulCompact(affinityKey, account.ID(), isV2CompactionRequest)
 		}
 		h.store.Release(account)
 		return
@@ -3598,6 +3610,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(durationMs)*time.Millisecond)
+			h.clearAffinityAfterSuccessfulCompact(affinityKey, account.ID(), true)
 
 			promptTokens := int(gjson.GetBytes(respBody, "usage.input_tokens").Int())
 			completionTokens := int(gjson.GetBytes(respBody, "usage.output_tokens").Int())
@@ -3874,6 +3887,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		})
 
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+		h.clearAffinityAfterSuccessfulCompact(affinityKey, account.ID(), true)
 		h.store.Release(account)
 		c.Data(http.StatusOK, "application/json", respBody)
 		return
