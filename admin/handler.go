@@ -740,6 +740,7 @@ type accountResponse struct {
 	AllowedAPIKeyIDs                  []int64                    `json:"allowed_api_key_ids"`
 	Tags                              []string                   `json:"tags"`
 	GroupIDs                          []int64                    `json:"group_ids"`
+	SchedulerPriority                 *int64                     `json:"scheduler_priority"`
 	// 图片配额信息
 	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
@@ -904,6 +905,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		resp.PriceMultiplier = accountPriceMultiplier(row)
 		resp.CheapProbeRecoveryMargin = accountCheapProbeRecoveryMargin(row)
 		resp.CheapProbeBonusDurationMinutes = accountCheapProbeBonusDurationMinutes(row)
+		resp.SchedulerPriority = accountSchedulerPriority(row)
 		if acc, ok := accountMap[row.ID]; ok {
 			resp.UsageLimitOverride = acc.GetIgnoreUsageLimitStatusOverride()
 			resp.UsageLimitEffective = acc.IgnoresUsageLimitStatus()
@@ -1124,6 +1126,7 @@ type updateAccountSchedulerReq struct {
 	AutoPause7dDisabled            json.RawMessage `json:"auto_pause_7d_disabled"`
 	UsageLimitOverride             json.RawMessage `json:"ignore_usage_limit_status_override"`
 	DispatchCountLimit             json.RawMessage `json:"dispatch_count_limit"`
+	SchedulerPriority              json.RawMessage `json:"scheduler_priority"`
 	ProxyURL                       json.RawMessage `json:"proxy_url"`
 	CustomHeaders                  json.RawMessage `json:"custom_headers"`
 }
@@ -1148,6 +1151,7 @@ type accountSchedulerUpdate struct {
 	AutoPause7dDisabled            database.OptionalBool
 	UsageLimitOverride             optionalNullableBool
 	DispatchCountLimit             database.OptionalNullInt64
+	SchedulerPriority              database.OptionalNullInt64
 	ProxyURL                       database.OptionalString
 	CustomHeaders                  optionalCustomHeaders
 	CredentialUpdates              map[string]interface{}
@@ -1230,6 +1234,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
+	schedulerPriority, err := parseOptionalIntegerField(req.SchedulerPriority, "scheduler_priority", -100, 100)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
 
 	proxyURL, err := parseOptionalStringField(req.ProxyURL, "proxy_url", security.ValidateProxyURL)
 	if err != nil {
@@ -1302,6 +1310,13 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 			credentialUpdates["dispatch_count_limit"] = int64(0)
 		}
 	}
+	if schedulerPriority.Set {
+		if schedulerPriority.Value.Valid {
+			credentialUpdates["scheduler_priority"] = schedulerPriority.Value.Int64
+		} else {
+			credentialUpdates["scheduler_priority"] = int64(0)
+		}
+	}
 	if len(credentialUpdates) == 0 {
 		credentialUpdates = nil
 	}
@@ -1326,6 +1341,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		AutoPause7dDisabled:            autoPause7dDisabled,
 		UsageLimitOverride:             ignoreUsageLimitStatusOverride,
 		DispatchCountLimit:             dispatchCountLimit,
+		SchedulerPriority:              schedulerPriority,
 		ProxyURL:                       proxyURL,
 		CustomHeaders:                  customHeaders,
 		CredentialUpdates:              credentialUpdates,
@@ -1352,6 +1368,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.AutoPause7dDisabled.Set ||
 		u.UsageLimitOverride.Set ||
 		u.DispatchCountLimit.Set ||
+		u.SchedulerPriority.Set ||
 		u.ProxyURL.Set
 }
 
@@ -1540,6 +1557,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.DispatchCountLimit.Set {
 		h.store.ApplyAccountDispatchCountLimit(id, nullableInt64Pointer(update.DispatchCountLimit.Value))
+	}
+	if update.SchedulerPriority.Set {
+		h.store.ApplyAccountSchedulerPriority(id, nullableInt64Pointer(update.SchedulerPriority.Value))
 	}
 	if update.Tags.Set {
 		h.store.ApplyAccountTags(id, update.Tags.Values)
@@ -1794,6 +1814,20 @@ func accountCheapProbeBonusDurationMinutes(row *database.AccountRow) *int {
 func normalizePositiveFloatPointer(value float64) *float64 {
 	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return nil
+	}
+	return &value
+}
+
+func accountSchedulerPriority(row *database.AccountRow) *int64 {
+	value, ok := row.GetCredentialInt64("scheduler_priority")
+	if !ok || value == 0 {
+		return nil
+	}
+	if value > 100 {
+		value = 100
+	}
+	if value < -100 {
+		value = -100
 	}
 	return &value
 }

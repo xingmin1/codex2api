@@ -1,5 +1,16 @@
 # Changelog
 
+## v2.5.2-xmin.1 - 2026-07-12
+
+### Features
+
+- **合并官方 v2.5.2 及后续主线更新。** 纳入账号严格调度优先级、账号组并发与优先级控制、Codex CLI standalone 联网搜索透传，并保留便宜账号倍率探测、调度倍率上限、失败双阈值容错、长压缩账号池、账号排序复制和 Nix 发布链路。
+
+### Fixes
+
+- **纳入 compact 模型映射回归修复。** 合成的 `-openai-compact` 别名不再误命中通用通配规则，映射目标在发往上游前会剥离 compact 后缀，同时保持本 fork 的普通 Responses 压缩触发器调度语义。
+- **保留 GPT-5.6 Anthropic 映射的 max 思考强度。** Claude Code 经 Anthropic 兼容接口映射到 GPT-5.6 时不再把 `max` 降为 `xhigh`。
+
 ## v2.5.0-xmin.1 - 2026-07-11
 
 ### Features
@@ -9,6 +20,22 @@
 ### Fixes
 
 - **保持普通 Responses 压缩触发器的 fork 语义。** 普通 `/v1/responses` 中的 `compaction_trigger` 继续按普通请求调度并保留原路径、`stream` 与 `client_metadata`；只有显式 `/v1/responses/compact` 才进入长压缩账号轮转。
+## v2.5.2 - 2026-07-11
+
+### Features
+
+- **Per-account scheduling priority (#358).** Each account gains a scheduler priority (-100 to 100, default 0), editable in the account scheduler drawer or via `PATCH /accounts/:id/scheduler` (`scheduler_priority`, null resets; hot-applied without restart). Higher-priority accounts are scheduled **strictly first** — lower priorities only serve when every higher-priority account is unavailable (cooldown, paused, concurrency-saturated) — while accounts at the same priority keep competing on the existing health-tier + dispatch-score rules. Typical use: give official OAuth accounts a positive priority (or relay/API-key channels a negative one) so relays act purely as fallback, i.e. "use up the official accounts before touching the relay". The value is stored in the account credentials JSON (no schema migration); FastScheduler mode gets the same semantics via priority-descending segments inside each health bucket (round-robin preserved within a segment). Default 0 keeps existing deployments byte-identical.
+- **Codex CLI standalone web search passthrough — `POST /v1/alpha/search` (#359).** Newer Codex CLI (e.g. 0.144.1) with `web_search = "live"` (or `--search`) calls a dedicated search endpoint instead of the Responses hosted tool; the gateway previously had no such route and the CLI's built-in web search 404'd. The endpoint (registered under `/v1`, prefix-less, and `/backend-api/codex` alike) now forwards to the ChatGPT backend's standalone search using a schedulable ChatGPT OAuth account's credentials — request body and response (including upstream 4xx/5xx status codes) pass through verbatim so the CLI sees real error semantics, UA/Version follow the same outbound-client-header resolution as `/responses`, and the same uTLS transport is used. Search is a model-driven retrieval turn, so the upstream timeout is 120s. Relay-only pools fast-fail with 503 (the endpoint only exists on the ChatGPT backend). Verified live against the real upstream with the codex-rs `SearchCommands` request shape (`commands.search_query[].q`): 200 with full `output` + `encrypted_output`.
+
+### Fixes
+
+- **Anthropic path preserves `max` reasoning effort for gpt-5.6 mappings (#357).** Translating Anthropic `/v1/messages` `output_config.effort` into Responses `reasoning.effort` used the model-agnostic normalizer, which unconditionally clamps `max` to `xhigh` — so Claude Code requests mapped to `gpt-5.6-sol` etc. lost `max`. The translation now passes the mapped Codex model into the same model-aware normalizer the `/v1/responses` path uses: gpt-5.6+ keeps `max`, older models still clamp to `xhigh`, all other efforts unchanged.
+
+## v2.5.1 - 2026-07-11
+
+### Fixes
+
+- **Compact model-mapping regression: synthesized aliases no longer hijack generic wildcard rules, and mapping targets are stripped of `-openai-compact` before reaching the upstream (#350 regression).** v2.5.0's compact mapping resolves the endpoint-qualified `<model>-openai-compact` alias before the base model, but the alias *synthesized* for clients that sent a plain base name participated in all rule matching, with three fallouts. (1) Rules keyed on the suffixed name — which operators had copied from relay-side compact route markers (e.g. `gpt-5.6-sol-openai-compact` in a channel's model list) and which were dead letters before v2.5.0 because the suffix was stripped before matching — suddenly activated and forwarded the suffixed name verbatim upstream; relays fail to resolve it as a literal model, and compaction died with `stream disconnected before completion: stream closed before response.completed`. (2) Generic wildcard rules (`gpt-*`, `*`) matched the synthesized alias and outranked the base model's exact rule. (3) An identity suffixed→suffixed rule could knock an account that only lists the suffixed marker out of the compact pool entirely (503 no available account). Now a synthesized alias only matches rules explicitly keyed with the `-openai-compact` suffix (including `*-openai-compact` wildcards); any matched mapping target has the suffix stripped before entering the upstream body — the upstream call is always `/v1/responses/compact`, where the alias convention never applies; and the compact account filter and per-attempt rewrite share the same resolver. Verified via an A/B scenario matrix against the pre-#350 build: every configuration is restored to its pre-v2.5.0 upstream behavior, while v2.5.0's intended feature — suffixed-key rules that apply only to compaction — keeps working. Usage stats also now display the base model for suffixed requests: a bare suffix strip no longer renders as a mapping arrow (`gpt-5.6-sol-openai-compact → gpt-5.6-sol` simply shows as `gpt-5.6-sol`), which also keeps pricing lookups on the clean base name.
 
 ## v2.5.0 - 2026-07-11
 
