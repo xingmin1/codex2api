@@ -2933,3 +2933,35 @@ func TestSQLiteSystemSettingsContinueThinkingRoundtrip(t *testing.T) {
 		t.Errorf("越界轮数应归一到 32, got %d", clamped.CodexContinueMaxRounds)
 	}
 }
+
+func TestSQLiteSystemSettingsFailureToleranceWindowRoundtrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	settings := &SystemSettings{
+		MaxConcurrency:                   2,
+		TestConcurrency:                  1,
+		TestModel:                        "gpt-5.4",
+		FailureScoreThreshold:            3,
+		FailureCooldownThreshold:         10,
+		FailureToleranceWindowSeconds:    90,
+		CodexContinueMaxRounds:           8,
+		CodexCLIVersionSyncIntervalHours: 12,
+	}
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings: %v", err)
+	}
+
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if got.FailureToleranceWindowSeconds != 90 {
+		t.Fatalf("failure tolerance window = %d, want 90", got.FailureToleranceWindowSeconds)
+	}
+}

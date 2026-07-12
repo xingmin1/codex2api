@@ -96,8 +96,11 @@ export interface AccountRow {
   ignore_unauthorized_cooldown?: boolean
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
+  failure_tolerance_window_seconds?: number | null
   failure_score_threshold_effective?: number
   failure_cooldown_threshold_effective?: number
+  failure_tolerance_window_seconds_effective?: number
+  failure_window_count?: number
   consecutive_failure_count?: number
   price_multiplier?: number | null
   cheap_probe_recovery_margin?: number | null
@@ -282,6 +285,7 @@ export interface UpdateAccountSchedulerRequest {
   ignore_unauthorized_cooldown?: boolean
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
+  failure_tolerance_window_seconds?: number | null
   price_multiplier?: number | null
   cheap_probe_recovery_margin?: number | null
   cheap_probe_bonus_duration_minutes?: number | null
@@ -646,6 +650,7 @@ export interface SystemSettings {
   dispatch_max_multiplier: number
   failure_score_threshold: number
   failure_cooldown_threshold: number
+  failure_tolerance_window_seconds: number
   lazy_mode: boolean
   proxy_url?: string
   pg_max_conns: number

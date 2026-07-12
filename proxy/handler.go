@@ -4861,7 +4861,7 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 	ignoreFailureCooldown := shouldIgnoreAccountFailureCooldown(account)
 	if IsUsageLimitReachedError(body) {
 		if ignoreFailureCooldown {
-			log.Printf("账号 %d 连续失败尚未达到冷却阈值，本次 usage_limit_reached 不写入持久冷却", account.ID())
+			log.Printf("账号 %d 时间窗内失败次数尚未达到冷却阈值，本次 usage_limit_reached 不写入持久冷却", account.ID())
 			return codex429Decision{}
 		}
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
@@ -4871,7 +4871,7 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 	switch statusCode {
 	case http.StatusTooManyRequests:
 		if ignoreFailureCooldown {
-			log.Printf("账号 %d 连续失败尚未达到冷却阈值，本次 429 不写入持久冷却", account.ID())
+			log.Printf("账号 %d 时间窗内失败次数尚未达到冷却阈值，本次 429 不写入持久冷却", account.ID())
 			return codex429Decision{}
 		}
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
@@ -4918,7 +4918,7 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 			return codex429Decision{}
 		}
 		if ignoreFailureCooldown {
-			log.Printf("账号 %d 连续失败尚未达到冷却阈值，本次 %d 不写入 payment_required 冷却", account.ID(), statusCode)
+			log.Printf("账号 %d 时间窗内失败次数尚未达到冷却阈值，本次 %d 不写入 payment_required 冷却", account.ID(), statusCode)
 			return codex429Decision{}
 		}
 		h.store.MarkCooldown(account, 30*time.Minute, "payment_required")
@@ -5051,7 +5051,7 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 
 // SyncCodexFailureUsageState 解析失败响应中的 Codex 用量头。
 //
-// 账号启用连续失败容错且尚未达到冷却阈值时，不根据失败响应头写入
+// 账号启用时间窗失败容错且尚未达到冷却阈值时，不根据失败响应头写入
 // plan / 5h / 7d 用量快照、usage_exhausted 或 premium 5h 冷却状态。
 func SyncCodexFailureUsageState(store *auth.Store, account *auth.Account, resp *http.Response) CodexUsageSyncResult {
 	if ShouldIgnoreFailureCooldown(account) {

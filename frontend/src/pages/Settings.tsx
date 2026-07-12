@@ -1136,6 +1136,7 @@ export default function Settings() {
 	    dispatch_max_multiplier: 0,
 	    failure_score_threshold: 3,
 	    failure_cooldown_threshold: 10,
+	    failure_tolerance_window_seconds: 60,
 	    lazy_mode: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
@@ -2080,6 +2081,15 @@ export default function Settings() {
 	                      max={1000}
 	                      value={settingsForm.failure_score_threshold}
 	                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, failure_score_threshold: parseInt(e.target.value) || 1 }))}
+	                    />
+	                  </SettingField>
+	                  <SettingField label={t('settings.failureToleranceWindow')} description={t('settings.failureToleranceWindowDesc')}>
+	                    <Input
+	                      type="number"
+	                      min={1}
+	                      max={3600}
+	                      value={settingsForm.failure_tolerance_window_seconds}
+	                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, failure_tolerance_window_seconds: parseInt(e.target.value) || 1 }))}
 	                    />
 	                  </SettingField>
 	                  <SettingField label={t('settings.failureCooldownThreshold')} description={t('settings.failureCooldownThresholdDesc')}>

@@ -159,9 +159,11 @@ type Account struct {
 	IgnoreUnauthorizedCooldown        bool
 	FailureScoreThresholdOverride     int // 0 表示继承全局
 	FailureCooldownThresholdOverride  int // 0 表示继承全局
+	FailureToleranceWindowOverride    int // 秒，0 表示继承全局
 	FailureScoreThresholdEffective    int
 	FailureCooldownThresholdEffective int
-	ConsecutiveFailureCount           int
+	FailureToleranceWindowEffective   int
+	failureTimestamps                 []time.Time
 	PriceMultiplier                   float64 // 价格倍率，0 表示未显式配置
 	CheapProbeRecoveryMargin          float64 // 便宜账号探测成功后高出当前最高分的账号级覆盖，0 表示继承全局
 	CheapProbeBonusDuration           time.Duration
@@ -269,7 +271,9 @@ const (
 	defaultDispatchMaxMultiplier     = 0.0
 	defaultFailureScoreThreshold     = 3
 	defaultFailureCooldownThreshold  = 10
+	defaultFailureToleranceWindow    = 60
 	maxFailureToleranceThreshold     = 1000
+	maxFailureToleranceWindow        = 3600
 )
 
 var (
@@ -912,6 +916,20 @@ func normalizeFailureToleranceOverride(value int) int {
 		return 0
 	}
 	return normalizeFailureToleranceThreshold(value, 1)
+}
+
+func normalizeFailureToleranceWindow(value, fallback int) int {
+	if value <= 0 {
+		value = fallback
+	}
+	return min(max(value, 1), maxFailureToleranceWindow)
+}
+
+func normalizeFailureToleranceWindowOverride(value int) int {
+	if value <= 0 {
+		return 0
+	}
+	return normalizeFailureToleranceWindow(value, defaultFailureToleranceWindow)
 }
 
 func cheapProbeRecoveryMarginFromBits(bits uint64) float64 {
@@ -1631,14 +1649,19 @@ func (a *Account) ShouldIgnoreUsageLimit429Cooldown() bool {
 func (a *Account) recomputeFailureToleranceThresholdsLocked(store *Store) {
 	scoreThreshold := 1
 	cooldownThreshold := 1
+	windowSeconds := defaultFailureToleranceWindow
 	if a.IgnoreUsageLimit429Cooldown {
 		scoreThreshold = store.GetFailureScoreThreshold()
 		cooldownThreshold = store.GetFailureCooldownThreshold()
+		windowSeconds = store.GetFailureToleranceWindowSeconds()
 		if a.FailureScoreThresholdOverride > 0 {
 			scoreThreshold = a.FailureScoreThresholdOverride
 		}
 		if a.FailureCooldownThresholdOverride > 0 {
 			cooldownThreshold = a.FailureCooldownThresholdOverride
+		}
+		if a.FailureToleranceWindowOverride > 0 {
+			windowSeconds = a.FailureToleranceWindowOverride
 		}
 	}
 	if cooldownThreshold < scoreThreshold {
@@ -1646,21 +1669,47 @@ func (a *Account) recomputeFailureToleranceThresholdsLocked(store *Store) {
 	}
 	a.FailureScoreThresholdEffective = normalizeFailureToleranceThreshold(scoreThreshold, 1)
 	a.FailureCooldownThresholdEffective = normalizeFailureToleranceThreshold(cooldownThreshold, a.FailureScoreThresholdEffective)
+	a.FailureToleranceWindowEffective = normalizeFailureToleranceWindow(windowSeconds, defaultFailureToleranceWindow)
+	a.pruneFailureTimestampsLocked(time.Now())
 }
 
-// FailureToleranceSnapshot 返回账号连续失败容错配置与当前连续失败次数。
-func (a *Account) FailureToleranceSnapshot() (enabled bool, scoreOverride, cooldownOverride, scoreEffective, cooldownEffective, consecutiveFailures int) {
-	if a == nil {
-		return false, 0, 0, 1, 1, 0
+func (a *Account) pruneFailureTimestampsLocked(now time.Time) {
+	window := time.Duration(normalizeFailureToleranceWindow(a.FailureToleranceWindowEffective, defaultFailureToleranceWindow)) * time.Second
+	cutoff := now.Add(-window)
+	firstValid := 0
+	for firstValid < len(a.failureTimestamps) && !a.failureTimestamps[firstValid].After(cutoff) {
+		firstValid++
 	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	if firstValid > 0 {
+		a.failureTimestamps = append(a.failureTimestamps[:0], a.failureTimestamps[firstValid:]...)
+	}
+}
+
+func (a *Account) recordFailureTimestampLocked(now time.Time) int {
+	a.pruneFailureTimestampsLocked(now)
+	a.failureTimestamps = append(a.failureTimestamps, now)
+	if len(a.failureTimestamps) > maxFailureToleranceThreshold {
+		a.failureTimestamps = a.failureTimestamps[len(a.failureTimestamps)-maxFailureToleranceThreshold:]
+	}
+	return len(a.failureTimestamps)
+}
+
+// FailureToleranceSnapshot 返回账号时间窗失败容错配置与当前窗口失败次数。
+func (a *Account) FailureToleranceSnapshot() (enabled bool, scoreOverride, cooldownOverride, windowOverride, scoreEffective, cooldownEffective, windowEffective, failures int) {
+	if a == nil {
+		return false, 0, 0, 0, 1, 1, defaultFailureToleranceWindow, 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruneFailureTimestampsLocked(time.Now())
 	return a.IgnoreUsageLimit429Cooldown,
 		a.FailureScoreThresholdOverride,
 		a.FailureCooldownThresholdOverride,
+		a.FailureToleranceWindowOverride,
 		normalizeFailureToleranceThreshold(a.FailureScoreThresholdEffective, 1),
 		normalizeFailureToleranceThreshold(a.FailureCooldownThresholdEffective, 1),
-		a.ConsecutiveFailureCount
+		normalizeFailureToleranceWindow(a.FailureToleranceWindowEffective, defaultFailureToleranceWindow),
+		len(a.failureTimestamps)
 }
 
 // ShouldDeferFailureCooldown 判断本次失败是否尚未达到持久冷却阈值。
@@ -1670,13 +1719,14 @@ func (a *Account) ShouldDeferFailureCooldown() bool {
 	if a == nil {
 		return false
 	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if !a.IgnoreUsageLimit429Cooldown {
 		return false
 	}
+	a.pruneFailureTimestampsLocked(time.Now())
 	threshold := normalizeFailureToleranceThreshold(a.FailureCooldownThresholdEffective, defaultFailureCooldownThreshold)
-	return a.ConsecutiveFailureCount < threshold
+	return len(a.failureTimestamps) < threshold
 }
 
 // ShouldIgnoreUnauthorizedCooldown 返回该账号是否把 401 当作普通上游错误。
@@ -2598,6 +2648,7 @@ type Store struct {
 	dispatchMaxMultiplierBits          atomic.Uint64
 	failureScoreThreshold              atomic.Int64
 	failureCooldownThreshold           atomic.Int64
+	failureToleranceWindowSeconds      atomic.Int64
 	cheapProbeTopologyVersion          atomic.Uint64
 	cheapProbeRescanRequested          atomic.Bool
 	cheapProbeWakeCh                   chan struct{}
@@ -3057,6 +3108,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			DispatchMaxMultiplier:              defaultDispatchMaxMultiplier,
 			FailureScoreThreshold:              defaultFailureScoreThreshold,
 			FailureCooldownThreshold:           defaultFailureCooldownThreshold,
+			FailureToleranceWindowSeconds:      defaultFailureToleranceWindow,
 			LazyMode:                           false,
 			ProxyURL:                           "",
 			MaxRateLimitRetries:                1,
@@ -3127,6 +3179,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.setDispatchMaxMultiplier(settings.DispatchMaxMultiplier, false)
 	s.failureScoreThreshold.Store(int64(normalizeFailureToleranceThreshold(settings.FailureScoreThreshold, defaultFailureScoreThreshold)))
 	s.failureCooldownThreshold.Store(int64(normalizeFailureToleranceThreshold(settings.FailureCooldownThreshold, defaultFailureCooldownThreshold)))
+	s.failureToleranceWindowSeconds.Store(int64(normalizeFailureToleranceWindow(settings.FailureToleranceWindowSeconds, defaultFailureToleranceWindow)))
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
@@ -4272,6 +4325,9 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	if threshold, ok := row.GetCredentialInt64("failure_cooldown_threshold"); ok {
 		account.FailureCooldownThresholdOverride = normalizeFailureToleranceOverride(int(threshold))
 	}
+	if seconds, ok := row.GetCredentialInt64("failure_tolerance_window_seconds"); ok {
+		account.FailureToleranceWindowOverride = normalizeFailureToleranceWindowOverride(int(seconds))
+	}
 	account.recomputeFailureToleranceThresholdsLocked(s)
 	account.PriceMultiplier = resolveAccountRowPriceMultiplier(row)
 	if margin, ok := row.GetCredentialFloat64("cheap_probe_recovery_margin"); ok {
@@ -5254,7 +5310,7 @@ func (s *Store) GetRetryIntervalMS() int {
 	return int(s.retryIntervalMS.Load())
 }
 
-// SetFailureScoreThreshold 设置启用连续失败容错时的全局计分阈值。
+// SetFailureScoreThreshold 设置启用时间窗失败容错时的全局计分阈值。
 func (s *Store) SetFailureScoreThreshold(value int) {
 	if s == nil {
 		return
@@ -5263,7 +5319,7 @@ func (s *Store) SetFailureScoreThreshold(value int) {
 	s.refreshFailureToleranceThresholds()
 }
 
-// GetFailureScoreThreshold 返回全局连续失败计分阈值。
+// GetFailureScoreThreshold 返回全局时间窗失败计分阈值。
 func (s *Store) GetFailureScoreThreshold() int {
 	if s == nil {
 		return defaultFailureScoreThreshold
@@ -5271,7 +5327,7 @@ func (s *Store) GetFailureScoreThreshold() int {
 	return normalizeFailureToleranceThreshold(int(s.failureScoreThreshold.Load()), defaultFailureScoreThreshold)
 }
 
-// SetFailureCooldownThreshold 设置启用连续失败容错时的全局持久冷却阈值。
+// SetFailureCooldownThreshold 设置启用时间窗失败容错时的全局持久冷却阈值。
 func (s *Store) SetFailureCooldownThreshold(value int) {
 	if s == nil {
 		return
@@ -5280,12 +5336,29 @@ func (s *Store) SetFailureCooldownThreshold(value int) {
 	s.refreshFailureToleranceThresholds()
 }
 
-// GetFailureCooldownThreshold 返回全局连续失败持久冷却阈值。
+// GetFailureCooldownThreshold 返回全局时间窗失败持久冷却阈值。
 func (s *Store) GetFailureCooldownThreshold() int {
 	if s == nil {
 		return defaultFailureCooldownThreshold
 	}
 	return normalizeFailureToleranceThreshold(int(s.failureCooldownThreshold.Load()), defaultFailureCooldownThreshold)
+}
+
+// SetFailureToleranceWindowSeconds 设置全局失败统计滚动窗口。
+func (s *Store) SetFailureToleranceWindowSeconds(value int) {
+	if s == nil {
+		return
+	}
+	s.failureToleranceWindowSeconds.Store(int64(normalizeFailureToleranceWindow(value, defaultFailureToleranceWindow)))
+	s.refreshFailureToleranceThresholds()
+}
+
+// GetFailureToleranceWindowSeconds 返回全局失败统计滚动窗口秒数。
+func (s *Store) GetFailureToleranceWindowSeconds() int {
+	if s == nil {
+		return defaultFailureToleranceWindow
+	}
+	return normalizeFailureToleranceWindow(int(s.failureToleranceWindowSeconds.Load()), defaultFailureToleranceWindow)
 }
 
 func (s *Store) refreshFailureToleranceThresholds() {
@@ -5835,21 +5908,24 @@ func (s *Store) ApplyAccountSchedulerOverridePatch(dbID int64, scoreBiasSet bool
 	return true
 }
 
-// ApplyAccountUsageLimit429CooldownConfig 更新账号连续失败容错开关。
+// ApplyAccountUsageLimit429CooldownConfig 更新账号时间窗失败容错开关。
 func (s *Store) ApplyAccountUsageLimit429CooldownConfig(dbID int64, ignore bool) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
 	}
 	acc.mu.Lock()
+	if acc.IgnoreUsageLimit429Cooldown != ignore {
+		acc.failureTimestamps = nil
+	}
 	acc.IgnoreUsageLimit429Cooldown = ignore
 	acc.recomputeFailureToleranceThresholdsLocked(s)
 	acc.mu.Unlock()
 	return true
 }
 
-// ApplyAccountFailureToleranceConfig 更新账号级连续失败阈值覆盖。
-func (s *Store) ApplyAccountFailureToleranceConfig(dbID int64, scoreSet bool, scoreThreshold int, cooldownSet bool, cooldownThreshold int) bool {
+// ApplyAccountFailureToleranceConfig 更新账号级时间窗失败容错覆盖。
+func (s *Store) ApplyAccountFailureToleranceConfig(dbID int64, scoreSet bool, scoreThreshold int, cooldownSet bool, cooldownThreshold int, windowSet bool, windowSeconds int) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
@@ -5861,6 +5937,9 @@ func (s *Store) ApplyAccountFailureToleranceConfig(dbID int64, scoreSet bool, sc
 	}
 	if cooldownSet {
 		acc.FailureCooldownThresholdOverride = normalizeFailureToleranceOverride(cooldownThreshold)
+	}
+	if windowSet {
+		acc.FailureToleranceWindowOverride = normalizeFailureToleranceWindowOverride(windowSeconds)
 	}
 	acc.recomputeFailureToleranceThresholdsLocked(s)
 	acc.mu.Unlock()
@@ -6717,7 +6796,7 @@ func (s *Store) RecordManualTestSuccess(acc *Account, latency time.Duration) {
 	acc.LastSuccessAt = now
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
 	acc.FailureStreak = 0
-	acc.ConsecutiveFailureCount = 0
+	acc.failureTimestamps = nil
 	if wasUsageLimitCooldown {
 		acc.LastRateLimitedAt = time.Time{}
 	}
@@ -6758,7 +6837,6 @@ func (s *Store) ReportRequestSuccess(acc *Account, latency time.Duration) {
 	acc.LastSuccessAt = time.Now()
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
 	acc.FailureStreak = 0
-	acc.ConsecutiveFailureCount = 0
 	if acc.HealthTier == "" {
 		acc.HealthTier = HealthTierHealthy
 	}
@@ -6773,11 +6851,27 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 		return
 	}
 
-	now := time.Now()
+	s.reportRequestFailureAt(acc, kind, latency, time.Time{})
+}
+
+func (s *Store) reportRequestFailureAt(acc *Account, kind string, latency time.Duration, now time.Time) {
+	if acc == nil {
+		return
+	}
+
 	acc.mu.Lock()
-	acc.ConsecutiveFailureCount = clampInt(acc.ConsecutiveFailureCount+1, 0, maxFailureToleranceThreshold)
+	// 时间必须在账号锁内采样，保证并发失败写入的时间戳仍按顺序排列，窗口裁剪才能只扫描队首。
+	if now.IsZero() {
+		now = time.Now()
+	}
+	failureCount := 1
+	if acc.IgnoreUsageLimit429Cooldown {
+		failureCount = acc.recordFailureTimestampLocked(now)
+	} else {
+		acc.failureTimestamps = nil
+	}
 	scoreThreshold := normalizeFailureToleranceThreshold(acc.FailureScoreThresholdEffective, 1)
-	if acc.ConsecutiveFailureCount < scoreThreshold {
+	if failureCount < scoreThreshold {
 		acc.mu.Unlock()
 		return
 	}
@@ -7841,7 +7935,7 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 						account.HealthTier = HealthTierWarm
 						account.SchedulerScore = 80
 						account.FailureStreak = 0
-						account.ConsecutiveFailureCount = 0
+						account.failureTimestamps = nil
 						account.SuccessStreak = 1
 						account.LastSuccessAt = time.Now()
 						if account.Status == StatusCooldown {

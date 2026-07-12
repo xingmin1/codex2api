@@ -677,6 +677,13 @@ function failureThresholdInputToValue(value: string): number | null {
   return parsed;
 }
 
+function isFailureWindowInputInvalid(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (!/^\d+$/.test(trimmed)) return true;
+  const parsed = Number.parseInt(trimmed, 10);
+  return parsed < 1 || parsed > 3600;
+}
 
 function sortMissingNumber(direction: SortDirection): number {
   return direction === "asc" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
@@ -996,6 +1003,7 @@ export default function Accounts() {
     editFailureCooldownThresholdInput,
     setEditFailureCooldownThresholdInput,
   ] = useState("");
+  const [editFailureWindowInput, setEditFailureWindowInput] = useState("");
   const [editSchedulerPriorityInput, setEditSchedulerPriorityInput] =
     useState("");
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
@@ -3675,6 +3683,9 @@ export default function Accounts() {
     setEditFailureCooldownThresholdInput(
       formatFailureThresholdInput(account.failure_cooldown_threshold),
     );
+    setEditFailureWindowInput(
+      formatFailureThresholdInput(account.failure_tolerance_window_seconds),
+    );
     setEditSchedulerPriorityInput(
       formatSchedulerPriorityInput(account.scheduler_priority),
     );
@@ -3788,6 +3799,9 @@ export default function Accounts() {
   const editFailureCooldownThresholdInvalid = isFailureThresholdInputInvalid(
     editFailureCooldownThresholdInput,
   );
+  const editFailureWindowInvalid = isFailureWindowInputInvalid(
+    editFailureWindowInput,
+  );
   const editSchedulerPriorityInvalid = isSchedulerPriorityInputInvalid(
     editSchedulerPriorityInput,
   );
@@ -3861,6 +3875,7 @@ export default function Accounts() {
       editPriceMultiplierInvalid ||
       editFailureScoreThresholdInvalid ||
       editFailureCooldownThresholdInvalid ||
+      editFailureWindowInvalid ||
       editSchedulerPriorityInvalid
     ) {
       showToast(t("accounts.schedulerInvalidInput"), "error");
@@ -3904,6 +3919,9 @@ export default function Accounts() {
         ),
         failure_cooldown_threshold: failureThresholdInputToValue(
           editFailureCooldownThresholdInput,
+        ),
+        failure_tolerance_window_seconds: failureThresholdInputToValue(
+          editFailureWindowInput,
         ),
         price_multiplier: priceMultiplierInputToNumber(editPriceMultiplierInput),
         scheduler_priority: schedulerPriorityInputToValue(
@@ -7248,7 +7266,7 @@ export default function Accounts() {
                             />
                           </button>
                         </div>
-                        <div className="mt-4 grid gap-4 md:grid-cols-2">
+                        <div className="mt-4 grid gap-4 md:grid-cols-3">
                           <div>
                             <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
                               {t("accounts.failureScoreThresholdLabel")}
@@ -7273,6 +7291,31 @@ export default function Accounts() {
                             >
                               {editFailureScoreThresholdInvalid
                                 ? t("accounts.failureThresholdRange")
+                                : t("accounts.failureThresholdInheritHint")}
+                            </div>
+                          </div>
+                          <div>
+                            <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
+                              {t("accounts.failureToleranceWindowLabel")}
+                            </label>
+                            <Input
+                              disabled={!editFailureToleranceEnabled}
+                              inputMode="numeric"
+                              value={editFailureWindowInput}
+                              placeholder={t(
+                                "accounts.failureThresholdPlaceholder",
+                              )}
+                              onChange={(
+                                event: ChangeEvent<HTMLInputElement>,
+                              ) =>
+                                setEditFailureWindowInput(event.target.value)
+                              }
+                            />
+                            <div
+                              className={`mt-1.5 text-xs ${editFailureWindowInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                            >
+                              {editFailureWindowInvalid
+                                ? t("accounts.failureWindowRange")
                                 : t("accounts.failureThresholdInheritHint")}
                             </div>
                           </div>
@@ -7307,7 +7350,12 @@ export default function Accounts() {
                         <div className="mt-3 text-xs text-muted-foreground">
                           {t("accounts.failureToleranceStatus", {
                             count:
-                              editingAccount.consecutive_failure_count ?? 0,
+                              editingAccount.failure_window_count ??
+                              editingAccount.consecutive_failure_count ??
+                              0,
+                            window:
+                              editingAccount.failure_tolerance_window_seconds_effective ??
+                              60,
                             score:
                               editingAccount.failure_score_threshold_effective ??
                               1,

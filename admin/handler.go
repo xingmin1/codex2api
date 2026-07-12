@@ -698,8 +698,11 @@ type accountResponse struct {
 	IgnoreUnauthorizedCooldown        bool                       `json:"ignore_unauthorized_cooldown"`
 	FailureScoreThreshold             *int                       `json:"failure_score_threshold,omitempty"`
 	FailureCooldownThreshold          *int                       `json:"failure_cooldown_threshold,omitempty"`
+	FailureToleranceWindowSeconds     *int                       `json:"failure_tolerance_window_seconds,omitempty"`
 	FailureScoreThresholdEffective    int                        `json:"failure_score_threshold_effective"`
 	FailureCooldownThresholdEffective int                        `json:"failure_cooldown_threshold_effective"`
+	FailureToleranceWindowEffective   int                        `json:"failure_tolerance_window_seconds_effective"`
+	FailureWindowCount                int                        `json:"failure_window_count"`
 	ConsecutiveFailureCount           int                        `json:"consecutive_failure_count"`
 	PriceMultiplier                   *float64                   `json:"price_multiplier,omitempty"`
 	CheapProbeRecoveryMargin          *float64                   `json:"cheap_probe_recovery_margin,omitempty"`
@@ -895,12 +898,15 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		resp.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
 		resp.FailureScoreThreshold = accountFailureThreshold(row, "failure_score_threshold")
 		resp.FailureCooldownThreshold = accountFailureThreshold(row, "failure_cooldown_threshold")
+		resp.FailureToleranceWindowSeconds = accountFailureThreshold(row, "failure_tolerance_window_seconds")
 		if resp.IgnoreUsageLimit429Cooldown {
 			resp.FailureScoreThresholdEffective = h.store.GetFailureScoreThreshold()
 			resp.FailureCooldownThresholdEffective = max(h.store.GetFailureCooldownThreshold(), resp.FailureScoreThresholdEffective)
+			resp.FailureToleranceWindowEffective = h.store.GetFailureToleranceWindowSeconds()
 		} else {
 			resp.FailureScoreThresholdEffective = 1
 			resp.FailureCooldownThresholdEffective = 1
+			resp.FailureToleranceWindowEffective = h.store.GetFailureToleranceWindowSeconds()
 		}
 		resp.PriceMultiplier = accountPriceMultiplier(row)
 		resp.CheapProbeRecoveryMargin = accountCheapProbeRecoveryMargin(row)
@@ -962,12 +968,15 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			if priceMultiplier, ok := acc.GetPriceMultiplier(); ok {
 				resp.PriceMultiplier = &priceMultiplier
 			}
-			_, scoreOverride, cooldownOverride, scoreEffective, cooldownEffective, consecutiveFailures := acc.FailureToleranceSnapshot()
+			_, scoreOverride, cooldownOverride, windowOverride, scoreEffective, cooldownEffective, windowEffective, failures := acc.FailureToleranceSnapshot()
 			resp.FailureScoreThreshold = optionalPositiveIntPointer(scoreOverride)
 			resp.FailureCooldownThreshold = optionalPositiveIntPointer(cooldownOverride)
+			resp.FailureToleranceWindowSeconds = optionalPositiveIntPointer(windowOverride)
 			resp.FailureScoreThresholdEffective = scoreEffective
 			resp.FailureCooldownThresholdEffective = cooldownEffective
-			resp.ConsecutiveFailureCount = consecutiveFailures
+			resp.FailureToleranceWindowEffective = windowEffective
+			resp.FailureWindowCount = failures
+			resp.ConsecutiveFailureCount = failures
 			if margin, duration := acc.CheapProbeConfigSnapshot(); margin > 0 || duration > 0 {
 				resp.CheapProbeRecoveryMargin = normalizePositiveFloatPointer(margin)
 				if duration > 0 {
@@ -1114,6 +1123,7 @@ type updateAccountSchedulerReq struct {
 	IgnoreUnauthorizedCooldown     json.RawMessage `json:"ignore_unauthorized_cooldown"`
 	FailureScoreThreshold          json.RawMessage `json:"failure_score_threshold"`
 	FailureCooldownThreshold       json.RawMessage `json:"failure_cooldown_threshold"`
+	FailureToleranceWindowSeconds  json.RawMessage `json:"failure_tolerance_window_seconds"`
 	PriceMultiplier                json.RawMessage `json:"price_multiplier"`
 	CheapProbeRecoveryMargin       json.RawMessage `json:"cheap_probe_recovery_margin"`
 	CheapProbeBonusDurationMinutes json.RawMessage `json:"cheap_probe_bonus_duration_minutes"`
@@ -1139,6 +1149,7 @@ type accountSchedulerUpdate struct {
 	IgnoreUnauthorizedCooldown     database.OptionalBool
 	FailureScoreThreshold          database.OptionalNullInt64
 	FailureCooldownThreshold       database.OptionalNullInt64
+	FailureToleranceWindowSeconds  database.OptionalNullInt64
 	PriceMultiplier                optionalFloat64
 	CheapProbeRecoveryMargin       optionalFloat64
 	CheapProbeBonusDurationMinutes database.OptionalNullInt64
@@ -1183,6 +1194,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	failureCooldownThreshold, err := parseOptionalIntegerField(req.FailureCooldownThreshold, "failure_cooldown_threshold", 1, 1000)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	failureToleranceWindowSeconds, err := parseOptionalIntegerField(req.FailureToleranceWindowSeconds, "failure_tolerance_window_seconds", 1, 3600)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1283,6 +1298,13 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 			credentialUpdates["failure_cooldown_threshold"] = nil
 		}
 	}
+	if failureToleranceWindowSeconds.Set {
+		if failureToleranceWindowSeconds.Value.Valid {
+			credentialUpdates["failure_tolerance_window_seconds"] = failureToleranceWindowSeconds.Value.Int64
+		} else {
+			credentialUpdates["failure_tolerance_window_seconds"] = nil
+		}
+	}
 	if priceMultiplier.Set {
 		credentialUpdates["price_multiplier"] = priceMultiplier.Value
 	}
@@ -1329,6 +1351,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		IgnoreUnauthorizedCooldown:     ignoreUnauthorizedCooldown,
 		FailureScoreThreshold:          failureScoreThreshold,
 		FailureCooldownThreshold:       failureCooldownThreshold,
+		FailureToleranceWindowSeconds:  failureToleranceWindowSeconds,
 		PriceMultiplier:                priceMultiplier,
 		CheapProbeRecoveryMargin:       cheapProbeRecoveryMargin,
 		CheapProbeBonusDurationMinutes: cheapProbeBonusDurationMinutes,
@@ -1356,6 +1379,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.IgnoreUnauthorizedCooldown.Set ||
 		u.FailureScoreThreshold.Set ||
 		u.FailureCooldownThreshold.Set ||
+		u.FailureToleranceWindowSeconds.Set ||
 		u.PriceMultiplier.Set ||
 		u.CheapProbeRecoveryMargin.Set ||
 		u.CheapProbeBonusDurationMinutes.Set ||
@@ -1507,7 +1531,7 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	if update.IgnoreUnauthorizedCooldown.Set {
 		h.store.ApplyAccountUnauthorizedCooldownConfig(id, update.IgnoreUnauthorizedCooldown.Value)
 	}
-	if update.FailureScoreThreshold.Set || update.FailureCooldownThreshold.Set {
+	if update.FailureScoreThreshold.Set || update.FailureCooldownThreshold.Set || update.FailureToleranceWindowSeconds.Set {
 		scoreThreshold := 0
 		if update.FailureScoreThreshold.Set && update.FailureScoreThreshold.Value.Valid {
 			scoreThreshold = int(update.FailureScoreThreshold.Value.Int64)
@@ -1516,12 +1540,18 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 		if update.FailureCooldownThreshold.Set && update.FailureCooldownThreshold.Value.Valid {
 			cooldownThreshold = int(update.FailureCooldownThreshold.Value.Int64)
 		}
+		windowSeconds := 0
+		if update.FailureToleranceWindowSeconds.Set && update.FailureToleranceWindowSeconds.Value.Valid {
+			windowSeconds = int(update.FailureToleranceWindowSeconds.Value.Int64)
+		}
 		h.store.ApplyAccountFailureToleranceConfig(
 			id,
 			update.FailureScoreThreshold.Set,
 			scoreThreshold,
 			update.FailureCooldownThreshold.Set,
 			cooldownThreshold,
+			update.FailureToleranceWindowSeconds.Set,
+			windowSeconds,
 		)
 	}
 	if update.PriceMultiplier.Set {
@@ -6372,6 +6402,7 @@ type settingsResponse struct {
 	DispatchMaxMultiplier              float64 `json:"dispatch_max_multiplier"`
 	FailureScoreThreshold              int     `json:"failure_score_threshold"`
 	FailureCooldownThreshold           int     `json:"failure_cooldown_threshold"`
+	FailureToleranceWindowSeconds      int     `json:"failure_tolerance_window_seconds"`
 	LazyMode                           bool    `json:"lazy_mode"`
 	ProxyURL                           string  `json:"proxy_url"`
 	PgMaxConns                         int     `json:"pg_max_conns"`
@@ -6491,6 +6522,7 @@ type updateSettingsReq struct {
 	DispatchMaxMultiplier              *float64 `json:"dispatch_max_multiplier"`
 	FailureScoreThreshold              *int     `json:"failure_score_threshold"`
 	FailureCooldownThreshold           *int     `json:"failure_cooldown_threshold"`
+	FailureToleranceWindowSeconds      *int     `json:"failure_tolerance_window_seconds"`
 	LazyMode                           *bool    `json:"lazy_mode"`
 	ProxyURL                           *string  `json:"proxy_url"`
 	PgMaxConns                         *int     `json:"pg_max_conns"`
@@ -7101,6 +7133,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		DispatchMaxMultiplier:              h.store.GetDispatchMaxMultiplier(),
 		FailureScoreThreshold:              h.store.GetFailureScoreThreshold(),
 		FailureCooldownThreshold:           h.store.GetFailureCooldownThreshold(),
+		FailureToleranceWindowSeconds:      h.store.GetFailureToleranceWindowSeconds(),
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,
@@ -7536,6 +7569,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		v := min(max(*req.FailureCooldownThreshold, 1), 1000)
 		h.store.SetFailureCooldownThreshold(v)
 		log.Printf("设置已更新: failure_cooldown_threshold = %d", v)
+	}
+
+	if req.FailureToleranceWindowSeconds != nil {
+		v := min(max(*req.FailureToleranceWindowSeconds, 1), 3600)
+		h.store.SetFailureToleranceWindowSeconds(v)
+		log.Printf("设置已更新: failure_tolerance_window_seconds = %d", v)
 	}
 
 	if req.LazyMode != nil {
@@ -8074,6 +8113,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		DispatchMaxMultiplier:              h.store.GetDispatchMaxMultiplier(),
 		FailureScoreThreshold:              h.store.GetFailureScoreThreshold(),
 		FailureCooldownThreshold:           h.store.GetFailureCooldownThreshold(),
+		FailureToleranceWindowSeconds:      h.store.GetFailureToleranceWindowSeconds(),
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,
@@ -8196,6 +8236,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		DispatchMaxMultiplier:              h.store.GetDispatchMaxMultiplier(),
 		FailureScoreThreshold:              h.store.GetFailureScoreThreshold(),
 		FailureCooldownThreshold:           h.store.GetFailureCooldownThreshold(),
+		FailureToleranceWindowSeconds:      h.store.GetFailureToleranceWindowSeconds(),
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,

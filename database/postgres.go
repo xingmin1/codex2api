@@ -826,6 +826,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS dispatch_max_multiplier DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS failure_score_threshold INT DEFAULT 3;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS failure_cooldown_threshold INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS failure_tolerance_window_seconds INT DEFAULT 60;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_mode VARCHAR(20) DEFAULT 'round_robin';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS affinity_mode VARCHAR(16) DEFAULT 'bounded';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
@@ -1470,6 +1471,7 @@ type SystemSettings struct {
 	DispatchMaxMultiplier              float64
 	FailureScoreThreshold              int
 	FailureCooldownThreshold           int
+	FailureToleranceWindowSeconds      int
 	SchedulerMode                      string
 	AffinityMode                       string // session 粘性模式: bounded / off / strict
 	ResinURL                           string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
@@ -1679,7 +1681,8 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(codex_cli_version_sync_interval_hours, 12),
 			       COALESCE(model_pricing_overrides, '{}'),
 			       COALESCE(model_pricing_sync_url, ''),
-			       COALESCE(ignore_usage_limit_status, false)
+			       COALESCE(ignore_usage_limit_status, false),
+			       COALESCE(failure_tolerance_window_seconds, 60)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1734,6 +1737,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.ModelPricingOverrides,
 		&s.ModelPricingSyncURL,
 		&s.IgnoreUsageLimitStatus,
+		&s.FailureToleranceWindowSeconds,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1757,6 +1761,7 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
 	s.FailureScoreThreshold = normalizeFailureToleranceThresholdDB(s.FailureScoreThreshold, 3)
 	s.FailureCooldownThreshold = normalizeFailureToleranceThresholdDB(s.FailureCooldownThreshold, 10)
+	s.FailureToleranceWindowSeconds = normalizeFailureToleranceWindowDB(s.FailureToleranceWindowSeconds)
 	return s, err
 }
 
@@ -1828,9 +1833,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_cli_version_sync_interval_hours,
 					model_pricing_overrides,
 					model_pricing_sync_url,
-					ignore_usage_limit_status
+					ignore_usage_limit_status,
+					failure_tolerance_window_seconds
 					)
-					VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100)
+					VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1931,7 +1937,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					codex_cli_version_sync_interval_hours = EXCLUDED.codex_cli_version_sync_interval_hours,
 					model_pricing_overrides = EXCLUDED.model_pricing_overrides,
 					model_pricing_sync_url = EXCLUDED.model_pricing_sync_url,
-					ignore_usage_limit_status = EXCLUDED.ignore_usage_limit_status
+					ignore_usage_limit_status = EXCLUDED.ignore_usage_limit_status,
+					failure_tolerance_window_seconds = EXCLUDED.failure_tolerance_window_seconds
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -1960,7 +1967,8 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		strings.TrimSpace(s.CodexSyncedCLIVersion),
 		s.CodexCLIVersionSyncEnabled, NormalizeCodexCLIVersionSyncIntervalHours(s.CodexCLIVersionSyncIntervalHours),
 		normalizeModelPricingOverridesJSON(s.ModelPricingOverrides), strings.TrimSpace(s.ModelPricingSyncURL),
-		s.IgnoreUsageLimitStatus)
+		s.IgnoreUsageLimitStatus,
+		normalizeFailureToleranceWindowDB(s.FailureToleranceWindowSeconds))
 	return err
 }
 
@@ -1975,6 +1983,13 @@ func normalizeFailureToleranceThresholdDB(value, fallback int) int {
 		return 1000
 	}
 	return value
+}
+
+func normalizeFailureToleranceWindowDB(value int) int {
+	if value <= 0 {
+		value = 60
+	}
+	return min(max(value, 1), 3600)
 }
 
 // normalizeModelPricingOverridesJSON 空/非法 JSON 归一为 "{}"。
