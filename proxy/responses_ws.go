@@ -239,6 +239,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	var lastBody []byte
 	var lastRetryableUpstreamErr *api.APIError
 	retryExclusions := newRetryAccountExclusions()
+	transportRetries := newTransportRetryTracker()
 	invalidEncryptedContentRetried := false
 	forceHTTPAfterWSMessageTooBig := false
 	var lastUpstreamCancel context.CancelFunc
@@ -312,17 +313,20 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				continue
 			}
 			retryable := IsRetryableError(reqErr) || kind != ""
-			shouldRetry := false
-			if silentRetryEnabled && retryable && attempt < maxRetries {
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := false, 0, 0
+			if silentRetryEnabled {
+				sameAccountRetry, sameAccountFailures, sameAccountLimit = transportRetries.shouldRetrySameAccount(h, account, retryable, timedOut, kind)
+			}
+			shouldRetry := sameAccountRetry
+			if silentRetryEnabled && retryable && !sameAccountRetry {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+			// 同号重试预算内的传输错误不记账号失败；真正换号时只记一次。
+			if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			if !stickyRetry {
+			if !sameAccountRetry {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
@@ -330,7 +334,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				log.Printf("Responses WebSocket upstream first token timeout, retrying with another account (attempt %d/%d, account %d): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
 				continue
 			}
-			if !timedOut && !stickyRetry {
+			if !timedOut && !sameAccountRetry {
 				retryExclusions.MarkHard(account.ID())
 			}
 
@@ -343,8 +347,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			log.Printf("Responses WebSocket upstream request failed (attempt %d): %v", attempt+1, reqErr)
 			lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, reqErr.Error(), api.ErrorTypeUpstream)
 			if shouldRetry {
-				if stickyRetry {
-					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, ws)", account.ID(), attempt+1, maxRetries+1)
+				if sameAccountRetry {
+					logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses-ws")
 				}
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return errResponsesWSClientGone

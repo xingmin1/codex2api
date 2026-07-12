@@ -677,6 +677,24 @@ function failureThresholdInputToValue(value: string): number | null {
   return parsed;
 }
 
+function formatTransportSameAccountRetriesInput(value?: number | null): string {
+  return typeof value === "number" ? String(Math.trunc(value)) : "";
+}
+
+function isTransportSameAccountRetriesInputInvalid(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (!/^\d+$/.test(trimmed)) return true;
+  const parsed = Number.parseInt(trimmed, 10);
+  return parsed < 0 || parsed > 10;
+}
+
+function transportSameAccountRetriesInputToValue(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return Number.parseInt(trimmed, 10);
+}
+
 function isFailureWindowInputInvalid(value: string): boolean {
   const trimmed = value.trim();
   if (!trimmed) return false;
@@ -1004,6 +1022,7 @@ export default function Accounts() {
     setEditFailureCooldownThresholdInput,
   ] = useState("");
   const [editFailureWindowInput, setEditFailureWindowInput] = useState("");
+  const [editTransportSameAccountRetriesInput, setEditTransportSameAccountRetriesInput] = useState("");
   const [editSchedulerPriorityInput, setEditSchedulerPriorityInput] =
     useState("");
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
@@ -3686,6 +3705,9 @@ export default function Accounts() {
     setEditFailureWindowInput(
       formatFailureThresholdInput(account.failure_tolerance_window_seconds),
     );
+    setEditTransportSameAccountRetriesInput(
+      formatTransportSameAccountRetriesInput(account.transport_same_account_retries),
+    );
     setEditSchedulerPriorityInput(
       formatSchedulerPriorityInput(account.scheduler_priority),
     );
@@ -3741,6 +3763,8 @@ export default function Accounts() {
     setEditFailureToleranceEnabled(false);
     setEditFailureScoreThresholdInput("");
     setEditFailureCooldownThresholdInput("");
+    setEditFailureWindowInput("");
+    setEditTransportSameAccountRetriesInput("");
     setEditSchedulerPriorityInput("");
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
@@ -3802,6 +3826,10 @@ export default function Accounts() {
   const editFailureWindowInvalid = isFailureWindowInputInvalid(
     editFailureWindowInput,
   );
+  const editTransportSameAccountRetriesInvalid =
+    isTransportSameAccountRetriesInputInvalid(
+      editTransportSameAccountRetriesInput,
+    );
   const editSchedulerPriorityInvalid = isSchedulerPriorityInputInvalid(
     editSchedulerPriorityInput,
   );
@@ -3876,6 +3904,7 @@ export default function Accounts() {
       editFailureScoreThresholdInvalid ||
       editFailureCooldownThresholdInvalid ||
       editFailureWindowInvalid ||
+      editTransportSameAccountRetriesInvalid ||
       editSchedulerPriorityInvalid
     ) {
       showToast(t("accounts.schedulerInvalidInput"), "error");
@@ -3923,6 +3952,10 @@ export default function Accounts() {
         failure_tolerance_window_seconds: failureThresholdInputToValue(
           editFailureWindowInput,
         ),
+        transport_same_account_retries:
+          transportSameAccountRetriesInputToValue(
+            editTransportSameAccountRetriesInput,
+          ),
         price_multiplier: priceMultiplierInputToNumber(editPriceMultiplierInput),
         scheduler_priority: schedulerPriorityInputToValue(
           editSchedulerPriorityInput,
@@ -7153,6 +7186,36 @@ export default function Accounts() {
                             </div>
                           </div>
                         )}
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <label className="text-sm font-semibold text-foreground">
+                          {t("accounts.transportSameAccountRetriesLabel")}
+                        </label>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.transportSameAccountRetriesHint")}
+                        </div>
+                        <Input
+                          className="mt-3"
+                          inputMode="numeric"
+                          value={editTransportSameAccountRetriesInput}
+                          placeholder={String(
+                            editingAccount.transport_same_account_retries_effective ?? 2,
+                          )}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            setEditTransportSameAccountRetriesInput(event.target.value)
+                          }
+                        />
+                        <div
+                          className={`mt-1.5 text-xs ${editTransportSameAccountRetriesInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                        >
+                          {editTransportSameAccountRetriesInvalid
+                            ? t("accounts.transportSameAccountRetriesRange")
+                            : t("accounts.transportSameAccountRetriesInherit", {
+                                value:
+                                  editingAccount.transport_same_account_retries_effective ?? 2,
+                              })}
+                        </div>
                       </div>
 
                       <div className="rounded-xl border border-border p-4">

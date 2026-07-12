@@ -147,26 +147,28 @@ type Account struct {
 	autoPause5hGuardConcurrency int     // 0 = disabled; otherwise guard-band concurrency cap
 	// 智能配速（issue #312）：按剩余配额/剩余时间把用量匀速摊到窗口重置，
 	// 燃烧过快时按可持续速率缩放并发。参数由 Store 全局设置快照而来。
-	smartPacingEnabled                bool
-	smartPacingMinConcurrency         int
-	smartPacingWindows5h              bool
-	smartPacingWindows7d              bool
-	DispatchCountLimit                int64 // 0 = disabled; per-reset-window dispatch cap
-	dispatchCountMu                   sync.Mutex
-	dispatchWindowUsed                int64
-	dispatchWindowResetAt             time.Time
-	IgnoreUsageLimit429Cooldown       bool
-	IgnoreUnauthorizedCooldown        bool
-	FailureScoreThresholdOverride     int // 0 表示继承全局
-	FailureCooldownThresholdOverride  int // 0 表示继承全局
-	FailureToleranceWindowOverride    int // 秒，0 表示继承全局
-	FailureScoreThresholdEffective    int
-	FailureCooldownThresholdEffective int
-	FailureToleranceWindowEffective   int
-	failureTimestamps                 []time.Time
-	PriceMultiplier                   float64 // 价格倍率，0 表示未显式配置
-	CheapProbeRecoveryMargin          float64 // 便宜账号探测成功后高出当前最高分的账号级覆盖，0 表示继承全局
-	CheapProbeBonusDuration           time.Duration
+	smartPacingEnabled                     bool
+	smartPacingMinConcurrency              int
+	smartPacingWindows5h                   bool
+	smartPacingWindows7d                   bool
+	DispatchCountLimit                     int64 // 0 = disabled; per-reset-window dispatch cap
+	dispatchCountMu                        sync.Mutex
+	dispatchWindowUsed                     int64
+	dispatchWindowResetAt                  time.Time
+	IgnoreUsageLimit429Cooldown            bool
+	IgnoreUnauthorizedCooldown             bool
+	FailureScoreThresholdOverride          int // 0 表示继承全局
+	FailureCooldownThresholdOverride       int // 0 表示继承全局
+	FailureToleranceWindowOverride         int // 秒，0 表示继承全局
+	TransportSameAccountRetriesOverride    int
+	TransportSameAccountRetriesOverrideSet bool
+	FailureScoreThresholdEffective         int
+	FailureCooldownThresholdEffective      int
+	FailureToleranceWindowEffective        int
+	failureTimestamps                      []time.Time
+	PriceMultiplier                        float64 // 价格倍率，0 表示未显式配置
+	CheapProbeRecoveryMargin               float64 // 便宜账号探测成功后高出当前最高分的账号级覆盖，0 表示继承全局
+	CheapProbeBonusDuration                time.Duration
 	// SchedulerPriority 账号调度优先级（issue #358）：数值大者严格先调度，
 	// 同优先级内才按健康档位与调度分竞争。0 为默认；负值可把账号压为兜底渠道。
 	SchedulerPriority int64
@@ -246,34 +248,35 @@ const (
 	// probeBoundaryLag 是「到点即探」定时器相对边界时刻的滞后量：稍晚于重置/冷却
 	// 结束再探，确保 NeedsUsageProbe 里 `!ResetAt.After(now)` 已成立，并给上游与
 	// 本地之间的时钟偏差留出余量，避免探早了仍拿到重置前的旧数据。
-	probeBoundaryLag                 = 2 * time.Second
-	premium5hUrgencyWindow           = 4 * time.Hour
-	premium5hUrgencyMaxBonus         = 25.0
-	premium5hUrgencyMinRemainingPct  = 5.0
-	premium5hUrgencyFullRemainingPct = 50.0
-	premium7dUrgencyWindow           = 72 * time.Hour
-	premium7dUrgencyMaxBonus         = 80.0
-	premium7dUrgencyMinRemainingPct  = 5.0
-	premium7dUrgencyFullRemainingPct = 70.0
-	expiryUrgencyUrgentDays          = 3
-	expiryUrgencyWarnDays            = 7
-	expiryUrgencyUrgentBonus         = 60.0
-	expiryUrgencyWarnBonus           = 25.0
-	defaultCheapProbeScanInterval    = 10 * time.Second
-	defaultCheapProbeConcurrency     = 2
-	defaultCheapProbeRecoveryMargin  = 10.0
-	defaultCheapProbeBonusDuration   = 10 * time.Minute
-	defaultCheapProbeTimeout         = 30 * time.Second
-	defaultCheapProbeRankBase        = 180 * time.Second
-	defaultCheapProbeRankStep        = 30 * time.Second
-	defaultCheapProbeRankMin         = 30 * time.Second
-	defaultCheapProbeMaxMultiplier   = 0.0
-	defaultDispatchMaxMultiplier     = 0.0
-	defaultFailureScoreThreshold     = 3
-	defaultFailureCooldownThreshold  = 10
-	defaultFailureToleranceWindow    = 60
-	maxFailureToleranceThreshold     = 1000
-	maxFailureToleranceWindow        = 3600
+	probeBoundaryLag                   = 2 * time.Second
+	premium5hUrgencyWindow             = 4 * time.Hour
+	premium5hUrgencyMaxBonus           = 25.0
+	premium5hUrgencyMinRemainingPct    = 5.0
+	premium5hUrgencyFullRemainingPct   = 50.0
+	premium7dUrgencyWindow             = 72 * time.Hour
+	premium7dUrgencyMaxBonus           = 80.0
+	premium7dUrgencyMinRemainingPct    = 5.0
+	premium7dUrgencyFullRemainingPct   = 70.0
+	expiryUrgencyUrgentDays            = 3
+	expiryUrgencyWarnDays              = 7
+	expiryUrgencyUrgentBonus           = 60.0
+	expiryUrgencyWarnBonus             = 25.0
+	defaultCheapProbeScanInterval      = 10 * time.Second
+	defaultCheapProbeConcurrency       = 2
+	defaultCheapProbeRecoveryMargin    = 10.0
+	defaultCheapProbeBonusDuration     = 10 * time.Minute
+	defaultCheapProbeTimeout           = 30 * time.Second
+	defaultCheapProbeRankBase          = 180 * time.Second
+	defaultCheapProbeRankStep          = 30 * time.Second
+	defaultCheapProbeRankMin           = 30 * time.Second
+	defaultCheapProbeMaxMultiplier     = 0.0
+	defaultDispatchMaxMultiplier       = 0.0
+	defaultFailureScoreThreshold       = 3
+	defaultFailureCooldownThreshold    = 10
+	defaultFailureToleranceWindow      = 60
+	defaultTransportSameAccountRetries = 2
+	maxFailureToleranceThreshold       = 1000
+	maxFailureToleranceWindow          = 3600
 )
 
 var (
@@ -2691,8 +2694,9 @@ type Store struct {
 	ignoreUsageLimitStatus       atomic.Bool  // 用量窗口只记录，不作为账号不可用证据
 
 	// 重试间隔与传输错误重试策略（issue #331）
-	retryIntervalMS      atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
-	transportRetryPolicy atomic.Value // 传输错误重试策略: rotate / sticky
+	retryIntervalMS             atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
+	transportRetryPolicy        atomic.Value // 传输错误重试策略: rotate / sticky / hybrid
+	transportSameAccountRetries atomic.Int64 // hybrid 下每个账号额外同号重试次数
 
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
@@ -3109,6 +3113,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			FailureScoreThreshold:              defaultFailureScoreThreshold,
 			FailureCooldownThreshold:           defaultFailureCooldownThreshold,
 			FailureToleranceWindowSeconds:      defaultFailureToleranceWindow,
+			TransportRetryPolicy:               "hybrid",
+			TransportSameAccountRetries:        defaultTransportSameAccountRetries,
 			LazyMode:                           false,
 			ProxyURL:                           "",
 			MaxRateLimitRetries:                1,
@@ -3233,6 +3239,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.ignoreUsageLimitStatus.Store(settings.IgnoreUsageLimitStatus)
 	s.retryIntervalMS.Store(int64(normalizeRetryIntervalMS(settings.RetryIntervalMS)))
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(settings.TransportRetryPolicy))
+	s.transportSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.TransportSameAccountRetries)))
 
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
 	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause7dThreshold)
@@ -4328,6 +4335,10 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	if seconds, ok := row.GetCredentialInt64("failure_tolerance_window_seconds"); ok {
 		account.FailureToleranceWindowOverride = normalizeFailureToleranceWindowOverride(int(seconds))
 	}
+	if retries, ok := row.GetCredentialInt64("transport_same_account_retries"); ok {
+		account.TransportSameAccountRetriesOverride = database.NormalizeTransportSameAccountRetries(int(retries))
+		account.TransportSameAccountRetriesOverrideSet = true
+	}
 	account.recomputeFailureToleranceThresholdsLocked(s)
 	account.PriceMultiplier = resolveAccountRowPriceMultiplier(row)
 	if margin, ok := row.GetCredentialFloat64("cheap_probe_recovery_margin"); ok {
@@ -5378,12 +5389,57 @@ func (s *Store) refreshFailureToleranceThresholds() {
 	}
 }
 
-// SetTransportRetryPolicy 动态更新传输错误重试策略（rotate / sticky）。
+// SetTransportRetryPolicy 动态更新传输错误重试策略（rotate / sticky / hybrid）。
 func (s *Store) SetTransportRetryPolicy(policy string) {
 	if s == nil {
 		return
 	}
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(policy))
+}
+
+// SetTransportSameAccountRetries 更新 hybrid 策略的全局同号重试次数。
+func (s *Store) SetTransportSameAccountRetries(retries int) {
+	if s == nil {
+		return
+	}
+	s.transportSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(retries)))
+}
+
+// GetTransportSameAccountRetries 返回 hybrid 策略的全局同号重试次数。
+func (s *Store) GetTransportSameAccountRetries() int {
+	if s == nil {
+		return defaultTransportSameAccountRetries
+	}
+	return database.NormalizeTransportSameAccountRetries(int(s.transportSameAccountRetries.Load()))
+}
+
+// TransportSameAccountRetriesForAccount 返回账号覆盖优先的同号重试次数。
+func (s *Store) TransportSameAccountRetriesForAccount(account *Account) int {
+	global := s.GetTransportSameAccountRetries()
+	if account == nil {
+		return global
+	}
+	account.mu.RLock()
+	defer account.mu.RUnlock()
+	if !account.TransportSameAccountRetriesOverrideSet {
+		return global
+	}
+	return database.NormalizeTransportSameAccountRetries(account.TransportSameAccountRetriesOverride)
+}
+
+// TransportSameAccountRetriesConfig 返回账号覆盖值及其当前有效值。
+func (a *Account) TransportSameAccountRetriesConfig(global int) (*int, int) {
+	global = database.NormalizeTransportSameAccountRetries(global)
+	if a == nil {
+		return nil, global
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.TransportSameAccountRetriesOverrideSet {
+		return nil, global
+	}
+	override := database.NormalizeTransportSameAccountRetries(a.TransportSameAccountRetriesOverride)
+	return &override, override
 }
 
 // GetTransportRetryPolicy 获取传输错误重试策略，缺省 rotate（换号，旧行为）。
@@ -5942,6 +5998,28 @@ func (s *Store) ApplyAccountFailureToleranceConfig(dbID int64, scoreSet bool, sc
 		acc.FailureToleranceWindowOverride = normalizeFailureToleranceWindowOverride(windowSeconds)
 	}
 	acc.recomputeFailureToleranceThresholdsLocked(s)
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountTransportSameAccountRetries 更新账号级同号重试次数覆盖，set=false 时不修改。
+func (s *Store) ApplyAccountTransportSameAccountRetries(dbID int64, set bool, retries *int) bool {
+	if !set {
+		return true
+	}
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	if retries == nil {
+		acc.TransportSameAccountRetriesOverride = 0
+		acc.TransportSameAccountRetriesOverrideSet = false
+	} else {
+		acc.TransportSameAccountRetriesOverride = database.NormalizeTransportSameAccountRetries(*retries)
+		acc.TransportSameAccountRetriesOverrideSet = true
+	}
 	acc.mu.Unlock()
 	return true
 }

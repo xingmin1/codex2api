@@ -93,15 +93,19 @@ func TestRetrySettingsNormalization(t *testing.T) {
 	if got := store.GetTransportRetryPolicy(); got != "sticky" {
 		t.Errorf("policy STICKY → %q, want sticky", got)
 	}
+	store.SetTransportRetryPolicy(" HYBRID ")
+	if got := store.GetTransportRetryPolicy(); got != "hybrid" {
+		t.Errorf("policy HYBRID → %q, want hybrid", got)
+	}
 	store.SetTransportRetryPolicy("whatever")
 	if got := store.GetTransportRetryPolicy(); got != "rotate" {
 		t.Errorf("unknown policy → %q, want rotate", got)
 	}
 }
 
-// runWSTransportRetryScenario 驱动入站 WS:首次上游连接报传输错误,第二次成功,
-// 返回两次尝试使用的账号 ID。用于验证 rotate/sticky 两种传输错误重试策略。
-func runWSTransportRetryScenario(t *testing.T, policy string) (first, second int64) {
+// runWSTransportRetryScenario 驱动入站 WS 连续返回指定次数的传输错误，
+// 返回每次尝试使用的账号 ID，用于验证三种传输错误重试策略。
+func runWSTransportRetryScenario(t *testing.T, policy string, sameAccountRetries, failures int) []int64 {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 
@@ -118,10 +122,10 @@ func runWSTransportRetryScenario(t *testing.T, policy string) (first, second int
 	ApplyRuntimeSettings(nextSettings)
 
 	var calls atomic.Int64
-	attemptCh := make(chan int64, 4)
+	attemptCh := make(chan int64, 16)
 	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
 		attemptCh <- account.ID()
-		if calls.Add(1) == 1 {
+		if calls.Add(1) <= int64(failures) {
 			return nil, errors.New("read tcp 127.0.0.1:443: connection reset by peer")
 		}
 		sse := `data: {"type":"response.created"}` + "\n\n" +
@@ -139,6 +143,7 @@ func runWSTransportRetryScenario(t *testing.T, policy string) (first, second int
 	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "at-2", PlanType: "pro", AccountID: "acct-2"})
 	store.SetRetryIntervalMS(10)
 	store.SetTransportRetryPolicy(policy)
+	store.SetTransportSameAccountRetries(sameAccountRetries)
 
 	router := gin.New()
 	handler.RegisterRoutes(router)
@@ -181,21 +186,42 @@ func runWSTransportRetryScenario(t *testing.T, policy string) (first, second int
 			return 0
 		}
 	}
-	return readAttempt(), readAttempt()
+	attempts := make([]int64, failures+1)
+	for i := range attempts {
+		attempts[i] = readAttempt()
+	}
+	return attempts
 }
 
 // 传输错误 + sticky 策略:同号重试(不换号、保留会话亲和)。issue #331
 func TestResponsesWebSocketTransportRetrySticky(t *testing.T) {
-	first, second := runWSTransportRetryScenario(t, "sticky")
-	if first != second {
-		t.Fatalf("sticky 策略应同号重试: first=%d second=%d", first, second)
+	attempts := runWSTransportRetryScenario(t, "sticky", 0, 1)
+	if attempts[0] != attempts[1] {
+		t.Fatalf("sticky 策略应同号重试: attempts=%v", attempts)
 	}
 }
 
 // 传输错误 + rotate 策略(默认):换号重试,保持旧行为。
 func TestResponsesWebSocketTransportRetryRotate(t *testing.T) {
-	first, second := runWSTransportRetryScenario(t, "rotate")
-	if first == second {
-		t.Fatalf("rotate 策略应换号重试: first=%d second=%d", first, second)
+	attempts := runWSTransportRetryScenario(t, "rotate", 2, 1)
+	if attempts[0] == attempts[1] {
+		t.Fatalf("rotate 策略应换号重试: attempts=%v", attempts)
+	}
+}
+
+func TestResponsesWebSocketTransportRetryHybridRetriesSameAccountThenRotates(t *testing.T) {
+	attempts := runWSTransportRetryScenario(t, "hybrid", 2, 3)
+	if attempts[0] != attempts[1] || attempts[1] != attempts[2] {
+		t.Fatalf("hybrid 策略前两次额外重试应保持同号: attempts=%v", attempts)
+	}
+	if attempts[2] == attempts[3] {
+		t.Fatalf("hybrid 策略同号预算耗尽后应换号: attempts=%v", attempts)
+	}
+}
+
+func TestResponsesWebSocketTransportRetryHybridZeroRotatesImmediately(t *testing.T) {
+	attempts := runWSTransportRetryScenario(t, "hybrid", 0, 1)
+	if attempts[0] == attempts[1] {
+		t.Fatalf("hybrid 同号次数为 0 时应立即换号: attempts=%v", attempts)
 	}
 }

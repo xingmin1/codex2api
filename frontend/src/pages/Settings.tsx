@@ -1057,6 +1057,7 @@ export default function Settings() {
     { label: t('settings.schedulerModeRemainingQuota'), value: 'remaining_quota' },
   ]
   const transportRetryPolicyOptions = [
+    { label: t('settings.transportRetryPolicyHybrid'), value: 'hybrid' },
     { label: t('settings.transportRetryPolicyRotate'), value: 'rotate' },
     { label: t('settings.transportRetryPolicySticky'), value: 'sticky' },
   ]
@@ -1162,7 +1163,8 @@ export default function Settings() {
     max_retries: 2,
     max_rate_limit_retries: 1,
     retry_interval_ms: 0,
-    transport_retry_policy: 'rotate',
+    transport_retry_policy: 'hybrid',
+    transport_same_account_retries: 2,
     allow_remote_migration: false,
     database_driver: 'postgres',
     database_label: 'PostgreSQL',
@@ -1936,9 +1938,19 @@ export default function Settings() {
                 </SettingField>
                 <SettingField label={t('settings.transportRetryPolicy')} description={t('settings.transportRetryPolicyDesc')}>
                   <Select
-                    value={settingsForm.transport_retry_policy || 'rotate'}
+                    value={settingsForm.transport_retry_policy || 'hybrid'}
                     onValueChange={(value) => autoSaveStringField('transport_retry_policy', value)}
                     options={transportRetryPolicyOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.transportSameAccountRetries')} description={t('settings.transportSameAccountRetriesDesc')} suffix={t('settings.unit.times')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10}
+                    disabled={settingsForm.transport_retry_policy !== 'hybrid'}
+                    value={settingsForm.transport_same_account_retries}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, transport_same_account_retries: parseInt(e.target.value) || 0 }))}
                   />
                 </SettingField>
               </div>

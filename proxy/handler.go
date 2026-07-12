@@ -1831,8 +1831,6 @@ func downstreamRequestCanceled(c *gin.Context) bool {
 	return c != nil && c.Request != nil && c.Request.Context().Err() != nil
 }
 
-const transportRetryPolicySticky = "sticky"
-
 // waitBeforeRetry 在两次重试之间等待管理端配置的重试间隔(retry_interval_ms,0 = 立即重试)。
 // 等待期间客户端断开返回 false，调用方应放弃本次重试(issue #331)。
 func (h *Handler) waitBeforeRetry(ctx context.Context) bool {
@@ -1858,13 +1856,6 @@ func (h *Handler) waitBeforeRetry(ctx context.Context) bool {
 	case <-ctx.Done():
 		return false
 	}
-}
-
-// stickyTransportRetryEnabled 返回是否对传输类失败粘滞同号重试(issue #331)。
-// 网络波动或代理换节点等连接级故障的根源不在账号：粘滞模式下不换号、不记账号失败、
-// 不解绑会话亲和，等重试间隔后同号重试；换号模式保持原有行为。
-func (h *Handler) stickyTransportRetryEnabled() bool {
-	return h != nil && h.store != nil && h.store.GetTransportRetryPolicy() == transportRetryPolicySticky
 }
 
 func IsDeactivatedWorkspaceError(body []byte) bool {
@@ -2094,6 +2085,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	transportRetries := newTransportRetryTracker()
 	transientRetry := transientUpstreamRetryState{}
 	forceHTTPAfterWSMessageTooBig := false
 	encryptedContentStrippedRetried := false
@@ -2157,6 +2149,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						openAIResponsesBody = PrepareOpenAIResponsesBody(rawBody)
 						expandedInputRaw = responsesInputRaw(codexBody)
 						retryExclusions = newRetryAccountExclusions()
+						transportRetries.reset()
 						transientRetry.clear()
 						log.Printf("OpenAI Responses 连续 5xx 疑似旧会话 encrypted_content 不兼容，已移除加密 reasoning 上下文后重试 (round %d)", round)
 						continue
@@ -2170,6 +2163,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 				retryExclusions = newRetryAccountExclusions()
+				transportRetries.reset()
 				transientRetry.nextRound()
 				continue
 			}
@@ -2247,8 +2241,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				kind := classifyTransportFailure(reqErr)
 				retryable := IsRetryableError(reqErr) || kind != ""
-				shouldRetry := false
-				if retryable {
+				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, retryable, timedOut, kind)
+				shouldRetry := sameAccountRetry
+				if retryable && !sameAccountRetry {
 					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 				}
 				persistentTransient := shouldPersistTransientRequestError(reqErr)
@@ -2263,13 +2258,12 @@ func (h *Handler) Responses(c *gin.Context) {
 					h.store.Release(account)
 					continue
 				}
-				// 传输类失败粘滞同号重试时，不记账号失败、不解绑亲和、不硬排除。
-				stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-				if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+				// 同号重试预算内不记账号失败、不解绑亲和、不硬排除。
+				if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
-				if !stickyRetry {
+				if !sameAccountRetry {
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				}
 				if timedOut && shouldRetry {
@@ -2277,7 +2271,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					log.Printf("OpenAI Responses 上游首字超时，断开并重试 (attempt %d/%d, account %d): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
 					continue
 				}
-				if !timedOut && !stickyRetry {
+				if !timedOut && !sameAccountRetry {
 					retryExclusions.MarkHard(account.ID())
 				}
 
@@ -2293,8 +2287,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					} else {
 						transientRetry.clear()
 					}
-					if stickyRetry {
-						log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d)", account.ID(), attempt+1, maxRetries+1)
+					if sameAccountRetry {
+						logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses-relay")
 					}
 					if !h.waitBeforeRetry(c.Request.Context()) {
 						return
@@ -2666,8 +2660,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				continue
 			}
 			retryable := IsRetryableError(reqErr) || kind != ""
-			shouldRetry := false
-			if retryable {
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, retryable, timedOut, kind)
+			shouldRetry := sameAccountRetry
+			if retryable && !sameAccountRetry {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
 			persistentTransient := shouldPersistTransientRequestError(reqErr)
@@ -2681,13 +2676,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.Release(account)
 				continue
 			}
-			// 传输类失败粘滞同号重试时，不记账号失败、不解绑亲和、不硬排除。
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+			// 同号重试预算内的传输错误不记账号失败；真正换号时只记一次。
+			if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			if !stickyRetry {
+			if !sameAccountRetry {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
@@ -2695,7 +2689,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				log.Printf("上游首字超时，断开并重试 (attempt %d/%d, account %d, /v1/responses): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
 				continue
 			}
-			if !timedOut && !stickyRetry {
+			if !timedOut && !sameAccountRetry {
 				retryExclusions.MarkHard(account.ID())
 			}
 
@@ -2712,8 +2706,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				} else {
 					transientRetry.clear()
 				}
-				if stickyRetry {
-					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, /v1/responses)", account.ID(), attempt+1, maxRetries+1)
+				if sameAccountRetry {
+					logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses")
 				}
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
@@ -3988,6 +3982,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastStatusCode int
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
+	transportRetries := newTransportRetryTracker()
 	forceHTTPAfterWSMessageTooBig := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
@@ -4089,17 +4084,17 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				continue
 			}
 			retryable := IsRetryableError(reqErr) || kind != ""
-			shouldRetry := false
-			if retryable {
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, retryable, timedOut, kind)
+			shouldRetry := sameAccountRetry
+			if retryable && !sameAccountRetry {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
+			// 同号重试预算内的传输错误不记账号失败；真正换号时只记一次。
+			if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			if !stickyRetry {
+			if !sameAccountRetry {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
 			if timedOut && shouldRetry {
@@ -4107,7 +4102,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				log.Printf("上游首字超时，断开并重试 (attempt %d/%d, account %d, /v1/chat/completions): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
 				continue
 			}
-			if !timedOut && !stickyRetry {
+			if !timedOut && !sameAccountRetry {
 				retryExclusions.MarkHard(account.ID())
 			}
 
@@ -4119,8 +4114,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			if shouldRetry {
-				if stickyRetry {
-					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, /v1/chat/completions)", account.ID(), attempt+1, maxRetries+1)
+				if sameAccountRetry {
+					logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/chat/completions")
 				}
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return

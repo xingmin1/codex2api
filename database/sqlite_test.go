@@ -1117,6 +1117,8 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		CheapProbeMaxMultiplier:          0.25,
 		DispatchMaxMultiplier:            0.5,
 		IgnoreUsageLimitStatus:           true,
+		TransportRetryPolicy:             "hybrid",
+		TransportSameAccountRetries:      2,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1136,6 +1138,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.TestContent != "say pong" {
 		t.Fatalf("TestContent = %q, want say pong", settings.TestContent)
+	}
+	if settings.TransportRetryPolicy != "hybrid" || settings.TransportSameAccountRetries != 2 {
+		t.Fatalf("传输重试设置 = {%q %d}, want {hybrid 2}", settings.TransportRetryPolicy, settings.TransportSameAccountRetries)
 	}
 	if settings.FirstTokenMode != "loose" {
 		t.Fatalf("FirstTokenMode = %q, want loose", settings.FirstTokenMode)
