@@ -2693,9 +2693,9 @@ type Store struct {
 	codexCLIVersionSyncInterval  atomic.Int64 // 定时同步间隔（小时），默认 12
 	ignoreUsageLimitStatus       atomic.Bool  // 用量窗口只记录，不作为账号不可用证据
 
-	// 重试间隔与传输错误重试策略（issue #331）
+	// 重试间隔与上游错误重试策略（issue #331）
 	retryIntervalMS             atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
-	transportRetryPolicy        atomic.Value // 传输错误重试策略: rotate / sticky / hybrid
+	transportRetryPolicy        atomic.Value // 上游错误重试策略: rotate / sticky / hybrid
 	transportSameAccountRetries atomic.Int64 // hybrid 下每个账号额外同号重试次数
 
 	// 智能刷新调度器
@@ -2736,6 +2736,59 @@ type sessionAffinity struct {
 	boundAt      time.Time
 	requestCount int64
 	expiresAt    time.Time
+}
+
+func sessionAffinityCacheBinding(binding sessionAffinity) cache.SessionAffinityBinding {
+	return cache.SessionAffinityBinding{
+		AccountID:         binding.accountID,
+		ProxyURL:          binding.proxyURL,
+		BoundAtUnixNano:   strconv.FormatInt(binding.boundAt.UnixNano(), 10),
+		ExpiresAtUnixNano: strconv.FormatInt(binding.expiresAt.UnixNano(), 10),
+		RequestCount:      binding.requestCount,
+	}
+}
+
+func sessionAffinityFromCacheBinding(binding cache.SessionAffinityBinding, now time.Time) (sessionAffinity, bool) {
+	if binding.AccountID == 0 {
+		return sessionAffinity{}, false
+	}
+	boundAtUnixNano, _ := strconv.ParseInt(strings.TrimSpace(binding.BoundAtUnixNano), 10, 64)
+	boundAt := time.Unix(0, boundAtUnixNano)
+	if boundAtUnixNano <= 0 {
+		// 兼容旧缓存：旧值没有原始绑定时间，只允许从本次恢复时开始计时，
+		// 不能继续沿用每次读取都重新延长的滑动 TTL。
+		boundAt = now
+	}
+	expiresAtUnixNano, _ := strconv.ParseInt(strings.TrimSpace(binding.ExpiresAtUnixNano), 10, 64)
+	expiresAt := time.Unix(0, expiresAtUnixNano)
+	if expiresAtUnixNano <= 0 {
+		expiresAt = boundAt.Add(sessionAffinityTTL())
+	}
+	return sessionAffinity{
+		accountID:    binding.AccountID,
+		proxyURL:     strings.TrimSpace(binding.ProxyURL),
+		boundAt:      boundAt,
+		requestCount: max(binding.RequestCount, int64(0)),
+		expiresAt:    expiresAt,
+	}, true
+}
+
+func sessionAffinityCacheTTL(binding sessionAffinity, now time.Time) time.Duration {
+	if binding.expiresAt.IsZero() {
+		return sessionAffinityTTL()
+	}
+	ttl := binding.expiresAt.Sub(now)
+	if ttl <= 0 {
+		return 0
+	}
+	return ttl
+}
+
+func sameSessionAffinityIdentity(left, right sessionAffinity) bool {
+	return left.accountID == right.accountID &&
+		left.proxyURL == right.proxyURL &&
+		left.boundAt.Equal(right.boundAt) &&
+		left.expiresAt.Equal(right.expiresAt)
 }
 
 const defaultSessionAffinityTTL = time.Hour
@@ -4886,8 +4939,8 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 	if key == "" {
 		return
 	}
-	ttl := sessionAffinityTTL()
 	now := time.Now()
+	ttl := sessionAffinityTTL()
 	binding := sessionAffinity{
 		accountID:    account.DBID,
 		proxyURL:     strings.TrimSpace(proxyURL),
@@ -4912,26 +4965,28 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 	}
 	// 同账号的连续 Bind 视为复用,沿用 boundAt 与 requestCount 以保持 bounded 上限计数;
 	// 换账号时则按新绑定从 0 开始计。
-	if existing, ok := s.sessionBindings[key]; ok && existing.accountID == account.DBID {
+	if existing, ok := s.sessionBindings[key]; ok && existing.accountID == account.DBID && existing.expiresAt.After(now) {
 		binding.boundAt = existing.boundAt
 		binding.requestCount = existing.requestCount
+		binding.expiresAt = existing.expiresAt
 	}
 	s.sessionBindings[key] = binding
 	s.sessionMu.Unlock()
 
 	if s.tokenCache != nil {
+		ttl := sessionAffinityCacheTTL(binding, now)
+		if ttl <= 0 {
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer cancel()
-		if err := s.tokenCache.SetSessionAffinity(ctx, key, cache.SessionAffinityBinding{
-			AccountID: binding.accountID,
-			ProxyURL:  binding.proxyURL,
-		}, ttl); err != nil {
+		if err := s.tokenCache.SetSessionAffinity(ctx, key, sessionAffinityCacheBinding(binding), ttl); err != nil {
 			log.Printf("写入缓存会话粘性失败: account=%d err=%v", binding.accountID, err)
 		}
 	}
 }
 
-// UnbindSessionAffinity removes a session binding when it still points to the failed account.
+// UnbindSessionAffinity 仅在会话仍指向指定账号时删除亲和绑定。
 func (s *Store) UnbindSessionAffinity(key string, accountID int64) {
 	if s == nil || accountID == 0 {
 		return
@@ -4991,6 +5046,7 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	s.sessionMu.RLock()
 	binding, ok := s.sessionBindings[key]
 	s.sessionMu.RUnlock()
+	skipCachedAffinity := false
 
 	if ok {
 		expired := !binding.expiresAt.After(now)
@@ -5007,11 +5063,17 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 
 		if expired || escape {
+			skipCachedAffinity = true
+			deleteCachedAffinity := false
 			s.sessionMu.Lock()
-			if current, exists := s.sessionBindings[key]; exists && current.accountID == binding.accountID {
+			if current, exists := s.sessionBindings[key]; exists && sameSessionAffinityIdentity(current, binding) {
 				delete(s.sessionBindings, key)
+				deleteCachedAffinity = true
 			}
 			s.sessionMu.Unlock()
+			if deleteCachedAffinity {
+				s.deleteCachedSessionAffinityIfMatches(key, binding)
+			}
 		} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
 			// 命中粘性,记一次复用
 			s.sessionMu.Lock()
@@ -5023,18 +5085,24 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 			return acc, binding.proxyURL
 		}
 	}
-	if binding, ok := s.getCachedSessionAffinity(key); ok {
-		// 跨进程缓存的 binding 也按 bounded 逻辑校验账号健康
-		if mode == AffinityModeBounded && !s.affinityAccountStillHealthy(binding.accountID) {
-			// 不复用,落到完整挑号
-		} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
-			s.sessionMu.Lock()
-			if s.sessionBindings == nil {
-				s.sessionBindings = make(map[string]sessionAffinity)
+	if !skipCachedAffinity {
+		if binding, ok := s.getCachedSessionAffinity(key); ok {
+			expired := !binding.expiresAt.After(now)
+			escape := mode == AffinityModeBounded && (binding.requestCount >= defaultMaxAffinityRequests ||
+				(!binding.boundAt.IsZero() && now.Sub(binding.boundAt) >= defaultMaxAffinityDuration) ||
+				!s.affinityAccountStillHealthy(binding.accountID))
+			if expired || escape {
+				s.deleteCachedSessionAffinityIfMatches(key, binding)
+			} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
+				binding.requestCount++
+				s.sessionMu.Lock()
+				if s.sessionBindings == nil {
+					s.sessionBindings = make(map[string]sessionAffinity)
+				}
+				s.sessionBindings[key] = binding
+				s.sessionMu.Unlock()
+				return acc, binding.proxyURL
 			}
-			s.sessionBindings[key] = binding
-			s.sessionMu.Unlock()
-			return acc, binding.proxyURL
 		}
 	}
 
@@ -5079,11 +5147,18 @@ func (s *Store) getCachedSessionAffinity(key string) (sessionAffinity, bool) {
 	if !ok || binding.AccountID == 0 {
 		return sessionAffinity{}, false
 	}
-	return sessionAffinity{
-		accountID: binding.AccountID,
-		proxyURL:  strings.TrimSpace(binding.ProxyURL),
-		expiresAt: time.Now().Add(sessionAffinityTTL()),
-	}, true
+	return sessionAffinityFromCacheBinding(binding, time.Now())
+}
+
+func (s *Store) deleteCachedSessionAffinityIfMatches(key string, binding sessionAffinity) {
+	if s == nil || s.tokenCache == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := s.tokenCache.DeleteSessionAffinityIfMatches(ctx, key, sessionAffinityCacheBinding(binding)); err != nil {
+		log.Printf("按绑定条件删除缓存会话粘性失败: account=%d err=%v", binding.accountID, err)
+	}
 }
 
 func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
@@ -5135,6 +5210,12 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 		return nil
 	}
 	return target
+}
+
+// TakeAccountForRetryWithFilter 在同号重试时重新占用指定账号。
+// 调用方必须保证该账号尚未被本次请求解绑或硬隔离。
+func (s *Store) TakeAccountForRetryWithFilter(id int64, apiKeyID int64, filter AccountFilter) *Account {
+	return s.takeByIDExcluding(id, apiKeyID, nil, filter)
 }
 
 // WaitForAvailable 等待可用账号（带超时的请求排队）
@@ -5389,12 +5470,25 @@ func (s *Store) refreshFailureToleranceThresholds() {
 	}
 }
 
-// SetTransportRetryPolicy 动态更新传输错误重试策略（rotate / sticky / hybrid）。
+// SetTransportRetryPolicy 动态更新上游错误重试策略（rotate / sticky / hybrid）。
 func (s *Store) SetTransportRetryPolicy(policy string) {
 	if s == nil {
 		return
 	}
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(policy))
+}
+
+// IsSameAccountRetryEnabled 返回是否启用了会保留当前账号的上游错误重试策略。
+func (s *Store) IsSameAccountRetryEnabled() bool {
+	if s == nil {
+		return false
+	}
+	switch s.GetTransportRetryPolicy() {
+	case "sticky", "hybrid":
+		return true
+	default:
+		return false
+	}
 }
 
 // SetTransportSameAccountRetries 更新 hybrid 策略的全局同号重试次数。
@@ -5442,7 +5536,7 @@ func (a *Account) TransportSameAccountRetriesConfig(global int) (*int, int) {
 	return &override, override
 }
 
-// GetTransportRetryPolicy 获取传输错误重试策略，缺省 rotate（换号，旧行为）。
+// GetTransportRetryPolicy 获取上游错误重试策略，缺省 rotate（换号，旧行为）。
 func (s *Store) GetTransportRetryPolicy() string {
 	if s == nil {
 		return "rotate"

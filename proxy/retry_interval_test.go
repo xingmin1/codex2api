@@ -103,6 +103,100 @@ func TestRetrySettingsNormalization(t *testing.T) {
 	}
 }
 
+func TestSameAccountRetryIncludesUnclassifiedUpstreamErrors(t *testing.T) {
+	handler, store := newRetryTestHandler(t)
+	store.SetTransportRetryPolicy("hybrid")
+	store.SetTransportSameAccountRetries(1)
+	account := &auth.Account{DBID: 1, AccessToken: "token"}
+	tracker := newTransportRetryTracker()
+
+	retry, failures, limit := tracker.shouldRetrySameAccount(handler, account, true, false, "")
+	if !retry || failures != 1 || limit != 1 {
+		t.Fatalf("first retry = %v failures=%d limit=%d, want true 1 1", retry, failures, limit)
+	}
+	retry, failures, limit = tracker.shouldRetrySameAccount(handler, account, true, false, "")
+	if retry || failures != 2 || limit != 1 {
+		t.Fatalf("second retry = %v failures=%d limit=%d, want false 2 1", retry, failures, limit)
+	}
+}
+
+func TestSameAccountRetryExcludesFirstTokenTimeout(t *testing.T) {
+	handler, store := newRetryTestHandler(t)
+	store.SetTransportRetryPolicy("sticky")
+	account := &auth.Account{DBID: 1, AccessToken: "token"}
+
+	retry, _, _ := newTransportRetryTracker().shouldRetrySameAccount(handler, account, true, true, "timeout")
+	if retry {
+		t.Fatal("first-token timeout must not enter same-account retry")
+	}
+}
+
+func TestSameAccountStreamRetryEligibility(t *testing.T) {
+	upstream400 := streamOutcome{logStatusCode: http.StatusBadRequest, failureKind: "client", penalize: false}
+	if !sameAccountStreamRetryEligible(false, upstream400, false, nil, nil) {
+		t.Fatal("上游 4xx response.failed 应纳入同号重试，不能复用扣分判定")
+	}
+	if sameAccountStreamRetryEligible(true, upstream400, false, nil, nil) {
+		t.Fatal("compact 专用失败不能进入普通同号流重试")
+	}
+	if sameAccountStreamRetryEligible(false, upstream400, true, nil, nil) {
+		t.Fatal("已写出下游内容后不能透明同号重试")
+	}
+	if sameAccountStreamRetryEligible(false, upstream400, false, context.Canceled, nil) {
+		t.Fatal("客户端取消不能作为上游错误同号重试")
+	}
+	if sameAccountStreamRetryEligible(false, streamOutcome{logStatusCode: http.StatusOK}, false, nil, nil) {
+		t.Fatal("成功流不能进入同号重试")
+	}
+}
+
+func TestSameAccountRetryRequestErrorMarksUsageAttempt(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	handler, _ := newRetryTestHandler(t)
+	input := &database.UsageLogInput{AccountID: 1, Endpoint: "/v1/responses"}
+
+	handler.logSameAccountRetryRequestError(ctx, input, 2, "transport", errors.New("connection reset"))
+
+	if !input.IsRetryAttempt || input.AttemptIndex != 3 {
+		t.Fatalf("retry metadata = enabled:%v attempt:%d, want true/3", input.IsRetryAttempt, input.AttemptIndex)
+	}
+	if input.StatusCode != http.StatusBadGateway || input.UpstreamErrorKind != "transport" || !strings.Contains(input.ErrorMessage, "connection reset") {
+		t.Fatalf("usage failure metadata = %+v", input)
+	}
+}
+
+func TestApply429CooldownTreats429AsOrdinaryUnderSameAccountPolicy(t *testing.T) {
+	handler, store := newRetryTestHandler(t)
+	store.SetTransportRetryPolicy("hybrid")
+	account := &auth.Account{DBID: 1, AccessToken: "token", PlanType: "pro"}
+	body := []byte(`{"error":{"type":"usage_limit_reached"}}`)
+
+	decision := handler.applyCooldownForModel(account, http.StatusTooManyRequests, body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+	if decision.Reason != "" || decision.Scope != "" {
+		t.Fatalf("decision = %#v, want empty ordinary-error decision", decision)
+	}
+	if account.HasActiveCooldown() {
+		t.Fatal("429 under same-account policy must not write account cooldown")
+	}
+}
+
+func TestSameAccountFailureStateSuppressionOnlyCovers429AndUsageLimit(t *testing.T) {
+	_, store := newRetryTestHandler(t)
+	store.SetTransportRetryPolicy("hybrid")
+
+	if !shouldSuppressSameAccountFailureState(store, http.StatusTooManyRequests, nil) {
+		t.Fatal("429 should suppress quota/cooldown state under same-account policy")
+	}
+	if !shouldSuppressSameAccountFailureState(store, http.StatusBadRequest, []byte(`{"error":{"type":"usage_limit_reached"}}`)) {
+		t.Fatal("usage_limit_reached should suppress quota/cooldown state under same-account policy")
+	}
+	if shouldSuppressSameAccountFailureState(store, http.StatusInternalServerError, []byte(`{"error":{"type":"server_error"}}`)) {
+		t.Fatal("non-quota compact failures must retain the existing failure state machine")
+	}
+}
+
 // runWSTransportRetryScenario 驱动入站 WS 连续返回指定次数的传输错误，
 // 返回每次尝试使用的账号 ID，用于验证三种传输错误重试策略。
 func runWSTransportRetryScenario(t *testing.T, policy string, sameAccountRetries, failures int) []int64 {
@@ -144,6 +238,8 @@ func runWSTransportRetryScenario(t *testing.T, policy string, sameAccountRetries
 	store.SetRetryIntervalMS(10)
 	store.SetTransportRetryPolicy(policy)
 	store.SetTransportSameAccountRetries(sameAccountRetries)
+	// 同号重试必须由请求内目标保证，不能依赖 session affinity 恰好仍有效。
+	store.SetAffinityMode(auth.AffinityModeOff)
 
 	router := gin.New()
 	handler.RegisterRoutes(router)
@@ -193,7 +289,7 @@ func runWSTransportRetryScenario(t *testing.T, policy string, sameAccountRetries
 	return attempts
 }
 
-// 传输错误 + sticky 策略:同号重试(不换号、保留会话亲和)。issue #331
+// 上游错误 + sticky 策略:同号重试(不换号、保留请求内账号和代理)。issue #331
 func TestResponsesWebSocketTransportRetrySticky(t *testing.T) {
 	attempts := runWSTransportRetryScenario(t, "sticky", 0, 1)
 	if attempts[0] != attempts[1] {
@@ -201,7 +297,7 @@ func TestResponsesWebSocketTransportRetrySticky(t *testing.T) {
 	}
 }
 
-// 传输错误 + rotate 策略(默认):换号重试,保持旧行为。
+// 上游错误 + rotate 策略(默认):换号重试,保持旧行为。
 func TestResponsesWebSocketTransportRetryRotate(t *testing.T) {
 	attempts := runWSTransportRetryScenario(t, "rotate", 2, 1)
 	if attempts[0] == attempts[1] {

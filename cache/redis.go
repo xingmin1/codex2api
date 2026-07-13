@@ -389,6 +389,41 @@ return 0
 	return tc.client.Eval(ctx, script, []string{sessionAffinityKey(key)}, accountID).Err()
 }
 
+// DeleteSessionAffinityIfMatches 仅在 Redis 中仍是指定版本时删除会话亲和。
+func (tc *redisTokenCache) DeleteSessionAffinityIfMatches(ctx context.Context, key string, binding SessionAffinityBinding) error {
+	key = strings.TrimSpace(key)
+	if key == "" || binding.AccountID == 0 {
+		return nil
+	}
+	const script = `
+local value = redis.call("GET", KEYS[1])
+if not value then
+  return 0
+end
+local ok, data = pcall(cjson.decode, value)
+if not ok then
+  return 0
+end
+local same_account = tonumber(data["account_id"]) == tonumber(ARGV[1])
+local same_proxy = (data["proxy_url"] or "") == ARGV[2]
+local same_bound_at = (data["bound_at_unix_nano"] or "") == ARGV[3]
+local same_expires_at = (data["expires_at_unix_nano"] or "") == ARGV[4]
+if same_account and same_proxy and same_bound_at and same_expires_at then
+  return redis.call("DEL", KEYS[1])
+end
+return 0
+`
+	return tc.client.Eval(
+		ctx,
+		script,
+		[]string{sessionAffinityKey(key)},
+		binding.AccountID,
+		binding.ProxyURL,
+		binding.BoundAtUnixNano,
+		binding.ExpiresAtUnixNano,
+	).Err()
+}
+
 func (tc *redisTokenCache) SetResponseContext(ctx context.Context, responseID string, items []json.RawMessage, ttl time.Duration) error {
 	responseID = strings.TrimSpace(responseID)
 	if responseID == "" {

@@ -726,6 +726,22 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	h.logUsage(input)
 }
 
+func (h *Handler) logSameAccountRetryRequestError(c *gin.Context, input *database.UsageLogInput, attempt int, kind string, err error) {
+	if input == nil {
+		return
+	}
+	if input.StatusCode == 0 {
+		input.StatusCode = http.StatusBadGateway
+	}
+	input.IsRetryAttempt = true
+	input.AttemptIndex = attempt + 1
+	input.UpstreamErrorKind = kind
+	if err != nil {
+		input.ErrorMessage = usageLogErrorMessage(input.StatusCode, []byte(err.Error()))
+	}
+	h.logUsageForRequest(c, input)
+}
+
 // logContinueThinkingRounds 为思考截断续想中「被折叠隐藏」的上游轮次补记真实用量。
 // 每一轮续想都是一次独立的上游请求，各自产生真实 token 消耗；对客户端折叠成单响应
 // 后，最终成功轮的用量由本 attempt 收尾统一记账，这里补记除最终成功轮外的其余各轮
@@ -2097,6 +2113,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
 	transportRetries := newTransportRetryTracker()
+	sameAccountTarget := sameAccountRetryTarget{}
 	transientRetry := transientUpstreamRetryState{}
 	forceHTTPAfterWSMessageTooBig := false
 	encryptedContentStrippedRetried := false
@@ -2142,7 +2159,10 @@ func (h *Handler) Responses(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+		account, stickyProxyURL := sameAccountTarget.take(h.store, apiKeyID, accountFilter)
+		if account == nil {
+			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+		}
 		if account == nil {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -2252,22 +2272,40 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				kind := classifyTransportFailure(reqErr)
 				retryable := IsRetryableError(reqErr) || kind != ""
-				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, retryable, timedOut, kind)
-				shouldRetry := sameAccountRetry
-				if retryable && !sameAccountRetry {
-					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
-				}
 				persistentTransient := shouldPersistTransientRequestError(reqErr)
-				if persistentTransient && !shouldRetry {
-					shouldRetry = true
-					log.Printf("OpenAI Responses 上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr)
-				}
 				// encrypted_content 可能只是不被当前 relay 背后的真实上游身份接受。
 				// 先保留当前 session affinity，去掉加密上下文重试一次；若仍失败，再按普通失败流程
 				// 记分、解绑并换号，避免把一次可恢复的加密上下文不兼容直接放大成账号池轮流失败。
 				if retryable && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游请求连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr) {
 					h.store.Release(account)
 					continue
+				}
+				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, !isV2CompactionRequest, timedOut, kind)
+				shouldRetry := sameAccountRetry
+				if retryable && !sameAccountRetry {
+					shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+				}
+				if !sameAccountRetry && persistentTransient && !shouldRetry {
+					shouldRetry = true
+					log.Printf("OpenAI Responses 上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr)
+				}
+				if sameAccountRetry {
+					usageTiers := resolveUsageServiceTiers("", serviceTier)
+					h.logSameAccountRetryRequestError(c, &database.UsageLogInput{
+						AccountID:            account.ID(),
+						Endpoint:             "/v1/responses",
+						Model:                logModel,
+						EffectiveModel:       attemptLogEffectiveModel,
+						DurationMs:           durationMs,
+						ReasoningEffort:      reasoningEffort,
+						InboundEndpoint:      "/v1/responses",
+						UpstreamEndpoint:     upstreamEndpoint,
+						Stream:               isStream,
+						ServiceTier:          usageTiers.ServiceTier,
+						RequestedServiceTier: usageTiers.RequestedServiceTier,
+						ActualServiceTier:    usageTiers.ActualServiceTier,
+						BillingServiceTier:   usageTiers.BillingServiceTier,
+					}, attempt, kind, reqErr)
 				}
 				// 同号重试预算内不记账号失败、不解绑亲和、不硬排除。
 				if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
@@ -2286,19 +2324,22 @@ func (h *Handler) Responses(c *gin.Context) {
 					retryExclusions.MarkHard(account.ID())
 				}
 
-				if !retryable {
+				if !retryable && !sameAccountRetry {
 					ErrorToGinResponse(c, reqErr)
 					return
 				}
 
 				log.Printf("OpenAI Responses 上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 				if shouldRetry {
-					if persistentTransient && !timedOut {
+					if sameAccountRetry {
+						transientRetry.clear()
+					} else if persistentTransient && !timedOut {
 						transientRetry.rememberTransport(account.ID(), reqErr)
 					} else {
 						transientRetry.clear()
 					}
 					if sameAccountRetry {
+						sameAccountTarget.remember(account, proxyURL)
 						logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses-relay")
 					}
 					if !h.waitBeforeRetry(c.Request.Context()) {
@@ -2337,20 +2378,29 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, !isV2CompactionRequest, false, "http")
+				if !sameAccountRetry {
+					if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
+						h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+					}
 				}
 				h.store.Release(account)
-				h.store.UnbindSessionAffinity(affinityKey, account.ID())
-				retryExclusions.MarkHard(account.ID())
+				if !sameAccountRetry {
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					retryExclusions.MarkHard(account.ID())
+				}
 
 				log.Printf("OpenAI Responses 上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
-				decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				decision := codex429Decision{}
+				shouldRetry := sameAccountRetry
+				if !sameAccountRetry {
+					decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
+					shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				}
 				persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody)
-				if persistentTransient && !shouldRetry {
+				if !sameAccountRetry && persistentTransient && !shouldRetry {
 					shouldRetry = true
 					log.Printf("OpenAI Responses 上游 %d 已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d)", resp.StatusCode, attempt+1, account.ID())
 				}
@@ -2380,7 +2430,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
-					if persistentTransient {
+					if sameAccountRetry {
+						sameAccountTarget.remember(account, proxyURL)
+						logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses-relay")
+						transientRetry.clear()
+					} else if persistentTransient {
 						transientRetry.rememberHTTP(account.ID(), resp.StatusCode, errBody, resp)
 					} else {
 						transientRetry.clear()
@@ -2514,26 +2568,36 @@ func (h *Handler) Responses(c *gin.Context) {
 				outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 			}
 			ttftGuard.Stop()
-			if outcome.verifyAccountAuth {
-				h.store.VerifyAccountAuthAsync(account)
-			}
 			var responseFailedDecision codex429Decision
 			if len(terminalFailurePayload) > 0 {
 				outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
-				responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
-				if responseFailedDecision.Reason != "" {
-					outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
-				}
 				// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 				// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 			}
-			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
-				if shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
-					resp.Body.Close()
-					h.store.Release(account)
-					continue
+			transparentStreamRetry := shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)
+			if transparentStreamRetry && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
+				resp.Body.Close()
+				h.store.Release(account)
+				continue
+			}
+			sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := transportRetries.shouldRetrySameAccount(
+				h,
+				account,
+				sameAccountStreamRetryEligible(isV2CompactionRequest, outcome, wroteAnyBody, c.Request.Context().Err(), writeErr),
+				isFirstTokenTimeoutOutcome(outcome),
+				outcome.failureKind,
+			)
+			if outcome.verifyAccountAuth && !sameAccountStreamRetry {
+				h.store.VerifyAccountAuthAsync(account)
+			}
+			if len(terminalFailurePayload) > 0 && !sameAccountStreamRetry {
+				responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
+				if responseFailedDecision.Reason != "" {
+					outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 				}
+			}
+			if !sameAccountStreamRetry && transparentStreamRetry {
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
 				if isFirstTokenTimeoutOutcome(outcome) {
@@ -2550,7 +2614,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 				continue
 			}
-			if isStream && !wroteAnyBody && c.Request.Context().Err() == nil &&
+			if !sameAccountStreamRetry && isStream && !wroteAnyBody && c.Request.Context().Err() == nil &&
 				(abortedForHTTPError || (isV2CompactionRequest && outcome.logStatusCode != http.StatusOK)) {
 				// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 				// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
@@ -2560,7 +2624,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
 				})
 			}
-			if !isStream && readErr != nil {
+			if !sameAccountStreamRetry && !isStream && readErr != nil {
 				c.JSON(http.StatusBadGateway, gin.H{
 					"error": gin.H{"message": "读取 OpenAI Responses 响应失败", "type": "upstream_error"},
 				})
@@ -2614,8 +2678,20 @@ func (h *Handler) Responses(c *gin.Context) {
 				logInput.CachedTokens = usage.CachedTokens
 			}
 			applyImageUsageLogInfo(logInput, imageLogInfo)
+			logInput.IsRetryAttempt = sameAccountStreamRetry
+			logInput.AttemptIndex = attempt + 1
 			h.logUsageForRequest(c, logInput)
 
+			if sameAccountStreamRetry {
+				resp.Body.Close()
+				h.store.Release(account)
+				sameAccountTarget.remember(account, proxyURL)
+				logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountStreamFailures, sameAccountStreamLimit, "/v1/responses-relay-stream")
+				if !h.waitBeforeRetry(c.Request.Context()) {
+					return
+				}
+				continue
+			}
 			resp.Body.Close()
 			if outcome.penalize {
 				recyclePooledClient(account, proxyURL)
@@ -2671,23 +2747,42 @@ func (h *Handler) Responses(c *gin.Context) {
 				continue
 			}
 			retryable := IsRetryableError(reqErr) || kind != ""
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, retryable, timedOut, kind)
-			shouldRetry := sameAccountRetry
-			if retryable && !sameAccountRetry {
-				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
-			}
 			persistentTransient := shouldPersistTransientRequestError(reqErr)
-			if persistentTransient && !shouldRetry {
-				shouldRetry = true
-				log.Printf("上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr)
-			}
 			// encrypted_content 不是普通可跨真实上游身份复用的状态。Codex/OAuth 路径同样
 			// 先用当前账号去掉加密上下文重试一次；只有重试后仍失败才进入普通换号流程。
 			if retryable && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("上游请求连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr) {
 				h.store.Release(account)
 				continue
 			}
-			// 同号重试预算内的传输错误不记账号失败；真正换号时只记一次。
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, !isV2CompactionRequest, timedOut, kind)
+			shouldRetry := sameAccountRetry
+			if retryable && !sameAccountRetry {
+				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+			}
+			if !sameAccountRetry && persistentTransient && !shouldRetry {
+				shouldRetry = true
+				log.Printf("上游请求失败已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d, /v1/responses): %v", attempt+1, account.ID(), reqErr)
+			}
+			if sameAccountRetry {
+				usageTiers := resolveUsageServiceTiers("", serviceTier)
+				h.logSameAccountRetryRequestError(c, &database.UsageLogInput{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					InboundEndpoint:      "/v1/responses",
+					UpstreamEndpoint:     "/v1/responses",
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					ServiceTier:          usageTiers.ServiceTier,
+					RequestedServiceTier: usageTiers.RequestedServiceTier,
+					ActualServiceTier:    usageTiers.ActualServiceTier,
+					BillingServiceTier:   usageTiers.BillingServiceTier,
+				}, attempt, kind, reqErr)
+			}
+			// 同号重试预算内的上游错误不记账号失败；真正换号时只记一次。
 			if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -2705,19 +2800,22 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			// 不可重试的结构化错误直接返回
-			if !retryable {
+			if !retryable && !sameAccountRetry {
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
 
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			if shouldRetry {
-				if persistentTransient && !timedOut {
+				if sameAccountRetry {
+					transientRetry.clear()
+				} else if persistentTransient && !timedOut {
 					transientRetry.rememberTransport(account.ID(), reqErr)
 				} else {
 					transientRetry.clear()
 				}
 				if sameAccountRetry {
+					sameAccountTarget.remember(account, proxyURL)
 					logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses")
 				}
 				if !h.waitBeforeRetry(c.Request.Context()) {
@@ -2753,21 +2851,32 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 
-			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, !isV2CompactionRequest, false, "http")
+			if !sameAccountRetry {
+				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
+					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				}
+				if !shouldSuppressSameAccountFailureState(h.store, resp.StatusCode, errBody) {
+					SyncCodexFailureUsageState(h.store, account, resp)
+				}
 			}
-			SyncCodexFailureUsageState(h.store, account, resp)
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			retryExclusions.MarkHard(account.ID())
+			if !sameAccountRetry {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkHard(account.ID())
+			}
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			decision := codex429Decision{}
+			shouldRetry := sameAccountRetry
+			if !sameAccountRetry {
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			}
 			persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody)
-			if persistentTransient && !shouldRetry {
+			if !sameAccountRetry && persistentTransient && !shouldRetry {
 				shouldRetry = true
 				log.Printf("上游 %d 已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d, /v1/responses)", resp.StatusCode, attempt+1, account.ID())
 			}
@@ -2797,7 +2906,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
-				if persistentTransient {
+				if sameAccountRetry {
+					sameAccountTarget.remember(account, proxyURL)
+					logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses")
+					transientRetry.clear()
+				} else if persistentTransient {
 					transientRetry.rememberHTTP(account.ID(), resp.StatusCode, errBody, resp)
 				} else {
 					transientRetry.clear()
@@ -2811,8 +2924,6 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
-
-		SyncCodexUsageState(h.store, account, resp)
 
 		// 成功！透传响应并跟踪 TTFT / usage
 		account.Mu().RLock()
@@ -3054,19 +3165,34 @@ func (h *Handler) Responses(c *gin.Context) {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
 		ttftGuard.Stop()
-		if outcome.verifyAccountAuth {
-			h.store.VerifyAccountAuthAsync(account)
-		}
 		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
+			// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
+			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
+			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
+		}
+		transparentStreamRetry := shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)
+		if transparentStreamRetry && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
+			resp.Body.Close()
+			h.store.Release(account)
+			continue
+		}
+		sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := transportRetries.shouldRetrySameAccount(
+			h,
+			account,
+			sameAccountStreamRetryEligible(isV2CompactionRequest, outcome, wroteAnyBody, c.Request.Context().Err(), writeErr),
+			isFirstTokenTimeoutOutcome(outcome),
+			outcome.failureKind,
+		)
+		if outcome.verifyAccountAuth && !sameAccountStreamRetry {
+			h.store.VerifyAccountAuthAsync(account)
+		}
+		if len(terminalFailurePayload) > 0 && !sameAccountStreamRetry {
 			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
 			if responseFailedDecision.Reason != "" {
 				outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 			}
-			// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
-			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
-			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/responses): %s", attempt+1, account.ID(), outcome.failureMessage)
@@ -3076,12 +3202,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
 		}
-		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
-			if shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
-				resp.Body.Close()
-				h.store.Release(account)
-				continue
-			}
+		if !sameAccountStreamRetry && transparentStreamRetry {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
@@ -3115,7 +3236,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 		}
-		if isStream && !wroteAnyBody && c.Request.Context().Err() == nil &&
+		if !sameAccountStreamRetry && isStream && !wroteAnyBody && c.Request.Context().Err() == nil &&
 			(abortedForHTTPError || (isV2CompactionRequest && outcome.logStatusCode != http.StatusOK)) {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
@@ -3124,7 +3245,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			c.JSON(streamFailureClientStatus(outcome), gin.H{
 				"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
 			})
-		} else if !isStream {
+		} else if !sameAccountStreamRetry && !isStream {
 			if len(terminalFailurePayload) > 0 {
 				c.JSON(logStatusCode, gin.H{
 					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
@@ -3173,8 +3294,21 @@ func (h *Handler) Responses(c *gin.Context) {
 			logInput.CachedTokens = usage.CachedTokens
 		}
 		applyImageUsageLogInfo(logInput, imageLogInfo)
+		logInput.IsRetryAttempt = sameAccountStreamRetry
+		logInput.AttemptIndex = attempt + 1
 		h.logUsageForRequest(c, logInput)
 
+		if sameAccountStreamRetry {
+			resp.Body.Close()
+			h.store.Release(account)
+			sameAccountTarget.remember(account, proxyURL)
+			logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountStreamFailures, sameAccountStreamLimit, "/v1/responses-stream")
+			if !h.waitBeforeRetry(c.Request.Context()) {
+				return
+			}
+			continue
+		}
+		SyncCodexUsageState(h.store, account, resp)
 		resp.Body.Close()
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
@@ -3734,7 +3868,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexFailureUsageState(h.store, account, resp)
+			if !shouldSuppressSameAccountFailureState(h.store, resp.StatusCode, errBody) {
+				SyncCodexFailureUsageState(h.store, account, resp)
+			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
@@ -3997,6 +4133,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
 	transportRetries := newTransportRetryTracker()
+	sameAccountTarget := sameAccountRetryTarget{}
 	forceHTTPAfterWSMessageTooBig := false
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
@@ -4009,7 +4146,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+		account, stickyProxyURL := sameAccountTarget.take(h.store, apiKeyID, accountFilter)
+		if account == nil {
+			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+		}
 		if account == nil {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -4098,12 +4238,31 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				continue
 			}
 			retryable := IsRetryableError(reqErr) || kind != ""
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, retryable, timedOut, kind)
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, true, timedOut, kind)
 			shouldRetry := sameAccountRetry
 			if retryable && !sameAccountRetry {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			// 同号重试预算内的传输错误不记账号失败；真正换号时只记一次。
+			if sameAccountRetry {
+				usageTiers := resolveUsageServiceTiers("", serviceTier)
+				h.logSameAccountRetryRequestError(c, &database.UsageLogInput{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/chat/completions",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					InboundEndpoint:      "/v1/chat/completions",
+					UpstreamEndpoint:     upstreamEndpoint,
+					Stream:               isStream,
+					ViaWebsocket:         useWebsocket,
+					ServiceTier:          usageTiers.ServiceTier,
+					RequestedServiceTier: usageTiers.RequestedServiceTier,
+					ActualServiceTier:    usageTiers.ActualServiceTier,
+					BillingServiceTier:   usageTiers.BillingServiceTier,
+				}, attempt, kind, reqErr)
+			}
+			// 同号重试预算内的上游错误不记账号失败；真正换号时只记一次。
 			if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
@@ -4121,7 +4280,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 
 			// 不可重试的结构化错误直接返回
-			if !retryable {
+			if !retryable && !sameAccountRetry {
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
@@ -4129,6 +4288,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			log.Printf("上游请求失败 (attempt %d): %v", attempt+1, reqErr)
 			if shouldRetry {
 				if sameAccountRetry {
+					sameAccountTarget.remember(account, proxyURL)
 					logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/chat/completions")
 				}
 				if !h.waitBeforeRetry(c.Request.Context()) {
@@ -4142,21 +4302,32 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		if resp.StatusCode != http.StatusOK {
 			ttftGuard.Stop()
-			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-			}
-			SyncCodexFailureUsageState(h.store, account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, true, false, "http")
+			if !sameAccountRetry {
+				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
+					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				}
+				if !shouldSuppressSameAccountFailureState(h.store, resp.StatusCode, errBody) {
+					SyncCodexFailureUsageState(h.store, account, resp)
+				}
+			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			retryExclusions.MarkHard(account.ID())
+			if !sameAccountRetry {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkHard(account.ID())
+			}
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-			shouldRetry := shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			decision := codex429Decision{}
+			shouldRetry := sameAccountRetry
+			if !sameAccountRetry {
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
+				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:            account.ID(),
@@ -4183,6 +4354,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
+				if sameAccountRetry {
+					sameAccountTarget.remember(account, proxyURL)
+					logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/chat/completions")
+				}
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return
 				}
@@ -4192,8 +4367,6 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
-
-		SyncCodexUsageState(h.store, account, resp)
 
 		// 成功！翻译响应 + TTFT 跟踪
 		account.Mu().RLock()
@@ -4376,19 +4549,28 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
 		ttftGuard.Stop()
-		if outcome.verifyAccountAuth {
-			h.store.VerifyAccountAuthAsync(account)
-		}
 		var responseFailedDecision codex429Decision
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
+			// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
+			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
+			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, responseFailedErrorBody(terminalFailurePayload))
+		}
+		sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := transportRetries.shouldRetrySameAccount(
+			h,
+			account,
+			sameAccountStreamRetryEligible(false, outcome, wroteAnyBody, c.Request.Context().Err(), writeErr),
+			isFirstTokenTimeoutOutcome(outcome),
+			outcome.failureKind,
+		)
+		if outcome.verifyAccountAuth && !sameAccountStreamRetry {
+			h.store.VerifyAccountAuthAsync(account)
+		}
+		if len(terminalFailurePayload) > 0 && !sameAccountStreamRetry {
 			responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, attemptEffectiveModel)
 			if responseFailedDecision.Reason != "" {
 				outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 			}
-			// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
-			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
-			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
 		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游 WebSocket 消息过大，首包前自动降级 HTTP 重试 (attempt %d, account %d, /v1/chat/completions): %s", attempt+1, account.ID(), outcome.failureMessage)
@@ -4398,7 +4580,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			continue
 		}
-		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
+		if !sameAccountStreamRetry && shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
@@ -4432,7 +4614,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				}
 			}
 		}
-		if isStream && abortedForHTTPError && !wroteAnyBody {
+		if !sameAccountStreamRetry && isStream && abortedForHTTPError && !wroteAnyBody {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
 			// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
@@ -4440,7 +4622,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			c.JSON(logStatusCode, gin.H{
 				"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
 			})
-		} else if !isStream {
+		} else if !sameAccountStreamRetry && !isStream {
 			if len(terminalFailurePayload) > 0 {
 				c.JSON(logStatusCode, gin.H{
 					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
@@ -4488,8 +4670,21 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
+		logInput.IsRetryAttempt = sameAccountStreamRetry
+		logInput.AttemptIndex = attempt + 1
 		h.logUsageForRequest(c, logInput)
 
+		if sameAccountStreamRetry {
+			resp.Body.Close()
+			h.store.Release(account)
+			sameAccountTarget.remember(account, proxyURL)
+			logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountStreamFailures, sameAccountStreamLimit, "/v1/chat/completions-stream")
+			if !h.waitBeforeRetry(c.Request.Context()) {
+				return
+			}
+			continue
+		}
+		SyncCodexUsageState(h.store, account, resp)
 		resp.Body.Close()
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
@@ -4885,8 +5080,18 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 	h.applyCooldownForModel(account, statusCode, body, resp, "")
 }
 
+func shouldSuppressSameAccountFailureState(store *auth.Store, statusCode int, body []byte) bool {
+	return store != nil &&
+		store.IsSameAccountRetryEnabled() &&
+		(statusCode == http.StatusTooManyRequests || IsUsageLimitReachedError(body))
+}
+
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
 	ignoreFailureCooldown := shouldIgnoreAccountFailureCooldown(account)
+	if h != nil && shouldSuppressSameAccountFailureState(h.store, statusCode, body) {
+		log.Printf("账号 %d 在同号重试策略下将 %d/usage_limit_reached 视为普通上游错误，不写入额度冷却", account.ID(), statusCode)
+		return codex429Decision{}
+	}
 	if IsUsageLimitReachedError(body) {
 		if ignoreFailureCooldown {
 			log.Printf("账号 %d 时间窗内失败次数尚未达到冷却阈值，本次 usage_limit_reached 不写入持久冷却", account.ID())

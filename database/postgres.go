@@ -1523,7 +1523,7 @@ type SystemSettings struct {
 	SmartPacingWindows                 string // "5h,7d" / "5h" / "7d"
 	IgnoreUsageLimitStatus             bool   // 用量窗口仅作参考，以 Responses 成功/usage_limit_reached 判定可用性
 	RetryIntervalMS                    int    // 重试间隔毫秒（0 = 立即重试，保持旧行为）
-	TransportRetryPolicy               string // 传输错误重试策略: rotate / sticky / hybrid
+	TransportRetryPolicy               string // 上游错误重试策略: rotate / sticky / hybrid
 	TransportSameAccountRetries        int    // hybrid 下每个账号额外同号重试次数
 	// CodexSyncedCLIVersion 是从 openai/codex releases 同步到的最新 Codex CLI 版本缓存，
 	// 用于抬升出站 UA / manifest 的模拟版本（绝不低于内置常量），空表示尚未同步。
@@ -2042,7 +2042,7 @@ func normalizeRetryIntervalMSDB(ms int) int {
 	return ms
 }
 
-// NormalizeTransportRetryPolicy 归一化传输错误重试策略，空或未知值回落到 rotate 以兼容旧配置。
+// NormalizeTransportRetryPolicy 归一化上游错误重试策略，空或未知值回落到 rotate 以兼容旧配置。
 func NormalizeTransportRetryPolicy(policy string) string {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
 	case "sticky", "hybrid":
