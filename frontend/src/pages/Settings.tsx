@@ -1165,6 +1165,7 @@ export default function Settings() {
     retry_interval_ms: 0,
     transport_retry_policy: 'hybrid',
     transport_same_account_retries: 2,
+    compact_same_account_retries: 2,
     allow_remote_migration: false,
     database_driver: 'postgres',
     database_label: 'PostgreSQL',
@@ -1951,6 +1952,15 @@ export default function Settings() {
                     disabled={settingsForm.transport_retry_policy !== 'hybrid'}
                     value={settingsForm.transport_same_account_retries}
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, transport_same_account_retries: parseInt(e.target.value) || 0 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.compactSameAccountRetries')} description={t('settings.compactSameAccountRetriesDesc')} suffix={t('settings.unit.times')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10}
+                    value={settingsForm.compact_same_account_retries}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, compact_same_account_retries: parseInt(e.target.value) || 0 }))}
                   />
                 </SettingField>
               </div>

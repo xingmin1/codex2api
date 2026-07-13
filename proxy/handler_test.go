@@ -928,6 +928,141 @@ func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	}
 }
 
+func TestResponsesCompactRetriesOnlyInitialAccountBeforeRotation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var sequence []string
+	counts := make(map[string]int)
+	firstKey := ""
+	secondKey := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		sequence = append(sequence, key)
+		counts[key]++
+		if firstKey == "" {
+			firstKey = key
+		}
+		if key == firstKey && counts[key] <= 3 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","message":"temporary"}}`)
+			return
+		}
+		if key != firstKey && secondKey == "" {
+			secondKey = key
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","message":"temporary"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_compact","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`)
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:            3,
+		MaxRetries:                5,
+		MaxRateLimitRetries:       5,
+		TransportRetryPolicy:      "rotate",
+		CompactSameAccountRetries: 2,
+	})
+	t.Cleanup(store.Stop)
+	for id, key := range []string{"sk-first", "sk-second", "sk-third"} {
+		store.AddAccount(&auth.Account{
+			DBID:         int64(id + 1),
+			UpstreamType: auth.UpstreamOpenAIResponses,
+			BaseURL:      upstream.URL,
+			APIKey:       key,
+			Models:       []string{"gpt-5.6-sol"},
+			PlanType:     "api",
+		})
+	}
+	handler := NewHandler(store, nil, nil, nil)
+	body := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"compact"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ResponsesCompact(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(sequence) != 5 {
+		t.Fatalf("upstream sequence = %v, want 5 attempts", sequence)
+	}
+	if sequence[0] != sequence[1] || sequence[1] != sequence[2] {
+		t.Fatalf("首账号未获得完整同号预算: %v", sequence)
+	}
+	if sequence[3] == sequence[0] || sequence[4] == sequence[0] || sequence[4] == sequence[3] {
+		t.Fatalf("预算耗尽后应换号，且后续账号不重新获得预算: %v", sequence)
+	}
+}
+
+func TestResponsesCompactRetriesInitialAccountBeforeLongCompactFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var sequence []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		sequence = append(sequence, key)
+		w.Header().Set("Content-Type", "application/json")
+		if key == "sk-normal" {
+			w.WriteHeader(cloudflareOriginResponseTimeoutStatus)
+			_, _ = io.WriteString(w, `{"error_name":"origin_response_timeout","error_code":524}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_long_compact","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`)
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:            2,
+		MaxRetries:                2,
+		TransportRetryPolicy:      "rotate",
+		CompactSameAccountRetries: 2,
+	})
+	t.Cleanup(store.Stop)
+	store.AddAccount(&auth.Account{
+		DBID:              1,
+		UpstreamType:      auth.UpstreamOpenAIResponses,
+		BaseURL:           upstream.URL,
+		APIKey:            "sk-normal",
+		Models:            []string{"gpt-5.6-sol"},
+		PlanType:          "api",
+		SchedulerPriority: 1,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         2,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-long",
+		Models:       []string{"gpt-5.6-sol"},
+		PlanType:     "api",
+		Tags:         []string{longCompactAccountTag},
+	})
+	handler := NewHandler(store, nil, nil, nil)
+	body := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"compact"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ResponsesCompact(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	want := []string{"sk-normal", "sk-normal", "sk-normal", "sk-long"}
+	if !slices.Equal(sequence, want) {
+		t.Fatalf("524 fallback sequence = %v, want %v", sequence, want)
+	}
+}
+
 func TestResponsesCompactAppliesAccountMappingBeforeSuffixFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2900,6 +3035,144 @@ func TestResponses_V2CompactionRetriesAfterPartialUpstreamStream(t *testing.T) {
 	if !strings.Contains(responseBody, "accepted-second-attempt") ||
 		!strings.Contains(responseBody, `"type":"response.completed"`) {
 		t.Fatalf("下游必须收到完整的第二次压缩结果: %s", responseBody)
+	}
+}
+
+func TestResponses_V2CompactionRetriesOnlyInitialAccountBeforeRotation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var sequence []string
+	counts := make(map[string]int)
+	firstKey := ""
+	secondKey := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		sequence = append(sequence, key)
+		counts[key]++
+		if firstKey == "" {
+			firstKey = key
+		}
+		if key == firstKey && counts[key] <= 3 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","message":"temporary"}}`)
+			return
+		}
+		if key != firstKey && secondKey == "" {
+			secondKey = key
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","message":"temporary"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"accepted"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_compact","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:            3,
+		MaxRetries:                5,
+		MaxRateLimitRetries:       5,
+		TransportRetryPolicy:      "rotate",
+		CompactSameAccountRetries: 2,
+	})
+	t.Cleanup(store.Stop)
+	for id, key := range []string{"sk-first", "sk-second", "sk-third"} {
+		store.AddAccount(&auth.Account{
+			DBID:         int64(id + 1),
+			UpstreamType: auth.UpstreamOpenAIResponses,
+			BaseURL:      upstream.URL,
+			APIKey:       key,
+			Models:       []string{"gpt-5.6-sol"},
+			PlanType:     "api",
+		})
+	}
+	handler := NewHandler(store, nil, nil, nil)
+	body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"role":"user","content":"compact"},{"type":"compaction_trigger"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(sequence) != 5 {
+		t.Fatalf("upstream sequence = %v, want 5 attempts", sequence)
+	}
+	if sequence[0] != sequence[1] || sequence[1] != sequence[2] {
+		t.Fatalf("v2 compact 首账号未获得完整同号预算: %v", sequence)
+	}
+	if sequence[3] == sequence[0] || sequence[4] == sequence[0] || sequence[4] == sequence[3] {
+		t.Fatalf("v2 compact 预算耗尽后应换号，且后续账号不重新获得预算: %v", sequence)
+	}
+}
+
+func TestResponses_V2CompactionRetriesEveryUpstreamHTTPErrorOnInitialAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, status := range []int{
+		http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		cloudflareOriginResponseTimeoutStatus,
+	} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			attempts := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				if attempts == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status)
+					_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","message":"temporary"}}`)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"accepted"}}`+"\n\n")
+				_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_compact","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+			}))
+			defer upstream.Close()
+
+			store := auth.NewStore(nil, nil, &database.SystemSettings{
+				MaxConcurrency:            1,
+				MaxRetries:                0,
+				MaxRateLimitRetries:       0,
+				TransportRetryPolicy:      "rotate",
+				CompactSameAccountRetries: 1,
+			})
+			t.Cleanup(store.Stop)
+			store.AddAccount(&auth.Account{
+				DBID:         1,
+				UpstreamType: auth.UpstreamOpenAIResponses,
+				BaseURL:      upstream.URL,
+				APIKey:       "sk-compact",
+				Models:       []string{"gpt-5.6-sol"},
+				PlanType:     "api",
+			})
+			handler := NewHandler(store, nil, nil, nil)
+			body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"role":"user","content":"compact"},{"type":"compaction_trigger"}]}`)
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = req
+
+			handler.Responses(ctx)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+			}
+			if attempts != 2 {
+				t.Fatalf("upstream attempts = %d, want 2", attempts)
+			}
+		})
 	}
 }
 

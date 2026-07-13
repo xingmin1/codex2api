@@ -1089,6 +1089,11 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 			body:    `{"auto_pause_7d_threshold":-0.01}`,
 			message: "auto_pause_7d_threshold 超出范围，必须在 0..1 之间",
 		},
+		{
+			name:    "compact same account retries out of range",
+			body:    `{"compact_same_account_retries":11}`,
+			message: "compact_same_account_retries 超出范围，必须在 0..10 之间",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1609,6 +1614,61 @@ func TestUpdateAccountSchedulerPersistsIgnoreUsageLimitOverrideAndInheritance(t 
 	}
 	if override := row.GetCredentialOptionalBool("ignore_usage_limit_status_override"); override != nil {
 		t.Fatalf("persisted override = %v, want nil", override)
+	}
+}
+
+func TestUpdateAccountSchedulerPersistsCompactRetriesOverrideAndInheritance(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:            2,
+		TestConcurrency:           1,
+		TestModel:                 "gpt-5.4",
+		CompactSameAccountRetries: 2,
+	})
+	t.Cleanup(store.Stop)
+	runtimeAccount := &auth.Account{DBID: accountID, AccessToken: "token", Status: auth.StatusReady}
+	store.AddAccount(runtimeAccount)
+	handler := &Handler{db: db, store: store}
+
+	patchOverride := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+		ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(body))
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateAccountScheduler(ginCtx)
+		return recorder
+	}
+
+	if recorder := patchOverride(`{"compact_same_account_retries":0}`); recorder.Code != http.StatusOK {
+		t.Fatalf("disable override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := store.CompactSameAccountRetriesForAccount(runtimeAccount); got != 0 {
+		t.Fatalf("runtime compact retries = %d, want 0", got)
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if value, ok := row.GetCredentialInt64("compact_same_account_retries"); !ok || value != 0 {
+		t.Fatalf("persisted compact retries = (%d, %t), want (0, true)", value, ok)
+	}
+
+	if recorder := patchOverride(`{"compact_same_account_retries":null}`); recorder.Code != http.StatusOK {
+		t.Fatalf("inherit override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := store.CompactSameAccountRetriesForAccount(runtimeAccount); got != 2 {
+		t.Fatalf("inherited compact retries = %d, want 2", got)
+	}
+	row, err = db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID after inherit: %v", err)
+	}
+	if _, ok := row.GetCredentialInt64("compact_same_account_retries"); ok {
+		t.Fatal("cleared compact retry override should not remain in credentials")
 	}
 }
 

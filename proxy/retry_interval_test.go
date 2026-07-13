@@ -136,8 +136,8 @@ func TestSameAccountStreamRetryEligibility(t *testing.T) {
 	if !sameAccountStreamRetryEligible(false, upstream400, false, nil, nil) {
 		t.Fatal("上游 4xx response.failed 应纳入同号重试，不能复用扣分判定")
 	}
-	if sameAccountStreamRetryEligible(true, upstream400, false, nil, nil) {
-		t.Fatal("compact 专用失败不能进入普通同号流重试")
+	if !sameAccountStreamRetryEligible(true, upstream400, false, nil, nil) {
+		t.Fatal("compact 上游流错误应满足安全同号重试条件")
 	}
 	if sameAccountStreamRetryEligible(false, upstream400, true, nil, nil) {
 		t.Fatal("已写出下游内容后不能透明同号重试")
@@ -147,6 +147,51 @@ func TestSameAccountStreamRetryEligibility(t *testing.T) {
 	}
 	if sameAccountStreamRetryEligible(false, streamOutcome{logStatusCode: http.StatusOK}, false, nil, nil) {
 		t.Fatal("成功流不能进入同号重试")
+	}
+}
+
+func TestCompactSameAccountRetryProtectsOnlyInitialAccount(t *testing.T) {
+	handler, store := newRetryTestHandler(t)
+	store.SetTransportRetryPolicy("rotate")
+	store.SetCompactSameAccountRetries(2)
+	first := &auth.Account{DBID: 1, AccessToken: "first"}
+	second := &auth.Account{DBID: 2, AccessToken: "second"}
+	tracker := newTransportRetryTracker()
+
+	tracker.captureCompactInitialAccount(handler, first, true)
+	for failure := 1; failure <= 2; failure++ {
+		retry, failures, limit := tracker.shouldRetryForRequest(handler, first, true, true, failure == 1, "http")
+		if !retry || failures != failure || limit != 2 {
+			t.Fatalf("首账号第 %d 次失败 = retry:%v failures:%d limit:%d, want true/%d/2", failure, retry, failures, limit, failure)
+		}
+	}
+	if retry, failures, limit := tracker.shouldRetryForRequest(handler, first, true, true, false, "http"); retry || failures != 3 || limit != 2 {
+		t.Fatalf("首账号预算耗尽 = retry:%v failures:%d limit:%d, want false/3/2", retry, failures, limit)
+	}
+	if retry, _, _ := tracker.shouldRetryForRequest(handler, second, true, true, false, "http"); retry {
+		t.Fatal("后续账号不能获得新的 compact 同号预算")
+	}
+}
+
+func TestCompactSameAccountRetryBudgetDoesNotResetWithTransportRounds(t *testing.T) {
+	handler, store := newRetryTestHandler(t)
+	store.SetCompactSameAccountRetries(1)
+	account := &auth.Account{DBID: 1, AccessToken: "token"}
+	tracker := newTransportRetryTracker()
+	tracker.captureCompactInitialAccount(handler, account, true)
+
+	if retry, _, _ := tracker.shouldRetryForRequest(handler, account, true, true, false, "http"); !retry {
+		t.Fatal("首个 compact 错误应同号重试")
+	}
+	if got := tracker.stateMachineAttempt(1, true); got != 0 {
+		t.Fatalf("compact 同号重试不应消耗原状态机 attempt: got %d, want 0", got)
+	}
+	tracker.reset()
+	if retry, failures, limit := tracker.shouldRetryForRequest(handler, account, true, true, false, "http"); retry || failures != 2 || limit != 1 {
+		t.Fatalf("状态机新轮次不能重置 compact 预算: retry=%v failures=%d limit=%d", retry, failures, limit)
+	}
+	if got := tracker.stateMachineAttempt(2, true); got != 1 {
+		t.Fatalf("预算耗尽后应从原状态机第 1 次重试继续: got %d, want 1", got)
 	}
 }
 

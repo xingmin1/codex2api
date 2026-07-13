@@ -102,6 +102,8 @@ export interface AccountRow {
   failure_tolerance_window_seconds_effective?: number
   transport_same_account_retries?: number | null
   transport_same_account_retries_effective?: number
+  compact_same_account_retries?: number | null
+  compact_same_account_retries_effective?: number
   failure_window_count?: number
   consecutive_failure_count?: number
   price_multiplier?: number | null
@@ -289,6 +291,7 @@ export interface UpdateAccountSchedulerRequest {
   failure_cooldown_threshold?: number | null
   failure_tolerance_window_seconds?: number | null
   transport_same_account_retries?: number | null
+  compact_same_account_retries?: number | null
   price_multiplier?: number | null
   cheap_probe_recovery_margin?: number | null
   cheap_probe_bonus_duration_minutes?: number | null
@@ -683,6 +686,7 @@ export interface SystemSettings {
   retry_interval_ms: number
   transport_retry_policy: string
   transport_same_account_retries: number
+  compact_same_account_retries: number
   allow_remote_migration: boolean
   database_driver: string
   database_label: string

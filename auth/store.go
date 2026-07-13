@@ -162,6 +162,8 @@ type Account struct {
 	FailureToleranceWindowOverride         int // 秒，0 表示继承全局
 	TransportSameAccountRetriesOverride    int
 	TransportSameAccountRetriesOverrideSet bool
+	CompactSameAccountRetriesOverride      int
+	CompactSameAccountRetriesOverrideSet   bool
 	FailureScoreThresholdEffective         int
 	FailureCooldownThresholdEffective      int
 	FailureToleranceWindowEffective        int
@@ -275,6 +277,7 @@ const (
 	defaultFailureCooldownThreshold    = 10
 	defaultFailureToleranceWindow      = 60
 	defaultTransportSameAccountRetries = 2
+	defaultCompactSameAccountRetries   = 2
 	maxFailureToleranceThreshold       = 1000
 	maxFailureToleranceWindow          = 3600
 )
@@ -2697,6 +2700,7 @@ type Store struct {
 	retryIntervalMS             atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
 	transportRetryPolicy        atomic.Value // 上游错误重试策略: rotate / sticky / hybrid
 	transportSameAccountRetries atomic.Int64 // hybrid 下每个账号额外同号重试次数
+	compactSameAccountRetries   atomic.Int64 // compact 首账号额外同号重试次数
 
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
@@ -3168,6 +3172,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			FailureToleranceWindowSeconds:      defaultFailureToleranceWindow,
 			TransportRetryPolicy:               "hybrid",
 			TransportSameAccountRetries:        defaultTransportSameAccountRetries,
+			CompactSameAccountRetries:          defaultCompactSameAccountRetries,
 			LazyMode:                           false,
 			ProxyURL:                           "",
 			MaxRateLimitRetries:                1,
@@ -3293,6 +3298,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.retryIntervalMS.Store(int64(normalizeRetryIntervalMS(settings.RetryIntervalMS)))
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(settings.TransportRetryPolicy))
 	s.transportSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.TransportSameAccountRetries)))
+	s.compactSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.CompactSameAccountRetries)))
 
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
 	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause7dThreshold)
@@ -4391,6 +4397,10 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	if retries, ok := row.GetCredentialInt64("transport_same_account_retries"); ok {
 		account.TransportSameAccountRetriesOverride = database.NormalizeTransportSameAccountRetries(int(retries))
 		account.TransportSameAccountRetriesOverrideSet = true
+	}
+	if retries, ok := row.GetCredentialInt64("compact_same_account_retries"); ok {
+		account.CompactSameAccountRetriesOverride = database.NormalizeTransportSameAccountRetries(int(retries))
+		account.CompactSameAccountRetriesOverrideSet = true
 	}
 	account.recomputeFailureToleranceThresholdsLocked(s)
 	account.PriceMultiplier = resolveAccountRowPriceMultiplier(row)
@@ -5536,6 +5546,51 @@ func (a *Account) TransportSameAccountRetriesConfig(global int) (*int, int) {
 	return &override, override
 }
 
+// SetCompactSameAccountRetries 更新 compact 首账号的全局额外同号重试次数。
+func (s *Store) SetCompactSameAccountRetries(retries int) {
+	if s == nil {
+		return
+	}
+	s.compactSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(retries)))
+}
+
+// GetCompactSameAccountRetries 返回 compact 首账号的全局额外同号重试次数。
+func (s *Store) GetCompactSameAccountRetries() int {
+	if s == nil {
+		return defaultCompactSameAccountRetries
+	}
+	return database.NormalizeTransportSameAccountRetries(int(s.compactSameAccountRetries.Load()))
+}
+
+// CompactSameAccountRetriesForAccount 返回 compact 首账号的账号覆盖优先重试次数。
+func (s *Store) CompactSameAccountRetriesForAccount(account *Account) int {
+	global := s.GetCompactSameAccountRetries()
+	if account == nil {
+		return global
+	}
+	account.mu.RLock()
+	defer account.mu.RUnlock()
+	if !account.CompactSameAccountRetriesOverrideSet {
+		return global
+	}
+	return database.NormalizeTransportSameAccountRetries(account.CompactSameAccountRetriesOverride)
+}
+
+// CompactSameAccountRetriesConfig 返回账号覆盖值及其当前有效值。
+func (a *Account) CompactSameAccountRetriesConfig(global int) (*int, int) {
+	global = database.NormalizeTransportSameAccountRetries(global)
+	if a == nil {
+		return nil, global
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.CompactSameAccountRetriesOverrideSet {
+		return nil, global
+	}
+	override := database.NormalizeTransportSameAccountRetries(a.CompactSameAccountRetriesOverride)
+	return &override, override
+}
+
 // GetTransportRetryPolicy 获取上游错误重试策略，缺省 rotate（换号，旧行为）。
 func (s *Store) GetTransportRetryPolicy() string {
 	if s == nil {
@@ -6113,6 +6168,28 @@ func (s *Store) ApplyAccountTransportSameAccountRetries(dbID int64, set bool, re
 	} else {
 		acc.TransportSameAccountRetriesOverride = database.NormalizeTransportSameAccountRetries(*retries)
 		acc.TransportSameAccountRetriesOverrideSet = true
+	}
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountCompactSameAccountRetries 更新账号级 compact 首账号同号重试次数覆盖。
+func (s *Store) ApplyAccountCompactSameAccountRetries(dbID int64, set bool, retries *int) bool {
+	if !set {
+		return true
+	}
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	if retries == nil {
+		acc.CompactSameAccountRetriesOverride = 0
+		acc.CompactSameAccountRetriesOverrideSet = false
+	} else {
+		acc.CompactSameAccountRetriesOverride = database.NormalizeTransportSameAccountRetries(*retries)
+		acc.CompactSameAccountRetriesOverrideSet = true
 	}
 	acc.mu.Unlock()
 	return true

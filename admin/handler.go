@@ -704,6 +704,8 @@ type accountResponse struct {
 	FailureToleranceWindowEffective      int                        `json:"failure_tolerance_window_seconds_effective"`
 	TransportSameAccountRetries          *int                       `json:"transport_same_account_retries,omitempty"`
 	TransportSameAccountRetriesEffective int                        `json:"transport_same_account_retries_effective"`
+	CompactSameAccountRetries            *int                       `json:"compact_same_account_retries,omitempty"`
+	CompactSameAccountRetriesEffective   int                        `json:"compact_same_account_retries_effective"`
 	FailureWindowCount                   int                        `json:"failure_window_count"`
 	ConsecutiveFailureCount              int                        `json:"consecutive_failure_count"`
 	PriceMultiplier                      *float64                   `json:"price_multiplier,omitempty"`
@@ -906,6 +908,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if resp.TransportSameAccountRetries != nil {
 			resp.TransportSameAccountRetriesEffective = *resp.TransportSameAccountRetries
 		}
+		resp.CompactSameAccountRetries = accountCompactSameAccountRetries(row)
+		resp.CompactSameAccountRetriesEffective = h.store.GetCompactSameAccountRetries()
+		if resp.CompactSameAccountRetries != nil {
+			resp.CompactSameAccountRetriesEffective = *resp.CompactSameAccountRetries
+		}
 		if resp.IgnoreUsageLimit429Cooldown {
 			resp.FailureScoreThresholdEffective = h.store.GetFailureScoreThreshold()
 			resp.FailureCooldownThresholdEffective = max(h.store.GetFailureCooldownThreshold(), resp.FailureScoreThresholdEffective)
@@ -985,6 +992,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			resp.FailureWindowCount = failures
 			resp.ConsecutiveFailureCount = failures
 			resp.TransportSameAccountRetries, resp.TransportSameAccountRetriesEffective = acc.TransportSameAccountRetriesConfig(h.store.GetTransportSameAccountRetries())
+			resp.CompactSameAccountRetries, resp.CompactSameAccountRetriesEffective = acc.CompactSameAccountRetriesConfig(h.store.GetCompactSameAccountRetries())
 			if margin, duration := acc.CheapProbeConfigSnapshot(); margin > 0 || duration > 0 {
 				resp.CheapProbeRecoveryMargin = normalizePositiveFloatPointer(margin)
 				if duration > 0 {
@@ -1133,6 +1141,7 @@ type updateAccountSchedulerReq struct {
 	FailureCooldownThreshold       json.RawMessage `json:"failure_cooldown_threshold"`
 	FailureToleranceWindowSeconds  json.RawMessage `json:"failure_tolerance_window_seconds"`
 	TransportSameAccountRetries    json.RawMessage `json:"transport_same_account_retries"`
+	CompactSameAccountRetries      json.RawMessage `json:"compact_same_account_retries"`
 	PriceMultiplier                json.RawMessage `json:"price_multiplier"`
 	CheapProbeRecoveryMargin       json.RawMessage `json:"cheap_probe_recovery_margin"`
 	CheapProbeBonusDurationMinutes json.RawMessage `json:"cheap_probe_bonus_duration_minutes"`
@@ -1160,6 +1169,7 @@ type accountSchedulerUpdate struct {
 	FailureCooldownThreshold       database.OptionalNullInt64
 	FailureToleranceWindowSeconds  database.OptionalNullInt64
 	TransportSameAccountRetries    database.OptionalNullInt64
+	CompactSameAccountRetries      database.OptionalNullInt64
 	PriceMultiplier                optionalFloat64
 	CheapProbeRecoveryMargin       optionalFloat64
 	CheapProbeBonusDurationMinutes database.OptionalNullInt64
@@ -1212,6 +1222,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	transportSameAccountRetries, err := parseOptionalIntegerField(req.TransportSameAccountRetries, "transport_same_account_retries", 0, 10)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	compactSameAccountRetries, err := parseOptionalIntegerField(req.CompactSameAccountRetries, "compact_same_account_retries", 0, 10)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1326,6 +1340,13 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 			credentialUpdates["transport_same_account_retries"] = nil
 		}
 	}
+	if compactSameAccountRetries.Set {
+		if compactSameAccountRetries.Value.Valid {
+			credentialUpdates["compact_same_account_retries"] = compactSameAccountRetries.Value.Int64
+		} else {
+			credentialUpdates["compact_same_account_retries"] = nil
+		}
+	}
 	if priceMultiplier.Set {
 		credentialUpdates["price_multiplier"] = priceMultiplier.Value
 	}
@@ -1374,6 +1395,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		FailureCooldownThreshold:       failureCooldownThreshold,
 		FailureToleranceWindowSeconds:  failureToleranceWindowSeconds,
 		TransportSameAccountRetries:    transportSameAccountRetries,
+		CompactSameAccountRetries:      compactSameAccountRetries,
 		PriceMultiplier:                priceMultiplier,
 		CheapProbeRecoveryMargin:       cheapProbeRecoveryMargin,
 		CheapProbeBonusDurationMinutes: cheapProbeBonusDurationMinutes,
@@ -1403,6 +1425,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.FailureCooldownThreshold.Set ||
 		u.FailureToleranceWindowSeconds.Set ||
 		u.TransportSameAccountRetries.Set ||
+		u.CompactSameAccountRetries.Set ||
 		u.PriceMultiplier.Set ||
 		u.CheapProbeRecoveryMargin.Set ||
 		u.CheapProbeBonusDurationMinutes.Set ||
@@ -1584,6 +1607,14 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 			retries = &value
 		}
 		h.store.ApplyAccountTransportSameAccountRetries(id, true, retries)
+	}
+	if update.CompactSameAccountRetries.Set {
+		var retries *int
+		if update.CompactSameAccountRetries.Value.Valid {
+			value := int(update.CompactSameAccountRetries.Value.Int64)
+			retries = &value
+		}
+		h.store.ApplyAccountCompactSameAccountRetries(id, true, retries)
 	}
 	if update.PriceMultiplier.Set {
 		h.store.ApplyAccountPriceMultiplier(id, update.PriceMultiplier.Value)
@@ -1855,6 +1886,18 @@ func accountTransportSameAccountRetries(row *database.AccountRow) *int {
 		return nil
 	}
 	value, ok := row.GetCredentialInt64("transport_same_account_retries")
+	if !ok {
+		return nil
+	}
+	retries := database.NormalizeTransportSameAccountRetries(int(value))
+	return &retries
+}
+
+func accountCompactSameAccountRetries(row *database.AccountRow) *int {
+	if row == nil {
+		return nil
+	}
+	value, ok := row.GetCredentialInt64("compact_same_account_retries")
 	if !ok {
 		return nil
 	}
@@ -6477,6 +6520,7 @@ type settingsResponse struct {
 	RetryIntervalMS                    int     `json:"retry_interval_ms"`
 	TransportRetryPolicy               string  `json:"transport_retry_policy"`
 	TransportSameAccountRetries        int     `json:"transport_same_account_retries"`
+	CompactSameAccountRetries          int     `json:"compact_same_account_retries"`
 	AllowRemoteMigration               bool    `json:"allow_remote_migration"`
 	DatabaseDriver                     string  `json:"database_driver"`
 	DatabaseLabel                      string  `json:"database_label"`
@@ -6596,6 +6640,7 @@ type updateSettingsReq struct {
 	RetryIntervalMS                    *int     `json:"retry_interval_ms"`
 	TransportRetryPolicy               *string  `json:"transport_retry_policy"`
 	TransportSameAccountRetries        *int     `json:"transport_same_account_retries"`
+	CompactSameAccountRetries          *int     `json:"compact_same_account_retries"`
 	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
 	ModelMapping                       *string  `json:"model_mapping"`
 	CodexModelMapping                  *string  `json:"codex_model_mapping"`
@@ -7210,6 +7255,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
+		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                     h.databaseDriver,
 		DatabaseLabel:                      h.databaseLabel,
@@ -7830,6 +7876,12 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: transport_same_account_retries = %d", v)
 	}
 
+	if req.CompactSameAccountRetries != nil {
+		v := database.NormalizeTransportSameAccountRetries(*req.CompactSameAccountRetries)
+		h.store.SetCompactSameAccountRetries(v)
+		log.Printf("设置已更新: compact_same_account_retries = %d", v)
+	}
+
 	if req.AllowRemoteMigration != nil {
 		if *req.AllowRemoteMigration && !hasAdminSecret {
 			writeError(c, http.StatusBadRequest, "请先设置管理密钥，再启用远程迁移")
@@ -8196,6 +8248,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
+		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
@@ -8321,6 +8374,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RetryIntervalMS:                    h.store.GetRetryIntervalMS(),
 		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
+		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                     h.databaseDriver,
 		DatabaseLabel:                      h.databaseLabel,

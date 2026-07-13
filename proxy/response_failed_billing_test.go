@@ -274,3 +274,99 @@ func TestResponsesWebSocketNonRetryableFailureReturnsErrorClose(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// v2 compact 的首账号重试独立于普通 WebSocket 静默重试。首包前的
+// response.failed 必须留在服务端，不能先透传给客户端而使同号重试失效。
+func TestResponsesWebSocketV2CompactRetriesResponseFailedOnInitialAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousExec := WebsocketExecuteFunc
+	previousSettings := CurrentRuntimeSettings()
+	t.Cleanup(func() {
+		WebsocketExecuteFunc = previousExec
+		ApplyRuntimeSettings(previousSettings)
+	})
+	nextSettings := previousSettings
+	nextSettings.CodexWSSilentRetry = false
+	nextSettings.CodexWSHideErrors = false
+	nextSettings.CodexWSSilentRetries = 0
+	ApplyRuntimeSettings(nextSettings)
+
+	attemptCh := make(chan int64, 3)
+	WebsocketExecuteFunc = func(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header, poolRouteKey string) (*http.Response, error) {
+		attemptCh <- account.ID()
+		if len(attemptCh) == 1 {
+			sse := `data: {"type":"response.created","response":{"id":"resp_failed"}}` + "\n\n" +
+				`data: {"type":"response.failed","response":{"error":{"code":"server_error","message":"temporary"}}}` + "\n\n"
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(sse)),
+			}, nil
+		}
+
+		sse := `data: {"type":"response.created","response":{"id":"resp_ok"}}` + "\n\n" +
+			`data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"accepted"}}` + "\n\n" +
+			`data: {"type":"response.completed","response":{"id":"resp_ok","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}` + "\n\n"
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(sse)),
+		}, nil
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:            1,
+		TestConcurrency:           1,
+		TestModel:                 "gpt-5.4",
+		CompactSameAccountRetries: 1,
+	})
+	t.Cleanup(store.Stop)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "pro", AccountID: "acct-1"})
+	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
+
+	router := gin.New()
+	handler.RegisterRoutes(router)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/responses"
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial websocket failed: %v status=%d", err, resp.StatusCode)
+		}
+		t.Fatalf("dial websocket failed: %v", err)
+	}
+	defer conn.Close()
+
+	request := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"compact"},{"type":"compaction_trigger"}]}`)
+	if err := conn.WriteMessage(websocket.TextMessage, request); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	completed := false
+	for !completed {
+		_, message, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("read compact response: %v", err)
+		}
+		eventType := gjson.GetBytes(message, "type").String()
+		if eventType == "response.failed" || eventType == "error" {
+			t.Fatalf("首轮失败不应透传给客户端: %s", message)
+		}
+		completed = eventType == "response.completed"
+	}
+
+	first := <-attemptCh
+	second := <-attemptCh
+	if first != second {
+		t.Fatalf("v2 compact 首轮 response.failed 后换了账号: first=%d second=%d", first, second)
+	}
+	select {
+	case third := <-attemptCh:
+		t.Fatalf("成功后出现多余的第三次请求，账号=%d", third)
+	case <-time.After(100 * time.Millisecond):
+	}
+}

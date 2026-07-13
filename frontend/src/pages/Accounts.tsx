@@ -1023,6 +1023,7 @@ export default function Accounts() {
   ] = useState("");
   const [editFailureWindowInput, setEditFailureWindowInput] = useState("");
   const [editTransportSameAccountRetriesInput, setEditTransportSameAccountRetriesInput] = useState("");
+  const [editCompactSameAccountRetriesInput, setEditCompactSameAccountRetriesInput] = useState("");
   const [editSchedulerPriorityInput, setEditSchedulerPriorityInput] =
     useState("");
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
@@ -3708,6 +3709,9 @@ export default function Accounts() {
     setEditTransportSameAccountRetriesInput(
       formatTransportSameAccountRetriesInput(account.transport_same_account_retries),
     );
+    setEditCompactSameAccountRetriesInput(
+      formatTransportSameAccountRetriesInput(account.compact_same_account_retries),
+    );
     setEditSchedulerPriorityInput(
       formatSchedulerPriorityInput(account.scheduler_priority),
     );
@@ -3765,6 +3769,7 @@ export default function Accounts() {
     setEditFailureCooldownThresholdInput("");
     setEditFailureWindowInput("");
     setEditTransportSameAccountRetriesInput("");
+    setEditCompactSameAccountRetriesInput("");
     setEditSchedulerPriorityInput("");
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
@@ -3829,6 +3834,10 @@ export default function Accounts() {
   const editTransportSameAccountRetriesInvalid =
     isTransportSameAccountRetriesInputInvalid(
       editTransportSameAccountRetriesInput,
+    );
+  const editCompactSameAccountRetriesInvalid =
+    isTransportSameAccountRetriesInputInvalid(
+      editCompactSameAccountRetriesInput,
     );
   const editSchedulerPriorityInvalid = isSchedulerPriorityInputInvalid(
     editSchedulerPriorityInput,
@@ -3905,6 +3914,7 @@ export default function Accounts() {
       editFailureCooldownThresholdInvalid ||
       editFailureWindowInvalid ||
       editTransportSameAccountRetriesInvalid ||
+      editCompactSameAccountRetriesInvalid ||
       editSchedulerPriorityInvalid
     ) {
       showToast(t("accounts.schedulerInvalidInput"), "error");
@@ -3955,6 +3965,10 @@ export default function Accounts() {
         transport_same_account_retries:
           transportSameAccountRetriesInputToValue(
             editTransportSameAccountRetriesInput,
+          ),
+        compact_same_account_retries:
+          transportSameAccountRetriesInputToValue(
+            editCompactSameAccountRetriesInput,
           ),
         price_multiplier: priceMultiplierInputToNumber(editPriceMultiplierInput),
         scheduler_priority: schedulerPriorityInputToValue(
@@ -7214,6 +7228,36 @@ export default function Accounts() {
                             : t("accounts.transportSameAccountRetriesInherit", {
                                 value:
                                   editingAccount.transport_same_account_retries_effective ?? 2,
+                              })}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <label className="text-sm font-semibold text-foreground">
+                          {t("accounts.compactSameAccountRetriesLabel")}
+                        </label>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.compactSameAccountRetriesHint")}
+                        </div>
+                        <Input
+                          className="mt-3"
+                          inputMode="numeric"
+                          value={editCompactSameAccountRetriesInput}
+                          placeholder={String(
+                            editingAccount.compact_same_account_retries_effective ?? 2,
+                          )}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            setEditCompactSameAccountRetriesInput(event.target.value)
+                          }
+                        />
+                        <div
+                          className={`mt-1.5 text-xs ${editCompactSameAccountRetriesInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                        >
+                          {editCompactSameAccountRetriesInvalid
+                            ? t("accounts.compactSameAccountRetriesRange")
+                            : t("accounts.compactSameAccountRetriesInherit", {
+                                value:
+                                  editingAccount.compact_same_account_retries_effective ?? 2,
                               })}
                         </div>
                       </div>
