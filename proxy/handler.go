@@ -2144,6 +2144,8 @@ func (h *Handler) Responses(c *gin.Context) {
 	transientRetry := transientUpstreamRetryState{}
 	forceHTTPAfterWSMessageTooBig := false
 	encryptedContentStrippedRetried := false
+	encryptedContentCompatibilityRetried := false
+	encryptedContentCompatibilityBodies := make(map[int64][]byte)
 	encryptedContentFailureCount := 0
 	persistentEncryptedContentStripped := false
 	shouldStripEncryptedContentForFailure := func(explicitInvalidEncryptedContent bool) bool {
@@ -2283,6 +2285,17 @@ func (h *Handler) Responses(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
+			encryptedCompatibilityEnabled := account.ShouldUseEncryptedContentCompatibility() && !isV2CompactionRequest
+			if encryptedCompatibilityEnabled {
+				if repairedBody, ok := encryptedContentCompatibilityBodies[account.ID()]; ok {
+					upstreamBody = repairedBody
+				} else if preparedBody, changed := prepareEncryptedContentCompatibilityRequest(upstreamBody); changed {
+					upstreamBody = preparedBody
+				}
+			}
+			encryptedCompatibilityBuffering := encryptedCompatibilityEnabled &&
+				!encryptedContentCompatibilityRetried &&
+				responsesBodyHasEncryptedContent(upstreamBody)
 			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
@@ -2304,7 +2317,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				// encrypted_content 可能只是不被当前 relay 背后的真实上游身份接受。
 				// 先保留当前 session affinity，去掉加密上下文重试一次；若仍失败，再按普通失败流程
 				// 记分、解绑并换号，避免把一次可恢复的加密上下文不兼容直接放大成账号池轮流失败。
-				if retryable && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游请求连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr) {
+				_, compatibilityRepairAlreadyUsed := encryptedContentCompatibilityBodies[account.ID()]
+				if retryable && !encryptedCompatibilityEnabled && !compatibilityRepairAlreadyUsed && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游请求连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d): %v", attempt+1, account.ID(), reqErr) {
 					if !isV2CompactionRequest {
 						h.store.Release(account)
 						continue
@@ -2400,8 +2414,25 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 
+				compatibilityRetry := false
+				compatibilityHandled := false
+				compatibilityReport := encryptedContentCompatibilityReport{}
+				if encryptedCompatibilityEnabled && !encryptedContentCompatibilityRetried {
+					repairedBody, report := repairResponsesEncryptedContentForError(upstreamBody, resp.StatusCode, errBody)
+					compatibilityHandled = report.Handled
+					if report.Changed {
+						encryptedContentCompatibilityRetried = true
+						encryptedContentCompatibilityBodies[account.ID()] = repairedBody
+						compatibilityRetry = true
+						compatibilityReport = report
+					} else if report.Protected {
+						log.Printf("账号 %d encrypted_content 错误命中受保护的 %s，未删除压缩或子代理状态 (param=%q)", account.ID(), report.ItemType, report.Param)
+					}
+				}
+
 				explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
-				if shouldStripEncryptedContentForFailure(explicitInvalidEncryptedContent) {
+				_, compatibilityRepairAlreadyUsed := encryptedContentCompatibilityBodies[account.ID()]
+				if !encryptedCompatibilityEnabled && !compatibilityRetry && !compatibilityHandled && !compatibilityRepairAlreadyUsed && shouldStripEncryptedContentForFailure(explicitInvalidEncryptedContent) {
 					message := "OpenAI Responses 上游返回错误且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
 					if explicitInvalidEncryptedContent {
 						message = "OpenAI Responses 上游拒绝 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
@@ -2414,12 +2445,15 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 				}
 
-				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, true, false, "http")
+				sameAccountRetry, sameAccountFailures, sameAccountLimit := false, 0, 0
+				if !compatibilityRetry {
+					sameAccountRetry, sameAccountFailures, sameAccountLimit = transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, true, false, "http")
+				}
 				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
 					h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
-				if !sameAccountRetry {
+				if !sameAccountRetry && !compatibilityRetry {
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					retryExclusions.MarkHard(account.ID())
 				}
@@ -2428,13 +2462,13 @@ func (h *Handler) Responses(c *gin.Context) {
 				logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 				decision := codex429Decision{}
-				shouldRetry := sameAccountRetry
-				if !sameAccountRetry {
+				shouldRetry := sameAccountRetry || compatibilityRetry
+				if !sameAccountRetry && !compatibilityRetry {
 					decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
 					shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				}
 				persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody)
-				if !sameAccountRetry && persistentTransient && !shouldRetry {
+				if !sameAccountRetry && !compatibilityRetry && persistentTransient && !shouldRetry {
 					shouldRetry = true
 					log.Printf("OpenAI Responses 上游 %d 已耗尽普通重试预算，继续按瞬时错误策略重试 (attempt %d, account %d)", resp.StatusCode, attempt+1, account.ID())
 				}
@@ -2464,6 +2498,12 @@ func (h *Handler) Responses(c *gin.Context) {
 				if shouldRetry {
 					lastStatusCode = resp.StatusCode
 					lastBody = errBody
+					if compatibilityRetry {
+						sameAccountTarget.remember(account, proxyURL)
+						transientRetry.clear()
+						log.Printf("账号 %d encrypted_content 兼容修复后同号重试一次 (attempt %d, strategy=%s, param=%q)", account.ID(), attempt+1, compatibilityReport.Strategy, compatibilityReport.Param)
+						continue
+					}
 					if sameAccountRetry {
 						sameAccountTarget.remember(account, proxyURL)
 						if isV2CompactionRequest {
@@ -2506,6 +2546,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			abortedForHTTPError := false
 			var imageLogInfo imageUsageLogInfo
 			var terminalFailurePayload []byte
+			compatibilityRetry := false
+			compatibilityHandled := false
+			compatibilityReport := encryptedContentCompatibilityReport{}
 
 			if isStream {
 				c.Header("Content-Type", "text/event-stream")
@@ -2550,15 +2593,33 @@ func (h *Handler) Responses(c *gin.Context) {
 						terminalFailurePayload = append([]byte(nil), data...)
 						gotTerminal = true
 					}
+					if eventType == "response.failed" && encryptedCompatibilityBuffering && !wroteAnyBody {
+						statusCode := responseFailedStatusCode(terminalFailurePayload)
+						repairedBody, report := repairResponsesEncryptedContentForError(upstreamBody, statusCode, terminalFailurePayload)
+						compatibilityHandled = report.Handled
+						if report.Changed {
+							encryptedContentCompatibilityRetried = true
+							encryptedContentCompatibilityBodies[account.ID()] = repairedBody
+							compatibilityRetry = true
+							compatibilityReport = report
+							encryptedCompatibilityBuffering = false
+							pendingFirstTokenEvents.Reset()
+							completionBuffer.discard()
+							return false
+						} else if report.Protected {
+							log.Printf("账号 %d encrypted_content 响应错误命中受保护的 %s，未删除压缩或子代理状态 (param=%q)", account.ID(), report.ItemType, report.Param)
+						}
+					}
 					downstreamTTFTRecorded := ttftRecorded && !isV2CompactionRequest
-					if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, downstreamTTFTRecorded, wroteAnyBody, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, c.Request.Context().Err(), writeErr) {
+					wroteOrDeferredProtocol := wroteAnyBody || (encryptedCompatibilityBuffering && pendingFirstTokenEvents.Len() > 0)
+					if !clientGone && shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType, terminalFailurePayload, downstreamTTFTRecorded, wroteOrDeferredProtocol, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, c.Request.Context().Err(), writeErr) {
 						pendingFirstTokenEvents.Reset()
 						completionBuffer.discard()
 						return false
 					}
 					// 首 token 前的 response.failed 不写进下游流:不可重试(如 context_length_exceeded)
 					// 或已达重试上限时,交由循环外按真实错误码返回,而不是 200 流让中转层误计费。
-					if shouldReturnHTTPErrorForResponseFailed(eventType, downstreamTTFTRecorded, wroteAnyBody, clientGone) {
+					if shouldReturnHTTPErrorForResponseFailed(eventType, downstreamTTFTRecorded, wroteOrDeferredProtocol, clientGone) {
 						pendingFirstTokenEvents.Reset()
 						completionBuffer.discard()
 						abortedForHTTPError = true
@@ -2569,16 +2630,27 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 					if !clientGone {
 						shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
+						if encryptedCompatibilityBuffering {
+							shouldDefer = !gotTerminal && !isFirstTokenResult(parsed)
+						}
 						wrote, err := completionBuffer.writeEvent(streamWriter, &pendingFirstTokenEvents, data, eventType, shouldDefer)
 						if err != nil {
 							writeErr = err
 							clientGone = true
 						} else if wrote {
 							wroteAnyBody = true
+							encryptedCompatibilityBuffering = false
 						}
 					}
 					return eventType != "response.completed" && eventType != "response.failed"
 				})
+				if writeErr == nil && !compatibilityRetry && pendingFirstTokenEvents.Len() > 0 {
+					writeErr = streamWriter.WriteBytes(pendingFirstTokenEvents.Bytes())
+					pendingFirstTokenEvents.Reset()
+					if writeErr == nil {
+						wroteAnyBody = true
+					}
+				}
 				// 仅在真的写过 body 时才做收尾 flush:flusher.Flush 会先提交 HTTP 200 header,
 				// 零写入时提前 flush 会让循环外的 c.JSON(4xx) 失效(status 已定型为 200)。
 				if writeErr == nil && wroteAnyBody {
@@ -2592,11 +2664,27 @@ func (h *Handler) Responses(c *gin.Context) {
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
 					gotTerminal = true
-					contentType := resp.Header.Get("Content-Type")
-					if contentType == "" {
-						contentType = "application/json"
+					if encryptedCompatibilityEnabled && !encryptedContentCompatibilityRetried && responsesPayloadIsFailed(respBody) {
+						statusCode := responseFailedStatusCode(respBody)
+						repairedBody, report := repairResponsesEncryptedContentForError(upstreamBody, statusCode, respBody)
+						compatibilityHandled = report.Handled
+						if report.Changed {
+							encryptedContentCompatibilityRetried = true
+							encryptedContentCompatibilityBodies[account.ID()] = repairedBody
+							compatibilityRetry = true
+							compatibilityReport = report
+							terminalFailurePayload = append([]byte(nil), respBody...)
+						} else if report.Protected {
+							log.Printf("账号 %d encrypted_content 响应错误命中受保护的 %s，未删除压缩或子代理状态 (param=%q)", account.ID(), report.ItemType, report.Param)
+						}
 					}
-					c.Data(http.StatusOK, contentType, respBody)
+					if !compatibilityRetry {
+						contentType := resp.Header.Get("Content-Type")
+						if contentType == "" {
+							contentType = "application/json"
+						}
+						c.Data(http.StatusOK, contentType, respBody)
+					}
 				}
 			}
 
@@ -2617,21 +2705,26 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			transparentStreamRetry := shouldTransparentRetryStream(outcome, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)
-			if transparentStreamRetry && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
+			_, compatibilityRepairAlreadyUsed := encryptedContentCompatibilityBodies[account.ID()]
+			if !encryptedCompatibilityEnabled && !compatibilityRetry && !compatibilityHandled && !compatibilityRepairAlreadyUsed && transparentStreamRetry && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
 				if !isV2CompactionRequest {
 					resp.Body.Close()
 					h.store.Release(account)
 					continue
 				}
 			}
-			sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := transportRetries.shouldRetryForRequest(
-				h,
-				account,
-				isV2CompactionRequest,
-				sameAccountStreamRetryEligible(isV2CompactionRequest, outcome, wroteAnyBody, c.Request.Context().Err(), writeErr),
-				isFirstTokenTimeoutOutcome(outcome),
-				outcome.failureKind,
-			)
+			sameAccountStreamRetry := compatibilityRetry
+			sameAccountStreamFailures, sameAccountStreamLimit := 0, 0
+			if !compatibilityRetry {
+				sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit = transportRetries.shouldRetryForRequest(
+					h,
+					account,
+					isV2CompactionRequest,
+					sameAccountStreamRetryEligible(isV2CompactionRequest, outcome, wroteAnyBody, c.Request.Context().Err(), writeErr),
+					isFirstTokenTimeoutOutcome(outcome),
+					outcome.failureKind,
+				)
+			}
 			if outcome.verifyAccountAuth && !sameAccountStreamRetry {
 				h.store.VerifyAccountAuthAsync(account)
 			}
@@ -2641,7 +2734,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
 				}
 			}
-			if !sameAccountStreamRetry && transparentStreamRetry {
+			if !compatibilityRetry && !sameAccountStreamRetry && transparentStreamRetry {
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
 				if isFirstTokenTimeoutOutcome(outcome) {
@@ -2730,6 +2823,10 @@ func (h *Handler) Responses(c *gin.Context) {
 				resp.Body.Close()
 				h.store.Release(account)
 				sameAccountTarget.remember(account, proxyURL)
+				if compatibilityRetry {
+					log.Printf("账号 %d encrypted_content 响应兼容修复后同号重试一次 (attempt %d, strategy=%s, param=%q)", account.ID(), attempt+1, compatibilityReport.Strategy, compatibilityReport.Param)
+					continue
+				}
 				if isV2CompactionRequest {
 					logCompactSameAccountRetry(account.ID(), attempt+1, sameAccountStreamFailures, sameAccountStreamLimit, "/v1/responses-relay-stream")
 				} else {

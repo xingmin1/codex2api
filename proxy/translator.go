@@ -1089,6 +1089,10 @@ func isMissingEncryptedContentError(body []byte) bool {
 }
 
 func stripInvalidEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
+	return stripEncryptedContentFromResponsesBody(body)
+}
+
+func stripEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
 	var root map[string]any
 	if err := json.Unmarshal(body, &root); err != nil || root == nil {
 		return body, false
@@ -1885,6 +1889,9 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 	normalizeResponsesToolChoice(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
+	// reasoning 空壳无法被 Responses 重放，会让同一会话之后的每轮请求都返回
+	// missing_required_parameter。这里只删除不可重放的 reasoning；压缩和子代理密文保留。
+	dropBareReasoningInputItems(body)
 	stripRelayUnsupportedFunctionCallNamespaces(body)
 	if shouldInjectOpenAIResponsesImageGenerationTool(body) {
 		ensureResponsesImageGenerationTool(body)

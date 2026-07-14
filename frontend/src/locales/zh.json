@@ -718,6 +718,8 @@
     "compactSameAccountRetriesHint": "仅保护一次 compact 请求最初选中的账号，覆盖所有上游错误和首字超时；预算耗尽后才交回原 compact 状态机换号。",
     "compactSameAccountRetriesRange": "请输入 0~10 的整数；0 表示首个错误直接交回 compact 状态机。",
     "compactSameAccountRetriesInherit": "留空继承全局设置，当前有效值为 {{value}} 次。",
+    "encryptedContentCompatibilityLabel": "加密上下文兼容修复",
+    "encryptedContentCompatibilityHint": "仅为不完整支持 Responses encrypted_content 的中转账号开启。开启后会请求返回加密 reasoning，并在上游明确拒绝时暂缓首批结构帧、仅清理可安全丢弃的 reasoning 后同号重试一次；不会删除压缩记忆或子代理任务。正常中转账号请保持关闭。",
     "failureToleranceStatus": "过去 {{window}} 秒失败 {{count}} 次；有效计分阈值 {{score}}，追溯计分{{retroactive}}。",
     "ignoreUnauthorizedCooldown": "将 401 当作普通错误",
     "ignoreUnauthorizedCooldownHint": "开启后，上游返回 401 时只按普通失败请求记录，不把该账号标记为封禁、冷却或自动清理。",

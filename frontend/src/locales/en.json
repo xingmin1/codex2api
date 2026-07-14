@@ -718,6 +718,8 @@
     "compactSameAccountRetriesHint": "Protects only the first account selected for a compact request and covers every upstream error plus first-token timeouts. The existing compact state machine takes over after the budget is exhausted.",
     "compactSameAccountRetriesRange": "Enter an integer from 0 to 10; 0 hands the first error directly to the compact state machine.",
     "compactSameAccountRetriesInherit": "Blank inherits the global setting. The current effective value is {{value}}.",
+    "encryptedContentCompatibilityLabel": "Encrypted Context Compatibility",
+    "encryptedContentCompatibilityHint": "Enable only for Responses relays that do not fully preserve encrypted_content. It requests encrypted reasoning and, after an explicit rejection, buffers initial structural events, removes only safely discardable reasoning, and retries once on the same account. Compaction memory and subagent tasks are never deleted. Leave this off for normal relays.",
     "failureToleranceStatus": "Failures in the past {{window}} seconds: {{count}}. Effective score threshold: {{score}}; retroactive scoring: {{retroactive}}.",
     "ignoreUnauthorizedCooldown": "Treat 401 as ordinary error",
     "ignoreUnauthorizedCooldownHint": "When enabled, upstream 401 responses are recorded as ordinary failed requests without marking this account banned, cooled down, or auto-cleaned.",

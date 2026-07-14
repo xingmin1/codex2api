@@ -118,6 +118,26 @@ func TestFailureToleranceOnlyAppliesToAPIRelay(t *testing.T) {
 	}
 }
 
+func TestEncryptedContentCompatibilityOnlyAppliesToAPIRelay(t *testing.T) {
+	relay := &Account{
+		UpstreamType:                         UpstreamOpenAIResponses,
+		BaseURL:                              "https://relay.example.com",
+		APIKey:                               "sk-test",
+		EncryptedContentCompatibilityEnabled: true,
+	}
+	if !relay.ShouldUseEncryptedContentCompatibility() {
+		t.Fatal("enabled Responses API relay should use encrypted-content compatibility")
+	}
+
+	official := &Account{
+		AccessToken:                          "token",
+		EncryptedContentCompatibilityEnabled: true,
+	}
+	if official.ShouldUseEncryptedContentCompatibility() {
+		t.Fatal("official account must ignore relay encrypted-content compatibility config")
+	}
+}
+
 func TestFailureToleranceWindowOverride(t *testing.T) {
 	store := NewStore(nil, nil, nil)
 	store.SetFailureToleranceWindowSeconds(60)

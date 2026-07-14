@@ -94,6 +94,7 @@ export interface AccountRow {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
+  encrypted_content_compatibility_enabled?: boolean
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
   failure_tolerance_window_seconds?: number | null
@@ -289,6 +290,7 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
+  encrypted_content_compatibility_enabled?: boolean
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
   failure_tolerance_window_seconds?: number | null

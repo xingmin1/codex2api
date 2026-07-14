@@ -696,6 +696,7 @@ type accountResponse struct {
 	RateLimitResetCredits                *int                       `json:"rate_limit_reset_credits"`
 	IgnoreUsageLimit429Cooldown          bool                       `json:"ignore_usage_limit_429_cooldown"`
 	IgnoreUnauthorizedCooldown           bool                       `json:"ignore_unauthorized_cooldown"`
+	EncryptedContentCompatibilityEnabled bool                       `json:"encrypted_content_compatibility_enabled"`
 	FailureScoreThreshold                *int                       `json:"failure_score_threshold,omitempty"`
 	FailureCooldownThreshold             *int                       `json:"failure_cooldown_threshold,omitempty"`
 	FailureToleranceWindowSeconds        *int                       `json:"failure_tolerance_window_seconds,omitempty"`
@@ -902,6 +903,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		resp.DispatchCountLimit = accountDispatchCountLimit(row)
 		resp.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
 		resp.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
+		resp.EncryptedContentCompatibilityEnabled = row.GetCredentialBool("encrypted_content_compatibility_enabled")
 		resp.FailureScoreThreshold = accountFailureThreshold(row, "failure_score_threshold")
 		resp.FailureCooldownThreshold = accountFailureThreshold(row, "failure_cooldown_threshold")
 		resp.FailureToleranceWindowSeconds = accountFailureThreshold(row, "failure_tolerance_window_seconds")
@@ -1145,6 +1147,7 @@ type updateAccountSchedulerReq struct {
 	SkipWarmTier                   json.RawMessage `json:"skip_warm_tier"`
 	IgnoreUsageLimit429Cooldown    json.RawMessage `json:"ignore_usage_limit_429_cooldown"`
 	IgnoreUnauthorizedCooldown     json.RawMessage `json:"ignore_unauthorized_cooldown"`
+	EncryptedContentCompatibility  json.RawMessage `json:"encrypted_content_compatibility_enabled"`
 	FailureScoreThreshold          json.RawMessage `json:"failure_score_threshold"`
 	FailureCooldownThreshold       json.RawMessage `json:"failure_cooldown_threshold"`
 	FailureToleranceWindowSeconds  json.RawMessage `json:"failure_tolerance_window_seconds"`
@@ -1174,6 +1177,7 @@ type accountSchedulerUpdate struct {
 	SkipWarmTier                   database.OptionalBool
 	IgnoreUsageLimit429Cooldown    database.OptionalBool
 	IgnoreUnauthorizedCooldown     database.OptionalBool
+	EncryptedContentCompatibility  database.OptionalBool
 	FailureScoreThreshold          database.OptionalNullInt64
 	FailureCooldownThreshold       database.OptionalNullInt64
 	FailureToleranceWindowSeconds  database.OptionalNullInt64
@@ -1216,6 +1220,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	ignoreUnauthorizedCooldown, err := parseOptionalBoolField(req.IgnoreUnauthorizedCooldown, "ignore_unauthorized_cooldown")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	encryptedContentCompatibility, err := parseOptionalBoolField(req.EncryptedContentCompatibility, "encrypted_content_compatibility_enabled")
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1326,6 +1334,9 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if ignoreUnauthorizedCooldown.Set {
 		credentialUpdates["ignore_unauthorized_cooldown"] = ignoreUnauthorizedCooldown.Value
 	}
+	if encryptedContentCompatibility.Set {
+		credentialUpdates["encrypted_content_compatibility_enabled"] = encryptedContentCompatibility.Value
+	}
 	if failureScoreThreshold.Set {
 		if failureScoreThreshold.Value.Valid {
 			credentialUpdates["failure_score_threshold"] = failureScoreThreshold.Value.Int64
@@ -1408,6 +1419,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		SkipWarmTier:                   skipWarmTier,
 		IgnoreUsageLimit429Cooldown:    ignoreUsageLimit429Cooldown,
 		IgnoreUnauthorizedCooldown:     ignoreUnauthorizedCooldown,
+		EncryptedContentCompatibility:  encryptedContentCompatibility,
 		FailureScoreThreshold:          failureScoreThreshold,
 		FailureCooldownThreshold:       failureCooldownThreshold,
 		FailureToleranceWindowSeconds:  failureToleranceWindowSeconds,
@@ -1439,6 +1451,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.SkipWarmTier.Set ||
 		u.IgnoreUsageLimit429Cooldown.Set ||
 		u.IgnoreUnauthorizedCooldown.Set ||
+		u.EncryptedContentCompatibility.Set ||
 		u.FailureScoreThreshold.Set ||
 		u.FailureCooldownThreshold.Set ||
 		u.FailureToleranceWindowSeconds.Set ||
@@ -1595,6 +1608,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.IgnoreUnauthorizedCooldown.Set {
 		h.store.ApplyAccountUnauthorizedCooldownConfig(id, update.IgnoreUnauthorizedCooldown.Value)
+	}
+	if update.EncryptedContentCompatibility.Set {
+		h.store.ApplyAccountEncryptedContentCompatibilityConfig(id, update.EncryptedContentCompatibility.Value)
 	}
 	if update.FailureScoreThreshold.Set || update.FailureCooldownThreshold.Set || update.FailureToleranceWindowSeconds.Set {
 		scoreThreshold := 0

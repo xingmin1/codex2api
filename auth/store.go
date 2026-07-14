@@ -157,6 +157,7 @@ type Account struct {
 	dispatchWindowResetAt                  time.Time
 	IgnoreUsageLimit429Cooldown            bool
 	IgnoreUnauthorizedCooldown             bool
+	EncryptedContentCompatibilityEnabled   bool
 	FailureScoreThresholdOverride          int // 0 表示继承全局
 	FailureCooldownThresholdOverride       int // 0 表示继承全局
 	FailureToleranceWindowOverride         int // 秒，0 表示继承全局
@@ -1765,6 +1766,16 @@ func (a *Account) ShouldIgnoreUnauthorizedCooldown() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.IgnoreUnauthorizedCooldown
+}
+
+// ShouldUseEncryptedContentCompatibility 返回该 Responses API 中转账号是否启用加密上下文兼容修复。
+func (a *Account) ShouldUseEncryptedContentCompatibility() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.isOpenAIResponsesAPILocked() && a.EncryptedContentCompatibilityEnabled
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -4410,6 +4421,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	account.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
 	account.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
+	account.EncryptedContentCompatibilityEnabled = row.GetCredentialBool("encrypted_content_compatibility_enabled")
 	account.FailureScoreRetroactiveOverride = row.GetCredentialOptionalBool("failure_score_retroactive")
 	if threshold, ok := row.GetCredentialInt64("failure_score_threshold"); ok {
 		account.FailureScoreThresholdOverride = normalizeFailureToleranceOverride(int(threshold))
@@ -6266,6 +6278,18 @@ func (s *Store) ApplyAccountUnauthorizedCooldownConfig(dbID int64, ignore bool) 
 	}
 	acc.mu.Lock()
 	acc.IgnoreUnauthorizedCooldown = ignore
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountEncryptedContentCompatibilityConfig 更新账号级加密上下文兼容修复开关。
+func (s *Store) ApplyAccountEncryptedContentCompatibilityConfig(dbID int64, enabled bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	acc.EncryptedContentCompatibilityEnabled = enabled
 	acc.mu.Unlock()
 	return true
 }

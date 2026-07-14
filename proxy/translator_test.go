@@ -644,6 +644,61 @@ func TestPrepareOpenAIResponsesBody_NormalizesLegacyImageContentPart(t *testing.
 	}
 }
 
+func TestPrepareOpenAIResponsesBodyDropsBareReasoningOnly(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":[
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"reasoning","summary":[]},
+			{"type":"reasoning","encrypted_content":"valid-reasoning"},
+			{"type":"compaction","encrypted_content":"compact-state"},
+			{"type":"agent_message","content":[{"type":"encrypted_content"}]}
+		]
+	}`)
+
+	got := PrepareOpenAIResponsesBody(raw)
+
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 4 {
+		t.Fatalf("input len = %d, want 4; body=%s", len(items), got)
+	}
+	if items[1].Get("encrypted_content").String() != "valid-reasoning" ||
+		items[2].Get("type").String() != "compaction" ||
+		items[3].Get("type").String() != "agent_message" {
+		t.Fatalf("relay cleanup removed protected encrypted state: %s", got)
+	}
+}
+
+func TestPrepareOpenAIResponsesBodyDropsBareReasoningAtLongConversationIndexes(t *testing.T) {
+	input := make([]any, 0, 52)
+	for index := 0; index < 49; index++ {
+		input = append(input, map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": fmt.Sprintf("message-%d", index),
+		})
+	}
+	input = append(input,
+		map[string]any{"type": "reasoning", "summary": []any{}},
+		map[string]any{"type": "reasoning", "encrypted_content": nil},
+		map[string]any{"type": "reasoning", "encrypted_content": "valid-long-session-state"},
+	)
+	raw, err := json.Marshal(map[string]any{"model": "gpt-5.6-sol", "input": input})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	got := PrepareOpenAIResponsesBody(raw)
+
+	items := gjson.GetBytes(got, "input").Array()
+	if len(items) != 50 {
+		t.Fatalf("input len = %d, want 50 after removing input[49] and input[50]; body=%s", len(items), got)
+	}
+	if encrypted := items[49].Get("encrypted_content").String(); encrypted != "valid-long-session-state" {
+		t.Fatalf("valid reasoning after malformed long-session items was not preserved: %s", got)
+	}
+}
+
 func TestPrepareOpenAIResponsesBody_ImageGenerationToolChoiceInjectsTool(t *testing.T) {
 	tests := []struct {
 		name string

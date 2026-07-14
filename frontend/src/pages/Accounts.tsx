@@ -1015,6 +1015,10 @@ export default function Accounts() {
   const [editPriceMultiplierInput, setEditPriceMultiplierInput] = useState("");
   const [editFailureToleranceEnabled, setEditFailureToleranceEnabled] =
     useState(false);
+  const [
+    editEncryptedContentCompatibilityEnabled,
+    setEditEncryptedContentCompatibilityEnabled,
+  ] = useState(false);
   const [editFailureScoreThresholdInput, setEditFailureScoreThresholdInput] =
     useState("");
   const [editFailureWindowInput, setEditFailureWindowInput] = useState("");
@@ -3695,6 +3699,9 @@ export default function Accounts() {
     setEditFailureToleranceEnabled(
       account.ignore_usage_limit_429_cooldown ?? false,
     );
+    setEditEncryptedContentCompatibilityEnabled(
+      account.encrypted_content_compatibility_enabled ?? false,
+    );
     setEditFailureScoreThresholdInput(
       formatFailureThresholdInput(account.failure_score_threshold),
     );
@@ -3766,10 +3773,11 @@ export default function Accounts() {
     setEditIgnoreUsageLimitStatusMode("inherit");
     setEditDispatchCountLimitInput("");
     setEditPriceMultiplierInput("");
-	setEditFailureToleranceEnabled(false);
-	setEditFailureScoreThresholdInput("");
-	setEditFailureWindowInput("");
-	setEditFailureScoreRetroactiveMode("inherit");
+    setEditFailureToleranceEnabled(false);
+    setEditEncryptedContentCompatibilityEnabled(false);
+    setEditFailureScoreThresholdInput("");
+    setEditFailureWindowInput("");
+    setEditFailureScoreRetroactiveMode("inherit");
     setEditTransportSameAccountRetriesInput("");
     setEditCompactSameAccountRetriesInput("");
     setEditSchedulerPriorityInput("");
@@ -3951,6 +3959,8 @@ export default function Accounts() {
           editDispatchCountLimitInput,
         ),
         ignore_usage_limit_429_cooldown: editFailureToleranceEnabled,
+        encrypted_content_compatibility_enabled:
+          editEncryptedContentCompatibilityEnabled,
         failure_score_threshold: failureThresholdInputToValue(
           editFailureScoreThresholdInput,
         ),
@@ -7260,6 +7270,32 @@ export default function Accounts() {
                               })}
                         </div>
                       </div>
+
+                      {editingAccount.openai_responses_api && (
+                        <div className="rounded-xl border border-border p-4 md:col-span-2">
+                          <div className="flex items-start justify-between gap-4">
+                            <div className="min-w-0">
+                              <div className="text-sm font-semibold text-foreground">
+                                {t("accounts.encryptedContentCompatibilityLabel")}
+                              </div>
+                              <div className="mt-1 text-xs text-muted-foreground">
+                                {t("accounts.encryptedContentCompatibilityHint")}
+                              </div>
+                            </div>
+                            <Switch
+                              checked={
+                                editEncryptedContentCompatibilityEnabled
+                              }
+                              onCheckedChange={
+                                setEditEncryptedContentCompatibilityEnabled
+                              }
+                              aria-label={t(
+                                "accounts.encryptedContentCompatibilityLabel",
+                              )}
+                            />
+                          </div>
+                        </div>
+                      )}
 
                       <div className="rounded-xl border border-border p-4">
                         <div className="text-sm font-semibold text-foreground">
