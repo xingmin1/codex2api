@@ -275,8 +275,8 @@ func (h *Handler) Messages(c *gin.Context) {
 					BillingServiceTier:   usageTiers.BillingServiceTier,
 				}, attempt, kind, reqErr)
 			}
-			if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if kind != "" && ((!timedOut && account.IsOpenAIResponsesAPI()) || (!(timedOut && shouldRetry) && !sameAccountRetry)) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			if !sameAccountRetry {
@@ -313,12 +313,10 @@ func (h *Handler) Messages(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, true, false, "http")
-			if !sameAccountRetry {
-				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-				}
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry && !ShouldIgnoreFailureCooldown(account) && !shouldSuppressSameAccountFailureState(h.store, resp.StatusCode, errBody) {
+			if !sameAccountRetry && !ShouldIgnoreFailureCooldown(account) {
 				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 					h.store.PersistUsageSnapshot(account, usagePct)
 				}
@@ -555,6 +553,9 @@ func (h *Handler) Messages(c *gin.Context) {
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
 		}
+		if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
+			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		}
 		sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := transportRetries.shouldRetrySameAccount(
 			h,
 			account,
@@ -588,8 +589,8 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
-			} else {
-				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			} else if !account.IsOpenAIResponsesAPI() {
+				h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
 			h.store.Release(account)
@@ -680,7 +681,9 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			if !account.IsOpenAIResponsesAPI() {
+				h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			}
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)

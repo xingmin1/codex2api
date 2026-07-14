@@ -28,7 +28,7 @@ var errWhamUnauthorized = errors.New("wham usage probe unauthorized")
 // （会真实计入用量但保证向下兼容）。
 // 鉴权裁决：wham 401 不单方面封号，由 /responses 回退探针定夺（issue #328）。
 func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account) error {
-	if account == nil {
+	if account == nil || account.IsOpenAIResponsesAPI() {
 		return nil
 	}
 

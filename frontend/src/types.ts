@@ -97,9 +97,11 @@ export interface AccountRow {
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
   failure_tolerance_window_seconds?: number | null
+  failure_score_retroactive?: boolean | null
   failure_score_threshold_effective?: number
   failure_cooldown_threshold_effective?: number
   failure_tolerance_window_seconds_effective?: number
+  failure_score_retroactive_effective?: boolean
   transport_same_account_retries?: number | null
   transport_same_account_retries_effective?: number
   compact_same_account_retries?: number | null
@@ -290,6 +292,7 @@ export interface UpdateAccountSchedulerRequest {
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
   failure_tolerance_window_seconds?: number | null
+  failure_score_retroactive?: boolean | null
   transport_same_account_retries?: number | null
   compact_same_account_retries?: number | null
   price_multiplier?: number | null
@@ -657,6 +660,7 @@ export interface SystemSettings {
   failure_score_threshold: number
   failure_cooldown_threshold: number
   failure_tolerance_window_seconds: number
+  failure_score_retroactive: boolean
   lazy_mode: boolean
   proxy_url?: string
   pg_max_conns: number

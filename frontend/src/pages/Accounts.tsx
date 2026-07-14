@@ -1017,11 +1017,9 @@ export default function Accounts() {
     useState(false);
   const [editFailureScoreThresholdInput, setEditFailureScoreThresholdInput] =
     useState("");
-  const [
-    editFailureCooldownThresholdInput,
-    setEditFailureCooldownThresholdInput,
-  ] = useState("");
   const [editFailureWindowInput, setEditFailureWindowInput] = useState("");
+  const [editFailureScoreRetroactiveMode, setEditFailureScoreRetroactiveMode] =
+    useState<"inherit" | "enabled" | "disabled">("inherit");
   const [editTransportSameAccountRetriesInput, setEditTransportSameAccountRetriesInput] = useState("");
   const [editCompactSameAccountRetriesInput, setEditCompactSameAccountRetriesInput] = useState("");
   const [editSchedulerPriorityInput, setEditSchedulerPriorityInput] =
@@ -3700,11 +3698,15 @@ export default function Accounts() {
     setEditFailureScoreThresholdInput(
       formatFailureThresholdInput(account.failure_score_threshold),
     );
-    setEditFailureCooldownThresholdInput(
-      formatFailureThresholdInput(account.failure_cooldown_threshold),
-    );
     setEditFailureWindowInput(
       formatFailureThresholdInput(account.failure_tolerance_window_seconds),
+    );
+    setEditFailureScoreRetroactiveMode(
+      account.failure_score_retroactive === true
+        ? "enabled"
+        : account.failure_score_retroactive === false
+          ? "disabled"
+          : "inherit",
     );
     setEditTransportSameAccountRetriesInput(
       formatTransportSameAccountRetriesInput(account.transport_same_account_retries),
@@ -3764,10 +3766,10 @@ export default function Accounts() {
     setEditIgnoreUsageLimitStatusMode("inherit");
     setEditDispatchCountLimitInput("");
     setEditPriceMultiplierInput("");
-    setEditFailureToleranceEnabled(false);
-    setEditFailureScoreThresholdInput("");
-    setEditFailureCooldownThresholdInput("");
-    setEditFailureWindowInput("");
+	setEditFailureToleranceEnabled(false);
+	setEditFailureScoreThresholdInput("");
+	setEditFailureWindowInput("");
+	setEditFailureScoreRetroactiveMode("inherit");
     setEditTransportSameAccountRetriesInput("");
     setEditCompactSameAccountRetriesInput("");
     setEditSchedulerPriorityInput("");
@@ -3824,9 +3826,6 @@ export default function Accounts() {
   );
   const editFailureScoreThresholdInvalid = isFailureThresholdInputInvalid(
     editFailureScoreThresholdInput,
-  );
-  const editFailureCooldownThresholdInvalid = isFailureThresholdInputInvalid(
-    editFailureCooldownThresholdInput,
   );
   const editFailureWindowInvalid = isFailureWindowInputInvalid(
     editFailureWindowInput,
@@ -3911,7 +3910,6 @@ export default function Accounts() {
       editDispatchCountLimitInvalid ||
       editPriceMultiplierInvalid ||
       editFailureScoreThresholdInvalid ||
-      editFailureCooldownThresholdInvalid ||
       editFailureWindowInvalid ||
       editTransportSameAccountRetriesInvalid ||
       editCompactSameAccountRetriesInvalid ||
@@ -3956,12 +3954,13 @@ export default function Accounts() {
         failure_score_threshold: failureThresholdInputToValue(
           editFailureScoreThresholdInput,
         ),
-        failure_cooldown_threshold: failureThresholdInputToValue(
-          editFailureCooldownThresholdInput,
-        ),
         failure_tolerance_window_seconds: failureThresholdInputToValue(
           editFailureWindowInput,
         ),
+        failure_score_retroactive:
+          editFailureScoreRetroactiveMode === "inherit"
+            ? null
+            : editFailureScoreRetroactiveMode === "enabled",
         transport_same_account_retries:
           transportSameAccountRetriesInputToValue(
             editTransportSameAccountRetriesInput,
@@ -7344,8 +7343,9 @@ export default function Accounts() {
                         </div>
                       </div>
 
-                      <div className="rounded-xl border border-border p-4 md:col-span-2">
-                        <div className="flex items-start justify-between gap-4">
+                      {editingAccount.openai_responses_api && (
+                        <div className="rounded-xl border border-border p-4 md:col-span-2">
+                          <div className="flex items-start justify-between gap-4">
                           <div>
                             <div className="text-sm font-semibold text-foreground">
                               {t("accounts.ignoreUsageLimit429Cooldown")}
@@ -7373,7 +7373,7 @@ export default function Accounts() {
                             />
                           </button>
                         </div>
-                        <div className="mt-4 grid gap-4 md:grid-cols-3">
+                          <div className="mt-4 grid gap-4 md:grid-cols-2">
                           <div>
                             <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
                               {t("accounts.failureScoreThresholdLabel")}
@@ -7426,34 +7426,32 @@ export default function Accounts() {
                                 : t("accounts.failureThresholdInheritHint")}
                             </div>
                           </div>
-                          <div>
-                            <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
-                              {t("accounts.failureCooldownThresholdLabel")}
-                            </label>
-                            <Input
-                              disabled={!editFailureToleranceEnabled}
-                              inputMode="numeric"
-                              value={editFailureCooldownThresholdInput}
-                              placeholder={t(
-                                "accounts.failureThresholdPlaceholder",
-                              )}
-                              onChange={(
-                                event: ChangeEvent<HTMLInputElement>,
-                              ) =>
-                                setEditFailureCooldownThresholdInput(
-                                  event.target.value,
-                                )
-                              }
-                            />
-                            <div
-                              className={`mt-1.5 text-xs ${editFailureCooldownThresholdInvalid ? "text-red-500" : "text-muted-foreground"}`}
-                            >
-                              {editFailureCooldownThresholdInvalid
-                                ? t("accounts.failureThresholdRange")
-                                : t("accounts.failureThresholdInheritHint")}
+                            <div className="md:col-span-2">
+                              <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
+                                {t("accounts.failureScoreRetroactiveLabel")}
+                              </label>
+                              <div className="mb-2 text-xs text-muted-foreground">
+                                {t("accounts.failureScoreRetroactiveHint")}
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                <TogglePill
+                                  active={editFailureScoreRetroactiveMode === "inherit"}
+                                  onClick={() => setEditFailureScoreRetroactiveMode("inherit")}
+                                  label={t("accounts.failureScoreRetroactiveInherit")}
+                                />
+                                <TogglePill
+                                  active={editFailureScoreRetroactiveMode === "enabled"}
+                                  onClick={() => setEditFailureScoreRetroactiveMode("enabled")}
+                                  label={t("common.enabled")}
+                                />
+                                <TogglePill
+                                  active={editFailureScoreRetroactiveMode === "disabled"}
+                                  onClick={() => setEditFailureScoreRetroactiveMode("disabled")}
+                                  label={t("common.disabled")}
+                                />
+                              </div>
                             </div>
                           </div>
-                        </div>
                         <div className="mt-3 text-xs text-muted-foreground">
                           {t("accounts.failureToleranceStatus", {
                             count:
@@ -7466,12 +7464,14 @@ export default function Accounts() {
                             score:
                               editingAccount.failure_score_threshold_effective ??
                               1,
-                            cooldown:
-                              editingAccount.failure_cooldown_threshold_effective ??
-                              1,
+                            retroactive:
+                              editingAccount.failure_score_retroactive_effective
+                                ? t("common.enabled")
+                                : t("common.disabled"),
                           })}
                         </div>
                       </div>
+                      )}
 
                       <div className="rounded-xl border border-border p-4">
                         <label className="text-sm font-semibold text-foreground">

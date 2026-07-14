@@ -699,9 +699,11 @@ type accountResponse struct {
 	FailureScoreThreshold                *int                       `json:"failure_score_threshold,omitempty"`
 	FailureCooldownThreshold             *int                       `json:"failure_cooldown_threshold,omitempty"`
 	FailureToleranceWindowSeconds        *int                       `json:"failure_tolerance_window_seconds,omitempty"`
+	FailureScoreRetroactive              *bool                      `json:"failure_score_retroactive"`
 	FailureScoreThresholdEffective       int                        `json:"failure_score_threshold_effective"`
 	FailureCooldownThresholdEffective    int                        `json:"failure_cooldown_threshold_effective"`
 	FailureToleranceWindowEffective      int                        `json:"failure_tolerance_window_seconds_effective"`
+	FailureScoreRetroactiveEffective     bool                       `json:"failure_score_retroactive_effective"`
 	TransportSameAccountRetries          *int                       `json:"transport_same_account_retries,omitempty"`
 	TransportSameAccountRetriesEffective int                        `json:"transport_same_account_retries_effective"`
 	CompactSameAccountRetries            *int                       `json:"compact_same_account_retries,omitempty"`
@@ -903,6 +905,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		resp.FailureScoreThreshold = accountFailureThreshold(row, "failure_score_threshold")
 		resp.FailureCooldownThreshold = accountFailureThreshold(row, "failure_cooldown_threshold")
 		resp.FailureToleranceWindowSeconds = accountFailureThreshold(row, "failure_tolerance_window_seconds")
+		resp.FailureScoreRetroactive = row.GetCredentialOptionalBool("failure_score_retroactive")
 		resp.TransportSameAccountRetries = accountTransportSameAccountRetries(row)
 		resp.TransportSameAccountRetriesEffective = h.store.GetTransportSameAccountRetries()
 		if resp.TransportSameAccountRetries != nil {
@@ -913,10 +916,14 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if resp.CompactSameAccountRetries != nil {
 			resp.CompactSameAccountRetriesEffective = *resp.CompactSameAccountRetries
 		}
-		if resp.IgnoreUsageLimit429Cooldown {
+		if resp.OpenAIResponsesAPI && resp.IgnoreUsageLimit429Cooldown {
 			resp.FailureScoreThresholdEffective = h.store.GetFailureScoreThreshold()
-			resp.FailureCooldownThresholdEffective = max(h.store.GetFailureCooldownThreshold(), resp.FailureScoreThresholdEffective)
+			resp.FailureCooldownThresholdEffective = 1
 			resp.FailureToleranceWindowEffective = h.store.GetFailureToleranceWindowSeconds()
+			resp.FailureScoreRetroactiveEffective = h.store.GetFailureScoreRetroactive()
+			if resp.FailureScoreRetroactive != nil {
+				resp.FailureScoreRetroactiveEffective = *resp.FailureScoreRetroactive
+			}
 		} else {
 			resp.FailureScoreThresholdEffective = 1
 			resp.FailureCooldownThresholdEffective = 1
@@ -986,6 +993,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			resp.FailureScoreThreshold = optionalPositiveIntPointer(scoreOverride)
 			resp.FailureCooldownThreshold = optionalPositiveIntPointer(cooldownOverride)
 			resp.FailureToleranceWindowSeconds = optionalPositiveIntPointer(windowOverride)
+			resp.FailureScoreRetroactive, resp.FailureScoreRetroactiveEffective = acc.FailureScoreRetroactiveSnapshot()
 			resp.FailureScoreThresholdEffective = scoreEffective
 			resp.FailureCooldownThresholdEffective = cooldownEffective
 			resp.FailureToleranceWindowEffective = windowEffective
@@ -1140,6 +1148,7 @@ type updateAccountSchedulerReq struct {
 	FailureScoreThreshold          json.RawMessage `json:"failure_score_threshold"`
 	FailureCooldownThreshold       json.RawMessage `json:"failure_cooldown_threshold"`
 	FailureToleranceWindowSeconds  json.RawMessage `json:"failure_tolerance_window_seconds"`
+	FailureScoreRetroactive        json.RawMessage `json:"failure_score_retroactive"`
 	TransportSameAccountRetries    json.RawMessage `json:"transport_same_account_retries"`
 	CompactSameAccountRetries      json.RawMessage `json:"compact_same_account_retries"`
 	PriceMultiplier                json.RawMessage `json:"price_multiplier"`
@@ -1168,6 +1177,7 @@ type accountSchedulerUpdate struct {
 	FailureScoreThreshold          database.OptionalNullInt64
 	FailureCooldownThreshold       database.OptionalNullInt64
 	FailureToleranceWindowSeconds  database.OptionalNullInt64
+	FailureScoreRetroactive        optionalNullableBool
 	TransportSameAccountRetries    database.OptionalNullInt64
 	CompactSameAccountRetries      database.OptionalNullInt64
 	PriceMultiplier                optionalFloat64
@@ -1218,6 +1228,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	failureToleranceWindowSeconds, err := parseOptionalIntegerField(req.FailureToleranceWindowSeconds, "failure_tolerance_window_seconds", 1, 3600)
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	failureScoreRetroactive, err := parseOptionalNullableBoolField(req.FailureScoreRetroactive, "failure_score_retroactive")
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1333,6 +1347,9 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 			credentialUpdates["failure_tolerance_window_seconds"] = nil
 		}
 	}
+	if failureScoreRetroactive.Set {
+		credentialUpdates["failure_score_retroactive"] = failureScoreRetroactive.Value
+	}
 	if transportSameAccountRetries.Set {
 		if transportSameAccountRetries.Value.Valid {
 			credentialUpdates["transport_same_account_retries"] = transportSameAccountRetries.Value.Int64
@@ -1394,6 +1411,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		FailureScoreThreshold:          failureScoreThreshold,
 		FailureCooldownThreshold:       failureCooldownThreshold,
 		FailureToleranceWindowSeconds:  failureToleranceWindowSeconds,
+		FailureScoreRetroactive:        failureScoreRetroactive,
 		TransportSameAccountRetries:    transportSameAccountRetries,
 		CompactSameAccountRetries:      compactSameAccountRetries,
 		PriceMultiplier:                priceMultiplier,
@@ -1424,6 +1442,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.FailureScoreThreshold.Set ||
 		u.FailureCooldownThreshold.Set ||
 		u.FailureToleranceWindowSeconds.Set ||
+		u.FailureScoreRetroactive.Set ||
 		u.TransportSameAccountRetries.Set ||
 		u.CompactSameAccountRetries.Set ||
 		u.PriceMultiplier.Set ||
@@ -1599,6 +1618,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 			update.FailureToleranceWindowSeconds.Set,
 			windowSeconds,
 		)
+	}
+	if update.FailureScoreRetroactive.Set {
+		h.store.ApplyAccountFailureScoreRetroactive(id, true, update.FailureScoreRetroactive.Value)
 	}
 	if update.TransportSameAccountRetries.Set {
 		var retries *int
@@ -6489,6 +6511,7 @@ type settingsResponse struct {
 	FailureScoreThreshold              int     `json:"failure_score_threshold"`
 	FailureCooldownThreshold           int     `json:"failure_cooldown_threshold"`
 	FailureToleranceWindowSeconds      int     `json:"failure_tolerance_window_seconds"`
+	FailureScoreRetroactive            bool    `json:"failure_score_retroactive"`
 	LazyMode                           bool    `json:"lazy_mode"`
 	ProxyURL                           string  `json:"proxy_url"`
 	PgMaxConns                         int     `json:"pg_max_conns"`
@@ -6611,6 +6634,7 @@ type updateSettingsReq struct {
 	FailureScoreThreshold              *int     `json:"failure_score_threshold"`
 	FailureCooldownThreshold           *int     `json:"failure_cooldown_threshold"`
 	FailureToleranceWindowSeconds      *int     `json:"failure_tolerance_window_seconds"`
+	FailureScoreRetroactive            *bool    `json:"failure_score_retroactive"`
 	LazyMode                           *bool    `json:"lazy_mode"`
 	ProxyURL                           *string  `json:"proxy_url"`
 	PgMaxConns                         *int     `json:"pg_max_conns"`
@@ -7224,6 +7248,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		FailureScoreThreshold:              h.store.GetFailureScoreThreshold(),
 		FailureCooldownThreshold:           h.store.GetFailureCooldownThreshold(),
 		FailureToleranceWindowSeconds:      h.store.GetFailureToleranceWindowSeconds(),
+		FailureScoreRetroactive:            h.store.GetFailureScoreRetroactive(),
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,
@@ -7667,6 +7692,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		v := min(max(*req.FailureToleranceWindowSeconds, 1), 3600)
 		h.store.SetFailureToleranceWindowSeconds(v)
 		log.Printf("设置已更新: failure_tolerance_window_seconds = %d", v)
+	}
+
+	if req.FailureScoreRetroactive != nil {
+		h.store.SetFailureScoreRetroactive(*req.FailureScoreRetroactive)
+		log.Printf("设置已更新: failure_score_retroactive = %t", *req.FailureScoreRetroactive)
 	}
 
 	if req.LazyMode != nil {
@@ -8218,6 +8248,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FailureScoreThreshold:              h.store.GetFailureScoreThreshold(),
 		FailureCooldownThreshold:           h.store.GetFailureCooldownThreshold(),
 		FailureToleranceWindowSeconds:      h.store.GetFailureToleranceWindowSeconds(),
+		FailureScoreRetroactive:            h.store.GetFailureScoreRetroactive(),
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,
@@ -8343,6 +8374,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		FailureScoreThreshold:              h.store.GetFailureScoreThreshold(),
 		FailureCooldownThreshold:           h.store.GetFailureCooldownThreshold(),
 		FailureToleranceWindowSeconds:      h.store.GetFailureToleranceWindowSeconds(),
+		FailureScoreRetroactive:            h.store.GetFailureScoreRetroactive(),
 		LazyMode:                           h.store.GetLazyMode(),
 		ProxyURL:                           h.store.GetProxyURL(),
 		PgMaxConns:                         h.pgMaxConns,

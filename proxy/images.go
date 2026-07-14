@@ -1424,8 +1424,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 					Stream:           stream,
 				}, attempt, kind, reqErr)
 			}
-			if kind != "" && !sameAccountRetry {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			if sameAccountRetry {
@@ -1452,12 +1452,10 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, true, false, "http")
-			if !sameAccountRetry {
-				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-				}
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry && !ShouldIgnoreFailureCooldown(account) && !shouldSuppressSameAccountFailureState(h.store, resp.StatusCode, errBody) {
+			if !sameAccountRetry && !ShouldIgnoreFailureCooldown(account) {
 				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 					h.store.PersistUsageSnapshot(account, usagePct)
 				}

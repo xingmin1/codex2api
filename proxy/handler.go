@@ -1007,10 +1007,26 @@ func shouldTreatUnauthorizedAsClientError(account *auth.Account, statusCode int)
 }
 
 func classifyHTTPFailureForAccount(account *auth.Account, statusCode int) string {
+	if account != nil && account.IsOpenAIResponsesAPI() && statusCode >= 400 {
+		return "upstream"
+	}
 	if shouldTreatUnauthorizedAsClientError(account, statusCode) {
 		return "client"
 	}
 	return classifyHTTPFailure(statusCode)
+}
+
+func (h *Handler) reportUpstreamAttemptFailure(account *auth.Account, kind string, latency time.Duration) {
+	if h == nil || h.store == nil || account == nil {
+		return
+	}
+	if account.IsOpenAIResponsesAPI() {
+		h.store.ReportAPIUpstreamFailure(account, latency)
+		return
+	}
+	if kind != "" {
+		h.store.ReportRequestFailure(account, kind, latency)
+	}
 }
 
 func isCloudflareOriginResponseTimeout(statusCode int, body []byte) bool {
@@ -1113,11 +1129,16 @@ func classifyResponseFailedOutcomeForAccount(account *auth.Account, payload []by
 		}
 	}
 	penalizeUnauthorized := statusCode == http.StatusUnauthorized && !shouldTreatUnauthorizedAsClientError(account, statusCode)
+	penalize := penalizeUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500
+	if account != nil && account.IsOpenAIResponsesAPI() {
+		kind = "upstream"
+		penalize = true
+	}
 	return streamOutcome{
 		logStatusCode:  statusCode,
 		failureKind:    kind,
 		failureMessage: message,
-		penalize:       penalizeUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500,
+		penalize:       penalize,
 	}
 }
 
@@ -1634,6 +1655,9 @@ func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries
 }
 
 func shouldRetryHTTPStatusForAccount(account *auth.Account, statusCode int, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
+	if account != nil && account.IsOpenAIResponsesAPI() && statusCode == http.StatusTooManyRequests {
+		return shouldRetryHTTPStatus(http.StatusBadGateway, generalRetries, nil, maxGeneralRetries, 0)
+	}
 	if shouldTreatUnauthorizedAsClientError(account, statusCode) {
 		return false
 	}
@@ -1951,6 +1975,9 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 }
 
 func upstreamErrorKindForAccount(account *auth.Account, statusCode int, body []byte, decision codex429Decision) string {
+	if account != nil && account.IsOpenAIResponsesAPI() && statusCode >= 400 {
+		return "upstream"
+	}
 	if shouldTreatUnauthorizedAsClientError(account, statusCode) {
 		return "client"
 	}
@@ -2310,9 +2337,9 @@ func (h *Handler) Responses(c *gin.Context) {
 						BillingServiceTier:   usageTiers.BillingServiceTier,
 					}, attempt, kind, reqErr)
 				}
-				// 同号重试预算内不记账号失败、不解绑亲和、不硬排除。
-				if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				// 同号重试只决定是否保留账号；API 中转的每次真实上游失败都独立进入时间窗。
+				if kind != "" && ((!timedOut && account.IsOpenAIResponsesAPI()) || (!(timedOut && shouldRetry) && !sameAccountRetry)) {
+					h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
 				if !sameAccountRetry {
@@ -2388,10 +2415,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 
 				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, true, false, "http")
-				if !sameAccountRetry {
-					if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
-						h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-					}
+				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+					h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
 				if !sameAccountRetry {
@@ -2588,6 +2613,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 			}
+			if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
+				h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			}
 			transparentStreamRetry := shouldTransparentRetryStream(outcome, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)
 			if transparentStreamRetry && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
 				if !isV2CompactionRequest {
@@ -2618,8 +2646,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				recyclePooledClient(account, proxyURL)
 				if isFirstTokenTimeoutOutcome(outcome) {
 					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
-				} else {
-					h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				} else if !account.IsOpenAIResponsesAPI() {
+					h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 				}
 				resp.Body.Close()
 				h.store.Release(account)
@@ -2715,7 +2743,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			resp.Body.Close()
 			if outcome.penalize {
 				recyclePooledClient(account, proxyURL)
-				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				if !account.IsOpenAIResponsesAPI() {
+					h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				}
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			} else if outcome.logStatusCode == http.StatusOK {
 				h.store.ClearModelCooldown(account, attemptEffectiveModel)
@@ -2804,9 +2834,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					BillingServiceTier:   usageTiers.BillingServiceTier,
 				}, attempt, kind, reqErr)
 			}
-			// 同号重试预算内的上游错误不记账号失败；真正换号时只记一次。
-			if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			// 同号重试只决定是否保留账号；API 中转的每次真实上游失败都独立进入时间窗。
+			if kind != "" && ((!timedOut && account.IsOpenAIResponsesAPI()) || (!(timedOut && shouldRetry) && !sameAccountRetry)) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			if !sameAccountRetry {
@@ -2880,13 +2910,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, true, false, "http")
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
 			if !sameAccountRetry {
-				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-				}
-				if !shouldSuppressSameAccountFailureState(h.store, resp.StatusCode, errBody) {
-					SyncCodexFailureUsageState(h.store, account, resp)
-				}
+				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
 			if !sameAccountRetry {
@@ -3204,6 +3232,9 @@ func (h *Handler) Responses(c *gin.Context) {
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
+		if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
+			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		}
 		transparentStreamRetry := shouldTransparentRetryStream(outcome, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)
 		if transparentStreamRetry && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
 			if !isV2CompactionRequest {
@@ -3244,8 +3275,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
-			} else {
-				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			} else if !account.IsOpenAIResponsesAPI() {
+				h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
 			h.store.Release(account)
@@ -3353,7 +3384,9 @@ func (h *Handler) Responses(c *gin.Context) {
 		resp.Body.Close()
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			if !account.IsOpenAIResponsesAPI() {
+				h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			}
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, effectiveModel)
@@ -3648,8 +3681,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 						BillingServiceTier:   usageTiers.BillingServiceTier,
 					}, attempt, kind, reqErr)
 				}
-				if kind != "" && !sameAccountRetry {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				if kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+					h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
 				if !sameAccountRetry {
@@ -3699,8 +3732,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && !sameAccountRetry {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+					h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
 				if !sameAccountRetry {
@@ -3792,8 +3825,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				if shouldRetry && shouldStripCompactEncryptedContentForFailure(false) {
 					stripCompactEncryptedContentForRetry("OpenAI Responses compact 上游响应读取连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d): %v", attempt+1, account.ID(), readErr)
 				}
-				if !sameAccountRetry {
-					h.store.ReportRequestFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
+				if account.IsOpenAIResponsesAPI() || !sameAccountRetry {
+					h.reportUpstreamAttemptFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
 				}
 				h.store.Release(account)
 				if !sameAccountRetry {
@@ -3935,8 +3968,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					BillingServiceTier:   usageTiers.BillingServiceTier,
 				}, attempt, kind, reqErr)
 			}
-			if kind != "" && !sameAccountRetry {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			if !sameAccountRetry {
@@ -3986,10 +4019,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				}
 			}
 
-			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && !sameAccountRetry {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry && !shouldSuppressSameAccountFailureState(h.store, resp.StatusCode, errBody) {
+			if !sameAccountRetry {
 				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
@@ -4083,8 +4116,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if shouldRetry && shouldStripCompactEncryptedContentForFailure(false) {
 				stripCompactEncryptedContentForRetry("compact 上游响应读取连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, account %d): %v", attempt+1, account.ID(), readErr)
 			}
+			if account.IsOpenAIResponsesAPI() || !sameAccountRetry {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
+			}
 			if !sameAccountRetry {
-				h.store.ReportRequestFailure(account, kind, time.Duration(totalDuration)*time.Millisecond)
 				SyncCodexUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
@@ -4407,9 +4442,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 					BillingServiceTier:   usageTiers.BillingServiceTier,
 				}, attempt, kind, reqErr)
 			}
-			// 同号重试预算内的上游错误不记账号失败；真正换号时只记一次。
-			if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			// 同号重试只决定是否保留账号；API 中转的每次真实上游失败都独立进入时间窗。
+			if kind != "" && ((!timedOut && account.IsOpenAIResponsesAPI()) || (!(timedOut && shouldRetry) && !sameAccountRetry)) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			if !sameAccountRetry {
@@ -4450,13 +4485,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, true, false, "http")
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
 			if !sameAccountRetry {
-				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-				}
-				if !shouldSuppressSameAccountFailureState(h.store, resp.StatusCode, errBody) {
-					SyncCodexFailureUsageState(h.store, account, resp)
-				}
+				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
 			if !sameAccountRetry {
@@ -4701,6 +4734,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
+		if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
+			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		}
 		sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := transportRetries.shouldRetrySameAccount(
 			h,
 			account,
@@ -4730,8 +4766,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			recyclePooledClient(account, proxyURL)
 			if isFirstTokenTimeoutOutcome(outcome) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
-			} else {
-				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			} else if !account.IsOpenAIResponsesAPI() {
+				h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			resp.Body.Close()
 			h.store.Release(account)
@@ -4833,7 +4869,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		resp.Body.Close()
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			if !account.IsOpenAIResponsesAPI() {
+				h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			}
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
@@ -5183,9 +5221,10 @@ func usageLimitFallbackCooldown(account *auth.Account, body []byte) time.Duratio
 	}
 }
 
-// ShouldIgnoreFailureCooldown 返回账号本次失败是否尚未达到持久冷却阈值。
+// ShouldIgnoreFailureCooldown 返回账号是否禁止根据失败响应写入 Codex 语义状态。
 //
-// 请求内账号排除和换号由各处理链独立执行，不受该阈值影响。
+// API 中转账号的错误码不具备可靠的官方语义，只参与调度计分；请求内重试和换号
+// 仍由各处理链独立执行。
 func ShouldIgnoreFailureCooldown(account *auth.Account) bool {
 	return account != nil && account.ShouldDeferFailureCooldown()
 }
@@ -5225,18 +5264,11 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 	h.applyCooldownForModel(account, statusCode, body, resp, "")
 }
 
-func shouldSuppressSameAccountFailureState(store *auth.Store, statusCode int, body []byte) bool {
-	return store != nil &&
-		store.IsSameAccountRetryEnabled() &&
-		(statusCode == http.StatusTooManyRequests || IsUsageLimitReachedError(body))
-}
-
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
-	ignoreFailureCooldown := shouldIgnoreAccountFailureCooldown(account)
-	if h != nil && shouldSuppressSameAccountFailureState(h.store, statusCode, body) {
-		log.Printf("账号 %d 在同号重试策略下将 %d/usage_limit_reached 视为普通上游错误，不写入额度冷却", account.ID(), statusCode)
+	if account == nil || account.IsOpenAIResponsesAPI() {
 		return codex429Decision{}
 	}
+	ignoreFailureCooldown := shouldIgnoreAccountFailureCooldown(account)
 	if IsUsageLimitReachedError(body) {
 		if ignoreFailureCooldown {
 			log.Printf("账号 %d 时间窗内失败次数尚未达到冷却阈值，本次 usage_limit_reached 不写入持久冷却", account.ID())
@@ -5427,12 +5459,11 @@ func SyncCodexUsageState(store *auth.Store, account *auth.Account, resp *http.Re
 	return result
 }
 
-// SyncCodexFailureUsageState 解析失败响应中的 Codex 用量头。
+// SyncCodexFailureUsageState 解析官方 Codex 失败响应中的用量头。
 //
-// 账号启用时间窗失败容错且尚未达到冷却阈值时，不根据失败响应头写入
-// plan / 5h / 7d 用量快照、usage_exhausted 或 premium 5h 冷却状态。
+// API 中转响应头不具备可靠的官方额度语义，因此不会据此写入账号状态。
 func SyncCodexFailureUsageState(store *auth.Store, account *auth.Account, resp *http.Response) CodexUsageSyncResult {
-	if ShouldIgnoreFailureCooldown(account) {
+	if account != nil && account.IsOpenAIResponsesAPI() {
 		return CodexUsageSyncResult{}
 	}
 	return SyncCodexUsageState(store, account, resp)

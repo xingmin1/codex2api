@@ -120,6 +120,68 @@ func TestSameAccountRetryIncludesUnclassifiedUpstreamErrors(t *testing.T) {
 	}
 }
 
+func TestRelayFailureWindowCountsEverySameAccountAttempt(t *testing.T) {
+	handler, store := newRetryTestHandler(t)
+	store.SetFailureScoreThreshold(100)
+	store.SetTransportRetryPolicy("hybrid")
+	store.SetTransportSameAccountRetries(2)
+	account := &auth.Account{
+		DBID:                              1,
+		UpstreamType:                      auth.UpstreamOpenAIResponses,
+		BaseURL:                           "https://relay.example.com",
+		APIKey:                            "sk-test",
+		IgnoreUsageLimit429Cooldown:       true,
+		FailureScoreThresholdEffective:    100,
+		FailureToleranceWindowEffective:   60,
+		FailureCooldownThresholdEffective: 1,
+		HealthTier:                        auth.HealthTierHealthy,
+	}
+	tracker := newTransportRetryTracker()
+
+	for attempt := 0; attempt < 3; attempt++ {
+		tracker.shouldRetrySameAccount(handler, account, true, false, "server")
+		handler.reportUpstreamAttemptFailure(account, "server", time.Millisecond)
+	}
+
+	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
+	if failures != 3 {
+		t.Fatalf("failure window count = %d, want 3", failures)
+	}
+}
+
+func TestRelayHTTPFailuresUseOneGenericKind(t *testing.T) {
+	account := &auth.Account{
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example.com",
+		APIKey:       "sk-test",
+	}
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusTooManyRequests, http.StatusBadGateway} {
+		if got := classifyHTTPFailureForAccount(account, status); got != "upstream" {
+			t.Fatalf("status %d kind = %q, want upstream", status, got)
+		}
+	}
+	outcome := classifyResponseFailedOutcomeForAccount(account, []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_value","message":"temporary"}}}`))
+	if outcome.failureKind != "upstream" || !outcome.penalize {
+		t.Fatalf("relay response.failed outcome = %+v, want generic penalized failure", outcome)
+	}
+}
+
+func TestRelay429UsesGeneralRetryBudget(t *testing.T) {
+	account := &auth.Account{
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example.com",
+		APIKey:       "sk-test",
+	}
+	generalRetries := 0
+	rateLimitRetries := 0
+	if !shouldRetryHTTPStatusForAccount(account, http.StatusTooManyRequests, &generalRetries, &rateLimitRetries, 2, 1) {
+		t.Fatal("relay 429 should use the ordinary retry path")
+	}
+	if generalRetries != 1 || rateLimitRetries != 0 {
+		t.Fatalf("retry budgets = general:%d rate_limit:%d, want 1/0", generalRetries, rateLimitRetries)
+	}
+}
+
 func TestSameAccountRetryExcludesFirstTokenTimeout(t *testing.T) {
 	handler, store := newRetryTestHandler(t)
 	store.SetTransportRetryPolicy("sticky")
@@ -212,10 +274,16 @@ func TestSameAccountRetryRequestErrorMarksUsageAttempt(t *testing.T) {
 	}
 }
 
-func TestApply429CooldownTreats429AsOrdinaryUnderSameAccountPolicy(t *testing.T) {
+func TestApply429CooldownTreatsRelay429AsOrdinaryUpstreamFailure(t *testing.T) {
 	handler, store := newRetryTestHandler(t)
 	store.SetTransportRetryPolicy("hybrid")
-	account := &auth.Account{DBID: 1, AccessToken: "token", PlanType: "pro"}
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example.com",
+		APIKey:       "sk-test",
+		PlanType:     "api",
+	}
 	body := []byte(`{"error":{"type":"usage_limit_reached"}}`)
 
 	decision := handler.applyCooldownForModel(account, http.StatusTooManyRequests, body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
@@ -227,18 +295,47 @@ func TestApply429CooldownTreats429AsOrdinaryUnderSameAccountPolicy(t *testing.T)
 	}
 }
 
-func TestSameAccountFailureStateSuppressionOnlyCovers429AndUsageLimit(t *testing.T) {
-	_, store := newRetryTestHandler(t)
-	store.SetTransportRetryPolicy("hybrid")
+func TestRelayFailuresNeverWriteCodexSemanticState(t *testing.T) {
+	handler, _ := newRetryTestHandler(t)
+	cases := []struct {
+		status int
+		body   string
+	}{
+		{status: http.StatusUnauthorized, body: `{"error":{"code":"token_invalidated"}}`},
+		{status: http.StatusForbidden, body: `{"error":{"type":"deactivated_workspace"}}`},
+		{status: http.StatusTooManyRequests, body: `{"error":{"type":"usage_limit_reached"}}`},
+	}
+	for _, tc := range cases {
+		account := &auth.Account{
+			DBID:         int64(tc.status),
+			UpstreamType: auth.UpstreamOpenAIResponses,
+			BaseURL:      "https://relay.example.com",
+			APIKey:       "sk-test",
+			Status:       auth.StatusReady,
+			HealthTier:   auth.HealthTierHealthy,
+		}
+		resp := &http.Response{Header: make(http.Header)}
+		resp.Header.Set("x-codex-primary-used-percent", "100")
+		resp.Header.Set("x-codex-primary-window-minutes", "300")
+		handler.applyCooldownForModel(account, tc.status, []byte(tc.body), resp, "gpt-5.4")
+		SyncCodexFailureUsageState(handler.store, account, resp)
+		if account.HasActiveCooldown() || account.RuntimeStatus() != "active" || account.IsModelRateLimited("gpt-5.4") {
+			t.Fatalf("status %d wrote relay semantic state: runtime=%s", tc.status, account.RuntimeStatus())
+		}
+		if _, _, ok := account.GetUsageSnapshot5h(); ok {
+			t.Fatalf("status %d persisted relay usage headers", tc.status)
+		}
+	}
+}
 
-	if !shouldSuppressSameAccountFailureState(store, http.StatusTooManyRequests, nil) {
-		t.Fatal("429 should suppress quota/cooldown state under same-account policy")
-	}
-	if !shouldSuppressSameAccountFailureState(store, http.StatusBadRequest, []byte(`{"error":{"type":"usage_limit_reached"}}`)) {
-		t.Fatal("usage_limit_reached should suppress quota/cooldown state under same-account policy")
-	}
-	if shouldSuppressSameAccountFailureState(store, http.StatusInternalServerError, []byte(`{"error":{"type":"server_error"}}`)) {
-		t.Fatal("non-quota compact failures must retain the existing failure state machine")
+func TestSameAccountRetryDoesNotSuppressOfficialFailureState(t *testing.T) {
+	handler, store := newRetryTestHandler(t)
+	store.SetTransportRetryPolicy("hybrid")
+	account := &auth.Account{DBID: 1, AccessToken: "token", PlanType: "pro", Status: auth.StatusReady}
+	body := []byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":60}}`)
+	handler.applyCooldownForModel(account, http.StatusTooManyRequests, body, &http.Response{Header: make(http.Header)}, "gpt-5.4")
+	if !account.HasActiveCooldown() {
+		t.Fatal("same-account retry policy must not suppress official 429 cooldown state")
 	}
 }
 

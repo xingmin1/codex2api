@@ -1138,6 +1138,7 @@ export default function Settings() {
 	    failure_score_threshold: 3,
 	    failure_cooldown_threshold: 10,
 	    failure_tolerance_window_seconds: 60,
+	    failure_score_retroactive: false,
 	    lazy_mode: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
@@ -2114,17 +2115,14 @@ export default function Settings() {
 	                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, failure_tolerance_window_seconds: parseInt(e.target.value) || 1 }))}
 	                    />
 	                  </SettingField>
-	                  <SettingField label={t('settings.failureCooldownThreshold')} description={t('settings.failureCooldownThresholdDesc')}>
-	                    <Input
-	                      type="number"
-	                      min={1}
-	                      max={1000}
-	                      value={settingsForm.failure_cooldown_threshold}
-	                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, failure_cooldown_threshold: parseInt(e.target.value) || 1 }))}
-	                    />
-	                  </SettingField>
-	                </div>
-	                <div className={SETTINGS_SWITCH_GRID}>
+		                </div>
+		                <div className={SETTINGS_SWITCH_GRID}>
+		                  <SettingField label={t('settings.failureScoreRetroactive')} description={t('settings.failureScoreRetroactiveDesc')} layout="switch">
+		                    <Switch
+		                      checked={settingsForm.failure_score_retroactive}
+		                      onCheckedChange={(checked) => autoSaveBooleanField('failure_score_retroactive', checked)}
+		                    />
+		                  </SettingField>
                   <SettingField label={t('settings.usageProbeResponsesFallback')} description={t('settings.usageProbeResponsesFallbackDesc')} layout="switch">
                     <Switch
                       checked={settingsForm.usage_probe_responses_fallback_enabled}

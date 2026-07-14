@@ -9,6 +9,9 @@ import (
 func newFailureToleranceTestAccount() *Account {
 	return &Account{
 		DBID:                              1,
+		UpstreamType:                      UpstreamOpenAIResponses,
+		BaseURL:                           "https://relay.example.com",
+		APIKey:                            "sk-test",
 		IgnoreUsageLimit429Cooldown:       true,
 		FailureScoreThresholdEffective:    3,
 		FailureCooldownThresholdEffective: 10,
@@ -53,50 +56,65 @@ func TestFailureWindowExpiresByAge(t *testing.T) {
 
 	store.reportRequestFailureAt(account, "server", time.Second, start)
 	store.reportRequestFailureAt(account, "server", time.Second, start.Add(30*time.Second))
-	store.reportRequestFailureAt(account, "server", time.Second, start.Add(61*time.Second))
+	store.reportRequestFailureAt(account, "server", time.Second, start.Add(60*time.Second))
 
 	if got := len(account.failureTimestamps); got != 2 {
 		t.Fatalf("failure window count after expiry = %d, want 2", got)
 	}
 }
 
-func TestFailureToleranceCooldownThreshold(t *testing.T) {
+func TestAPIRelayNeverWritesCodexSemanticCooldown(t *testing.T) {
 	account := newFailureToleranceTestAccount()
 	now := time.Now()
 	for i := 0; i < 9; i++ {
 		account.failureTimestamps = append(account.failureTimestamps, now)
 	}
 	if !account.ShouldDeferFailureCooldown() {
-		t.Fatal("ShouldDeferFailureCooldown() = false before threshold")
+		t.Fatal("API relay must ignore semantic cooldown state")
 	}
 
 	account.mu.Lock()
 	account.failureTimestamps = append(account.failureTimestamps, time.Now())
 	account.mu.Unlock()
-	if account.ShouldDeferFailureCooldown() {
-		t.Fatal("ShouldDeferFailureCooldown() = true at threshold")
+	account.IgnoreUsageLimit429Cooldown = false
+	if !account.ShouldDeferFailureCooldown() {
+		t.Fatal("relay semantic cooldown suppression must not depend on score-window toggle")
 	}
 
-	account.IgnoreUsageLimit429Cooldown = false
-	if account.ShouldDeferFailureCooldown() {
-		t.Fatal("disabled failure tolerance must not defer cooldown")
+	official := &Account{AccessToken: "token"}
+	if official.ShouldDeferFailureCooldown() {
+		t.Fatal("official account must retain the existing Codex cooldown state machine")
 	}
 }
 
-func TestFailureToleranceCooldownThresholdIsNotBelowScoreThreshold(t *testing.T) {
+func TestFailureToleranceOnlyAppliesToAPIRelay(t *testing.T) {
 	store := NewStore(nil, nil, nil)
 	store.SetFailureScoreThreshold(8)
 	store.SetFailureCooldownThreshold(4)
 	store.SetFailureToleranceWindowSeconds(90)
-	account := &Account{IgnoreUsageLimit429Cooldown: true}
+	account := &Account{
+		UpstreamType:                UpstreamOpenAIResponses,
+		BaseURL:                     "https://relay.example.com",
+		APIKey:                      "sk-test",
+		IgnoreUsageLimit429Cooldown: true,
+	}
 
 	account.mu.Lock()
 	account.recomputeFailureToleranceThresholdsLocked(store)
 	account.mu.Unlock()
 
 	_, _, _, _, scoreEffective, cooldownEffective, windowEffective, _ := account.FailureToleranceSnapshot()
-	if scoreEffective != 8 || cooldownEffective != 8 || windowEffective != 90 {
+	if scoreEffective != 8 || cooldownEffective != 1 || windowEffective != 90 {
 		t.Fatalf("effective config = score:%d cooldown:%d window:%d", scoreEffective, cooldownEffective, windowEffective)
+	}
+
+	official := &Account{AccessToken: "token", IgnoreUsageLimit429Cooldown: true}
+	official.mu.Lock()
+	official.recomputeFailureToleranceThresholdsLocked(store)
+	official.mu.Unlock()
+	enabled, _, _, _, officialScore, officialCooldown, _, _ := official.FailureToleranceSnapshot()
+	if enabled || officialScore != 1 || officialCooldown != 1 {
+		t.Fatalf("official failure tolerance = enabled:%v score:%d cooldown:%d", enabled, officialScore, officialCooldown)
 	}
 }
 
@@ -104,6 +122,9 @@ func TestFailureToleranceWindowOverride(t *testing.T) {
 	store := NewStore(nil, nil, nil)
 	store.SetFailureToleranceWindowSeconds(60)
 	account := &Account{
+		UpstreamType:                   UpstreamOpenAIResponses,
+		BaseURL:                        "https://relay.example.com",
+		APIKey:                         "sk-test",
 		IgnoreUsageLimit429Cooldown:    true,
 		FailureToleranceWindowOverride: 120,
 	}
@@ -115,6 +136,26 @@ func TestFailureToleranceWindowOverride(t *testing.T) {
 	_, _, _, windowOverride, _, _, windowEffective, _ := account.FailureToleranceSnapshot()
 	if windowOverride != 120 || windowEffective != 120 {
 		t.Fatalf("window override/effective = %d/%d, want 120/120", windowOverride, windowEffective)
+	}
+}
+
+func TestFailureScoreRetroactiveScoresOnlyUnscoredWindowFailures(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	account := newFailureToleranceTestAccount()
+	account.FailureScoreRetroactiveEffective = true
+	start := time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC)
+
+	store.reportRequestFailureAt(account, "server", time.Second, start)
+	store.reportRequestFailureAt(account, "timeout", time.Second, start.Add(time.Second))
+	store.reportRequestFailureAt(account, "client", time.Second, start.Add(2*time.Second))
+	if account.FailureStreak != 3 || account.failureScoredCount != 3 {
+		t.Fatalf("retroactive score = streak:%d scored:%d, want 3/3", account.FailureStreak, account.failureScoredCount)
+	}
+
+	store.reportRequestFailureAt(account, "server", time.Second, start.Add(59*time.Second))
+	store.reportRequestFailureAt(account, "server", time.Second, start.Add(61*time.Second))
+	if account.FailureStreak != 5 || account.failureScoredCount != 3 {
+		t.Fatalf("sliding window rescored old failures: streak:%d scored:%d", account.FailureStreak, account.failureScoredCount)
 	}
 }
 

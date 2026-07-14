@@ -160,6 +160,7 @@ type Account struct {
 	FailureScoreThresholdOverride          int // 0 表示继承全局
 	FailureCooldownThresholdOverride       int // 0 表示继承全局
 	FailureToleranceWindowOverride         int // 秒，0 表示继承全局
+	FailureScoreRetroactiveOverride        *bool
 	TransportSameAccountRetriesOverride    int
 	TransportSameAccountRetriesOverrideSet bool
 	CompactSameAccountRetriesOverride      int
@@ -167,7 +168,9 @@ type Account struct {
 	FailureScoreThresholdEffective         int
 	FailureCooldownThresholdEffective      int
 	FailureToleranceWindowEffective        int
+	FailureScoreRetroactiveEffective       bool
 	failureTimestamps                      []time.Time
+	failureScoredCount                     int
 	PriceMultiplier                        float64 // 价格倍率，0 表示未显式配置
 	CheapProbeRecoveryMargin               float64 // 便宜账号探测成功后高出当前最高分的账号级覆盖，0 表示继承全局
 	CheapProbeBonusDuration                time.Duration
@@ -1656,26 +1659,29 @@ func (a *Account) recomputeFailureToleranceThresholdsLocked(store *Store) {
 	scoreThreshold := 1
 	cooldownThreshold := 1
 	windowSeconds := defaultFailureToleranceWindow
-	if a.IgnoreUsageLimit429Cooldown {
+	retroactive := false
+	enabled := a.IgnoreUsageLimit429Cooldown && a.isOpenAIResponsesAPILocked()
+	if enabled {
 		scoreThreshold = store.GetFailureScoreThreshold()
-		cooldownThreshold = store.GetFailureCooldownThreshold()
 		windowSeconds = store.GetFailureToleranceWindowSeconds()
+		retroactive = store.GetFailureScoreRetroactive()
 		if a.FailureScoreThresholdOverride > 0 {
 			scoreThreshold = a.FailureScoreThresholdOverride
-		}
-		if a.FailureCooldownThresholdOverride > 0 {
-			cooldownThreshold = a.FailureCooldownThresholdOverride
 		}
 		if a.FailureToleranceWindowOverride > 0 {
 			windowSeconds = a.FailureToleranceWindowOverride
 		}
-	}
-	if cooldownThreshold < scoreThreshold {
-		cooldownThreshold = scoreThreshold
+		if a.FailureScoreRetroactiveOverride != nil {
+			retroactive = *a.FailureScoreRetroactiveOverride
+		}
+	} else {
+		a.failureTimestamps = nil
+		a.failureScoredCount = 0
 	}
 	a.FailureScoreThresholdEffective = normalizeFailureToleranceThreshold(scoreThreshold, 1)
-	a.FailureCooldownThresholdEffective = normalizeFailureToleranceThreshold(cooldownThreshold, a.FailureScoreThresholdEffective)
+	a.FailureCooldownThresholdEffective = normalizeFailureToleranceThreshold(cooldownThreshold, 1)
 	a.FailureToleranceWindowEffective = normalizeFailureToleranceWindow(windowSeconds, defaultFailureToleranceWindow)
+	a.FailureScoreRetroactiveEffective = retroactive
 	a.pruneFailureTimestampsLocked(time.Now())
 }
 
@@ -1688,6 +1694,10 @@ func (a *Account) pruneFailureTimestampsLocked(now time.Time) {
 	}
 	if firstValid > 0 {
 		a.failureTimestamps = append(a.failureTimestamps[:0], a.failureTimestamps[firstValid:]...)
+		a.failureScoredCount = max(0, a.failureScoredCount-firstValid)
+	}
+	if a.failureScoredCount > len(a.failureTimestamps) {
+		a.failureScoredCount = len(a.failureTimestamps)
 	}
 }
 
@@ -1695,7 +1705,9 @@ func (a *Account) recordFailureTimestampLocked(now time.Time) int {
 	a.pruneFailureTimestampsLocked(now)
 	a.failureTimestamps = append(a.failureTimestamps, now)
 	if len(a.failureTimestamps) > maxFailureToleranceThreshold {
-		a.failureTimestamps = a.failureTimestamps[len(a.failureTimestamps)-maxFailureToleranceThreshold:]
+		removed := len(a.failureTimestamps) - maxFailureToleranceThreshold
+		a.failureTimestamps = a.failureTimestamps[removed:]
+		a.failureScoredCount = max(0, a.failureScoredCount-removed)
 	}
 	return len(a.failureTimestamps)
 }
@@ -1708,7 +1720,7 @@ func (a *Account) FailureToleranceSnapshot() (enabled bool, scoreOverride, coold
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pruneFailureTimestampsLocked(time.Now())
-	return a.IgnoreUsageLimit429Cooldown,
+	return a.IgnoreUsageLimit429Cooldown && a.isOpenAIResponsesAPILocked(),
 		a.FailureScoreThresholdOverride,
 		a.FailureCooldownThresholdOverride,
 		a.FailureToleranceWindowOverride,
@@ -1718,21 +1730,31 @@ func (a *Account) FailureToleranceSnapshot() (enabled bool, scoreOverride, coold
 		len(a.failureTimestamps)
 }
 
-// ShouldDeferFailureCooldown 判断本次失败是否尚未达到持久冷却阈值。
+// FailureScoreRetroactiveSnapshot 返回账号追溯计分的覆盖值与最终生效值。
+func (a *Account) FailureScoreRetroactiveSnapshot() (override *bool, effective bool) {
+	if a == nil {
+		return nil, false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.FailureScoreRetroactiveOverride != nil {
+		value := *a.FailureScoreRetroactiveOverride
+		override = &value
+	}
+	return override, a.FailureScoreRetroactiveEffective
+}
+
+// ShouldDeferFailureCooldown 判断账号是否禁止根据中转响应写入 Codex 语义冷却。
 //
-// 该判断只控制跨请求冷却、用量耗尽和错误状态写入；当前请求仍会立即排除失败账号并换号。
+// API 中转返回的状态码不一定具有官方 Codex 语义，因此这类账号只通过失败窗口影响
+// 调度评分，不写入账号冷却、模型冷却、额度耗尽或封禁状态。
 func (a *Account) ShouldDeferFailureCooldown() bool {
 	if a == nil {
 		return false
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if !a.IgnoreUsageLimit429Cooldown {
-		return false
-	}
-	a.pruneFailureTimestampsLocked(time.Now())
-	threshold := normalizeFailureToleranceThreshold(a.FailureCooldownThresholdEffective, defaultFailureCooldownThreshold)
-	return len(a.failureTimestamps) < threshold
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.isOpenAIResponsesAPILocked()
 }
 
 // ShouldIgnoreUnauthorizedCooldown 返回该账号是否把 401 当作普通上游错误。
@@ -2655,6 +2677,7 @@ type Store struct {
 	failureScoreThreshold              atomic.Int64
 	failureCooldownThreshold           atomic.Int64
 	failureToleranceWindowSeconds      atomic.Int64
+	failureScoreRetroactive            atomic.Bool
 	cheapProbeTopologyVersion          atomic.Uint64
 	cheapProbeRescanRequested          atomic.Bool
 	cheapProbeWakeCh                   chan struct{}
@@ -3170,6 +3193,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			FailureScoreThreshold:              defaultFailureScoreThreshold,
 			FailureCooldownThreshold:           defaultFailureCooldownThreshold,
 			FailureToleranceWindowSeconds:      defaultFailureToleranceWindow,
+			FailureScoreRetroactive:            false,
 			TransportRetryPolicy:               "hybrid",
 			TransportSameAccountRetries:        defaultTransportSameAccountRetries,
 			CompactSameAccountRetries:          defaultCompactSameAccountRetries,
@@ -3244,6 +3268,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.failureScoreThreshold.Store(int64(normalizeFailureToleranceThreshold(settings.FailureScoreThreshold, defaultFailureScoreThreshold)))
 	s.failureCooldownThreshold.Store(int64(normalizeFailureToleranceThreshold(settings.FailureCooldownThreshold, defaultFailureCooldownThreshold)))
 	s.failureToleranceWindowSeconds.Store(int64(normalizeFailureToleranceWindow(settings.FailureToleranceWindowSeconds, defaultFailureToleranceWindow)))
+	s.failureScoreRetroactive.Store(settings.FailureScoreRetroactive)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
@@ -4385,6 +4410,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	account.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
 	account.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
+	account.FailureScoreRetroactiveOverride = row.GetCredentialOptionalBool("failure_score_retroactive")
 	if threshold, ok := row.GetCredentialInt64("failure_score_threshold"); ok {
 		account.FailureScoreThresholdOverride = normalizeFailureToleranceOverride(int(threshold))
 	}
@@ -5463,6 +5489,20 @@ func (s *Store) GetFailureToleranceWindowSeconds() int {
 	return normalizeFailureToleranceWindow(int(s.failureToleranceWindowSeconds.Load()), defaultFailureToleranceWindow)
 }
 
+// SetFailureScoreRetroactive 设置达到失败阈值时是否补记窗口内尚未计分的失败。
+func (s *Store) SetFailureScoreRetroactive(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.failureScoreRetroactive.Store(enabled)
+	s.refreshFailureToleranceThresholds()
+}
+
+// GetFailureScoreRetroactive 返回全局失败追溯计分设置。
+func (s *Store) GetFailureScoreRetroactive() bool {
+	return s != nil && s.failureScoreRetroactive.Load()
+}
+
 func (s *Store) refreshFailureToleranceThresholds() {
 	if s == nil {
 		return
@@ -5998,6 +6038,7 @@ func (s *Store) AddAccount(acc *Account) {
 	defer s.mu.Unlock()
 	acc.mu.Lock()
 	acc.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
+	acc.recomputeFailureToleranceThresholdsLocked(s)
 	acc.recomputeEffectiveGroupBaseConcurrency(s)
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
@@ -6122,8 +6163,30 @@ func (s *Store) ApplyAccountUsageLimit429CooldownConfig(dbID int64, ignore bool)
 	acc.mu.Lock()
 	if acc.IgnoreUsageLimit429Cooldown != ignore {
 		acc.failureTimestamps = nil
+		acc.failureScoredCount = 0
 	}
 	acc.IgnoreUsageLimit429Cooldown = ignore
+	acc.recomputeFailureToleranceThresholdsLocked(s)
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountFailureScoreRetroactive 更新账号级追溯计分覆盖，nil 表示继承全局设置。
+func (s *Store) ApplyAccountFailureScoreRetroactive(dbID int64, set bool, override *bool) bool {
+	if !set {
+		return true
+	}
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	if override == nil {
+		acc.FailureScoreRetroactiveOverride = nil
+	} else {
+		value := *override
+		acc.FailureScoreRetroactiveOverride = &value
+	}
 	acc.recomputeFailureToleranceThresholdsLocked(s)
 	acc.mu.Unlock()
 	return true
@@ -7019,8 +7082,9 @@ func (s *Store) ConfirmResponsesAvailable(acc *Account) bool {
 	return true
 }
 
-// RecordManualTestSuccess clears failure/cooldown state after an explicit admin
-// connection test succeeds.
+// RecordManualTestSuccess 在管理员连接测试成功后恢复账号状态。
+//
+// 滚动失败窗口按时间自然过期，不因测试成功而清空，避免反复测试绕过计分阈值。
 func (s *Store) RecordManualTestSuccess(acc *Account, latency time.Duration) {
 	if acc == nil {
 		return
@@ -7045,7 +7109,6 @@ func (s *Store) RecordManualTestSuccess(acc *Account, latency time.Duration) {
 	acc.LastSuccessAt = now
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
 	acc.FailureStreak = 0
-	acc.failureTimestamps = nil
 	if wasUsageLimitCooldown {
 		acc.LastRateLimitedAt = time.Time{}
 	}
@@ -7103,6 +7166,16 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 	s.reportRequestFailureAt(acc, kind, latency, time.Time{})
 }
 
+// ReportAPIUpstreamFailure 记录一次 API 中转上游失败，不解释上游错误码的业务语义。
+//
+// 每次真实上游尝试只应调用一次；同号重试和 compact 重试也各自计入失败窗口。
+func (s *Store) ReportAPIUpstreamFailure(acc *Account, latency time.Duration) {
+	if acc == nil || !acc.IsOpenAIResponsesAPI() {
+		return
+	}
+	s.reportRequestFailureAt(acc, "upstream", latency, time.Time{})
+}
+
 func (s *Store) reportRequestFailureAt(acc *Account, kind string, latency time.Duration, now time.Time) {
 	if acc == nil {
 		return
@@ -7113,21 +7186,40 @@ func (s *Store) reportRequestFailureAt(acc *Account, kind string, latency time.D
 	if now.IsZero() {
 		now = time.Now()
 	}
+	isRelay := acc.isOpenAIResponsesAPILocked()
+	if isRelay {
+		kind = "upstream"
+	}
 	failureCount := 1
-	if acc.IgnoreUsageLimit429Cooldown {
+	windowEnabled := isRelay && acc.IgnoreUsageLimit429Cooldown
+	if windowEnabled {
 		failureCount = acc.recordFailureTimestampLocked(now)
 	} else {
 		acc.failureTimestamps = nil
+		acc.failureScoredCount = 0
 	}
 	scoreThreshold := normalizeFailureToleranceThreshold(acc.FailureScoreThresholdEffective, 1)
 	if failureCount < scoreThreshold {
 		acc.mu.Unlock()
 		return
 	}
+	penaltyCount := 1
+	if windowEnabled {
+		if acc.FailureScoreRetroactiveEffective {
+			penaltyCount = failureCount - acc.failureScoredCount
+		}
+		acc.failureScoredCount = failureCount
+	}
+	if penaltyCount <= 0 {
+		acc.mu.Unlock()
+		return
+	}
 	acc.recordLatencyLocked(latency)
-	acc.recordResultLocked(false)
+	for range penaltyCount {
+		acc.recordResultLocked(false)
+	}
 	acc.LastFailureAt = now
-	acc.FailureStreak = clampInt(acc.FailureStreak+1, 0, 20)
+	acc.FailureStreak = clampInt(acc.FailureStreak+penaltyCount, 0, 20)
 	acc.SuccessStreak = 0
 
 	switch kind {
@@ -7148,7 +7240,7 @@ func (s *Store) reportRequestFailureAt(acc *Account, kind string, latency time.D
 		} else {
 			acc.HealthTier = HealthTierRisky
 		}
-	case "transport":
+	case "transport", "upstream":
 		if acc.HealthTier == HealthTierHealthy {
 			acc.HealthTier = HealthTierWarm
 		} else {
@@ -7384,7 +7476,7 @@ const wsAuthVerifyMinInterval = 30 * time.Second
 // （wham 单方面 401 不定罪，避免误封 wham 恒 401 但流量可用的 codex_at 账号，issue #328）；
 // 若只是内容策略/网络抖动触发的 1008，探针返回正常，不会误封。带最小间隔节流。
 func (s *Store) VerifyAccountAuthAsync(account *Account) {
-	if s == nil || account == nil {
+	if s == nil || account == nil || account.IsOpenAIResponsesAPI() {
 		return
 	}
 	s.usageProbeMu.RLock()
@@ -8184,7 +8276,6 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 						account.HealthTier = HealthTierWarm
 						account.SchedulerScore = 80
 						account.FailureStreak = 0
-						account.failureTimestamps = nil
 						account.SuccessStreak = 1
 						account.LastSuccessAt = time.Now()
 						if account.Status == StatusCooldown {

@@ -2959,6 +2959,7 @@ func TestSQLiteSystemSettingsFailureToleranceWindowRoundtrip(t *testing.T) {
 		FailureScoreThreshold:            3,
 		FailureCooldownThreshold:         10,
 		FailureToleranceWindowSeconds:    90,
+		FailureScoreRetroactive:          true,
 		CodexContinueMaxRounds:           8,
 		CodexCLIVersionSyncIntervalHours: 12,
 	}
@@ -2972,5 +2973,8 @@ func TestSQLiteSystemSettingsFailureToleranceWindowRoundtrip(t *testing.T) {
 	}
 	if got.FailureToleranceWindowSeconds != 90 {
 		t.Fatalf("failure tolerance window = %d, want 90", got.FailureToleranceWindowSeconds)
+	}
+	if !got.FailureScoreRetroactive {
+		t.Fatal("failure score retroactive = false, want true")
 	}
 }

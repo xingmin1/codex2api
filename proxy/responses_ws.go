@@ -364,9 +364,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 					BillingServiceTier:   usageTiers.BillingServiceTier,
 				}, attempt, kind, reqErr)
 			}
-			// 同号重试预算内的上游错误不记账号失败；真正换号时只记一次。
-			if kind != "" && !(timedOut && shouldRetry) && !sameAccountRetry {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			// 同号重试只决定是否保留账号；API 中转的每次真实上游失败都独立进入时间窗。
+			if kind != "" && ((!timedOut && account.IsOpenAIResponsesAPI()) || (!(timedOut && shouldRetry) && !sameAccountRetry)) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			if !sameAccountRetry {
@@ -436,15 +436,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			}
 
 			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, true, false, "http")
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			}
 			if !sameAccountRetry {
-				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
-				}
-				if shouldSuppressSameAccountFailureState(h.store, resp.StatusCode, errBody) {
-					// 同号策略下 429/用量失败只参与本次重试，不把失败响应头写入额度状态。
-				} else {
-					SyncCodexFailureUsageState(h.store, account, resp)
-				}
+				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
 			if !sameAccountRetry {
@@ -714,6 +710,9 @@ func (h *Handler) streamResponsesWSUpstream(
 		// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 		h.logUpstreamCyberPolicy(c, "/v1/responses", model, responseFailedErrorBody(terminalFailurePayload))
 	}
+	if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
+		h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+	}
 	sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := transportRetries.shouldRetryForRequest(
 		h,
 		account,
@@ -744,8 +743,8 @@ func (h *Handler) streamResponsesWSUpstream(
 	}
 	if !sameAccountStreamRetry && silentRetryEnabled && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
 		resp.Body.Close()
-		if !isFirstTokenTimeoutOutcome(outcome) {
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		if !isFirstTokenTimeoutOutcome(outcome) && !account.IsOpenAIResponsesAPI() {
+			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
 		h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -818,7 +817,9 @@ func (h *Handler) streamResponsesWSUpstream(
 	resp.Body.Close()
 	if outcome.penalize {
 		recyclePooledClient(account, proxyURL)
-		h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		if !account.IsOpenAIResponsesAPI() {
+			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		}
 		h.store.UnbindSessionAffinity(affinityKey, account.ID())
 	} else if outcome.logStatusCode == http.StatusOK {
 		h.store.ClearModelCooldown(account, effectiveModel)
