@@ -8,6 +8,7 @@ export interface ToastState {
 
 export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | 'quota_paused' | string
 export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
+export type FastTierPolicy = 'preserve' | 'force_fast' | 'filter_fast'
 
 export interface StatsResponse {
   total: number
@@ -96,6 +97,8 @@ export interface AccountRow {
   ignore_unauthorized_cooldown?: boolean
   encrypted_content_compatibility_enabled?: boolean | null
   encrypted_content_compatibility_effective?: boolean
+  fast_tier_policy?: FastTierPolicy | null
+  fast_tier_policy_effective?: FastTierPolicy
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
   failure_tolerance_window_seconds?: number | null
@@ -292,6 +295,7 @@ export interface UpdateAccountSchedulerRequest {
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
   encrypted_content_compatibility_enabled?: boolean | null
+  fast_tier_policy?: FastTierPolicy | null
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
   failure_tolerance_window_seconds?: number | null
@@ -695,6 +699,7 @@ export interface SystemSettings {
   transport_same_account_retries: number
   compact_same_account_retries: number
   encrypted_content_compatibility_enabled: boolean
+  fast_tier_policy: FastTierPolicy
   allow_remote_migration: boolean
   database_driver: string
   database_label: string

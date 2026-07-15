@@ -45,6 +45,7 @@ Codex2API 采用三层配置架构：
 | `CODEX_PORT` | 否 | 8080 | HTTP 服务端口 |
 | `BIND_HOST` | 否 | `127.0.0.1`（SQLite）/ `0.0.0.0`（PostgreSQL） | Docker 端口发布绑定地址（非进程监听地址，由 `CODEX_BIND` 控制）。SQLite compose 默认 `127.0.0.1` 仅本机访问；标准 compose 默认 `0.0.0.0` 所有网络接口 |
 | `CODEX_MAX_REQUEST_BODY_SIZE_MB` | 否 | 48 | HTTP 请求体上限。后台 MP4 动态壁纸上传最大 40MB，默认值为 multipart 上传预留余量 |
+| `CODEX_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` | 否 | 360 | 收到 `SIGINT`/`SIGTERM` 后等待在途 HTTP 请求完成的最长时间，必须为正整数秒；非法值回退默认值 |
 | `ADMIN_SECRET` | 否 | - | 管理后台登录密钥 |
 | `CODEX_ALLOW_ANONYMOUS` | 否 | `false` | 设为 `true` 时，未配置任何对外 API Key 也允许 `/v1/*` 直接调用（仅限内网测试场景） |
 | `FAST_SCHEDULER_ENABLED` | 否 | `false` | 通过环境变量启用快速调度器（也可在管理后台运行时开启） |
@@ -128,6 +129,18 @@ Codex2API 采用三层配置架构：
 ## 系统设置（数据库）
 
 系统设置存储在数据库的 `SystemSettings` 表中，可通过管理后台 `/admin/settings` 实时修改。
+
+### Fast Tier 出站策略
+
+全局 `fast_tier_policy` 和账号级同名覆盖项控制业务请求发送给上游时的 `service_tier`：
+
+| 值 | 行为 |
+|----|------|
+| `preserve` | 保持客户端意图；`fast` 会转换为上游支持的 `priority`，不支持的值会被移除 |
+| `force_fast` | 无论客户端是否携带该字段，都向上游发送 `service_tier: "priority"` |
+| `filter_fast` | 移除 `service_tier` 与兼容字段 `serviceTier`，不向上游附加 Fast Tier |
+
+账号未配置覆盖值时继承全局策略。该策略覆盖 Responses HTTP/WebSocket、Chat Completions、Anthropic Messages、compact 以及中转账号请求；后台探测、模型列表和生图管理请求不受影响。用量日志中的 `requested_service_tier` 记录实际发送给本次所选账号上游的等级。
 
 ### 调度配置
 

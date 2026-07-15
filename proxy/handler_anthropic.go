@@ -146,7 +146,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)
-	serviceTier := extractServiceTier(codexBody)
+	requestedServiceTier := extractServiceTier(codexBody)
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
 	explicitSessionID := ResolveExplicitSessionID(c.Request.Header, codexBody)
 	apiKeyID := requestAPIKeyID(c)
@@ -190,6 +190,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		isRelayAccount := account.IsOpenAIResponsesAPI()
 		attemptEffectiveModel := effectiveModel
+		serviceTier := requestedServiceTier
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig && !isRelayAccount
 		upstreamEndpoint := "/v1/responses"
 		if isRelayAccount {
@@ -230,9 +231,14 @@ func (h *Handler) Messages(c *gin.Context) {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 			}
+			upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
+			c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
-			resp, reqErr = ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+			upstreamBody, effectiveServiceTier := applyAccountFastTierPolicy(codexBody, account)
+			serviceTier = effectiveServiceTier
+			c.Set("x-service-tier", resolveServiceTier("", serviceTier))
+			resp, reqErr = ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		}
 		durationMs := int(time.Since(start).Milliseconds())
 

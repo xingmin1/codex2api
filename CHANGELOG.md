@@ -1,5 +1,20 @@
 # Changelog
 
+## v2.5.2-xmin.11 - 2026-07-15
+
+### Features
+
+- **增加全局与账号级 Fast Tier 出站策略。** 支持保持客户端请求、强制附加
+  `service_tier: "priority"`、过滤所有 Fast Tier 字段三种互斥模式；账号可独立覆盖或
+  继承全局配置，覆盖 Responses HTTP/WebSocket、Chat Completions、Anthropic Messages、
+  compact、官方账号及 Responses 中转账号，用量日志记录实际出站等级。
+- **优雅关闭等待时间可配置。** `CODEX_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` 默认从 10 秒
+  延长到 360 秒，避免发布切换时中断耗时较长的流式响应或上下文压缩。
+
+### Tests
+
+- **补充 Fast Tier 策略、账号继承、管理接口、SQLite 持久化和关闭配置回归测试。**
+
 ## v2.5.2-xmin.4 - 2026-07-12
 
 ### Features

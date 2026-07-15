@@ -3,12 +3,14 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	keys := []string{
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"CODEX_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS",
 		"PORT",
 		"ADMIN_SECRET",
 		"DATABASE_DRIVER",
@@ -57,6 +59,9 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	}
 	if got := cfg.MaxRequestBodySize; got != 48*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 48*1024*1024)
+	}
+	if got := cfg.GracefulShutdownTimeout; got != 360*time.Second {
+		t.Fatalf("GracefulShutdownTimeout = %s, want 360s", got)
 	}
 	if got := strings.Join(cfg.TrustedProxies, ","); got != "127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16" {
 		t.Fatalf("TrustedProxies = %q, want loopback and private-network defaults", got)
@@ -186,6 +191,36 @@ func TestLoadReadsMaxRequestBodySizeFromEnv(t *testing.T) {
 
 	if got := cfg.MaxRequestBodySize; got != 64*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 64*1024*1024)
+	}
+}
+
+func TestLoadReadsGracefulShutdownTimeoutFromEnv(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "sqlite")
+	t.Setenv("DATABASE_PATH", "/data/codex2api.db")
+	t.Setenv("CACHE_DRIVER", "memory")
+	t.Setenv("CODEX_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS", "420")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := cfg.GracefulShutdownTimeout; got != 420*time.Second {
+		t.Fatalf("GracefulShutdownTimeout = %s, want 420s", got)
+	}
+}
+
+func TestLoadIgnoresInvalidGracefulShutdownTimeout(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "sqlite")
+	t.Setenv("DATABASE_PATH", "/data/codex2api.db")
+	t.Setenv("CACHE_DRIVER", "memory")
+	t.Setenv("CODEX_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS", "0")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if got := cfg.GracefulShutdownTimeout; got != 360*time.Second {
+		t.Fatalf("GracefulShutdownTimeout = %s, want default 360s", got)
 	}
 }
 

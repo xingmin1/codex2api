@@ -698,6 +698,8 @@ type accountResponse struct {
 	IgnoreUnauthorizedCooldown           bool                       `json:"ignore_unauthorized_cooldown"`
 	EncryptedContentCompat               *bool                      `json:"encrypted_content_compatibility_enabled"`
 	EncryptedContentCompatEffective      bool                       `json:"encrypted_content_compatibility_effective"`
+	FastTierPolicy                       *string                    `json:"fast_tier_policy"`
+	FastTierPolicyEffective              string                     `json:"fast_tier_policy_effective"`
 	FailureScoreThreshold                *int                       `json:"failure_score_threshold,omitempty"`
 	FailureCooldownThreshold             *int                       `json:"failure_cooldown_threshold,omitempty"`
 	FailureToleranceWindowSeconds        *int                       `json:"failure_tolerance_window_seconds,omitempty"`
@@ -909,6 +911,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if resp.EncryptedContentCompat != nil {
 			resp.EncryptedContentCompatEffective = *resp.EncryptedContentCompat
 		}
+		resp.FastTierPolicyEffective = h.store.GetFastTierPolicy()
+		if policy, ok := database.ParseFastTierPolicy(row.GetCredential("fast_tier_policy")); ok {
+			resp.FastTierPolicy = &policy
+			resp.FastTierPolicyEffective = policy
+		}
 		resp.FailureScoreThreshold = accountFailureThreshold(row, "failure_score_threshold")
 		resp.FailureCooldownThreshold = accountFailureThreshold(row, "failure_cooldown_threshold")
 		resp.FailureToleranceWindowSeconds = accountFailureThreshold(row, "failure_tolerance_window_seconds")
@@ -944,6 +951,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			resp.UsageLimitOverride = acc.GetIgnoreUsageLimitStatusOverride()
 			resp.UsageLimitEffective = acc.IgnoresUsageLimitStatus()
 			resp.EncryptedContentCompat, resp.EncryptedContentCompatEffective = acc.EncryptedContentCompatibilityConfig()
+			resp.FastTierPolicy, resp.FastTierPolicyEffective = acc.FastTierPolicyConfig()
 			acc.Mu().RLock()
 			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
 			acc.Mu().RUnlock()
@@ -1154,6 +1162,7 @@ type updateAccountSchedulerReq struct {
 	IgnoreUsageLimit429Cooldown    json.RawMessage `json:"ignore_usage_limit_429_cooldown"`
 	IgnoreUnauthorizedCooldown     json.RawMessage `json:"ignore_unauthorized_cooldown"`
 	EncryptedContentCompatibility  json.RawMessage `json:"encrypted_content_compatibility_enabled"`
+	FastTierPolicy                 json.RawMessage `json:"fast_tier_policy"`
 	FailureScoreThreshold          json.RawMessage `json:"failure_score_threshold"`
 	FailureCooldownThreshold       json.RawMessage `json:"failure_cooldown_threshold"`
 	FailureToleranceWindowSeconds  json.RawMessage `json:"failure_tolerance_window_seconds"`
@@ -1184,6 +1193,7 @@ type accountSchedulerUpdate struct {
 	IgnoreUsageLimit429Cooldown    database.OptionalBool
 	IgnoreUnauthorizedCooldown     database.OptionalBool
 	EncryptedContentCompatibility  optionalNullableBool
+	FastTierPolicy                 optionalNullableString
 	FailureScoreThreshold          database.OptionalNullInt64
 	FailureCooldownThreshold       database.OptionalNullInt64
 	FailureToleranceWindowSeconds  database.OptionalNullInt64
@@ -1230,6 +1240,10 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	encryptedContentCompatibility, err := parseOptionalNullableBoolField(req.EncryptedContentCompatibility, "encrypted_content_compatibility_enabled")
+	if err != nil {
+		return accountSchedulerUpdate{}, err
+	}
+	fastTierPolicy, err := parseOptionalNullableFastTierPolicyField(req.FastTierPolicy)
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1347,6 +1361,13 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 			credentialUpdates["encrypted_content_compatibility_enabled"] = *encryptedContentCompatibility.Value
 		}
 	}
+	if fastTierPolicy.Set {
+		if fastTierPolicy.Value == nil {
+			credentialUpdates["fast_tier_policy"] = nil
+		} else {
+			credentialUpdates["fast_tier_policy"] = *fastTierPolicy.Value
+		}
+	}
 	if failureScoreThreshold.Set {
 		if failureScoreThreshold.Value.Valid {
 			credentialUpdates["failure_score_threshold"] = failureScoreThreshold.Value.Int64
@@ -1430,6 +1451,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		IgnoreUsageLimit429Cooldown:    ignoreUsageLimit429Cooldown,
 		IgnoreUnauthorizedCooldown:     ignoreUnauthorizedCooldown,
 		EncryptedContentCompatibility:  encryptedContentCompatibility,
+		FastTierPolicy:                 fastTierPolicy,
 		FailureScoreThreshold:          failureScoreThreshold,
 		FailureCooldownThreshold:       failureCooldownThreshold,
 		FailureToleranceWindowSeconds:  failureToleranceWindowSeconds,
@@ -1462,6 +1484,7 @@ func (u accountSchedulerUpdate) hasChanges() bool {
 		u.IgnoreUsageLimit429Cooldown.Set ||
 		u.IgnoreUnauthorizedCooldown.Set ||
 		u.EncryptedContentCompatibility.Set ||
+		u.FastTierPolicy.Set ||
 		u.FailureScoreThreshold.Set ||
 		u.FailureCooldownThreshold.Set ||
 		u.FailureToleranceWindowSeconds.Set ||
@@ -1622,6 +1645,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	if update.EncryptedContentCompatibility.Set {
 		h.store.ApplyAccountEncryptedContentCompatibilityConfig(id, update.EncryptedContentCompatibility.Value)
 	}
+	if update.FastTierPolicy.Set {
+		h.store.ApplyAccountFastTierPolicy(id, update.FastTierPolicy.Value)
+	}
 	if update.FailureScoreThreshold.Set || update.FailureCooldownThreshold.Set || update.FailureToleranceWindowSeconds.Set {
 		scoreThreshold := 0
 		if update.FailureScoreThreshold.Set && update.FailureScoreThreshold.Value.Valid {
@@ -1723,6 +1749,11 @@ type optionalCustomHeaders struct {
 type optionalNullableBool struct {
 	Set   bool
 	Value *bool
+}
+
+type optionalNullableString struct {
+	Set   bool
+	Value *string
 }
 
 func parseOptionalCustomHeadersField(raw json.RawMessage) (optionalCustomHeaders, error) {
@@ -2151,6 +2182,25 @@ func parseOptionalNullableBoolField(raw json.RawMessage, field string) (optional
 		return optionalNullableBool{}, fmt.Errorf("%s 必须是布尔值或 null", field)
 	}
 	return optionalNullableBool{Set: true, Value: &value}, nil
+}
+
+func parseOptionalNullableFastTierPolicyField(raw json.RawMessage) (optionalNullableString, error) {
+	if len(raw) == 0 {
+		return optionalNullableString{}, nil
+	}
+	if string(raw) == "null" {
+		return optionalNullableString{Set: true}, nil
+	}
+
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return optionalNullableString{}, fmt.Errorf("fast_tier_policy 必须是字符串或 null")
+	}
+	normalized, ok := database.ParseFastTierPolicy(value)
+	if !ok {
+		return optionalNullableString{}, fmt.Errorf("fast_tier_policy 仅支持 preserve、force_fast 或 filter_fast")
+	}
+	return optionalNullableString{Set: true, Value: &normalized}, nil
 }
 
 func parseOptionalIntegerSliceField(raw json.RawMessage, field string) (database.OptionalInt64Slice, error) {
@@ -6571,6 +6621,7 @@ type settingsResponse struct {
 	TransportSameAccountRetries        int     `json:"transport_same_account_retries"`
 	CompactSameAccountRetries          int     `json:"compact_same_account_retries"`
 	EncryptedContentCompat             bool    `json:"encrypted_content_compatibility_enabled"`
+	FastTierPolicy                     string  `json:"fast_tier_policy"`
 	AllowRemoteMigration               bool    `json:"allow_remote_migration"`
 	DatabaseDriver                     string  `json:"database_driver"`
 	DatabaseLabel                      string  `json:"database_label"`
@@ -6693,6 +6744,7 @@ type updateSettingsReq struct {
 	TransportSameAccountRetries        *int     `json:"transport_same_account_retries"`
 	CompactSameAccountRetries          *int     `json:"compact_same_account_retries"`
 	EncryptedContentCompat             *bool    `json:"encrypted_content_compatibility_enabled"`
+	FastTierPolicy                     *string  `json:"fast_tier_policy"`
 	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
 	ModelMapping                       *string  `json:"model_mapping"`
 	CodexModelMapping                  *string  `json:"codex_model_mapping"`
@@ -7310,6 +7362,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
 		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
+		FastTierPolicy:                     h.store.GetFastTierPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                     h.databaseDriver,
 		DatabaseLabel:                      h.databaseLabel,
@@ -7945,6 +7998,15 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		h.store.SetEncryptedContentCompatibilityEnabled(*req.EncryptedContentCompat)
 		log.Printf("设置已更新: encrypted_content_compatibility_enabled = %t", *req.EncryptedContentCompat)
 	}
+	if req.FastTierPolicy != nil {
+		policy, ok := database.ParseFastTierPolicy(*req.FastTierPolicy)
+		if !ok {
+			writeError(c, http.StatusBadRequest, "fast_tier_policy 仅支持 preserve、force_fast 或 filter_fast")
+			return
+		}
+		h.store.SetFastTierPolicy(policy)
+		log.Printf("设置已更新: fast_tier_policy = %s", policy)
+	}
 
 	if req.AllowRemoteMigration != nil {
 		if *req.AllowRemoteMigration && !hasAdminSecret {
@@ -8315,6 +8377,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
 		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
+		FastTierPolicy:                     h.store.GetFastTierPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
@@ -8443,6 +8506,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
 		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
+		FastTierPolicy:                     h.store.GetFastTierPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                     h.databaseDriver,
 		DatabaseLabel:                      h.databaseLabel,

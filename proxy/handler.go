@@ -2092,10 +2092,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
-	serviceTier := extractServiceTier(rawBody)
-	if serviceTier != "" {
-		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
-	}
+	requestedServiceTier := extractServiceTier(rawBody)
 
 	// 2. 准备 Codex 上游请求体（Unmarshal→map→Marshal，一次序列化）。
 	// OpenAI Responses relay body 仅在实际命中 relay 账号时惰性生成，避免 Codex 路径重复转换。
@@ -2237,6 +2234,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
+		serviceTier := requestedServiceTier
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
@@ -2293,6 +2291,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					upstreamBody = preparedBody
 				}
 			}
+			upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
+			c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 			encryptedCompatibilityBuffering := encryptedCompatibilityEnabled &&
 				!encryptedContentCompatibilityRetried &&
 				responsesBodyHasEncryptedContent(upstreamBody)
@@ -2870,6 +2870,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		if useWebsocket {
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		}
+		upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -3223,6 +3225,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						if useWebsocket {
 							roundBody = stripResponsesImageGenerationTool(body)
 						}
+						roundBody, _ = applyAccountFastTierPolicy(roundBody, account)
 						roundResp, roundErr := ExecuteRequest(rctx, account, roundBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 						// 续想轮同样消耗账号额度：成功开轮后同步上游用量头，
 						// 否则多轮隐藏请求的额度对自动暂停/配速不可见。
@@ -3567,10 +3570,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	apiKeyID := requestAPIKeyID(c)
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
-	serviceTier := extractServiceTier(rawBody)
-	if serviceTier != "" {
-		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
-	}
+	requestedServiceTier := extractServiceTier(rawBody)
 
 	// compact 强制非流式
 	rawBody, _ = sjson.SetBytes(rawBody, "stream", false)
@@ -3717,6 +3717,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
+		serviceTier := requestedServiceTier
 
 		apiKey := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
 		apiKey = strings.TrimSpace(apiKey)
@@ -3735,6 +3736,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
+			upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
+			c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 			resp, reqErr := ExecuteOpenAIResponsesCompactRequest(c.Request.Context(), account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
@@ -4022,7 +4025,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		// compact（会话压缩续写）刻意保留确定性 IsolateCodexSessionID、不走 resolveUpstreamSessionID
 		// 的默认隔离：压缩本身是对同一会话的延续，需要稳定的 prompt_cache_key 维持缓存连续性。
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
-		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
+		upstreamBody, serviceTier := applyAccountFastTierPolicy(codexBody, account)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
+		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -4368,10 +4373,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	reasoningEffort := extractReasoningEffort(rawBody)
-	serviceTier := extractServiceTier(rawBody)
-	if serviceTier != "" {
-		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
-	}
+	requestedServiceTier := extractServiceTier(rawBody)
 
 	// 2. 翻译请求：OpenAI Chat → Codex Responses
 	codexBody, err := TranslateRequest(rawBody)
@@ -4442,6 +4444,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		isRelayAccount := account.IsOpenAIResponsesAPI()
 		attemptEffectiveModel := effectiveModel
 		attemptLogEffectiveModel := logEffectiveModel
+		serviceTier := requestedServiceTier
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !forceHTTPAfterWSMessageTooBig && !isRelayAccount
 		// 真实生图意图强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）。
 		// 仅凭注入的 image_generation 工具不触发降级，普通请求继续走 WS（issue #304）。
@@ -4489,6 +4492,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
+			upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
+			c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 			resp, reqErr = ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
 			// WebSocket 上游下剥离自动注入的图片工具，防止模型自主生图卡死 WS 流（issue #220）。
@@ -4496,6 +4501,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if useWebsocket {
 				upstreamBody = stripResponsesImageGenerationTool(codexBody)
 			}
+			upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
+			c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 			resp, reqErr = ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		}
 		durationMs := int(time.Since(start).Milliseconds())

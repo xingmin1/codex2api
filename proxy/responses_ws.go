@@ -191,10 +191,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	respCacheOwner := responseCacheOwner(apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
-	serviceTier := extractServiceTier(rawBody)
-	if serviceTier != "" {
-		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
-	}
+	requestedServiceTier := extractServiceTier(rawBody)
 
 	codexBody, expandedInputRaw := PrepareResponsesWebSocketBody(rawBody)
 	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
@@ -275,6 +272,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
+		serviceTier := requestedServiceTier
 
 		apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
 		deviceCfg := h.deviceCfg
@@ -300,6 +298,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if useWebsocket {
 			upstreamBody = stripResponsesImageGenerationTool(codexBody)
 		}
+		upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 		// 在 useWebsocket 最终确定后再派生上游身份键：与 handler.go 的
 		// Responses/ChatCompletions 路径一致——无显式会话默认每请求隔离上游身份，
 		// WS 路径交给 ExecuteRequest 的 stateless 槽位池处理。

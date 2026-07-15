@@ -33,7 +33,7 @@
 
 Codex2API 提供兼容 OpenAI 风格的 API 接口，同时包含完整的管理后台 API。
 
-Anthropic `/v1/messages` 仅将官方 `speed:"fast"` 映射为上游 Codex `service_tier:"priority"`；Anthropic 请求侧 `service_tier`（Priority Tier）不在此映射范围内。用量日志的 `service_tier` / `fast` 过滤反映该解析结果。
+Anthropic `/v1/messages` 仅将官方 `speed:"fast"` 映射为上游 Codex `service_tier:"priority"`；Anthropic 请求侧 `service_tier`（Priority Tier）不在此映射范围内。最终出站字段还会经过全局及账号级 `fast_tier_policy`，用量日志的 `service_tier` / `fast` 过滤反映实际出站结果。
 
 **Base URL:** `http://localhost:8080` (默认端口)
 
@@ -378,6 +378,8 @@ data: [DONE]
       "base_concurrency_override": null,
       "base_concurrency_effective": 2,
       "skip_warm_tier": false,
+      "fast_tier_policy": null,
+      "fast_tier_policy_effective": "preserve",
       "dynamic_concurrency_limit": 2,
       "allowed_api_key_ids": [1, 3],
       "proxy_url": "http://proxy.example.com:8080",
@@ -424,6 +426,8 @@ data: [DONE]
 | base_concurrency_override  | integer/null | 手工配置的基础并发覆盖值，`null` 表示跟随全局 `max_concurrency`   |
 | base_concurrency_effective | integer      | 当前生效的基础并发值                                              |
 | skip_warm_tier             | bool         | 是否跳过 warm 层级；仅把 warm 提升为 healthy，不覆盖 risky/banned |
+| fast_tier_policy           | string/null  | 账号级 Fast Tier 策略覆盖；`null` 表示继承全局                    |
+| fast_tier_policy_effective | string       | 当前生效的 Fast Tier 策略                                         |
 | allowed_api_key_ids        | integer[]    | 允许调用该账号的 API Key ID 列表；空数组表示所有 API Key 均可调用 |
 | credit_enabled             | bool         | 是否为信用计费模式账号                                            |
 | credit_skip_usage_window   | bool         | 是否跳过 7 天/5 小时用量窗口惩罚                                  |
@@ -441,6 +445,7 @@ data: [DONE]
   "score_bias_override": 80,
   "base_concurrency_override": 6,
   "skip_warm_tier": true,
+  "fast_tier_policy": "filter_fast",
   "allowed_api_key_ids": [1, 3]
 }
 ```
@@ -451,6 +456,7 @@ data: [DONE]
 {
   "score_bias_override": null,
   "base_concurrency_override": null,
+  "fast_tier_policy": null,
   "allowed_api_key_ids": null
 }
 ```
@@ -462,6 +468,7 @@ data: [DONE]
 | score_bias_override       | integer/null   | 否   | 总加权分覆盖值，范围 `-200..200`，`null` 表示恢复套餐默认                                                  |
 | base_concurrency_override | integer/null   | 否   | 基础并发覆盖值，范围 `1..50`，`null` 表示恢复全局默认                                                      |
 | skip_warm_tier            | boolean/null   | 否   | 是否跳过 warm 层级；`null` 等同 `false`，字段省略时保持原值                                                |
+| fast_tier_policy          | string/null    | 否   | `preserve`、`force_fast` 或 `filter_fast`；`null` 表示继承全局，字段省略时保持原值                         |
 | allowed_api_key_ids       | integer[]/null | 否   | 允许调用该账号的 API Key ID 列表，去重升序保存；字段省略时保持原值，传 `null` 或 `[]` 表示恢复为全部可调用 |
 
 **响应:**
@@ -1241,6 +1248,7 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "max_retries": 3,
   "max_rate_limit_retries": 2,
   "scheduler_mode": "round_robin",
+  "fast_tier_policy": "preserve",
   "allow_remote_migration": false,
   "database_driver": "postgres",
   "database_label": "PostgreSQL",
@@ -1269,9 +1277,16 @@ curl -X DELETE "http://localhost:8080/api/admin/account-groups/1?force=true" \
   "auto_clean_rate_limited": false,
   "fast_scheduler_enabled": true,
   "scheduler_mode": "remaining_quota",
+  "fast_tier_policy": "force_fast",
   "max_rate_limit_retries": 2
 }
 ```
+
+`fast_tier_policy` 支持：
+
+- `preserve`：保持请求意图，`fast` 规范化为 `priority`。
+- `force_fast`：强制向上游附加 `service_tier: "priority"`。
+- `filter_fast`：移除 `service_tier`/`serviceTier`。
 
 **响应:** 更新后的完整设置对象
 

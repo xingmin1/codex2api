@@ -1121,6 +1121,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		TransportSameAccountRetries:      2,
 		CompactSameAccountRetries:        3,
 		EncryptedContentCompat:           false,
+		FastTierPolicy:                   FastTierPolicyFilter,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1149,6 +1150,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.EncryptedContentCompat {
 		t.Fatal("EncryptedContentCompat = true, want false")
+	}
+	if settings.FastTierPolicy != FastTierPolicyFilter {
+		t.Fatalf("FastTierPolicy = %q, want %q", settings.FastTierPolicy, FastTierPolicyFilter)
 	}
 	if settings.FirstTokenMode != "loose" {
 		t.Fatalf("FirstTokenMode = %q, want loose", settings.FirstTokenMode)
@@ -1259,6 +1263,40 @@ func TestSystemSettingsNormalizeBlankBillingTierPolicy(t *testing.T) {
 	}
 	if stored != "actual" {
 		t.Fatalf("stored billing_tier_policy = %q, want actual", stored)
+	}
+}
+
+func TestSystemSettingsNormalizeBlankFastTierPolicy(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO system_settings (id, fast_tier_policy) VALUES (1, '')`); err != nil {
+		t.Fatalf("插入空 fast_tier_policy 失败: %v", err)
+	}
+
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings 返回错误: %v", err)
+	}
+	if settings == nil || settings.FastTierPolicy != FastTierPolicyPreserve {
+		t.Fatalf("FastTierPolicy = %q, want %q", settings.FastTierPolicy, FastTierPolicyPreserve)
+	}
+
+	settings.FastTierPolicy = "invalid"
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
+	}
+	var stored string
+	if err := db.conn.QueryRowContext(ctx, `SELECT fast_tier_policy FROM system_settings WHERE id = 1`).Scan(&stored); err != nil {
+		t.Fatalf("读取 fast_tier_policy 返回错误: %v", err)
+	}
+	if stored != FastTierPolicyPreserve {
+		t.Fatalf("stored fast_tier_policy = %q, want %q", stored, FastTierPolicyPreserve)
 	}
 }
 

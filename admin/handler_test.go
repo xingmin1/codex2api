@@ -1746,6 +1746,65 @@ func TestUpdateAccountSchedulerPersistsEncryptedContentCompatibilityOverrideAndI
 	}
 }
 
+func TestUpdateAccountSchedulerPersistsFastTierPolicyOverrideAndInheritance(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency: 2,
+		FastTierPolicy: database.FastTierPolicyForce,
+	})
+	t.Cleanup(store.Stop)
+	runtimeAccount := &auth.Account{DBID: accountID, AccessToken: "token", Status: auth.StatusReady}
+	store.AddAccount(runtimeAccount)
+	handler := &Handler{db: db, store: store}
+
+	patch := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+		ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(body))
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateAccountScheduler(ginCtx)
+		return recorder
+	}
+
+	if recorder := patch(`{"fast_tier_policy":"filter_fast"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("set override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	override, effective := runtimeAccount.FastTierPolicyConfig()
+	if override == nil || *override != database.FastTierPolicyFilter || effective != database.FastTierPolicyFilter {
+		t.Fatalf("runtime fast tier policy = (%v, %q), want (filter_fast, filter_fast)", override, effective)
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("fast_tier_policy"); got != database.FastTierPolicyFilter {
+		t.Fatalf("persisted fast_tier_policy = %q, want %q", got, database.FastTierPolicyFilter)
+	}
+
+	if recorder := patch(`{"fast_tier_policy":null}`); recorder.Code != http.StatusOK {
+		t.Fatalf("inherit policy status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	override, effective = runtimeAccount.FastTierPolicyConfig()
+	if override != nil || effective != database.FastTierPolicyForce {
+		t.Fatalf("inherited fast tier policy = (%v, %q), want (nil, force_fast)", override, effective)
+	}
+	row, err = db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID after inherit: %v", err)
+	}
+	if got := row.GetCredential("fast_tier_policy"); got != "" {
+		t.Fatalf("cleared fast_tier_policy remains persisted: %q", got)
+	}
+
+	if recorder := patch(`{"fast_tier_policy":"unknown"}`); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid policy status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+	}
+}
+
 func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

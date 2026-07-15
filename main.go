@@ -100,6 +100,7 @@ func main() {
 			FirstTokenMode:                   proxy.FirstTokenModeStrict,
 			FirstTokenTimeoutSeconds:         0,
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
+			FastTierPolicy:                   database.FastTierPolicyPreserve,
 			ImageStorageConfig:               "{}",
 			PublicKeyUsagePageEnabled:        true,
 			CodexWSHideUpstreamErrors:        true,
@@ -146,6 +147,7 @@ func main() {
 			FirstTokenMode:                   proxy.FirstTokenModeStrict,
 			FirstTokenTimeoutSeconds:         0,
 			BillingTierPolicy:                proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
+			FastTierPolicy:                   database.FastTierPolicyPreserve,
 			ImageStorageConfig:               "{}",
 			PublicKeyUsagePageEnabled:        true,
 			CodexWSHideUpstreamErrors:        true,
@@ -432,8 +434,8 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("正在关闭...")
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	log.Printf("正在关闭，最多等待在途请求完成 %s...", cfg.GracefulShutdownTimeout)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.GracefulShutdownTimeout)
 	defer cancelShutdown()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)

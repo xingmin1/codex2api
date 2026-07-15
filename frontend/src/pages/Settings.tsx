@@ -7,7 +7,7 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
-import type { HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '../types'
+import type { FastTierPolicy, HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, sanitizeBrandingImage, sanitizeBrandingLogo, useBranding } from '../branding'
@@ -142,6 +142,11 @@ const normalizeReasoningEffortValue = (effort: string) => {
 
 const normalizeBillingTierPolicyValue = (value?: string | null): 'actual' | 'requested' =>
   value === 'requested' ? 'requested' : 'actual'
+
+const normalizeFastTierPolicyValue = (value?: string | null): FastTierPolicy => {
+  if (value === 'force_fast' || value === 'filter_fast') return value
+  return 'preserve'
+}
 
 const normalizeFirstTokenModeValue = (value?: string | null): 'strict' | 'loose' =>
   value === 'loose' ? 'loose' : 'strict'
@@ -1080,6 +1085,11 @@ export default function Settings() {
     { label: t('settings.billingTierPolicyActual'), value: 'actual' },
     { label: t('settings.billingTierPolicyRequested'), value: 'requested' },
   ]
+  const fastTierPolicyOptions = [
+    { label: t('settings.fastTierPolicyPreserve'), value: 'preserve' },
+    { label: t('settings.fastTierPolicyForce'), value: 'force_fast' },
+    { label: t('settings.fastTierPolicyFilter'), value: 'filter_fast' },
+  ]
   const streamFlushPolicyOptions = [
     { label: t('settings.streamFlushImmediate'), value: 'immediate' },
     { label: t('settings.streamFlushCoalesce'), value: 'coalesce' },
@@ -1096,6 +1106,7 @@ export default function Settings() {
     const normalized = {
       ...settings,
       billing_tier_policy: normalizeBillingTierPolicyValue(settings.billing_tier_policy),
+      fast_tier_policy: normalizeFastTierPolicyValue(settings.fast_tier_policy),
       first_token_mode: normalizeFirstTokenModeValue(settings.first_token_mode),
     }
     if (!normalized.lazy_mode) {
@@ -1168,6 +1179,7 @@ export default function Settings() {
     transport_same_account_retries: 2,
     compact_same_account_retries: 2,
     encrypted_content_compatibility_enabled: true,
+    fast_tier_policy: 'preserve',
     allow_remote_migration: false,
     database_driver: 'postgres',
     database_label: 'PostgreSQL',
@@ -2488,6 +2500,13 @@ export default function Settings() {
                 </SettingField>
               </div>
               <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField label={t('settings.fastTierPolicy')} description={t('settings.fastTierPolicyDesc')}>
+                  <Select
+                    value={settingsForm.fast_tier_policy}
+                    onValueChange={(value) => autoSaveStringField('fast_tier_policy', value)}
+                    options={fastTierPolicyOptions}
+                  />
+                </SettingField>
                 <SettingField label={t('settings.clientCompatMode')} description={t('settings.clientCompatModeDesc')}>
                   <Select
                     value={settingsForm.client_compat_mode}

@@ -159,6 +159,8 @@ type Account struct {
 	IgnoreUnauthorizedCooldown             bool
 	EncryptedContentCompatOverride         *bool
 	encryptedContentCompatEnabled          bool
+	FastTierPolicyOverride                 string
+	fastTierPolicyEffective                string
 	FailureScoreThresholdOverride          int // 0 表示继承全局
 	FailureCooldownThresholdOverride       int // 0 表示继承全局
 	FailureToleranceWindowOverride         int // 秒，0 表示继承全局
@@ -1615,6 +1617,14 @@ func (a *Account) recomputeEffectiveEncryptedContentCompatibility(global bool) {
 	a.encryptedContentCompatEnabled = global
 }
 
+func (a *Account) recomputeEffectiveFastTierPolicy(global string) {
+	if override, ok := database.ParseFastTierPolicy(a.FastTierPolicyOverride); ok {
+		a.fastTierPolicyEffective = override
+		return
+	}
+	a.fastTierPolicyEffective = database.NormalizeFastTierPolicy(global)
+}
+
 func (a *Account) skipsUsageWindowLimitsLocked() bool {
 	return a.creditSkipsUsageWindowLocked() || a.ignoreUsageLimitStatus
 }
@@ -1799,6 +1809,31 @@ func (a *Account) EncryptedContentCompatibilityConfig() (*bool, bool) {
 	}
 	override := *a.EncryptedContentCompatOverride
 	return &override, a.encryptedContentCompatEnabled
+}
+
+// FastTierPolicy 返回该账号当前生效的 Fast Tier 出站策略。
+func (a *Account) FastTierPolicy() string {
+	if a == nil {
+		return database.FastTierPolicyPreserve
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return database.NormalizeFastTierPolicy(a.fastTierPolicyEffective)
+}
+
+// FastTierPolicyConfig 返回账号覆盖值及当前有效值；nil 表示继承全局。
+func (a *Account) FastTierPolicyConfig() (*string, string) {
+	if a == nil {
+		return nil, database.FastTierPolicyPreserve
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	effective := database.NormalizeFastTierPolicy(a.fastTierPolicyEffective)
+	if a.FastTierPolicyOverride == "" {
+		return nil, effective
+	}
+	override := database.NormalizeFastTierPolicy(a.FastTierPolicyOverride)
+	return &override, effective
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -2753,6 +2788,7 @@ type Store struct {
 	codexCLIVersionSyncInterval   atomic.Int64 // 定时同步间隔（小时），默认 12
 	ignoreUsageLimitStatus        atomic.Bool  // 用量窗口只记录，不作为账号不可用证据
 	encryptedContentCompatEnabled atomic.Bool  // Responses API 中转账号加密上下文兼容修复的全局默认
+	fastTierPolicy                atomic.Value // Fast Tier 出站策略: preserve / force_fast / filter_fast
 
 	// 重试间隔与上游错误重试策略（issue #331）
 	retryIntervalMS             atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
@@ -3233,6 +3269,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			TransportSameAccountRetries:        defaultTransportSameAccountRetries,
 			CompactSameAccountRetries:          defaultCompactSameAccountRetries,
 			EncryptedContentCompat:             true,
+			FastTierPolicy:                     database.FastTierPolicyPreserve,
 			LazyMode:                           false,
 			ProxyURL:                           "",
 			MaxRateLimitRetries:                1,
@@ -3357,6 +3394,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexCLIVersionSyncInterval.Store(int64(database.NormalizeCodexCLIVersionSyncIntervalHours(settings.CodexCLIVersionSyncIntervalHours)))
 	s.ignoreUsageLimitStatus.Store(settings.IgnoreUsageLimitStatus)
 	s.encryptedContentCompatEnabled.Store(settings.EncryptedContentCompat)
+	s.fastTierPolicy.Store(database.NormalizeFastTierPolicy(settings.FastTierPolicy))
 	s.retryIntervalMS.Store(int64(normalizeRetryIntervalMS(settings.RetryIntervalMS)))
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(settings.TransportRetryPolicy))
 	s.transportSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.TransportSameAccountRetries)))
@@ -4449,6 +4487,10 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	account.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
 	account.EncryptedContentCompatOverride = row.GetCredentialOptionalBool("encrypted_content_compatibility_enabled")
 	account.recomputeEffectiveEncryptedContentCompatibility(s.EncryptedContentCompatibilityEnabled())
+	if policy, ok := database.ParseFastTierPolicy(row.GetCredential("fast_tier_policy")); ok {
+		account.FastTierPolicyOverride = policy
+	}
+	account.recomputeEffectiveFastTierPolicy(s.GetFastTierPolicy())
 	account.FailureScoreRetroactiveOverride = row.GetCredentialOptionalBool("failure_score_retroactive")
 	if threshold, ok := row.GetCredentialInt64("failure_score_threshold"); ok {
 		account.FailureScoreThresholdOverride = normalizeFailureToleranceOverride(int(threshold))
@@ -5901,6 +5943,31 @@ func (s *Store) EncryptedContentCompatibilityEnabled() bool {
 	return s == nil || s.encryptedContentCompatEnabled.Load()
 }
 
+// SetFastTierPolicy 更新全局 Fast Tier 出站策略，并立即刷新继承全局的账号。
+func (s *Store) SetFastTierPolicy(policy string) {
+	if s == nil {
+		return
+	}
+	policy = database.NormalizeFastTierPolicy(policy)
+	s.fastTierPolicy.Store(policy)
+	for _, acc := range s.Accounts() {
+		acc.mu.Lock()
+		acc.recomputeEffectiveFastTierPolicy(policy)
+		acc.mu.Unlock()
+	}
+}
+
+// GetFastTierPolicy 返回全局 Fast Tier 出站策略。
+func (s *Store) GetFastTierPolicy() string {
+	if s == nil {
+		return database.FastTierPolicyPreserve
+	}
+	if policy, ok := s.fastTierPolicy.Load().(string); ok {
+		return database.NormalizeFastTierPolicy(policy)
+	}
+	return database.FastTierPolicyPreserve
+}
+
 func (s *Store) SetGlobalAutoPauseThresholds(t5h, t7d float64) {
 	s.mu.Lock()
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(t5h)
@@ -6096,6 +6163,7 @@ func (s *Store) AddAccount(acc *Account) {
 	acc.mu.Lock()
 	acc.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
 	acc.recomputeEffectiveEncryptedContentCompatibility(s.EncryptedContentCompatibilityEnabled())
+	acc.recomputeEffectiveFastTierPolicy(s.GetFastTierPolicy())
 	acc.recomputeFailureToleranceThresholdsLocked(s)
 	acc.recomputeEffectiveGroupBaseConcurrency(s)
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
@@ -6342,6 +6410,23 @@ func (s *Store) ApplyAccountEncryptedContentCompatibilityConfig(dbID int64, over
 		acc.EncryptedContentCompatOverride = &value
 	}
 	acc.recomputeEffectiveEncryptedContentCompatibility(s.EncryptedContentCompatibilityEnabled())
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountFastTierPolicy 更新账号级 Fast Tier 策略；nil 表示继承全局。
+func (s *Store) ApplyAccountFastTierPolicy(dbID int64, override *string) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	if override == nil {
+		acc.FastTierPolicyOverride = ""
+	} else {
+		acc.FastTierPolicyOverride = database.NormalizeFastTierPolicy(*override)
+	}
+	acc.recomputeEffectiveFastTierPolicy(s.GetFastTierPolicy())
 	acc.mu.Unlock()
 	return true
 }

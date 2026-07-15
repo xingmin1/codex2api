@@ -24,6 +24,7 @@ import type {
   AddATAccountRequest,
   AddOpenAIResponsesAccountRequest,
   CodexClientMetadataMode,
+  FastTierPolicy,
   UpdateOpenAIResponsesAccountRequest,
   APIKeyRow,
   OpsOverviewResponse,
@@ -1019,6 +1020,8 @@ export default function Accounts() {
     editEncryptedContentCompatibilityMode,
     setEditEncryptedContentCompatibilityMode,
   ] = useState<"inherit" | "enabled" | "disabled">("inherit");
+  const [editFastTierPolicyMode, setEditFastTierPolicyMode] =
+    useState<"inherit" | FastTierPolicy>("inherit");
   const [editFailureScoreThresholdInput, setEditFailureScoreThresholdInput] =
     useState("");
   const [editFailureWindowInput, setEditFailureWindowInput] = useState("");
@@ -3706,6 +3709,7 @@ export default function Accounts() {
           ? "disabled"
           : "inherit",
     );
+    setEditFastTierPolicyMode(account.fast_tier_policy ?? "inherit");
     setEditFailureScoreThresholdInput(
       formatFailureThresholdInput(account.failure_score_threshold),
     );
@@ -3779,6 +3783,7 @@ export default function Accounts() {
     setEditPriceMultiplierInput("");
     setEditFailureToleranceEnabled(false);
     setEditEncryptedContentCompatibilityMode("inherit");
+    setEditFastTierPolicyMode("inherit");
     setEditFailureScoreThresholdInput("");
     setEditFailureWindowInput("");
     setEditFailureScoreRetroactiveMode("inherit");
@@ -3967,6 +3972,8 @@ export default function Accounts() {
           editEncryptedContentCompatibilityMode === "inherit"
             ? null
             : editEncryptedContentCompatibilityMode === "enabled",
+        fast_tier_policy:
+          editFastTierPolicyMode === "inherit" ? null : editFastTierPolicyMode,
         failure_score_threshold: failureThresholdInputToValue(
           editFailureScoreThresholdInput,
         ),
@@ -7274,6 +7281,49 @@ export default function Accounts() {
                                 value:
                                   editingAccount.compact_same_account_retries_effective ?? 2,
                               })}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold text-foreground">
+                              {t("accounts.fastTierPolicyLabel")}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {t("accounts.fastTierPolicyHint")}
+                            </div>
+                          </div>
+                          <div className="flex shrink-0 flex-wrap gap-2">
+                            <TogglePill
+                              active={editFastTierPolicyMode === "inherit"}
+                              onClick={() => setEditFastTierPolicyMode("inherit")}
+                              label={t("accounts.fastTierPolicyInherit", {
+                                value: t(
+                                  editingAccount.fast_tier_policy_effective === "force_fast"
+                                    ? "accounts.fastTierPolicyForce"
+                                    : editingAccount.fast_tier_policy_effective === "filter_fast"
+                                      ? "accounts.fastTierPolicyFilter"
+                                      : "accounts.fastTierPolicyPreserve",
+                                ),
+                              })}
+                            />
+                            <TogglePill
+                              active={editFastTierPolicyMode === "preserve"}
+                              onClick={() => setEditFastTierPolicyMode("preserve")}
+                              label={t("accounts.fastTierPolicyPreserve")}
+                            />
+                            <TogglePill
+                              active={editFastTierPolicyMode === "force_fast"}
+                              onClick={() => setEditFastTierPolicyMode("force_fast")}
+                              label={t("accounts.fastTierPolicyForce")}
+                            />
+                            <TogglePill
+                              active={editFastTierPolicyMode === "filter_fast"}
+                              onClick={() => setEditFastTierPolicyMode("filter_fast")}
+                              label={t("accounts.fastTierPolicyFilter")}
+                            />
+                          </div>
                         </div>
                       </div>
 
