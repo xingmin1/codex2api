@@ -696,7 +696,8 @@ type accountResponse struct {
 	RateLimitResetCredits                *int                       `json:"rate_limit_reset_credits"`
 	IgnoreUsageLimit429Cooldown          bool                       `json:"ignore_usage_limit_429_cooldown"`
 	IgnoreUnauthorizedCooldown           bool                       `json:"ignore_unauthorized_cooldown"`
-	EncryptedContentCompatibilityEnabled bool                       `json:"encrypted_content_compatibility_enabled"`
+	EncryptedContentCompat               *bool                      `json:"encrypted_content_compatibility_enabled"`
+	EncryptedContentCompatEffective      bool                       `json:"encrypted_content_compatibility_effective"`
 	FailureScoreThreshold                *int                       `json:"failure_score_threshold,omitempty"`
 	FailureCooldownThreshold             *int                       `json:"failure_cooldown_threshold,omitempty"`
 	FailureToleranceWindowSeconds        *int                       `json:"failure_tolerance_window_seconds,omitempty"`
@@ -903,7 +904,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		resp.DispatchCountLimit = accountDispatchCountLimit(row)
 		resp.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
 		resp.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
-		resp.EncryptedContentCompatibilityEnabled = row.GetCredentialBool("encrypted_content_compatibility_enabled")
+		resp.EncryptedContentCompat = row.GetCredentialOptionalBool("encrypted_content_compatibility_enabled")
+		resp.EncryptedContentCompatEffective = h.store.EncryptedContentCompatibilityEnabled()
+		if resp.EncryptedContentCompat != nil {
+			resp.EncryptedContentCompatEffective = *resp.EncryptedContentCompat
+		}
 		resp.FailureScoreThreshold = accountFailureThreshold(row, "failure_score_threshold")
 		resp.FailureCooldownThreshold = accountFailureThreshold(row, "failure_cooldown_threshold")
 		resp.FailureToleranceWindowSeconds = accountFailureThreshold(row, "failure_tolerance_window_seconds")
@@ -938,6 +943,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		if acc, ok := accountMap[row.ID]; ok {
 			resp.UsageLimitOverride = acc.GetIgnoreUsageLimitStatusOverride()
 			resp.UsageLimitEffective = acc.IgnoresUsageLimitStatus()
+			resp.EncryptedContentCompat, resp.EncryptedContentCompatEffective = acc.EncryptedContentCompatibilityConfig()
 			acc.Mu().RLock()
 			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
 			acc.Mu().RUnlock()
@@ -1177,7 +1183,7 @@ type accountSchedulerUpdate struct {
 	SkipWarmTier                   database.OptionalBool
 	IgnoreUsageLimit429Cooldown    database.OptionalBool
 	IgnoreUnauthorizedCooldown     database.OptionalBool
-	EncryptedContentCompatibility  database.OptionalBool
+	EncryptedContentCompatibility  optionalNullableBool
 	FailureScoreThreshold          database.OptionalNullInt64
 	FailureCooldownThreshold       database.OptionalNullInt64
 	FailureToleranceWindowSeconds  database.OptionalNullInt64
@@ -1223,7 +1229,7 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
-	encryptedContentCompatibility, err := parseOptionalBoolField(req.EncryptedContentCompatibility, "encrypted_content_compatibility_enabled")
+	encryptedContentCompatibility, err := parseOptionalNullableBoolField(req.EncryptedContentCompatibility, "encrypted_content_compatibility_enabled")
 	if err != nil {
 		return accountSchedulerUpdate{}, err
 	}
@@ -1335,7 +1341,11 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		credentialUpdates["ignore_unauthorized_cooldown"] = ignoreUnauthorizedCooldown.Value
 	}
 	if encryptedContentCompatibility.Set {
-		credentialUpdates["encrypted_content_compatibility_enabled"] = encryptedContentCompatibility.Value
+		if encryptedContentCompatibility.Value == nil {
+			credentialUpdates["encrypted_content_compatibility_enabled"] = nil
+		} else {
+			credentialUpdates["encrypted_content_compatibility_enabled"] = *encryptedContentCompatibility.Value
+		}
 	}
 	if failureScoreThreshold.Set {
 		if failureScoreThreshold.Value.Valid {
@@ -6560,6 +6570,7 @@ type settingsResponse struct {
 	TransportRetryPolicy               string  `json:"transport_retry_policy"`
 	TransportSameAccountRetries        int     `json:"transport_same_account_retries"`
 	CompactSameAccountRetries          int     `json:"compact_same_account_retries"`
+	EncryptedContentCompat             bool    `json:"encrypted_content_compatibility_enabled"`
 	AllowRemoteMigration               bool    `json:"allow_remote_migration"`
 	DatabaseDriver                     string  `json:"database_driver"`
 	DatabaseLabel                      string  `json:"database_label"`
@@ -6681,6 +6692,7 @@ type updateSettingsReq struct {
 	TransportRetryPolicy               *string  `json:"transport_retry_policy"`
 	TransportSameAccountRetries        *int     `json:"transport_same_account_retries"`
 	CompactSameAccountRetries          *int     `json:"compact_same_account_retries"`
+	EncryptedContentCompat             *bool    `json:"encrypted_content_compatibility_enabled"`
 	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
 	ModelMapping                       *string  `json:"model_mapping"`
 	CodexModelMapping                  *string  `json:"codex_model_mapping"`
@@ -7297,6 +7309,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
+		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                     h.databaseDriver,
 		DatabaseLabel:                      h.databaseLabel,
@@ -7928,6 +7941,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: compact_same_account_retries = %d", v)
 	}
 
+	if req.EncryptedContentCompat != nil {
+		h.store.SetEncryptedContentCompatibilityEnabled(*req.EncryptedContentCompat)
+		log.Printf("设置已更新: encrypted_content_compatibility_enabled = %t", *req.EncryptedContentCompat)
+	}
+
 	if req.AllowRemoteMigration != nil {
 		if *req.AllowRemoteMigration && !hasAdminSecret {
 			writeError(c, http.StatusBadRequest, "请先设置管理密钥，再启用远程迁移")
@@ -8296,6 +8314,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
+		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && hasAdminSecret,
 		ModelMapping:                       h.store.GetModelMapping(),
 		CodexModelMapping:                  h.store.GetCodexModelMapping(),
@@ -8423,6 +8442,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
+		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
 		DatabaseDriver:                     h.databaseDriver,
 		DatabaseLabel:                      h.databaseLabel,

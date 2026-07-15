@@ -157,7 +157,8 @@ type Account struct {
 	dispatchWindowResetAt                  time.Time
 	IgnoreUsageLimit429Cooldown            bool
 	IgnoreUnauthorizedCooldown             bool
-	EncryptedContentCompatibilityEnabled   bool
+	EncryptedContentCompatOverride         *bool
+	encryptedContentCompatEnabled          bool
 	FailureScoreThresholdOverride          int // 0 表示继承全局
 	FailureCooldownThresholdOverride       int // 0 表示继承全局
 	FailureToleranceWindowOverride         int // 秒，0 表示继承全局
@@ -1606,6 +1607,14 @@ func (a *Account) recomputeEffectiveIgnoreUsageLimitStatus(global bool) {
 	a.ignoreUsageLimitStatus = global
 }
 
+func (a *Account) recomputeEffectiveEncryptedContentCompatibility(global bool) {
+	if a.EncryptedContentCompatOverride != nil {
+		a.encryptedContentCompatEnabled = *a.EncryptedContentCompatOverride
+		return
+	}
+	a.encryptedContentCompatEnabled = global
+}
+
 func (a *Account) skipsUsageWindowLimitsLocked() bool {
 	return a.creditSkipsUsageWindowLocked() || a.ignoreUsageLimitStatus
 }
@@ -1775,7 +1784,21 @@ func (a *Account) ShouldUseEncryptedContentCompatibility() bool {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.isOpenAIResponsesAPILocked() && a.EncryptedContentCompatibilityEnabled
+	return a.isOpenAIResponsesAPILocked() && a.encryptedContentCompatEnabled
+}
+
+// EncryptedContentCompatibilityConfig 返回账号覆盖值及当前有效值。
+func (a *Account) EncryptedContentCompatibilityConfig() (*bool, bool) {
+	if a == nil {
+		return nil, false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.EncryptedContentCompatOverride == nil {
+		return nil, a.encryptedContentCompatEnabled
+	}
+	override := *a.EncryptedContentCompatOverride
+	return &override, a.encryptedContentCompatEnabled
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -2724,11 +2747,12 @@ type Store struct {
 	codexWSSilentMaxRetries     atomic.Int64 // WS 静默换号最大重试次数，默认 2
 
 	// Codex 思考截断自动续想（默认关闭，不影响现有路径）
-	codexContinueThinkingEnabled atomic.Bool  // 检测到上游截断思考时自动续想并折叠成单响应
-	codexContinueMaxRounds       atomic.Int64 // 单次请求最大续想轮数（含首轮），默认 8
-	codexCLIVersionSyncEnabled   atomic.Bool  // 后台定时同步 Codex CLI 模拟版本，默认 true
-	codexCLIVersionSyncInterval  atomic.Int64 // 定时同步间隔（小时），默认 12
-	ignoreUsageLimitStatus       atomic.Bool  // 用量窗口只记录，不作为账号不可用证据
+	codexContinueThinkingEnabled  atomic.Bool  // 检测到上游截断思考时自动续想并折叠成单响应
+	codexContinueMaxRounds        atomic.Int64 // 单次请求最大续想轮数（含首轮），默认 8
+	codexCLIVersionSyncEnabled    atomic.Bool  // 后台定时同步 Codex CLI 模拟版本，默认 true
+	codexCLIVersionSyncInterval   atomic.Int64 // 定时同步间隔（小时），默认 12
+	ignoreUsageLimitStatus        atomic.Bool  // 用量窗口只记录，不作为账号不可用证据
+	encryptedContentCompatEnabled atomic.Bool  // Responses API 中转账号加密上下文兼容修复的全局默认
 
 	// 重试间隔与上游错误重试策略（issue #331）
 	retryIntervalMS             atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
@@ -3208,6 +3232,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			TransportRetryPolicy:               "hybrid",
 			TransportSameAccountRetries:        defaultTransportSameAccountRetries,
 			CompactSameAccountRetries:          defaultCompactSameAccountRetries,
+			EncryptedContentCompat:             true,
 			LazyMode:                           false,
 			ProxyURL:                           "",
 			MaxRateLimitRetries:                1,
@@ -3331,6 +3356,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexCLIVersionSyncEnabled.Store(settings.CodexCLIVersionSyncEnabled)
 	s.codexCLIVersionSyncInterval.Store(int64(database.NormalizeCodexCLIVersionSyncIntervalHours(settings.CodexCLIVersionSyncIntervalHours)))
 	s.ignoreUsageLimitStatus.Store(settings.IgnoreUsageLimitStatus)
+	s.encryptedContentCompatEnabled.Store(settings.EncryptedContentCompat)
 	s.retryIntervalMS.Store(int64(normalizeRetryIntervalMS(settings.RetryIntervalMS)))
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(settings.TransportRetryPolicy))
 	s.transportSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.TransportSameAccountRetries)))
@@ -4421,7 +4447,8 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	account.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
 	account.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
-	account.EncryptedContentCompatibilityEnabled = row.GetCredentialBool("encrypted_content_compatibility_enabled")
+	account.EncryptedContentCompatOverride = row.GetCredentialOptionalBool("encrypted_content_compatibility_enabled")
+	account.recomputeEffectiveEncryptedContentCompatibility(s.EncryptedContentCompatibilityEnabled())
 	account.FailureScoreRetroactiveOverride = row.GetCredentialOptionalBool("failure_score_retroactive")
 	if threshold, ok := row.GetCredentialInt64("failure_score_threshold"); ok {
 		account.FailureScoreThresholdOverride = normalizeFailureToleranceOverride(int(threshold))
@@ -5856,6 +5883,24 @@ func (s *Store) IgnoreUsageLimitStatus() bool {
 	return s != nil && s.ignoreUsageLimitStatus.Load()
 }
 
+// SetEncryptedContentCompatibilityEnabled 更新 Responses API 中转账号的全局兼容修复默认值。
+func (s *Store) SetEncryptedContentCompatibilityEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.encryptedContentCompatEnabled.Store(enabled)
+	for _, acc := range s.Accounts() {
+		acc.mu.Lock()
+		acc.recomputeEffectiveEncryptedContentCompatibility(enabled)
+		acc.mu.Unlock()
+	}
+}
+
+// EncryptedContentCompatibilityEnabled 返回加密上下文兼容修复的全局默认值。
+func (s *Store) EncryptedContentCompatibilityEnabled() bool {
+	return s == nil || s.encryptedContentCompatEnabled.Load()
+}
+
 func (s *Store) SetGlobalAutoPauseThresholds(t5h, t7d float64) {
 	s.mu.Lock()
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(t5h)
@@ -6050,6 +6095,7 @@ func (s *Store) AddAccount(acc *Account) {
 	defer s.mu.Unlock()
 	acc.mu.Lock()
 	acc.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
+	acc.recomputeEffectiveEncryptedContentCompatibility(s.EncryptedContentCompatibilityEnabled())
 	acc.recomputeFailureToleranceThresholdsLocked(s)
 	acc.recomputeEffectiveGroupBaseConcurrency(s)
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
@@ -6282,14 +6328,20 @@ func (s *Store) ApplyAccountUnauthorizedCooldownConfig(dbID int64, ignore bool) 
 	return true
 }
 
-// ApplyAccountEncryptedContentCompatibilityConfig 更新账号级加密上下文兼容修复开关。
-func (s *Store) ApplyAccountEncryptedContentCompatibilityConfig(dbID int64, enabled bool) bool {
+// ApplyAccountEncryptedContentCompatibilityConfig 更新账号级加密上下文兼容修复覆盖；nil 表示继承全局。
+func (s *Store) ApplyAccountEncryptedContentCompatibilityConfig(dbID int64, override *bool) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
 	}
 	acc.mu.Lock()
-	acc.EncryptedContentCompatibilityEnabled = enabled
+	if override == nil {
+		acc.EncryptedContentCompatOverride = nil
+	} else {
+		value := *override
+		acc.EncryptedContentCompatOverride = &value
+	}
+	acc.recomputeEffectiveEncryptedContentCompatibility(s.EncryptedContentCompatibilityEnabled())
 	acc.mu.Unlock()
 	return true
 }

@@ -119,20 +119,42 @@ func TestFailureToleranceOnlyAppliesToAPIRelay(t *testing.T) {
 }
 
 func TestEncryptedContentCompatibilityOnlyAppliesToAPIRelay(t *testing.T) {
+	store := NewStore(nil, nil, nil)
 	relay := &Account{
-		UpstreamType:                         UpstreamOpenAIResponses,
-		BaseURL:                              "https://relay.example.com",
-		APIKey:                               "sk-test",
-		EncryptedContentCompatibilityEnabled: true,
+		DBID:         101,
+		UpstreamType: UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example.com",
+		APIKey:       "sk-test",
 	}
+	store.AddAccount(relay)
 	if !relay.ShouldUseEncryptedContentCompatibility() {
-		t.Fatal("enabled Responses API relay should use encrypted-content compatibility")
+		t.Fatal("Responses API relay should inherit the enabled global default")
+	}
+
+	store.SetEncryptedContentCompatibilityEnabled(false)
+	if relay.ShouldUseEncryptedContentCompatibility() {
+		t.Fatal("inherited relay should follow the disabled global setting")
+	}
+
+	forceEnabled := true
+	overridden := &Account{
+		DBID:                           102,
+		UpstreamType:                   UpstreamOpenAIResponses,
+		BaseURL:                        "https://relay.example.com",
+		APIKey:                         "sk-override",
+		EncryptedContentCompatOverride: &forceEnabled,
+	}
+	store.AddAccount(overridden)
+	if !overridden.ShouldUseEncryptedContentCompatibility() {
+		t.Fatal("explicit account enable should override the disabled global setting")
 	}
 
 	official := &Account{
-		AccessToken:                          "token",
-		EncryptedContentCompatibilityEnabled: true,
+		DBID:                           103,
+		AccessToken:                    "token",
+		EncryptedContentCompatOverride: &forceEnabled,
 	}
+	store.AddAccount(official)
 	if official.ShouldUseEncryptedContentCompatibility() {
 		t.Fatal("official account must ignore relay encrypted-content compatibility config")
 	}

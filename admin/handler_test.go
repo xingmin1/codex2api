@@ -1678,12 +1678,15 @@ func TestUpdateAccountSchedulerPersistsCompactRetriesOverrideAndInheritance(t *t
 	}
 }
 
-func TestUpdateAccountSchedulerPersistsEncryptedContentCompatibility(t *testing.T) {
+func TestUpdateAccountSchedulerPersistsEncryptedContentCompatibilityOverrideAndInheritance(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	db := newTestAdminDB(t)
 	accountID := insertTestAccount(t, db)
-	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		EncryptedContentCompat: true,
+	})
 	t.Cleanup(store.Stop)
 	runtimeAccount := &auth.Account{
 		DBID:         accountID,
@@ -1695,36 +1698,51 @@ func TestUpdateAccountSchedulerPersistsEncryptedContentCompatibility(t *testing.
 	store.AddAccount(runtimeAccount)
 	handler := &Handler{db: db, store: store}
 
-	patch := func(enabled bool) *httptest.ResponseRecorder {
+	patch := func(value string) *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()
 		ginCtx, _ := gin.CreateTestContext(recorder)
 		ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-		body := fmt.Sprintf(`{"encrypted_content_compatibility_enabled":%t}`, enabled)
+		body := fmt.Sprintf(`{"encrypted_content_compatibility_enabled":%s}`, value)
 		ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(body))
 		ginCtx.Request.Header.Set("Content-Type", "application/json")
 		handler.UpdateAccountScheduler(ginCtx)
 		return recorder
 	}
 
-	if recorder := patch(true); recorder.Code != http.StatusOK {
-		t.Fatalf("enable status = %d, body=%s", recorder.Code, recorder.Body.String())
-	}
 	if !runtimeAccount.ShouldUseEncryptedContentCompatibility() {
-		t.Fatal("runtime Responses relay account should enable encrypted-content compatibility")
+		t.Fatal("account without override should inherit global true")
+	}
+
+	if recorder := patch("false"); recorder.Code != http.StatusOK {
+		t.Fatalf("disable override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if runtimeAccount.ShouldUseEncryptedContentCompatibility() {
+		t.Fatal("explicit account false should override global true")
 	}
 	row, err := db.GetAccountByID(context.Background(), accountID)
 	if err != nil {
 		t.Fatalf("GetAccountByID: %v", err)
 	}
-	if !row.GetCredentialBool("encrypted_content_compatibility_enabled") {
-		t.Fatal("encrypted_content_compatibility_enabled was not persisted")
+	if override := row.GetCredentialOptionalBool("encrypted_content_compatibility_enabled"); override == nil || *override {
+		t.Fatalf("persisted compatibility override = %v, want false", override)
 	}
 
-	if recorder := patch(false); recorder.Code != http.StatusOK {
-		t.Fatalf("disable status = %d, body=%s", recorder.Code, recorder.Body.String())
+	if recorder := patch("null"); recorder.Code != http.StatusOK {
+		t.Fatalf("inherit override status = %d, body=%s", recorder.Code, recorder.Body.String())
 	}
-	if runtimeAccount.ShouldUseEncryptedContentCompatibility() {
-		t.Fatal("runtime compatibility flag should be disabled")
+	if !runtimeAccount.ShouldUseEncryptedContentCompatibility() {
+		t.Fatal("cleared override should inherit global true")
+	}
+	override, effective := runtimeAccount.EncryptedContentCompatibilityConfig()
+	if override != nil || !effective {
+		t.Fatalf("runtime compatibility config = (%v, %t), want (nil, true)", override, effective)
+	}
+	row, err = db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID after inherit: %v", err)
+	}
+	if override := row.GetCredentialOptionalBool("encrypted_content_compatibility_enabled"); override != nil {
+		t.Fatalf("cleared compatibility override remains persisted: %v", override)
 	}
 }
 

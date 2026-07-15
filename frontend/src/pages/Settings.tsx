@@ -1167,6 +1167,7 @@ export default function Settings() {
     transport_retry_policy: 'hybrid',
     transport_same_account_retries: 2,
     compact_same_account_retries: 2,
+    encrypted_content_compatibility_enabled: true,
     allow_remote_migration: false,
     database_driver: 'postgres',
     database_label: 'PostgreSQL',
@@ -2474,6 +2475,18 @@ export default function Settings() {
 
           <SettingsCard title={t('settings.runtimeOptimization')} description={t('settings.runtimeOptimizationDesc')} icon={<Wrench className="size-4" />}>
             <div className="space-y-4">
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField
+                  label={t('settings.encryptedContentCompatibility')}
+                  description={t('settings.encryptedContentCompatibilityHint')}
+                  layout="switch"
+                >
+                  <Switch
+                    checked={settingsForm.encrypted_content_compatibility_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('encrypted_content_compatibility_enabled', checked)}
+                  />
+                </SettingField>
+              </div>
               <div className={SETTINGS_FIELD_GRID_3}>
                 <SettingField label={t('settings.clientCompatMode')} description={t('settings.clientCompatModeDesc')}>
                   <Select

@@ -876,19 +876,19 @@ func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	defer upstream.Close()
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency:      2,
-		MaxRetries:          0,
-		MaxRateLimitRetries: 0,
+		MaxConcurrency:         2,
+		MaxRetries:             0,
+		MaxRateLimitRetries:    0,
+		EncryptedContentCompat: true,
 	})
 	store.SetCodexModelMapping(`{"client-compact-alias":"gpt-4.1-direct","gpt-4.1-direct":"gpt-4.1-second"}`)
 	store.AddAccount(&auth.Account{
-		DBID:                                 1,
-		UpstreamType:                         auth.UpstreamOpenAIResponses,
-		BaseURL:                              upstream.URL,
-		APIKey:                               "sk-direct",
-		Models:                               []string{"gpt-4.1-direct"},
-		PlanType:                             "api",
-		EncryptedContentCompatibilityEnabled: true,
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
 	})
 	handler := NewHandler(store, nil, nil, nil)
 
@@ -1266,16 +1266,18 @@ func newEncryptedContentCompatibilityRelayStore(upstreamURL string, enabled bool
 		TransportRetryPolicy:          "rotate",
 		FailureScoreThreshold:         100,
 		FailureToleranceWindowSeconds: 60,
+		EncryptedContentCompat:        true,
 	})
+	enabledOverride := enabled
 	account := &auth.Account{
-		DBID:                                 1,
-		UpstreamType:                         auth.UpstreamOpenAIResponses,
-		BaseURL:                              upstreamURL,
-		APIKey:                               "sk-compatibility",
-		Models:                               []string{"gpt-5.6-sol"},
-		PlanType:                             "api",
-		IgnoreUsageLimit429Cooldown:          true,
-		EncryptedContentCompatibilityEnabled: enabled,
+		DBID:                           1,
+		UpstreamType:                   auth.UpstreamOpenAIResponses,
+		BaseURL:                        upstreamURL,
+		APIKey:                         "sk-compatibility",
+		Models:                         []string{"gpt-5.6-sol"},
+		PlanType:                       "api",
+		IgnoreUsageLimit429Cooldown:    true,
+		EncryptedContentCompatOverride: &enabledOverride,
 	}
 	store.AddAccount(account)
 	return store, account
@@ -1388,6 +1390,36 @@ func TestResponsesEncryptedContentCompatibilityRetriesHTTPBadRequest(t *testing.
 	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
 	if failures != 1 {
 		t.Fatalf("HTTP compatibility failure window count = %d, want 1", failures)
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityInheritsGlobalSetting(t *testing.T) {
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		if attempts == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"missing_required_parameter","param":"input[1].encrypted_content","message":"Missing required parameter: input[1].encrypted_content"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_ok","status":"completed","output":[]}`)
+	}))
+	defer upstream.Close()
+
+	store, account := newEncryptedContentCompatibilityRelayStore(upstream.URL, false)
+	t.Cleanup(store.Stop)
+	if !store.ApplyAccountEncryptedContentCompatibilityConfig(account.DBID, nil) {
+		t.Fatal("failed to clear account compatibility override")
+	}
+	override, effective := account.EncryptedContentCompatibilityConfig()
+	if override != nil || !effective {
+		t.Fatalf("inherited compatibility config = (%v, %t), want (nil, true)", override, effective)
+	}
+
+	recorder := performEncryptedContentCompatibilityRequest(t, NewHandler(store, nil, nil, nil), `{"model":"gpt-5.6-sol","stream":false,"input":[{"role":"user","content":"continue"},{"type":"reasoning","encrypted_content":"rejected"}]}`)
+	if recorder.Code != http.StatusOK || attempts != 2 {
+		t.Fatalf("global compatibility result = status:%d attempts:%d body=%s", recorder.Code, attempts, recorder.Body.String())
 	}
 }
 
@@ -1581,9 +1613,10 @@ func TestResponsesEncryptedContentCompatibilityRetriesNonStreamingFailedResponse
 
 func newOpenAIResponsesRelayStoreWithModelMapping(upstreamURL string) *auth.Store {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency:      2,
-		MaxRetries:          0,
-		MaxRateLimitRetries: 0,
+		MaxConcurrency:         2,
+		MaxRetries:             0,
+		MaxRateLimitRetries:    0,
+		EncryptedContentCompat: true,
 	})
 	store.SetCodexModelMapping(`{"client-alias":"gpt-5.4"}`)
 	store.AddAccount(&auth.Account{
@@ -3251,13 +3284,12 @@ func TestResponses_BodySignalCompactPassesThroughRelay(t *testing.T) {
 	})
 	store.SetCodexModelMapping(`{"client-body-signal-alias":"gpt-4.1-direct"}`)
 	store.AddAccount(&auth.Account{
-		DBID:                                 1,
-		UpstreamType:                         auth.UpstreamOpenAIResponses,
-		BaseURL:                              upstream.URL,
-		APIKey:                               "sk-direct",
-		Models:                               []string{"gpt-4.1-direct"},
-		PlanType:                             "api",
-		EncryptedContentCompatibilityEnabled: true,
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
 	})
 	handler := NewHandler(store, nil, nil, nil)
 

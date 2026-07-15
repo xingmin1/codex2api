@@ -94,7 +94,8 @@ export interface AccountRow {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
-  encrypted_content_compatibility_enabled?: boolean
+  encrypted_content_compatibility_enabled?: boolean | null
+  encrypted_content_compatibility_effective?: boolean
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
   failure_tolerance_window_seconds?: number | null
@@ -290,7 +291,7 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
-  encrypted_content_compatibility_enabled?: boolean
+  encrypted_content_compatibility_enabled?: boolean | null
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
   failure_tolerance_window_seconds?: number | null
@@ -693,6 +694,7 @@ export interface SystemSettings {
   transport_retry_policy: string
   transport_same_account_retries: number
   compact_same_account_retries: number
+  encrypted_content_compatibility_enabled: boolean
   allow_remote_migration: boolean
   database_driver: string
   database_label: string

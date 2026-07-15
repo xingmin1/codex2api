@@ -1016,9 +1016,9 @@ export default function Accounts() {
   const [editFailureToleranceEnabled, setEditFailureToleranceEnabled] =
     useState(false);
   const [
-    editEncryptedContentCompatibilityEnabled,
-    setEditEncryptedContentCompatibilityEnabled,
-  ] = useState(false);
+    editEncryptedContentCompatibilityMode,
+    setEditEncryptedContentCompatibilityMode,
+  ] = useState<"inherit" | "enabled" | "disabled">("inherit");
   const [editFailureScoreThresholdInput, setEditFailureScoreThresholdInput] =
     useState("");
   const [editFailureWindowInput, setEditFailureWindowInput] = useState("");
@@ -3699,8 +3699,12 @@ export default function Accounts() {
     setEditFailureToleranceEnabled(
       account.ignore_usage_limit_429_cooldown ?? false,
     );
-    setEditEncryptedContentCompatibilityEnabled(
-      account.encrypted_content_compatibility_enabled ?? false,
+    setEditEncryptedContentCompatibilityMode(
+      account.encrypted_content_compatibility_enabled === true
+        ? "enabled"
+        : account.encrypted_content_compatibility_enabled === false
+          ? "disabled"
+          : "inherit",
     );
     setEditFailureScoreThresholdInput(
       formatFailureThresholdInput(account.failure_score_threshold),
@@ -3774,7 +3778,7 @@ export default function Accounts() {
     setEditDispatchCountLimitInput("");
     setEditPriceMultiplierInput("");
     setEditFailureToleranceEnabled(false);
-    setEditEncryptedContentCompatibilityEnabled(false);
+    setEditEncryptedContentCompatibilityMode("inherit");
     setEditFailureScoreThresholdInput("");
     setEditFailureWindowInput("");
     setEditFailureScoreRetroactiveMode("inherit");
@@ -3960,7 +3964,9 @@ export default function Accounts() {
         ),
         ignore_usage_limit_429_cooldown: editFailureToleranceEnabled,
         encrypted_content_compatibility_enabled:
-          editEncryptedContentCompatibilityEnabled,
+          editEncryptedContentCompatibilityMode === "inherit"
+            ? null
+            : editEncryptedContentCompatibilityMode === "enabled",
         failure_score_threshold: failureThresholdInputToValue(
           editFailureScoreThresholdInput,
         ),
@@ -7273,7 +7279,7 @@ export default function Accounts() {
 
                       {editingAccount.openai_responses_api && (
                         <div className="rounded-xl border border-border p-4 md:col-span-2">
-                          <div className="flex items-start justify-between gap-4">
+                          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
                             <div className="min-w-0">
                               <div className="text-sm font-semibold text-foreground">
                                 {t("accounts.encryptedContentCompatibilityLabel")}
@@ -7282,17 +7288,29 @@ export default function Accounts() {
                                 {t("accounts.encryptedContentCompatibilityHint")}
                               </div>
                             </div>
-                            <Switch
-                              checked={
-                                editEncryptedContentCompatibilityEnabled
-                              }
-                              onCheckedChange={
-                                setEditEncryptedContentCompatibilityEnabled
-                              }
-                              aria-label={t(
-                                "accounts.encryptedContentCompatibilityLabel",
-                              )}
-                            />
+                            <div className="flex shrink-0 flex-wrap gap-2">
+                              <TogglePill
+                                active={editEncryptedContentCompatibilityMode === "inherit"}
+                                onClick={() => setEditEncryptedContentCompatibilityMode("inherit")}
+                                label={t("accounts.encryptedContentCompatibilityInherit", {
+                                  value: t(
+                                    editingAccount.encrypted_content_compatibility_effective ?? true
+                                      ? "common.enabled"
+                                      : "common.disabled",
+                                  ),
+                                })}
+                              />
+                              <TogglePill
+                                active={editEncryptedContentCompatibilityMode === "enabled"}
+                                onClick={() => setEditEncryptedContentCompatibilityMode("enabled")}
+                                label={t("common.enabled")}
+                              />
+                              <TogglePill
+                                active={editEncryptedContentCompatibilityMode === "disabled"}
+                                onClick={() => setEditEncryptedContentCompatibilityMode("disabled")}
+                                label={t("common.disabled")}
+                              />
+                            </div>
                           </div>
                         </div>
                       )}

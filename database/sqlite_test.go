@@ -1120,6 +1120,7 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		TransportRetryPolicy:             "hybrid",
 		TransportSameAccountRetries:      2,
 		CompactSameAccountRetries:        3,
+		EncryptedContentCompat:           false,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1145,6 +1146,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.CompactSameAccountRetries != 3 {
 		t.Fatalf("compact 同号重试次数 = %d, want 3", settings.CompactSameAccountRetries)
+	}
+	if settings.EncryptedContentCompat {
+		t.Fatal("EncryptedContentCompat = true, want false")
 	}
 	if settings.FirstTokenMode != "loose" {
 		t.Fatalf("FirstTokenMode = %q, want loose", settings.FirstTokenMode)
