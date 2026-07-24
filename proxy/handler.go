@@ -2024,8 +2024,12 @@ func firstGJSONInt(body []byte, paths ...string) int64 {
 	return 0
 }
 
-// Responses 处理 /v1/responses 请求（原生透传，增强输入验证）
+// Responses 处理 /v1/responses 请求，并在响应提交前按客户端语义重发失败请求。
 func (h *Handler) Responses(c *gin.Context) {
+	h.handleWithClientRequestReplay(c, "/v1/responses", h.responsesOnce)
+}
+
+func (h *Handler) responsesOnce(c *gin.Context) {
 	// 1. 读取请求体
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
@@ -2190,11 +2194,11 @@ func (h *Handler) Responses(c *gin.Context) {
 			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		}
 		if account == nil {
-			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+			if len(lastBody) > 0 && (clientRequestReplayManaged(c) || lastStatusCode == http.StatusTooManyRequests) {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
-			if transientRetry.active {
+			if transientRetry.active && !clientRequestReplayManaged(c) {
 				if shouldStripEncryptedContentAfterPersistentTransientRetry(transientRetry, persistentEncryptedContentStripped) {
 					strippedRawBody, strippedCodexBody, changed := stripPersistentEncryptedContentRetryBodies(rawBody, codexBody)
 					if changed {
@@ -3499,8 +3503,12 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 }
 
-// ResponsesCompact 处理 /v1/responses/compact 请求（非流式压缩接口，透传到上游 /responses/compact）
+// ResponsesCompact 处理 /v1/responses/compact 请求，并在响应提交前按客户端语义重发失败请求。
 func (h *Handler) ResponsesCompact(c *gin.Context) {
+	h.handleWithClientRequestReplay(c, "/v1/responses/compact", h.responsesCompactOnce)
+}
+
+func (h *Handler) responsesCompactOnce(c *gin.Context) {
 	// 1. 读取请求体
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
@@ -3659,6 +3667,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, activeAccountFilter)
 			if account == nil {
+				if clientRequestReplayManaged(c) && len(lastBody) > 0 {
+					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
 				if preferLongCompactAccounts {
 					if isCloudflareOriginResponseTimeout(lastStatusCode, lastBody) {
 						h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
@@ -3675,7 +3687,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
-				if transientRetry.active {
+				if transientRetry.active && !clientRequestReplayManaged(c) {
 					if shouldStripEncryptedContentAfterPersistentTransientRetry(transientRetry, persistentEncryptedContentStripped) {
 						strippedRawBody, strippedCodexBody, changed := stripPersistentEncryptedContentRetryBodies(rawBody, codexBody)
 						if changed {

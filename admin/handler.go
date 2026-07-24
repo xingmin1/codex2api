@@ -6620,6 +6620,9 @@ type settingsResponse struct {
 	TransportRetryPolicy               string  `json:"transport_retry_policy"`
 	TransportSameAccountRetries        int     `json:"transport_same_account_retries"`
 	CompactSameAccountRetries          int     `json:"compact_same_account_retries"`
+	ClientRequestReplayEnabled         bool    `json:"client_request_replay_enabled"`
+	ClientRequestReplayMaxRetries      int     `json:"client_request_replay_max_retries"`
+	ClientRequestReplayKeepaliveSec    int     `json:"client_request_replay_keepalive_seconds"`
 	EncryptedContentCompat             bool    `json:"encrypted_content_compatibility_enabled"`
 	FastTierPolicy                     string  `json:"fast_tier_policy"`
 	AllowRemoteMigration               bool    `json:"allow_remote_migration"`
@@ -6743,6 +6746,9 @@ type updateSettingsReq struct {
 	TransportRetryPolicy               *string  `json:"transport_retry_policy"`
 	TransportSameAccountRetries        *int     `json:"transport_same_account_retries"`
 	CompactSameAccountRetries          *int     `json:"compact_same_account_retries"`
+	ClientRequestReplayEnabled         *bool    `json:"client_request_replay_enabled"`
+	ClientRequestReplayMaxRetries      *int     `json:"client_request_replay_max_retries"`
+	ClientRequestReplayKeepaliveSec    *int     `json:"client_request_replay_keepalive_seconds"`
 	EncryptedContentCompat             *bool    `json:"encrypted_content_compatibility_enabled"`
 	FastTierPolicy                     *string  `json:"fast_tier_policy"`
 	AllowRemoteMigration               *bool    `json:"allow_remote_migration"`
@@ -7361,6 +7367,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
+		ClientRequestReplayEnabled:         h.store.ClientRequestReplayEnabled(),
+		ClientRequestReplayMaxRetries:      h.store.ClientRequestReplayMaxRetries(),
+		ClientRequestReplayKeepaliveSec:    h.store.ClientRequestReplayKeepaliveSeconds(),
 		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
 		FastTierPolicy:                     h.store.GetFastTierPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",
@@ -7994,6 +8003,30 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: compact_same_account_retries = %d", v)
 	}
 
+	if req.ClientRequestReplayEnabled != nil {
+		h.store.SetClientRequestReplayEnabled(*req.ClientRequestReplayEnabled)
+		log.Printf("设置已更新: client_request_replay_enabled = %t", *req.ClientRequestReplayEnabled)
+	}
+
+	if req.ClientRequestReplayMaxRetries != nil {
+		if *req.ClientRequestReplayMaxRetries < 0 {
+			writeError(c, http.StatusBadRequest, "client_request_replay_max_retries 不能小于 0")
+			return
+		}
+		h.store.SetClientRequestReplayMaxRetries(*req.ClientRequestReplayMaxRetries)
+		log.Printf("设置已更新: client_request_replay_max_retries = %d", *req.ClientRequestReplayMaxRetries)
+	}
+
+	if req.ClientRequestReplayKeepaliveSec != nil {
+		value := *req.ClientRequestReplayKeepaliveSec
+		if value != 0 && (value < 5 || value > 240) {
+			writeError(c, http.StatusBadRequest, "client_request_replay_keepalive_seconds 仅支持 0 或 5~240")
+			return
+		}
+		h.store.SetClientRequestReplayKeepaliveSeconds(value)
+		log.Printf("设置已更新: client_request_replay_keepalive_seconds = %d", value)
+	}
+
 	if req.EncryptedContentCompat != nil {
 		h.store.SetEncryptedContentCompatibilityEnabled(*req.EncryptedContentCompat)
 		log.Printf("设置已更新: encrypted_content_compatibility_enabled = %t", *req.EncryptedContentCompat)
@@ -8376,6 +8409,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
+		ClientRequestReplayEnabled:         h.store.ClientRequestReplayEnabled(),
+		ClientRequestReplayMaxRetries:      h.store.ClientRequestReplayMaxRetries(),
+		ClientRequestReplayKeepaliveSec:    h.store.ClientRequestReplayKeepaliveSeconds(),
 		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
 		FastTierPolicy:                     h.store.GetFastTierPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && hasAdminSecret,
@@ -8505,6 +8541,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		TransportRetryPolicy:               h.store.GetTransportRetryPolicy(),
 		TransportSameAccountRetries:        h.store.GetTransportSameAccountRetries(),
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
+		ClientRequestReplayEnabled:         h.store.ClientRequestReplayEnabled(),
+		ClientRequestReplayMaxRetries:      h.store.ClientRequestReplayMaxRetries(),
+		ClientRequestReplayKeepaliveSec:    h.store.ClientRequestReplayKeepaliveSeconds(),
 		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
 		FastTierPolicy:                     h.store.GetFastTierPolicy(),
 		AllowRemoteMigration:               h.store.GetAllowRemoteMigration() && adminAuthSource != "disabled",

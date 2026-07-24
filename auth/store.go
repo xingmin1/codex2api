@@ -2791,10 +2791,13 @@ type Store struct {
 	fastTierPolicy                atomic.Value // Fast Tier 出站策略: preserve / force_fast / filter_fast
 
 	// 重试间隔与上游错误重试策略（issue #331）
-	retryIntervalMS             atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
-	transportRetryPolicy        atomic.Value // 上游错误重试策略: rotate / sticky / hybrid
-	transportSameAccountRetries atomic.Int64 // hybrid 下每个账号额外同号重试次数
-	compactSameAccountRetries   atomic.Int64 // compact 首账号额外同号重试次数
+	retryIntervalMS              atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
+	transportRetryPolicy         atomic.Value // 上游错误重试策略: rotate / sticky / hybrid
+	transportSameAccountRetries  atomic.Int64 // hybrid 下每个账号额外同号重试次数
+	compactSameAccountRetries    atomic.Int64 // compact 首账号额外同号重试次数
+	clientRequestReplayEnabled   atomic.Bool  // 响应提交前模拟客户端重发整个请求
+	clientRequestReplayRetries   atomic.Int64 // 整请求最大重发次数，0 表示不限
+	clientRequestReplayKeepalive atomic.Int64 // 下游 SSE 保活间隔秒数，0 表示关闭
 
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
@@ -3268,6 +3271,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			TransportRetryPolicy:               "hybrid",
 			TransportSameAccountRetries:        defaultTransportSameAccountRetries,
 			CompactSameAccountRetries:          defaultCompactSameAccountRetries,
+			ClientRequestReplayMaxRetries:      0,
+			ClientRequestReplayKeepaliveSec:    15,
 			EncryptedContentCompat:             true,
 			FastTierPolicy:                     database.FastTierPolicyPreserve,
 			LazyMode:                           false,
@@ -3399,6 +3404,9 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(settings.TransportRetryPolicy))
 	s.transportSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.TransportSameAccountRetries)))
 	s.compactSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.CompactSameAccountRetries)))
+	s.clientRequestReplayEnabled.Store(settings.ClientRequestReplayEnabled)
+	s.clientRequestReplayRetries.Store(int64(normalizeClientRequestReplayMaxRetries(settings.ClientRequestReplayMaxRetries)))
+	s.clientRequestReplayKeepalive.Store(int64(normalizeClientRequestReplayKeepaliveSeconds(settings.ClientRequestReplayKeepaliveSec)))
 
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
 	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause7dThreshold)
@@ -5517,6 +5525,71 @@ func (s *Store) GetRetryIntervalMS() int {
 		return 0
 	}
 	return int(s.retryIntervalMS.Load())
+}
+
+func normalizeClientRequestReplayMaxRetries(retries int) int {
+	if retries < 0 {
+		return 0
+	}
+	return retries
+}
+
+func normalizeClientRequestReplayKeepaliveSeconds(seconds int) int {
+	if seconds <= 0 {
+		return 0
+	}
+	if seconds < 5 {
+		return 5
+	}
+	if seconds > 240 {
+		return 240
+	}
+	return seconds
+}
+
+// SetClientRequestReplayEnabled 设置是否在响应提交前模拟客户端重发整个请求。
+func (s *Store) SetClientRequestReplayEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayEnabled.Store(enabled)
+}
+
+// ClientRequestReplayEnabled 返回整请求代重发是否启用。
+func (s *Store) ClientRequestReplayEnabled() bool {
+	return s != nil && s.clientRequestReplayEnabled.Load()
+}
+
+// SetClientRequestReplayMaxRetries 设置整请求最大重发次数，0 表示不限。
+func (s *Store) SetClientRequestReplayMaxRetries(retries int) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayRetries.Store(int64(normalizeClientRequestReplayMaxRetries(retries)))
+}
+
+// ClientRequestReplayMaxRetries 返回整请求最大重发次数，0 表示不限。
+func (s *Store) ClientRequestReplayMaxRetries() int {
+	if s == nil {
+		return 0
+	}
+	return normalizeClientRequestReplayMaxRetries(int(s.clientRequestReplayRetries.Load()))
+}
+
+// SetClientRequestReplayKeepaliveSeconds 设置整请求重发期间的 SSE 保活间隔。
+func (s *Store) SetClientRequestReplayKeepaliveSeconds(seconds int) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayKeepalive.Store(int64(normalizeClientRequestReplayKeepaliveSeconds(seconds)))
+}
+
+// ClientRequestReplayKeepaliveSeconds 返回整请求重发期间的 SSE 保活间隔。
+func (s *Store) ClientRequestReplayKeepaliveSeconds() int {
+	if s == nil {
+		return 0
+	}
+	return normalizeClientRequestReplayKeepaliveSeconds(int(s.clientRequestReplayKeepalive.Load()))
 }
 
 // SetFailureScoreThreshold 设置启用时间窗失败容错时的全局计分阈值。

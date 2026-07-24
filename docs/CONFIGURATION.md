@@ -157,6 +157,9 @@ Codex2API 采用三层配置架构：
 | `CodexWSHideUpstreamErrors` | bool | true | - | WS 上游最终失败时向客户端隐藏原始错误，返回统一友好提示；原始错误仍记录在后台日志/用量记录 |
 | `CodexWSSilentRetryEnabled` | bool | true | - | WS 首包前遇到限流、额度耗尽、5xx、读取错误或超时时，静默换账号并重建上游 WS |
 | `CodexWSSilentMaxRetries` | int | 2 | 0-10 | WS 静默换号最大重试次数 |
+| `ClientRequestReplayEnabled` | bool | true | - | 响应提交前若完整请求最终失败，按原请求入口重新执行并复用现有调度规则 |
+| `ClientRequestReplayMaxRetries` | int | 0 | >=0 | 整请求最大重发次数；0 表示不限，直到成功或客户端断开 |
+| `ClientRequestReplayKeepaliveSec` | int | 15 | 0 或 5-240 | 等待首个业务响应和整请求重发期间的 SSE 保活间隔；0 表示关闭 |
 | `SchedulerMode` | string | `round_robin` | - | 调度模式：`round_robin`（轮询，按调度分权重排序）或 `remaining_quota`（优先使用用量少的账号） |
 
 ### 测试配置

@@ -885,6 +885,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'hybrid';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_same_account_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS compact_same_account_retries INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_max_retries INT DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_keepalive_seconds INT DEFAULT 15;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS encrypted_content_compatibility_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_tier_policy VARCHAR(20) DEFAULT 'preserve';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
@@ -1531,6 +1534,9 @@ type SystemSettings struct {
 	TransportRetryPolicy               string // 上游错误重试策略: rotate / sticky / hybrid
 	TransportSameAccountRetries        int    // hybrid 下每个账号额外同号重试次数
 	CompactSameAccountRetries          int    // compact 首账号额外同号重试次数
+	ClientRequestReplayEnabled         bool   // 响应提交前模拟客户端重发整个请求
+	ClientRequestReplayMaxRetries      int    // 整请求最大重发次数，0 表示不限
+	ClientRequestReplayKeepaliveSec    int    // 等待整请求重发时的下游 SSE 保活间隔，0 表示关闭
 	EncryptedContentCompat             bool   // Responses API 中转账号默认启用加密上下文兼容修复
 	FastTierPolicy                     string // Fast Tier 出站策略: preserve / force_fast / filter_fast
 	// CodexSyncedCLIVersion 是从 openai/codex releases 同步到的最新 Codex CLI 版本缓存，
@@ -1697,7 +1703,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(compact_same_account_retries, 2),
 			       COALESCE(failure_score_retroactive, false),
 			       COALESCE(encrypted_content_compatibility_enabled, true),
-			       COALESCE(NULLIF(TRIM(fast_tier_policy), ''), 'preserve')
+			       COALESCE(NULLIF(TRIM(fast_tier_policy), ''), 'preserve'),
+			       COALESCE(client_request_replay_enabled, true),
+			       COALESCE(client_request_replay_max_retries, 0),
+			       COALESCE(client_request_replay_keepalive_seconds, 15)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -1758,6 +1767,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.FailureScoreRetroactive,
 		&s.EncryptedContentCompat,
 		&s.FastTierPolicy,
+		&s.ClientRequestReplayEnabled,
+		&s.ClientRequestReplayMaxRetries,
+		&s.ClientRequestReplayKeepaliveSec,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1863,9 +1875,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					compact_same_account_retries,
 					failure_score_retroactive,
 						encrypted_content_compatibility_enabled,
-						fast_tier_policy
+						fast_tier_policy,
+						client_request_replay_enabled,
+						client_request_replay_max_retries,
+						client_request_replay_keepalive_seconds
 						)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1972,7 +1987,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					compact_same_account_retries = EXCLUDED.compact_same_account_retries,
 					failure_score_retroactive = EXCLUDED.failure_score_retroactive,
 					encrypted_content_compatibility_enabled = EXCLUDED.encrypted_content_compatibility_enabled,
-					fast_tier_policy = EXCLUDED.fast_tier_policy
+						fast_tier_policy = EXCLUDED.fast_tier_policy,
+						client_request_replay_enabled = EXCLUDED.client_request_replay_enabled,
+						client_request_replay_max_retries = EXCLUDED.client_request_replay_max_retries,
+						client_request_replay_keepalive_seconds = EXCLUDED.client_request_replay_keepalive_seconds
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -2007,7 +2025,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		NormalizeTransportSameAccountRetries(s.CompactSameAccountRetries),
 		s.FailureScoreRetroactive,
 		s.EncryptedContentCompat,
-		fastTierPolicy)
+		fastTierPolicy,
+		s.ClientRequestReplayEnabled,
+		s.ClientRequestReplayMaxRetries,
+		s.ClientRequestReplayKeepaliveSec)
 	return err
 }
 

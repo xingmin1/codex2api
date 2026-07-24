@@ -698,6 +698,9 @@ export interface SystemSettings {
   transport_retry_policy: string
   transport_same_account_retries: number
   compact_same_account_retries: number
+  client_request_replay_enabled: boolean
+  client_request_replay_max_retries: number
+  client_request_replay_keepalive_seconds: number
   encrypted_content_compatibility_enabled: boolean
   fast_tier_policy: FastTierPolicy
   allow_remote_migration: boolean

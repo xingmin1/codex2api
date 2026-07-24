@@ -1120,6 +1120,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		TransportRetryPolicy:             "hybrid",
 		TransportSameAccountRetries:      2,
 		CompactSameAccountRetries:        3,
+		ClientRequestReplayEnabled:       true,
+		ClientRequestReplayMaxRetries:    17,
+		ClientRequestReplayKeepaliveSec:  30,
 		EncryptedContentCompat:           false,
 		FastTierPolicy:                   FastTierPolicyFilter,
 	}); err != nil {
@@ -1147,6 +1150,9 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.CompactSameAccountRetries != 3 {
 		t.Fatalf("compact 同号重试次数 = %d, want 3", settings.CompactSameAccountRetries)
+	}
+	if !settings.ClientRequestReplayEnabled || settings.ClientRequestReplayMaxRetries != 17 || settings.ClientRequestReplayKeepaliveSec != 30 {
+		t.Fatalf("整请求代重发设置 = {%t %d %d}, want {true 17 30}", settings.ClientRequestReplayEnabled, settings.ClientRequestReplayMaxRetries, settings.ClientRequestReplayKeepaliveSec)
 	}
 	if settings.EncryptedContentCompat {
 		t.Fatal("EncryptedContentCompat = true, want false")
