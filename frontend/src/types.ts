@@ -700,6 +700,9 @@ export interface SystemSettings {
   compact_same_account_retries: number
   client_request_replay_enabled: boolean
   client_request_replay_max_retries: number
+  client_request_replay_max_duration_seconds: number
+  client_request_replay_retry_base_interval_ms: number
+  client_request_replay_retry_max_interval_seconds: number
   client_request_replay_keepalive_seconds: number
   encrypted_content_compatibility_enabled: boolean
   fast_tier_policy: FastTierPolicy

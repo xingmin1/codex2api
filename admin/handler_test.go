@@ -54,6 +54,40 @@ func TestRefreshAccountRejectsInvalidID(t *testing.T) {
 	}
 }
 
+func TestUpdateSettingsRejectsInvalidClientRequestReplayBounds(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := auth.NewStore(nil, nil, nil)
+	t.Cleanup(store.Stop)
+	handler := &Handler{store: store}
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "zero retries", body: `{"client_request_replay_max_retries":0}`},
+		{name: "too many retries", body: `{"client_request_replay_max_retries":11}`},
+		{name: "short duration", body: `{"client_request_replay_max_duration_seconds":29}`},
+		{name: "long duration", body: `{"client_request_replay_max_duration_seconds":3601}`},
+		{name: "negative base", body: `{"client_request_replay_retry_base_interval_ms":-1}`},
+		{name: "large base", body: `{"client_request_replay_retry_base_interval_ms":60001}`},
+		{name: "zero max interval", body: `{"client_request_replay_retry_max_interval_seconds":0}`},
+		{name: "large max interval", body: `{"client_request_replay_retry_max_interval_seconds":301}`},
+		{name: "max shorter than base", body: `{"client_request_replay_retry_base_interval_ms":5000,"client_request_replay_retry_max_interval_seconds":4}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(test.body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			handler.UpdateSettings(ctx)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestAccountEmailDomain(t *testing.T) {
 	tests := []struct {
 		name  string

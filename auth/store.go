@@ -2795,8 +2795,11 @@ type Store struct {
 	transportRetryPolicy         atomic.Value // 上游错误重试策略: rotate / sticky / hybrid
 	transportSameAccountRetries  atomic.Int64 // hybrid 下每个账号额外同号重试次数
 	compactSameAccountRetries    atomic.Int64 // compact 首账号额外同号重试次数
-	clientRequestReplayEnabled   atomic.Bool  // 响应提交前模拟客户端重发整个请求
-	clientRequestReplayRetries   atomic.Int64 // 整请求最大重发次数，0 表示不限
+	clientRequestReplayEnabled     atomic.Bool  // 响应提交前模拟客户端重发整个请求
+	clientRequestReplayRetries     atomic.Int64 // 原始请求失败后的额外重发次数
+	clientRequestReplayMaxDuration atomic.Int64 // 首个业务输出前的总预算秒数
+	clientRequestReplayBaseDelay   atomic.Int64 // 指数退避基础间隔毫秒数
+	clientRequestReplayMaxDelay    atomic.Int64 // 指数退避最大间隔秒数
 	clientRequestReplayKeepalive atomic.Int64 // 下游 SSE 保活间隔秒数，0 表示关闭
 
 	// 智能刷新调度器
@@ -3271,7 +3274,10 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			TransportRetryPolicy:               "hybrid",
 			TransportSameAccountRetries:        defaultTransportSameAccountRetries,
 			CompactSameAccountRetries:          defaultCompactSameAccountRetries,
-			ClientRequestReplayMaxRetries:      0,
+			ClientRequestReplayMaxRetries:      database.DefaultClientRequestReplayMaxRetries,
+			ClientRequestReplayMaxDurationSec:  database.DefaultClientRequestReplayMaxDurationSeconds,
+			ClientRequestReplayBaseIntervalMS:  database.DefaultClientRequestReplayBaseIntervalMS,
+			ClientRequestReplayMaxIntervalSec:  database.DefaultClientRequestReplayMaxIntervalSeconds,
 			ClientRequestReplayKeepaliveSec:    15,
 			EncryptedContentCompat:             true,
 			FastTierPolicy:                     database.FastTierPolicyPreserve,
@@ -3405,7 +3411,10 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.transportSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.TransportSameAccountRetries)))
 	s.compactSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.CompactSameAccountRetries)))
 	s.clientRequestReplayEnabled.Store(settings.ClientRequestReplayEnabled)
-	s.clientRequestReplayRetries.Store(int64(normalizeClientRequestReplayMaxRetries(settings.ClientRequestReplayMaxRetries)))
+	s.clientRequestReplayRetries.Store(int64(database.NormalizeClientRequestReplayMaxRetries(settings.ClientRequestReplayMaxRetries)))
+	s.clientRequestReplayMaxDuration.Store(int64(database.NormalizeClientRequestReplayMaxDurationSeconds(settings.ClientRequestReplayMaxDurationSec)))
+	s.clientRequestReplayBaseDelay.Store(int64(database.NormalizeClientRequestReplayBaseIntervalMS(settings.ClientRequestReplayBaseIntervalMS)))
+	s.clientRequestReplayMaxDelay.Store(int64(database.NormalizeClientRequestReplayMaxIntervalSeconds(settings.ClientRequestReplayMaxIntervalSec)))
 	s.clientRequestReplayKeepalive.Store(int64(normalizeClientRequestReplayKeepaliveSeconds(settings.ClientRequestReplayKeepaliveSec)))
 
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
@@ -5527,13 +5536,6 @@ func (s *Store) GetRetryIntervalMS() int {
 	return int(s.retryIntervalMS.Load())
 }
 
-func normalizeClientRequestReplayMaxRetries(retries int) int {
-	if retries < 0 {
-		return 0
-	}
-	return retries
-}
-
 func normalizeClientRequestReplayKeepaliveSeconds(seconds int) int {
 	if seconds <= 0 {
 		return 0
@@ -5560,20 +5562,68 @@ func (s *Store) ClientRequestReplayEnabled() bool {
 	return s != nil && s.clientRequestReplayEnabled.Load()
 }
 
-// SetClientRequestReplayMaxRetries 设置整请求最大重发次数，0 表示不限。
+// SetClientRequestReplayMaxRetries 设置原始请求失败后的额外重发次数。
 func (s *Store) SetClientRequestReplayMaxRetries(retries int) {
 	if s == nil {
 		return
 	}
-	s.clientRequestReplayRetries.Store(int64(normalizeClientRequestReplayMaxRetries(retries)))
+	s.clientRequestReplayRetries.Store(int64(database.NormalizeClientRequestReplayMaxRetries(retries)))
 }
 
-// ClientRequestReplayMaxRetries 返回整请求最大重发次数，0 表示不限。
+// ClientRequestReplayMaxRetries 返回原始请求失败后的额外重发次数。
 func (s *Store) ClientRequestReplayMaxRetries() int {
 	if s == nil {
-		return 0
+		return database.DefaultClientRequestReplayMaxRetries
 	}
-	return normalizeClientRequestReplayMaxRetries(int(s.clientRequestReplayRetries.Load()))
+	return database.NormalizeClientRequestReplayMaxRetries(int(s.clientRequestReplayRetries.Load()))
+}
+
+// SetClientRequestReplayMaxDurationSeconds 设置首个业务输出前的总预算。
+func (s *Store) SetClientRequestReplayMaxDurationSeconds(seconds int) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayMaxDuration.Store(int64(database.NormalizeClientRequestReplayMaxDurationSeconds(seconds)))
+}
+
+// ClientRequestReplayMaxDurationSeconds 返回首个业务输出前的总预算。
+func (s *Store) ClientRequestReplayMaxDurationSeconds() int {
+	if s == nil {
+		return database.DefaultClientRequestReplayMaxDurationSeconds
+	}
+	return database.NormalizeClientRequestReplayMaxDurationSeconds(int(s.clientRequestReplayMaxDuration.Load()))
+}
+
+// SetClientRequestReplayBaseIntervalMS 设置整请求指数退避的基础间隔。
+func (s *Store) SetClientRequestReplayBaseIntervalMS(milliseconds int) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayBaseDelay.Store(int64(database.NormalizeClientRequestReplayBaseIntervalMS(milliseconds)))
+}
+
+// ClientRequestReplayBaseIntervalMS 返回整请求指数退避的基础间隔。
+func (s *Store) ClientRequestReplayBaseIntervalMS() int {
+	if s == nil {
+		return database.DefaultClientRequestReplayBaseIntervalMS
+	}
+	return database.NormalizeClientRequestReplayBaseIntervalMS(int(s.clientRequestReplayBaseDelay.Load()))
+}
+
+// SetClientRequestReplayMaxIntervalSeconds 设置整请求指数退避的最大间隔。
+func (s *Store) SetClientRequestReplayMaxIntervalSeconds(seconds int) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayMaxDelay.Store(int64(database.NormalizeClientRequestReplayMaxIntervalSeconds(seconds)))
+}
+
+// ClientRequestReplayMaxIntervalSeconds 返回整请求指数退避的最大间隔。
+func (s *Store) ClientRequestReplayMaxIntervalSeconds() int {
+	if s == nil {
+		return database.DefaultClientRequestReplayMaxIntervalSeconds
+	}
+	return database.NormalizeClientRequestReplayMaxIntervalSeconds(int(s.clientRequestReplayMaxDelay.Load()))
 }
 
 // SetClientRequestReplayKeepaliveSeconds 设置整请求重发期间的 SSE 保活间隔。

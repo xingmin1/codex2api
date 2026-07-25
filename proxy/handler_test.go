@@ -830,9 +830,7 @@ func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body)).WithContext(ctx)
+			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
 			ginCtx, _ := gin.CreateTestContext(recorder)
@@ -1979,9 +1977,7 @@ func TestResponsesEndpointsAllowGPT55MaxOutputTokens128K(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body)).WithContext(ctx)
+			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
 			ginCtx, _ := gin.CreateTestContext(recorder)

@@ -1121,7 +1121,10 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		TransportSameAccountRetries:      2,
 		CompactSameAccountRetries:        3,
 		ClientRequestReplayEnabled:       true,
-		ClientRequestReplayMaxRetries:    17,
+		ClientRequestReplayMaxRetries:     7,
+		ClientRequestReplayMaxDurationSec: 777,
+		ClientRequestReplayBaseIntervalMS: 1234,
+		ClientRequestReplayMaxIntervalSec: 45,
 		ClientRequestReplayKeepaliveSec:  30,
 		EncryptedContentCompat:           false,
 		FastTierPolicy:                   FastTierPolicyFilter,
@@ -1151,8 +1154,19 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	if settings.CompactSameAccountRetries != 3 {
 		t.Fatalf("compact 同号重试次数 = %d, want 3", settings.CompactSameAccountRetries)
 	}
-	if !settings.ClientRequestReplayEnabled || settings.ClientRequestReplayMaxRetries != 17 || settings.ClientRequestReplayKeepaliveSec != 30 {
-		t.Fatalf("整请求代重发设置 = {%t %d %d}, want {true 17 30}", settings.ClientRequestReplayEnabled, settings.ClientRequestReplayMaxRetries, settings.ClientRequestReplayKeepaliveSec)
+	if !settings.ClientRequestReplayEnabled ||
+		settings.ClientRequestReplayMaxRetries != 7 ||
+		settings.ClientRequestReplayMaxDurationSec != 777 ||
+		settings.ClientRequestReplayBaseIntervalMS != 1234 ||
+		settings.ClientRequestReplayMaxIntervalSec != 45 ||
+		settings.ClientRequestReplayKeepaliveSec != 30 {
+		t.Fatalf("整请求代重发设置 = {%t %d %d %d %d %d}",
+			settings.ClientRequestReplayEnabled,
+			settings.ClientRequestReplayMaxRetries,
+			settings.ClientRequestReplayMaxDurationSec,
+			settings.ClientRequestReplayBaseIntervalMS,
+			settings.ClientRequestReplayMaxIntervalSec,
+			settings.ClientRequestReplayKeepaliveSec)
 	}
 	if settings.EncryptedContentCompat {
 		t.Fatal("EncryptedContentCompat = true, want false")

@@ -10,9 +10,9 @@ import (
 // 5 秒兜住绝大多数情况，又不会在上游卡住时无限占用连接。
 const upstreamDrainTimeout = 5 * time.Second
 
-// newDrainableUpstreamContext 创建一个与客户端 context 解耦的上游 context，
-// 用途：客户端断开后仍能再读 drainTimeout 时间，以便从上游 SSE 拿到
-// response.completed 事件里的 usage（流式请求计费的关键）。
+// newDrainableUpstreamContext 创建一个可有限排空的上游 context。
+// 普通请求保持原有排空行为；整请求代重发只在业务数据已交付后排空，
+// 首个业务输出前的取消会立即停止上游，避免客户端断开后继续创建或轮转请求。
 //
 // 行为：
 //   - 客户端 ctx 取消后，等待 drainTimeout 再 cancel 上游
@@ -23,9 +23,18 @@ func newDrainableUpstreamContext(clientCtx context.Context, drainTimeout time.Du
 	if clientCtx == nil || drainTimeout <= 0 {
 		return upstreamCtx, cancelUpstream
 	}
+	if clientCtx.Err() != nil {
+		cancelUpstream()
+		return upstreamCtx, cancelUpstream
+	}
 	go func() {
 		select {
 		case <-clientCtx.Done():
+			controller := clientRequestReplayControllerFromContext(clientCtx)
+			if controller != nil && !controller.hasBusinessStarted() {
+				cancelUpstream()
+				return
+			}
 			timer := time.NewTimer(drainTimeout)
 			defer timer.Stop()
 			select {

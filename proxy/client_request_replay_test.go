@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
@@ -198,6 +200,386 @@ func TestClientRequestReplayHonorsFiniteRetryLimit(t *testing.T) {
 	}
 }
 
+func TestClientRequestReplayLegacyZeroUsesSafeDefault(t *testing.T) {
+	handler := newClientReplayTestHandler(t, 0, 0)
+	c, recorder := newClientReplayTestContext(t, true)
+	attempts := 0
+
+	handler.handleWithClientRequestReplay(c, "/v1/responses", func(c *gin.Context) {
+		attempts++
+		c.JSON(http.StatusForbidden, gin.H{"error": gin.H{"message": "always fails"}})
+	})
+
+	wantAttempts := 1 + database.DefaultClientRequestReplayMaxRetries
+	if attempts != wantAttempts {
+		t.Fatalf("attempts = %d, want %d", attempts, wantAttempts)
+	}
+	if recorder.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusForbidden)
+	}
+}
+
+func TestClientRequestReplayDelayExponentialAndCapped(t *testing.T) {
+	base := time.Second
+	maxDelay := 30 * time.Second
+	want := []time.Duration{
+		time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		30 * time.Second,
+		30 * time.Second,
+	}
+	for replayIndex, wantDelay := range want {
+		if got := clientRequestReplayDelay(base, maxDelay, replayIndex); got != wantDelay {
+			t.Fatalf("delay(%d) = %s, want %s", replayIndex, got, wantDelay)
+		}
+	}
+	if got := clientRequestReplayDelay(0, maxDelay, 10); got != 0 {
+		t.Fatalf("zero base delay = %s, want 0", got)
+	}
+}
+
+func TestClientRequestReplayControllerStopsAtDurationBudget(t *testing.T) {
+	controller := newClientRequestReplayController(context.Background(), 20*time.Millisecond)
+	defer controller.close()
+
+	select {
+	case <-controller.context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("controller did not stop at duration budget")
+	}
+	if got := controller.reason(); got != clientRequestReplayStopMaxDuration {
+		t.Fatalf("stop reason = %q, want %q", got, clientRequestReplayStopMaxDuration)
+	}
+}
+
+func TestClientRequestReplayControllerDurationStopsAfterBusinessStarts(t *testing.T) {
+	controller := newClientRequestReplayController(context.Background(), 20*time.Millisecond)
+	defer controller.close()
+	controller.markBusinessStarted()
+	time.Sleep(40 * time.Millisecond)
+	if err := controller.context().Err(); err != nil {
+		t.Fatalf("business stream was canceled by replay duration budget: %v", err)
+	}
+}
+
+func TestClientRequestReplayRealClientDisconnectStopsCurrentAttempt(t *testing.T) {
+	handler := newClientReplayTestHandler(t, 5, 0)
+	var attempts atomic.Int32
+	attemptStarted := make(chan struct{})
+	attemptCanceled := make(chan struct{})
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/v1/responses", func(c *gin.Context) {
+		handler.handleWithClientRequestReplay(c, "/v1/responses", func(c *gin.Context) {
+			if attempts.Add(1) == 1 {
+				close(attemptStarted)
+			}
+			<-c.Request.Context().Done()
+			close(attemptCanceled)
+		})
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	clientCtx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(clientCtx, http.MethodPost, server.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","stream":true,"input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	done := make(chan error, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(request)
+		if response != nil {
+			response.Body.Close()
+		}
+		done <- requestErr
+	}()
+
+	select {
+	case <-attemptStarted:
+	case <-time.After(time.Second):
+		t.Fatal("attempt did not start")
+	}
+	cancel()
+	select {
+	case <-attemptCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("client disconnect did not cancel current attempt")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("client request did not finish after cancellation")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts after client disconnect = %d, want 1", got)
+	}
+}
+
+func TestClientRequestReplayRealClientDisconnectStopsBackoff(t *testing.T) {
+	handler := newClientReplayTestHandler(t, 5, 0)
+	handler.store.SetClientRequestReplayBaseIntervalMS(500)
+	handler.store.SetClientRequestReplayMaxIntervalSeconds(1)
+	var attempts atomic.Int32
+	firstAttemptDone := make(chan struct{})
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/v1/responses", func(c *gin.Context) {
+		handler.handleWithClientRequestReplay(c, "/v1/responses", func(c *gin.Context) {
+			if attempts.Add(1) == 1 {
+				close(firstAttemptDone)
+			}
+			c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "retry later"}})
+		})
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	clientCtx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(clientCtx, http.MethodPost, server.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.6-sol","stream":true,"input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	done := make(chan error, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(request)
+		if response != nil {
+			response.Body.Close()
+		}
+		done <- requestErr
+	}()
+
+	select {
+	case <-firstAttemptDone:
+	case <-time.After(time.Second):
+		t.Fatal("first attempt did not finish")
+	}
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("client request did not finish after cancellation during backoff")
+	}
+	time.Sleep(550 * time.Millisecond)
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attempts after cancellation during backoff = %d, want 1", got)
+	}
+}
+
+func TestResponsesClientDisconnectStopsAccountWaitBeforeUpstreamRequest(t *testing.T) {
+	var upstreamAttempts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		upstreamAttempts.Add(1)
+		response.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+
+	store := newOpenAIResponsesRelayStore(upstream.URL)
+	store.SetClientRequestReplayEnabled(true)
+	store.SetClientRequestReplayMaxRetries(5)
+	store.SetClientRequestReplayKeepaliveSeconds(0)
+	first, _ := store.NextForSession("occupied-1", 0, nil)
+	second, _ := store.NextForSession("occupied-2", 0, nil)
+	if first == nil || second == nil {
+		t.Fatal("failed to occupy all account concurrency slots")
+	}
+	defer store.Release(first)
+	defer store.Release(second)
+	t.Cleanup(store.Stop)
+
+	handler := NewHandler(store, nil, nil, nil)
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/v1/responses", handler.Responses)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	clientCtx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(clientCtx, http.MethodPost, server.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-4.1-direct","stream":true,"input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	done := make(chan error, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(request)
+		if response != nil {
+			response.Body.Close()
+		}
+		done <- requestErr
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("client request did not leave account wait after cancellation")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := upstreamAttempts.Load(); got != 0 {
+		t.Fatalf("upstream attempts after account-wait cancellation = %d, want 0", got)
+	}
+}
+
+func TestResponsesClientDisconnectCancelsRelayAndPreventsNewUpstreamRequest(t *testing.T) {
+	var upstreamAttempts atomic.Int32
+	upstreamStarted := make(chan struct{})
+	upstreamCanceled := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		first := upstreamAttempts.Add(1) == 1
+		if first {
+			close(upstreamStarted)
+		}
+		response.Header().Set("Content-Type", "text/event-stream")
+		response.WriteHeader(http.StatusOK)
+		response.(http.Flusher).Flush()
+		select {
+		case <-request.Context().Done():
+			if first {
+				close(upstreamCanceled)
+			}
+		case <-releaseUpstream:
+		}
+	}))
+	defer close(releaseUpstream)
+	defer upstream.Close()
+
+	store := newOpenAIResponsesRelayStore(upstream.URL)
+	store.SetMaxRetries(0)
+	store.SetMaxRateLimitRetries(0)
+	store.SetClientRequestReplayEnabled(true)
+	store.SetClientRequestReplayMaxRetries(5)
+	store.SetClientRequestReplayBaseIntervalMS(0)
+	store.SetClientRequestReplayKeepaliveSeconds(0)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/v1/responses", handler.Responses)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	clientCtx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(clientCtx, http.MethodPost, server.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-4.1-direct","stream":true,"input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	done := make(chan error, 1)
+	go func() {
+		response, requestErr := http.DefaultClient.Do(request)
+		if response != nil {
+			response.Body.Close()
+		}
+		done <- requestErr
+	}()
+
+	select {
+	case <-upstreamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("relay request did not start")
+	}
+	cancel()
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("client disconnect did not cancel relay request before business output")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("client request did not finish")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := upstreamAttempts.Load(); got != 1 {
+		t.Fatalf("upstream attempts after client disconnect = %d, want 1", got)
+	}
+}
+
+func TestResponsesClientDisconnectDrainsExistingUpstreamAfterBusinessOutput(t *testing.T) {
+	var upstreamAttempts atomic.Int32
+	upstreamCanceled := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		first := upstreamAttempts.Add(1) == 1
+		response.Header().Set("Content-Type", "text/event-stream")
+		response.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(response, `data: {"type":"response.output_text.delta","delta":"started"}`+"\n\n")
+		response.(http.Flusher).Flush()
+		select {
+		case <-request.Context().Done():
+			if first {
+				close(upstreamCanceled)
+			}
+		case <-releaseUpstream:
+		}
+	}))
+	defer close(releaseUpstream)
+	defer upstream.Close()
+
+	store := newOpenAIResponsesRelayStore(upstream.URL)
+	store.SetMaxRetries(0)
+	store.SetMaxRateLimitRetries(0)
+	store.SetClientRequestReplayEnabled(true)
+	store.SetClientRequestReplayMaxRetries(5)
+	store.SetClientRequestReplayBaseIntervalMS(0)
+	store.SetClientRequestReplayKeepaliveSeconds(0)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/v1/responses", handler.Responses)
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	clientCtx, cancel := context.WithCancel(context.Background())
+	request, err := http.NewRequestWithContext(clientCtx, http.MethodPost, server.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-4.1-direct","stream":true,"input":"hi"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buffer := make([]byte, 256)
+	if _, err := response.Body.Read(buffer); err != nil {
+		t.Fatalf("read first business event: %v", err)
+	}
+	cancel()
+	_ = response.Body.Close()
+
+	select {
+	case <-upstreamCanceled:
+		t.Fatal("client disconnect canceled upstream before usage drain window")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := upstreamAttempts.Load(); got != 1 {
+		t.Fatalf("upstream attempts during drain = %d, want 1", got)
+	}
+	select {
+	case <-upstreamCanceled:
+	case <-time.After(upstreamDrainTimeout + time.Second):
+		t.Fatal("upstream exceeded usage drain timeout after client disconnect")
+	}
+	if got := upstreamAttempts.Load(); got != 1 {
+		t.Fatalf("upstream attempts after drain timeout = %d, want 1", got)
+	}
+}
+
 func TestClientRequestReplayEmptyInternalResponseBecomesBadGateway(t *testing.T) {
 	handler := newClientReplayTestHandler(t, 1, 0)
 	c, recorder := newClientReplayTestContext(t, false)
@@ -215,7 +597,7 @@ func TestClientRequestReplayEmptyInternalResponseBecomesBadGateway(t *testing.T)
 	}
 }
 
-func TestClientRequestReplayUnlimitedStopsWhenClientCancels(t *testing.T) {
+func TestClientRequestReplayStopsWhenClientCancels(t *testing.T) {
 	handler := newClientReplayTestHandler(t, 0, 0)
 	c, recorder := newClientReplayTestContext(t, true)
 	ctx, cancel := context.WithCancel(c.Request.Context())
@@ -275,12 +657,12 @@ func TestClientRequestReplayKeepaliveAndFinalSSEFailure(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	delivery := newClientRequestReplayDelivery(c.Writer, true)
+	delivery := newClientRequestReplayDelivery(c.Writer, nil, true)
 
 	if err := delivery.writeKeepalive(); err != nil {
 		t.Fatalf("writeKeepalive: %v", err)
 	}
-	delivery.commitSSEFailure(http.StatusForbidden, []byte(`{"error":{"message":"quota temporarily unavailable"}}`))
+	delivery.commitSSEFailure(http.StatusForbidden, []byte(`{"error":{"message":"quota temporarily unavailable"}}`), clientRequestReplayStopMaxRetries)
 
 	body := recorder.Body.String()
 	if recorder.Code != http.StatusOK || !strings.Contains(body, "codex2api.keepalive") {
@@ -295,7 +677,7 @@ func TestGenericClientRequestReplayKeepaliveUsesSSEComment(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	delivery := newClientRequestReplayDelivery(c.Writer, false)
+	delivery := newClientRequestReplayDelivery(c.Writer, nil, false)
 
 	if err := delivery.writeKeepalive(); err != nil {
 		t.Fatalf("writeKeepalive: %v", err)

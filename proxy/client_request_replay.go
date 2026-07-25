@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,12 +20,208 @@ import (
 
 const clientRequestReplayManagedKey = "client_request_replay_managed"
 
+type clientRequestReplayStopReason string
+
+const (
+	clientRequestReplayStopSuccess     clientRequestReplayStopReason = "success"
+	clientRequestReplayStopMaxRetries  clientRequestReplayStopReason = "max_retries"
+	clientRequestReplayStopMaxDuration clientRequestReplayStopReason = "max_duration"
+	clientRequestReplayStopClientGone  clientRequestReplayStopReason = "client_closed"
+	clientRequestReplayStopWriteFailed clientRequestReplayStopReason = "write_failed"
+)
+
+type clientRequestReplayControllerContextKey struct{}
+
+type clientRequestReplayController struct {
+	mu              sync.RWMutex
+	ctx             context.Context
+	cancel          context.CancelFunc
+	clientCtx       context.Context
+	startedAt       time.Time
+	deadlineTimer   *time.Timer
+	businessStarted bool
+	stopReason      clientRequestReplayStopReason
+}
+
+func newClientRequestReplayController(clientCtx context.Context, maxDuration time.Duration) *clientRequestReplayController {
+	if clientCtx == nil {
+		clientCtx = context.Background()
+	}
+	baseCtx, cancel := context.WithCancel(context.WithoutCancel(clientCtx))
+	controller := &clientRequestReplayController{
+		cancel:    cancel,
+		clientCtx: clientCtx,
+		startedAt: time.Now(),
+	}
+	controller.ctx = context.WithValue(baseCtx, clientRequestReplayControllerContextKey{}, controller)
+	if maxDuration > 0 {
+		controller.deadlineTimer = time.AfterFunc(maxDuration, controller.expire)
+	}
+	go func() {
+		select {
+		case <-clientCtx.Done():
+			controller.stop(clientRequestReplayStopClientGone)
+		case <-controller.ctx.Done():
+		}
+	}()
+	return controller
+}
+
+func (c *clientRequestReplayController) expire() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.businessStarted || c.stopReason != "" {
+		c.mu.Unlock()
+		return
+	}
+	c.stopReason = clientRequestReplayStopMaxDuration
+	c.mu.Unlock()
+	c.cancel()
+}
+
+func (c *clientRequestReplayController) stop(reason clientRequestReplayStopReason) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.stopReason == "" {
+		c.stopReason = reason
+	}
+	if c.deadlineTimer != nil {
+		c.deadlineTimer.Stop()
+	}
+	c.mu.Unlock()
+	c.cancel()
+}
+
+func (c *clientRequestReplayController) succeed() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.stopReason == "" {
+		c.stopReason = clientRequestReplayStopSuccess
+	}
+	if c.deadlineTimer != nil {
+		c.deadlineTimer.Stop()
+	}
+	c.mu.Unlock()
+}
+
+func (c *clientRequestReplayController) markBusinessStarted() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.businessStarted = true
+	if c.deadlineTimer != nil {
+		c.deadlineTimer.Stop()
+	}
+	c.mu.Unlock()
+}
+
+func (c *clientRequestReplayController) hasBusinessStarted() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.businessStarted
+}
+
+func (c *clientRequestReplayController) reason() clientRequestReplayStopReason {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	reason := c.stopReason
+	c.mu.RUnlock()
+	if reason == "" && c.clientCtx.Err() != nil {
+		return clientRequestReplayStopClientGone
+	}
+	return reason
+}
+
+func (c *clientRequestReplayController) context() context.Context {
+	if c == nil {
+		return context.Background()
+	}
+	return c.ctx
+}
+
+func (c *clientRequestReplayController) elapsed() time.Duration {
+	if c == nil {
+		return 0
+	}
+	return time.Since(c.startedAt)
+}
+
+func (c *clientRequestReplayController) wait(delay time.Duration) bool {
+	if c == nil || c.context().Err() != nil {
+		return false
+	}
+	if delay <= 0 {
+		return c.context().Err() == nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-c.context().Done():
+		return false
+	}
+}
+
+func (c *clientRequestReplayController) close() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.deadlineTimer != nil {
+		c.deadlineTimer.Stop()
+	}
+	c.mu.Unlock()
+	c.cancel()
+}
+
+func clientRequestReplayControllerFromContext(ctx context.Context) *clientRequestReplayController {
+	if ctx == nil {
+		return nil
+	}
+	controller, _ := ctx.Value(clientRequestReplayControllerContextKey{}).(*clientRequestReplayController)
+	return controller
+}
+
+func clientRequestReplayDelay(baseInterval, maxInterval time.Duration, replayIndex int) time.Duration {
+	if baseInterval <= 0 || maxInterval <= 0 {
+		return 0
+	}
+	if baseInterval >= maxInterval {
+		return maxInterval
+	}
+	delay := baseInterval
+	for i := 0; i < replayIndex && delay < maxInterval; i++ {
+		if delay > maxInterval/2 {
+			return maxInterval
+		}
+		delay *= 2
+	}
+	if delay > maxInterval {
+		return maxInterval
+	}
+	return delay
+}
+
 var codexClientReplayKeepalive = []byte("event: codex2api.keepalive\ndata: {\"type\":\"codex2api.keepalive\"}\n\n")
 var genericClientReplayKeepalive = []byte(": codex2api.keepalive\n\n")
 
 type clientRequestReplayDelivery struct {
 	mu              sync.Mutex
 	downstream      gin.ResponseWriter
+	controller      *clientRequestReplayController
 	codexClient     bool
 	keepaliveSent   bool
 	businessStarted bool
@@ -40,8 +237,8 @@ type clientRequestReplayWriter struct {
 	buffer   bytes.Buffer
 }
 
-func newClientRequestReplayDelivery(downstream gin.ResponseWriter, codexClient bool) *clientRequestReplayDelivery {
-	return &clientRequestReplayDelivery{downstream: downstream, codexClient: codexClient}
+func newClientRequestReplayDelivery(downstream gin.ResponseWriter, controller *clientRequestReplayController, codexClient bool) *clientRequestReplayDelivery {
+	return &clientRequestReplayDelivery{downstream: downstream, controller: controller, codexClient: codexClient}
 }
 
 func newClientRequestReplayWriter(delivery *clientRequestReplayDelivery, stream bool) *clientRequestReplayWriter {
@@ -86,6 +283,8 @@ func (d *clientRequestReplayDelivery) writeKeepalive() error {
 	if d.writeErr == nil {
 		d.downstream.Flush()
 		d.keepaliveSent = true
+	} else if d.controller != nil {
+		d.controller.stop(clientRequestReplayStopWriteFailed)
 	}
 	return d.writeErr
 }
@@ -100,15 +299,21 @@ func (d *clientRequestReplayDelivery) writeBusiness(header http.Header, status i
 		return 0, d.writeErr
 	}
 	if !d.businessStarted {
+		d.businessStarted = true
+		if d.controller != nil {
+			d.controller.markBusinessStarted()
+		}
 		copyReplayHeaders(d.downstream.Header(), header)
 		if !d.downstream.Written() {
 			d.downstream.WriteHeader(status)
 		}
-		d.businessStarted = true
 	}
 	n, err := d.downstream.Write(data)
 	if err != nil {
 		d.writeErr = err
+		if d.controller != nil {
+			d.controller.stop(clientRequestReplayStopWriteFailed)
+		}
 	}
 	return n, err
 }
@@ -163,10 +368,13 @@ func (d *clientRequestReplayDelivery) commitBuffered(writer *clientRequestReplay
 	}
 	if writer.buffer.Len() > 0 {
 		_, d.writeErr = d.downstream.Write(writer.buffer.Bytes())
+		if d.writeErr != nil && d.controller != nil {
+			d.controller.stop(clientRequestReplayStopWriteFailed)
+		}
 	}
 }
 
-func (d *clientRequestReplayDelivery) commitSSEFailure(status int, body []byte) {
+func (d *clientRequestReplayDelivery) commitSSEFailure(status int, body []byte, reason clientRequestReplayStopReason) {
 	if d == nil {
 		return
 	}
@@ -179,9 +387,10 @@ func (d *clientRequestReplayDelivery) commitSSEFailure(status int, body []byte) 
 		"response": gin.H{
 			"status": "failed",
 			"error": gin.H{
-				"code":        fmt.Sprintf("upstream_%d", status),
+				"code":        "client_request_replay_exhausted",
 				"message":     message,
 				"status_code": status,
+				"stop_reason": string(reason),
 				"type":        "server_error",
 			},
 		},
@@ -198,6 +407,9 @@ func (d *clientRequestReplayDelivery) commitSSEFailure(status int, body []byte) 
 	}
 	if d.writeErr == nil {
 		_, d.writeErr = fmt.Fprintf(d.downstream, "event: response.failed\ndata: %s\n\n", payload)
+		if d.writeErr != nil && d.controller != nil {
+			d.controller.stop(clientRequestReplayStopWriteFailed)
+		}
 	}
 	if d.writeErr == nil {
 		d.downstream.Flush()
@@ -306,6 +518,30 @@ func (w *clientRequestReplayWriter) ensureFailureResponse() {
 	_, _ = w.buffer.WriteString(`{"error":{"code":"empty_internal_response","message":"请求未产生可交付响应","type":"server_error"}}`)
 }
 
+func (w *clientRequestReplayWriter) replaceWithDurationExceededResponse() {
+	if w == nil {
+		return
+	}
+	lastMessage := usageLogErrorMessage(w.status, w.buffer.Bytes())
+	if strings.TrimSpace(lastMessage) == "" {
+		lastMessage = "上游未在整请求总预算内返回可交付响应"
+	}
+	w.header = make(http.Header)
+	w.header.Set("Content-Type", "application/json; charset=utf-8")
+	w.status = http.StatusGatewayTimeout
+	w.size = 0
+	w.buffer.Reset()
+	payload, _ := json.Marshal(gin.H{
+		"error": gin.H{
+			"code":        "client_request_replay_exhausted",
+			"message":     lastMessage,
+			"stop_reason": string(clientRequestReplayStopMaxDuration),
+			"type":        "server_error",
+		},
+	})
+	_, _ = w.buffer.Write(payload)
+}
+
 func cloneGinKeys(keys map[any]any) map[any]any {
 	if len(keys) == 0 {
 		return nil
@@ -341,9 +577,24 @@ func (h *Handler) handleWithClientRequestReplay(c *gin.Context, endpoint string,
 	stream := gjson.GetBytes(originalBody, "stream").Bool()
 	baseKeys := cloneGinKeys(c.Keys)
 	downstream := c.Writer
+	originalRequest := c.Request
+	maxRetries := h.store.ClientRequestReplayMaxRetries()
+	maxDuration := time.Duration(h.store.ClientRequestReplayMaxDurationSeconds()) * time.Second
+	baseInterval := time.Duration(h.store.ClientRequestReplayBaseIntervalMS()) * time.Millisecond
+	maxInterval := time.Duration(h.store.ClientRequestReplayMaxIntervalSeconds()) * time.Second
+	controller := newClientRequestReplayController(originalRequest.Context(), maxDuration)
+	defer controller.close()
 	codexClient := IsCodexStrictOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("Originator"))
-	delivery := newClientRequestReplayDelivery(downstream, codexClient)
+	delivery := newClientRequestReplayDelivery(downstream, controller, codexClient)
 	keepaliveSeconds := h.store.ClientRequestReplayKeepaliveSeconds()
+	attempts := 0
+	lastStatus := 0
+	defer func() {
+		reason := controller.reason()
+		if attempts > 1 || reason != clientRequestReplayStopSuccess {
+			log.Printf("整请求代重发结束：%s 总轮数=%d 总耗时=%s 最后状态=%d 停止原因=%s", endpoint, attempts, controller.elapsed().Round(time.Millisecond), lastStatus, reason)
+		}
+	}()
 
 	var stopKeepalive chan struct{}
 	var keepaliveDone chan struct{}
@@ -356,11 +607,14 @@ func (h *Handler) handleWithClientRequestReplay(c *gin.Context, endpoint string,
 			defer ticker.Stop()
 			for {
 				select {
-				case <-c.Request.Context().Done():
+				case <-controller.context().Done():
 					return
 				case <-stopKeepalive:
 					return
 				case <-ticker.C:
+					if originalRequest.Context().Err() != nil || controller.context().Err() != nil {
+						return
+					}
 					if delivery.hasBusinessStarted() {
 						return
 					}
@@ -382,14 +636,18 @@ func (h *Handler) handleWithClientRequestReplay(c *gin.Context, endpoint string,
 	defer func() {
 		stopHeartbeat()
 		c.Writer = downstream
+		c.Request = originalRequest
 	}()
 
-	maxRetries := h.store.ClientRequestReplayMaxRetries()
 	var lastWriter *clientRequestReplayWriter
-	for replay := 0; ; replay++ {
+	for replay := 0; replay <= maxRetries; replay++ {
+		if controller.context().Err() != nil {
+			break
+		}
 		c.Keys = cloneGinKeys(baseKeys)
 		setRawRequestBody(c, originalBody)
 		c.Set(clientRequestReplayManagedKey, true)
+		c.Request = originalRequest.Clone(controller.context())
 		c.Request.Body = io.NopCloser(bytes.NewReader(originalBody))
 		c.Request.ContentLength = int64(len(originalBody))
 		c.Errors = c.Errors[:0]
@@ -397,45 +655,65 @@ func (h *Handler) handleWithClientRequestReplay(c *gin.Context, endpoint string,
 		writer := newClientRequestReplayWriter(delivery, stream)
 		lastWriter = writer
 		c.Writer = writer
+		attempts++
 		attempt(c)
 		c.Writer = downstream
+		lastStatus = writer.status
 
 		if delivery.hasBusinessStarted() {
 			stopHeartbeat()
+			controller.succeed()
+			return
+		}
+		reason := controller.reason()
+		if reason == clientRequestReplayStopClientGone || reason == clientRequestReplayStopWriteFailed {
 			return
 		}
 		if !stream && writer.successfulNonStreamResponse() {
 			stopHeartbeat()
 			delivery.commitBuffered(writer)
+			if !delivery.hasWriteError() {
+				controller.succeed()
+			}
 			return
 		}
-		if c.Request.Context().Err() != nil {
-			return
+		if reason == clientRequestReplayStopMaxDuration {
+			break
 		}
-		if delivery.hasWriteError() {
-			return
-		}
-		if maxRetries > 0 && replay >= maxRetries {
+		if replay >= maxRetries {
+			controller.stop(clientRequestReplayStopMaxRetries)
 			break
 		}
 
-		log.Printf("整请求代重发：%s 第 %d 轮未成功且尚未输出业务数据，按原请求入口重新调度", endpoint, replay+1)
-		if !h.waitBeforeRetry(c.Request.Context()) {
-			return
+		delay := clientRequestReplayDelay(baseInterval, maxInterval, replay)
+		log.Printf("整请求代重发：%s 第 %d 轮未成功，等待 %s 后按原请求入口重新调度，累计耗时=%s", endpoint, replay+1, delay, controller.elapsed().Round(time.Millisecond))
+		if !controller.wait(delay) {
+			break
 		}
 	}
 
 	stopHeartbeat()
+	if originalRequest.Context().Err() != nil {
+		return
+	}
+	reason := controller.reason()
+	if reason == clientRequestReplayStopClientGone || reason == clientRequestReplayStopWriteFailed {
+		return
+	}
 	if lastWriter == nil {
 		return
 	}
 	lastWriter.ensureFailureResponse()
+	if reason == clientRequestReplayStopMaxDuration {
+		lastWriter.replaceWithDurationExceededResponse()
+		lastStatus = lastWriter.status
+	}
 	if stream && delivery.sentKeepalive() {
 		status := lastWriter.status
 		if status < 400 || status > 599 {
 			status = http.StatusBadGateway
 		}
-		delivery.commitSSEFailure(status, lastWriter.buffer.Bytes())
+		delivery.commitSSEFailure(status, lastWriter.buffer.Bytes(), reason)
 		return
 	}
 	delivery.commitBuffered(lastWriter)

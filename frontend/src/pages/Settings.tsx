@@ -1179,7 +1179,10 @@ export default function Settings() {
     transport_same_account_retries: 2,
     compact_same_account_retries: 2,
     client_request_replay_enabled: true,
-    client_request_replay_max_retries: 0,
+    client_request_replay_max_retries: 5,
+    client_request_replay_max_duration_seconds: 600,
+    client_request_replay_retry_base_interval_ms: 1000,
+    client_request_replay_retry_max_interval_seconds: 30,
     client_request_replay_keepalive_seconds: 15,
     encrypted_content_compatibility_enabled: true,
     fast_tier_policy: 'preserve',
@@ -1989,10 +1992,41 @@ export default function Settings() {
                 <SettingField label={t('settings.clientRequestReplayMaxRetries')} description={t('settings.clientRequestReplayMaxRetriesDesc')} suffix={t('settings.unit.times')}>
                   <Input
                     type="number"
-                    min={0}
+                    min={1}
+                    max={10}
                     disabled={!settingsForm.client_request_replay_enabled}
                     value={settingsForm.client_request_replay_max_retries}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, client_request_replay_max_retries: Math.max(0, parseInt(e.target.value) || 0) }))}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, client_request_replay_max_retries: Math.min(10, Math.max(1, parseInt(e.target.value) || 1)) }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.clientRequestReplayMaxDuration')} description={t('settings.clientRequestReplayMaxDurationDesc')} suffix={t('settings.unit.sec')}>
+                  <Input
+                    type="number"
+                    min={30}
+                    max={3600}
+                    disabled={!settingsForm.client_request_replay_enabled}
+                    value={settingsForm.client_request_replay_max_duration_seconds}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, client_request_replay_max_duration_seconds: Math.min(3600, Math.max(30, parseInt(e.target.value) || 30)) }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.clientRequestReplayBaseInterval')} description={t('settings.clientRequestReplayBaseIntervalDesc')} suffix={t('settings.unit.ms')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={60000}
+                    disabled={!settingsForm.client_request_replay_enabled}
+                    value={settingsForm.client_request_replay_retry_base_interval_ms}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, client_request_replay_retry_base_interval_ms: Math.min(f.client_request_replay_retry_max_interval_seconds * 1000, Math.max(0, parseInt(e.target.value) || 0)) }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.clientRequestReplayMaxInterval')} description={t('settings.clientRequestReplayMaxIntervalDesc')} suffix={t('settings.unit.sec')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={300}
+                    disabled={!settingsForm.client_request_replay_enabled}
+                    value={settingsForm.client_request_replay_retry_max_interval_seconds}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, client_request_replay_retry_max_interval_seconds: Math.min(300, Math.max(Math.ceil(f.client_request_replay_retry_base_interval_ms / 1000), parseInt(e.target.value) || 1)) }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.clientRequestReplayKeepalive')} description={t('settings.clientRequestReplayKeepaliveDesc')} suffix={t('settings.unit.sec')}>

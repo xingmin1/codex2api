@@ -886,7 +886,11 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_same_account_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS compact_same_account_retries INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_enabled BOOLEAN DEFAULT TRUE;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_max_retries INT DEFAULT 0;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_max_retries INT DEFAULT 5;
+	ALTER TABLE system_settings ALTER COLUMN client_request_replay_max_retries SET DEFAULT 5;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_max_duration_seconds INT DEFAULT 600;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_retry_base_interval_ms INT DEFAULT 1000;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_retry_max_interval_seconds INT DEFAULT 30;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_keepalive_seconds INT DEFAULT 15;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS encrypted_content_compatibility_enabled BOOLEAN DEFAULT TRUE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_tier_policy VARCHAR(20) DEFAULT 'preserve';
@@ -1535,7 +1539,10 @@ type SystemSettings struct {
 	TransportSameAccountRetries        int    // hybrid 下每个账号额外同号重试次数
 	CompactSameAccountRetries          int    // compact 首账号额外同号重试次数
 	ClientRequestReplayEnabled         bool   // 响应提交前模拟客户端重发整个请求
-	ClientRequestReplayMaxRetries      int    // 整请求最大重发次数，0 表示不限
+	ClientRequestReplayMaxRetries      int    // 原始请求失败后的额外重发次数
+	ClientRequestReplayMaxDurationSec  int    // 首个业务输出前的总预算秒数
+	ClientRequestReplayBaseIntervalMS  int    // 第一次额外重发前的等待毫秒数
+	ClientRequestReplayMaxIntervalSec  int    // 指数退避最大间隔秒数
 	ClientRequestReplayKeepaliveSec    int    // 等待整请求重发时的下游 SSE 保活间隔，0 表示关闭
 	EncryptedContentCompat             bool   // Responses API 中转账号默认启用加密上下文兼容修复
 	FastTierPolicy                     string // Fast Tier 出站策略: preserve / force_fast / filter_fast
@@ -1705,7 +1712,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(encrypted_content_compatibility_enabled, true),
 			       COALESCE(NULLIF(TRIM(fast_tier_policy), ''), 'preserve'),
 			       COALESCE(client_request_replay_enabled, true),
-			       COALESCE(client_request_replay_max_retries, 0),
+			       COALESCE(client_request_replay_max_retries, 5),
+			       COALESCE(client_request_replay_max_duration_seconds, 600),
+			       COALESCE(client_request_replay_retry_base_interval_ms, 1000),
+			       COALESCE(client_request_replay_retry_max_interval_seconds, 30),
 			       COALESCE(client_request_replay_keepalive_seconds, 15)
 			FROM system_settings WHERE id = 1
 		`).Scan(
@@ -1769,6 +1779,9 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.FastTierPolicy,
 		&s.ClientRequestReplayEnabled,
 		&s.ClientRequestReplayMaxRetries,
+		&s.ClientRequestReplayMaxDurationSec,
+		&s.ClientRequestReplayBaseIntervalMS,
+		&s.ClientRequestReplayMaxIntervalSec,
 		&s.ClientRequestReplayKeepaliveSec,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1797,6 +1810,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	s.FailureToleranceWindowSeconds = normalizeFailureToleranceWindowDB(s.FailureToleranceWindowSeconds)
 	s.TransportSameAccountRetries = NormalizeTransportSameAccountRetries(s.TransportSameAccountRetries)
 	s.CompactSameAccountRetries = NormalizeTransportSameAccountRetries(s.CompactSameAccountRetries)
+	s.ClientRequestReplayMaxRetries = NormalizeClientRequestReplayMaxRetries(s.ClientRequestReplayMaxRetries)
+	s.ClientRequestReplayMaxDurationSec = NormalizeClientRequestReplayMaxDurationSeconds(s.ClientRequestReplayMaxDurationSec)
+	s.ClientRequestReplayBaseIntervalMS = NormalizeClientRequestReplayBaseIntervalMS(s.ClientRequestReplayBaseIntervalMS)
+	s.ClientRequestReplayMaxIntervalSec = NormalizeClientRequestReplayMaxIntervalSeconds(s.ClientRequestReplayMaxIntervalSec)
 	return s, err
 }
 
@@ -1878,9 +1895,12 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 						fast_tier_policy,
 						client_request_replay_enabled,
 						client_request_replay_max_retries,
+						client_request_replay_max_duration_seconds,
+						client_request_replay_retry_base_interval_ms,
+						client_request_replay_retry_max_interval_seconds,
 						client_request_replay_keepalive_seconds
 						)
-						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109)
+						VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1990,6 +2010,9 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 						fast_tier_policy = EXCLUDED.fast_tier_policy,
 						client_request_replay_enabled = EXCLUDED.client_request_replay_enabled,
 						client_request_replay_max_retries = EXCLUDED.client_request_replay_max_retries,
+						client_request_replay_max_duration_seconds = EXCLUDED.client_request_replay_max_duration_seconds,
+						client_request_replay_retry_base_interval_ms = EXCLUDED.client_request_replay_retry_base_interval_ms,
+						client_request_replay_retry_max_interval_seconds = EXCLUDED.client_request_replay_retry_max_interval_seconds,
 						client_request_replay_keepalive_seconds = EXCLUDED.client_request_replay_keepalive_seconds
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
@@ -2027,7 +2050,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.EncryptedContentCompat,
 		fastTierPolicy,
 		s.ClientRequestReplayEnabled,
-		s.ClientRequestReplayMaxRetries,
+		NormalizeClientRequestReplayMaxRetries(s.ClientRequestReplayMaxRetries),
+		NormalizeClientRequestReplayMaxDurationSeconds(s.ClientRequestReplayMaxDurationSec),
+		NormalizeClientRequestReplayBaseIntervalMS(s.ClientRequestReplayBaseIntervalMS),
+		NormalizeClientRequestReplayMaxIntervalSeconds(s.ClientRequestReplayMaxIntervalSec),
 		s.ClientRequestReplayKeepaliveSec)
 	return err
 }

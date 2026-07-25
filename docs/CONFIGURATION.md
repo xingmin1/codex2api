@@ -158,7 +158,10 @@ Codex2API 采用三层配置架构：
 | `CodexWSSilentRetryEnabled` | bool | true | - | WS 首包前遇到限流、额度耗尽、5xx、读取错误或超时时，静默换账号并重建上游 WS |
 | `CodexWSSilentMaxRetries` | int | 2 | 0-10 | WS 静默换号最大重试次数 |
 | `ClientRequestReplayEnabled` | bool | true | - | 响应提交前若完整请求最终失败，按原请求入口重新执行并复用现有调度规则 |
-| `ClientRequestReplayMaxRetries` | int | 0 | >=0 | 整请求最大重发次数；0 表示不限，直到成功或客户端断开 |
+| `ClientRequestReplayMaxRetries` | int | 5 | 1-10 | 原始请求失败后的额外重发次数；不再支持无限重发 |
+| `ClientRequestReplayMaxDurationSec` | int | 600 | 30-3600 | 首个业务输出前允许的整请求总时长；次数或时长任一耗尽即停止 |
+| `ClientRequestReplayBaseIntervalMS` | int | 1000 | 0-60000 | 第一次额外重发前的等待时间，后续按 2 倍递增；0 表示立即重发 |
+| `ClientRequestReplayMaxIntervalSec` | int | 30 | 1-300 | 指数退避的最大间隔，不得小于基础间隔 |
 | `ClientRequestReplayKeepaliveSec` | int | 15 | 0 或 5-240 | 等待首个业务响应和整请求重发期间的 SSE 保活间隔；0 表示关闭 |
 | `SchedulerMode` | string | `round_robin` | - | 调度模式：`round_robin`（轮询，按调度分权重排序）或 `remaining_quota`（优先使用用量少的账号） |
 

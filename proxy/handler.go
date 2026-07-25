@@ -2189,6 +2189,9 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 	}()
 
 	for attempt := 0; ; attempt++ {
+		if downstreamRequestCanceled(c) {
+			return
+		}
 		account, stickyProxyURL := sameAccountTarget.take(h.store, apiKeyID, accountFilter)
 		if account == nil {
 			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
@@ -2229,6 +2232,9 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				continue
 			}
 			c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(effectiveModel))
+			return
+		}
+		if downstreamRequestCanceled(c) {
 			return
 		}
 		transportRetries.captureCompactInitialAccount(h, account, isV2CompactionRequest)
@@ -2300,6 +2306,11 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			encryptedCompatibilityBuffering := encryptedCompatibilityEnabled &&
 				!encryptedContentCompatibilityRetried &&
 				responsesBodyHasEncryptedContent(upstreamBody)
+			if downstreamRequestCanceled(c) {
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				return
+			}
 			resp, reqErr := ExecuteOpenAIResponsesRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
@@ -2876,6 +2887,11 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 		}
 		upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
 		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
+		if downstreamRequestCanceled(c) {
+			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			return
+		}
 		resp, reqErr := ExecuteRequest(upstreamCtx, account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
@@ -3218,6 +3234,9 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					},
 					clientGone: func() bool { return clientGone || c.Request.Context().Err() != nil },
 					openRound: func(body []byte) (*http.Response, error) {
+						if c.Request.Context().Err() != nil {
+							return nil, c.Request.Context().Err()
+						}
 						// 续想轮复用同一账号与上游通道（reasoning encrypted_content 绑定账号，
 						// 换号会被上游拒绝），沿用与客户端解耦的 drainable context。
 						if lastUpstreamCancel != nil {
@@ -3230,6 +3249,10 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 							roundBody = stripResponsesImageGenerationTool(body)
 						}
 						roundBody, _ = applyAccountFastTierPolicy(roundBody, account)
+						if c.Request.Context().Err() != nil {
+							rcancel()
+							return nil, c.Request.Context().Err()
+						}
 						roundResp, roundErr := ExecuteRequest(rctx, account, roundBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 						// 续想轮同样消耗账号额度：成功开轮后同步上游用量头，
 						// 否则多轮隐藏请求的额度对自动暂停/配速不可见。
@@ -3656,6 +3679,9 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 	}
 
 	for attempt := 0; ; attempt++ {
+		if downstreamRequestCanceled(c) {
+			return
+		}
 		activeAccountFilter := accountFilter
 		if preferLongCompactAccounts {
 			activeAccountFilter = longCompactFilter
@@ -3722,6 +3748,9 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 				return
 			}
 		}
+		if downstreamRequestCanceled(c) {
+			return
+		}
 		transportRetries.captureCompactInitialAccount(h, account, true)
 
 		start := time.Now()
@@ -3750,6 +3779,11 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 			}
 			upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
 			c.Set("x-service-tier", resolveServiceTier("", serviceTier))
+			if downstreamRequestCanceled(c) {
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				return
+			}
 			resp, reqErr := ExecuteOpenAIResponsesCompactRequest(c.Request.Context(), account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
 
@@ -4039,6 +4073,11 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
 		upstreamBody, serviceTier := applyAccountFastTierPolicy(codexBody, account)
 		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
+		if downstreamRequestCanceled(c) {
+			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			return
+		}
 		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, upstreamBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
 		durationMs := int(time.Since(start).Milliseconds())
 

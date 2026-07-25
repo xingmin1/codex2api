@@ -6622,6 +6622,9 @@ type settingsResponse struct {
 	CompactSameAccountRetries          int     `json:"compact_same_account_retries"`
 	ClientRequestReplayEnabled         bool    `json:"client_request_replay_enabled"`
 	ClientRequestReplayMaxRetries      int     `json:"client_request_replay_max_retries"`
+	ClientRequestReplayMaxDurationSec  int     `json:"client_request_replay_max_duration_seconds"`
+	ClientRequestReplayBaseIntervalMS  int     `json:"client_request_replay_retry_base_interval_ms"`
+	ClientRequestReplayMaxIntervalSec  int     `json:"client_request_replay_retry_max_interval_seconds"`
 	ClientRequestReplayKeepaliveSec    int     `json:"client_request_replay_keepalive_seconds"`
 	EncryptedContentCompat             bool    `json:"encrypted_content_compatibility_enabled"`
 	FastTierPolicy                     string  `json:"fast_tier_policy"`
@@ -6748,6 +6751,9 @@ type updateSettingsReq struct {
 	CompactSameAccountRetries          *int     `json:"compact_same_account_retries"`
 	ClientRequestReplayEnabled         *bool    `json:"client_request_replay_enabled"`
 	ClientRequestReplayMaxRetries      *int     `json:"client_request_replay_max_retries"`
+	ClientRequestReplayMaxDurationSec  *int     `json:"client_request_replay_max_duration_seconds"`
+	ClientRequestReplayBaseIntervalMS  *int     `json:"client_request_replay_retry_base_interval_ms"`
+	ClientRequestReplayMaxIntervalSec  *int     `json:"client_request_replay_retry_max_interval_seconds"`
 	ClientRequestReplayKeepaliveSec    *int     `json:"client_request_replay_keepalive_seconds"`
 	EncryptedContentCompat             *bool    `json:"encrypted_content_compatibility_enabled"`
 	FastTierPolicy                     *string  `json:"fast_tier_policy"`
@@ -7369,6 +7375,9 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
 		ClientRequestReplayEnabled:         h.store.ClientRequestReplayEnabled(),
 		ClientRequestReplayMaxRetries:      h.store.ClientRequestReplayMaxRetries(),
+		ClientRequestReplayMaxDurationSec:  h.store.ClientRequestReplayMaxDurationSeconds(),
+		ClientRequestReplayBaseIntervalMS:  h.store.ClientRequestReplayBaseIntervalMS(),
+		ClientRequestReplayMaxIntervalSec:  h.store.ClientRequestReplayMaxIntervalSeconds(),
 		ClientRequestReplayKeepaliveSec:    h.store.ClientRequestReplayKeepaliveSeconds(),
 		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
 		FastTierPolicy:                     h.store.GetFastTierPolicy(),
@@ -7435,6 +7444,42 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	var req updateSettingsReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if req.ClientRequestReplayMaxRetries != nil &&
+		(*req.ClientRequestReplayMaxRetries < database.MinClientRequestReplayMaxRetries ||
+			*req.ClientRequestReplayMaxRetries > database.MaxClientRequestReplayMaxRetries) {
+		writeError(c, http.StatusBadRequest, "client_request_replay_max_retries 仅支持 1~10")
+		return
+	}
+	if req.ClientRequestReplayMaxDurationSec != nil &&
+		(*req.ClientRequestReplayMaxDurationSec < database.MinClientRequestReplayMaxDurationSeconds ||
+			*req.ClientRequestReplayMaxDurationSec > database.MaxClientRequestReplayMaxDurationSeconds) {
+		writeError(c, http.StatusBadRequest, "client_request_replay_max_duration_seconds 仅支持 30~3600")
+		return
+	}
+	if req.ClientRequestReplayBaseIntervalMS != nil &&
+		(*req.ClientRequestReplayBaseIntervalMS < 0 ||
+			*req.ClientRequestReplayBaseIntervalMS > database.MaxClientRequestReplayBaseIntervalMS) {
+		writeError(c, http.StatusBadRequest, "client_request_replay_retry_base_interval_ms 仅支持 0~60000")
+		return
+	}
+	if req.ClientRequestReplayMaxIntervalSec != nil &&
+		(*req.ClientRequestReplayMaxIntervalSec < database.MinClientRequestReplayMaxIntervalSeconds ||
+			*req.ClientRequestReplayMaxIntervalSec > database.MaxClientRequestReplayMaxIntervalSeconds) {
+		writeError(c, http.StatusBadRequest, "client_request_replay_retry_max_interval_seconds 仅支持 1~300")
+		return
+	}
+	candidateReplayBaseInterval := h.store.ClientRequestReplayBaseIntervalMS()
+	if req.ClientRequestReplayBaseIntervalMS != nil {
+		candidateReplayBaseInterval = *req.ClientRequestReplayBaseIntervalMS
+	}
+	candidateReplayMaxInterval := h.store.ClientRequestReplayMaxIntervalSeconds()
+	if req.ClientRequestReplayMaxIntervalSec != nil {
+		candidateReplayMaxInterval = *req.ClientRequestReplayMaxIntervalSec
+	}
+	if candidateReplayBaseInterval > candidateReplayMaxInterval*1000 {
+		writeError(c, http.StatusBadRequest, "整请求重发最大间隔不能小于基础间隔")
 		return
 	}
 	if req.AutoPause5hThreshold != nil {
@@ -8009,12 +8054,20 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	}
 
 	if req.ClientRequestReplayMaxRetries != nil {
-		if *req.ClientRequestReplayMaxRetries < 0 {
-			writeError(c, http.StatusBadRequest, "client_request_replay_max_retries 不能小于 0")
-			return
-		}
 		h.store.SetClientRequestReplayMaxRetries(*req.ClientRequestReplayMaxRetries)
 		log.Printf("设置已更新: client_request_replay_max_retries = %d", *req.ClientRequestReplayMaxRetries)
+	}
+	if req.ClientRequestReplayMaxDurationSec != nil {
+		h.store.SetClientRequestReplayMaxDurationSeconds(*req.ClientRequestReplayMaxDurationSec)
+		log.Printf("设置已更新: client_request_replay_max_duration_seconds = %d", *req.ClientRequestReplayMaxDurationSec)
+	}
+	if req.ClientRequestReplayBaseIntervalMS != nil {
+		h.store.SetClientRequestReplayBaseIntervalMS(*req.ClientRequestReplayBaseIntervalMS)
+		log.Printf("设置已更新: client_request_replay_retry_base_interval_ms = %d", *req.ClientRequestReplayBaseIntervalMS)
+	}
+	if req.ClientRequestReplayMaxIntervalSec != nil {
+		h.store.SetClientRequestReplayMaxIntervalSeconds(*req.ClientRequestReplayMaxIntervalSec)
+		log.Printf("设置已更新: client_request_replay_retry_max_interval_seconds = %d", *req.ClientRequestReplayMaxIntervalSec)
 	}
 
 	if req.ClientRequestReplayKeepaliveSec != nil {
@@ -8411,6 +8464,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
 		ClientRequestReplayEnabled:         h.store.ClientRequestReplayEnabled(),
 		ClientRequestReplayMaxRetries:      h.store.ClientRequestReplayMaxRetries(),
+		ClientRequestReplayMaxDurationSec:  h.store.ClientRequestReplayMaxDurationSeconds(),
+		ClientRequestReplayBaseIntervalMS:  h.store.ClientRequestReplayBaseIntervalMS(),
+		ClientRequestReplayMaxIntervalSec:  h.store.ClientRequestReplayMaxIntervalSeconds(),
 		ClientRequestReplayKeepaliveSec:    h.store.ClientRequestReplayKeepaliveSeconds(),
 		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
 		FastTierPolicy:                     h.store.GetFastTierPolicy(),
@@ -8543,6 +8599,9 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CompactSameAccountRetries:          h.store.GetCompactSameAccountRetries(),
 		ClientRequestReplayEnabled:         h.store.ClientRequestReplayEnabled(),
 		ClientRequestReplayMaxRetries:      h.store.ClientRequestReplayMaxRetries(),
+		ClientRequestReplayMaxDurationSec:  h.store.ClientRequestReplayMaxDurationSeconds(),
+		ClientRequestReplayBaseIntervalMS:  h.store.ClientRequestReplayBaseIntervalMS(),
+		ClientRequestReplayMaxIntervalSec:  h.store.ClientRequestReplayMaxIntervalSeconds(),
 		ClientRequestReplayKeepaliveSec:    h.store.ClientRequestReplayKeepaliveSeconds(),
 		EncryptedContentCompat:             h.store.EncryptedContentCompatibilityEnabled(),
 		FastTierPolicy:                     h.store.GetFastTierPolicy(),
