@@ -1164,7 +1164,7 @@ func (a *Account) effectiveScoreBiasLocked(now time.Time, tier AccountHealthTier
 }
 
 func (a *Account) activeManualScoreBonusLocked(now time.Time) int64 {
-	if a.ManualScoreBonus <= 0 || a.ManualScoreBonusUntil.IsZero() || !now.Before(a.ManualScoreBonusUntil) {
+	if a.ManualScoreBonus == 0 || a.ManualScoreBonusUntil.IsZero() || !now.Before(a.ManualScoreBonusUntil) {
 		return 0
 	}
 	return a.ManualScoreBonus
@@ -4337,7 +4337,7 @@ func (s *Store) Init(ctx context.Context) error {
 // loadFromDB 从数据库加载账号
 func (s *Store) loadFromDB(ctx context.Context) error {
 	if err := s.db.ClearExpiredAccountManualScoreBonuses(ctx, time.Now()); err != nil {
-		log.Printf("清理过期临时调度加分失败: %v", err)
+		log.Printf("清理过期临时调度分调整失败: %v", err)
 	}
 	rows, err := s.db.ListActive(ctx)
 	if err != nil {
@@ -4426,7 +4426,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
 	account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
-	if row.ManualScoreBonus > 0 && row.ManualScoreBonusUntil.Valid && time.Now().Before(row.ManualScoreBonusUntil.Time) {
+	if row.ManualScoreBonus != 0 && row.ManualScoreBonusUntil.Valid && time.Now().Before(row.ManualScoreBonusUntil.Time) {
 		account.ManualScoreBonus = row.ManualScoreBonus
 		account.ManualScoreBonusUntil = row.ManualScoreBonusUntil.Time
 	}
@@ -4693,7 +4693,7 @@ func (s *Store) StartBackgroundRefresh() {
 				if s.db != nil {
 					go func() {
 						if err := s.db.ClearExpiredAccountManualScoreBonuses(context.Background(), time.Now()); err != nil {
-							log.Printf("清理过期临时调度加分失败: %v", err)
+							log.Printf("清理过期临时调度分调整失败: %v", err)
 						}
 					}()
 				}
@@ -4840,6 +4840,41 @@ func (s *Store) tryAcquireAccount(acc *Account, limit int64, updateSchedulerOnLi
 			return true
 		}
 	}
+}
+
+// TryAcquireMaintenanceSlot 为指定账号占用一个维护请求槽。
+//
+// 该槽与真实请求共享 ActiveRequests 并受账号并发上限约束，但不会增加调度次数、
+// 触发请求次数限制或改变健康状态。调用成功后必须配对 ReleaseMaintenanceSlot。
+func (s *Store) TryAcquireMaintenanceSlot(acc *Account) bool {
+	if s == nil || acc == nil || !acc.IsAvailable() {
+		return false
+	}
+	_, _, _, limit := acc.schedulerSnapshot(atomic.LoadInt64(&s.maxConcurrency))
+	if limit <= 0 {
+		return false
+	}
+	for {
+		current := atomic.LoadInt64(&acc.ActiveRequests)
+		if current >= limit {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(&acc.ActiveRequests, current, current+1) {
+			s.fastSchedulerUpdate(acc)
+			return true
+		}
+	}
+}
+
+// ReleaseMaintenanceSlot 释放 TryAcquireMaintenanceSlot 占用的账号槽。
+func (s *Store) ReleaseMaintenanceSlot(acc *Account) {
+	if s == nil || acc == nil {
+		return
+	}
+	if atomic.AddInt64(&acc.ActiveRequests, -1) < 0 {
+		atomic.StoreInt64(&acc.ActiveRequests, 0)
+	}
+	s.fastSchedulerUpdate(acc)
 }
 
 // NextExcludingWithFilter 获取下一个可用账号，并应用请求级账号过滤器。
@@ -6419,13 +6454,13 @@ func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, ba
 	return true
 }
 
-// ApplyAccountManualScoreBonus 替换账号的临时调度加分并立即重算；bonus 为零时清除。
+// ApplyAccountManualScoreBonus 替换账号的临时调度分调整并立即重算；bonus 为零时清除。
 func (s *Store) ApplyAccountManualScoreBonus(dbID int64, bonus int64, until time.Time) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
 	}
-	if bonus <= 0 || until.IsZero() || !time.Now().Before(until) {
+	if bonus == 0 || until.IsZero() || !time.Now().Before(until) {
 		bonus = 0
 		until = time.Time{}
 	}

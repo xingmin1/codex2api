@@ -718,6 +718,78 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_account_first_token_created
 		ON account_first_token_samples(created_at);
 
+	CREATE TABLE IF NOT EXISTS account_quality_eval_batches (
+		id               BIGSERIAL PRIMARY KEY,
+		account_id       BIGINT NOT NULL,
+		trigger_source   VARCHAR(16) NOT NULL,
+		test_kind        VARCHAR(16) NOT NULL DEFAULT 'full',
+		scheduled_hour   TIMESTAMPTZ NULL,
+		model            VARCHAR(100) NOT NULL,
+		reasoning_effort VARCHAR(20) NOT NULL,
+		status           VARCHAR(20) NOT NULL DEFAULT 'running',
+		juice_requested  INT NOT NULL DEFAULT 0,
+		juice_graded     INT NOT NULL DEFAULT 0,
+		juice_correct    INT NOT NULL DEFAULT 0,
+		candy_requested  INT NOT NULL DEFAULT 0,
+		candy_graded     INT NOT NULL DEFAULT 0,
+		candy_correct    INT NOT NULL DEFAULT 0,
+		started_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		finished_at      TIMESTAMPTZ NULL,
+		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		UNIQUE(account_id, trigger_source, scheduled_hour)
+	);
+	CREATE TABLE IF NOT EXISTS account_quality_eval_samples (
+		id               BIGSERIAL PRIMARY KEY,
+		batch_id         BIGINT NOT NULL,
+		account_id       BIGINT NOT NULL,
+		test_kind        VARCHAR(16) NOT NULL,
+		sample_index     INT NOT NULL,
+		attempt_count    INT NOT NULL DEFAULT 1,
+		model            VARCHAR(100) NOT NULL,
+		reasoning_effort VARCHAR(20) NOT NULL,
+		attempt_answers  TEXT NOT NULL DEFAULT '[]',
+		raw_answer       TEXT NOT NULL DEFAULT '',
+		parsed_answer    TEXT NOT NULL DEFAULT '',
+		graded           BOOLEAN NOT NULL DEFAULT FALSE,
+		correct          BOOLEAN NOT NULL DEFAULT FALSE,
+		input_tokens     INT NOT NULL DEFAULT 0,
+		output_tokens    INT NOT NULL DEFAULT 0,
+		reasoning_tokens INT NOT NULL DEFAULT 0,
+		first_token_ms   INT NOT NULL DEFAULT 0,
+		duration_ms      INT NOT NULL DEFAULT 0,
+		error_message    TEXT NOT NULL DEFAULT '',
+		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		UNIQUE(batch_id, test_kind, sample_index)
+	);
+	CREATE TABLE IF NOT EXISTS quality_eval_config (
+		id                INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+		auto_enabled      BOOLEAN NOT NULL DEFAULT FALSE,
+		interval_minutes  INT NOT NULL DEFAULT 60,
+		lookback_hours    INT NOT NULL DEFAULT 5,
+		top_accounts      INT NOT NULL DEFAULT 5,
+		min_requests      INT NOT NULL DEFAULT 50,
+		batch_concurrency INT NOT NULL DEFAULT 1,
+		updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE TABLE IF NOT EXISTS quality_eval_schedule_runs (
+		scheduled_hour TIMESTAMPTZ PRIMARY KEY,
+		status         VARCHAR(20) NOT NULL DEFAULT 'running',
+		started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		finished_at    TIMESTAMPTZ NULL
+	);
+	CREATE TABLE IF NOT EXISTS quality_eval_scheduler_lock (
+		id          INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+		owner       VARCHAR(100) NOT NULL DEFAULT '',
+		lease_until TIMESTAMPTZ NOT NULL,
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_quality_eval_batches_account_created
+		ON account_quality_eval_batches(account_id, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_quality_eval_batches_status
+		ON account_quality_eval_batches(status, created_at);
+	CREATE INDEX IF NOT EXISTS idx_quality_eval_samples_batch
+		ON account_quality_eval_samples(batch_id, test_kind, sample_index);
+
 	-- 增强字段（向后兼容 ALTER）
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS input_tokens INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS output_tokens INT DEFAULT 0;

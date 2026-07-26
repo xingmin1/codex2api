@@ -31,6 +31,9 @@ import type {
   AccountGroup,
   SystemSettings,
   RecycleBinAccountRow,
+  QualityEvalBatch,
+  QualityEvalKind,
+  QualityEvalSample,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -103,6 +106,7 @@ import AccountHealthBar from "../components/AccountHealthBar";
 import AccountDetailSheet from "../components/AccountDetailSheet";
 import AccountFirstTokenStatsView from "../components/AccountFirstTokenStatsView";
 import AccountManualScoreBonusBadge from "../components/AccountManualScoreBonusBadge";
+import AccountQualityEvalBadge from "../components/AccountQualityEvalBadge";
 import CodexInviteView from "../components/CodexInviteView";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
@@ -1000,6 +1004,11 @@ export default function Accounts() {
   const [manualBonusDurationInput, setManualBonusDurationInput] =
     useState("30");
   const [manualBonusSubmitting, setManualBonusSubmitting] = useState(false);
+  const [qualityEvalAccount, setQualityEvalAccount] = useState<AccountRow | null>(null);
+  const [qualityEvalHistory, setQualityEvalHistory] = useState<QualityEvalBatch[]>([]);
+  const [qualityEvalSamples, setQualityEvalSamples] = useState<QualityEvalSample[]>([]);
+  const [qualityEvalRunning, setQualityEvalRunning] = useState(false);
+  const [qualityEvalLoading, setQualityEvalLoading] = useState(false);
   const [editingAccount, setEditingAccount] = useState<AccountRow | null>(null);
   const [editSubmitting, setEditSubmitting] = useState(false);
   const [editTab, setEditTab] = useState<"scheduler" | "account">("scheduler");
@@ -2066,7 +2075,7 @@ export default function Accounts() {
   const openManualScoreBonus = useCallback((account: AccountRow) => {
     setManualBonusAccount(account);
     setManualBonusInput(
-      (account.manual_score_bonus ?? 0) > 0
+      (account.manual_score_bonus ?? 0) !== 0
         ? String(account.manual_score_bonus)
         : "30",
     );
@@ -2080,7 +2089,7 @@ export default function Accounts() {
     if (!manualBonusAccount || manualBonusSubmitting) return;
     const bonus = Number(manualBonusInput);
     const durationMinutes = Number(manualBonusDurationInput);
-    if (!Number.isInteger(bonus) || bonus < 1 || bonus > 200) {
+    if (!Number.isInteger(bonus) || bonus < -400 || bonus > 400) {
       showToast(t("accounts.manualScoreBonusRange"), "error");
       return;
     }
@@ -2102,7 +2111,7 @@ export default function Accounts() {
       );
       await reloadSilently();
       setManualBonusAccount(null);
-      showToast(t("accounts.manualScoreBonusSaved"));
+      showToast(bonus === 0 ? t("accounts.manualScoreBonusCleared") : t("accounts.manualScoreBonusSaved"));
     } catch (error) {
       showToast(
         t("accounts.manualScoreBonusFailed", {
@@ -2147,6 +2156,56 @@ export default function Accounts() {
     showToast,
     t,
   ]);
+  const openQualityEval = useCallback(async (account: AccountRow) => {
+    setQualityEvalAccount(account);
+    setQualityEvalSamples([]);
+    setQualityEvalLoading(true);
+    try {
+      const response = await api.getAccountQualityEvals(account.id);
+      setQualityEvalHistory(response.batches ?? []);
+    } catch (error) {
+      showToast(t("accounts.qualityEvalHistoryFailed", { error: getErrorMessage(error) }), "error");
+    } finally {
+      setQualityEvalLoading(false);
+    }
+  }, [showToast, t]);
+  const runQualityEval = useCallback(async (kind: QualityEvalKind) => {
+    if (!qualityEvalAccount || qualityEvalRunning) return;
+    setQualityEvalRunning(true);
+    setQualityEvalSamples([]);
+    try {
+      const response = await api.runAccountQualityEval(qualityEvalAccount.id, kind);
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error(t("accounts.qualityEvalNoStream"));
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let completedBatch: QualityEvalBatch | null = null;
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += decoder.decode(value, { stream: !done });
+        const frames = buffer.split("\n\n");
+        buffer = frames.pop() ?? "";
+        for (const frame of frames) {
+          const payload = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+          if (!payload) continue;
+          const event = JSON.parse(payload) as { type: string; sample?: QualityEvalSample; batch?: QualityEvalBatch; error?: string };
+          if (event.sample) setQualityEvalSamples((samples) => [...samples, event.sample!]);
+          if (event.batch) completedBatch = event.batch;
+          if (event.error) throw new Error(event.error);
+        }
+        if (done) break;
+      }
+      if (!completedBatch) throw new Error(t("accounts.qualityEvalMissingComplete"));
+      const history = await api.getAccountQualityEvals(qualityEvalAccount.id);
+      setQualityEvalHistory(history.batches ?? []);
+      await reloadSilently();
+      showToast(t("accounts.qualityEvalComplete", { status: completedBatch.status }));
+    } catch (error) {
+      showToast(t("accounts.qualityEvalFailed", { error: getErrorMessage(error) }), "error");
+    } finally {
+      setQualityEvalRunning(false);
+    }
+  }, [qualityEvalAccount, qualityEvalRunning, reloadSilently, showToast, t]);
   const goDetailPrev = useCallback(() => {
     if (detailNavIndex <= 0) return;
     setDetailAccountId(sortedAccounts[detailNavIndex - 1]?.id ?? null);
@@ -5622,13 +5681,19 @@ export default function Accounts() {
                                       errorMessage={account.error_message}
                                     />
                                     <AccountStatusCountdown account={account} />
-                                    {(account.manual_score_bonus ?? 0) > 0 && (
+                                    {(account.manual_score_bonus ?? 0) !== 0 && (
                                       <AccountManualScoreBonusBadge
                                         account={account}
                                         className="h-6"
                                         onClick={() => {
                                           openManualScoreBonus(account);
                                         }}
+                                      />
+                                    )}
+                                    {account.latest_quality_eval && (
+                                      <AccountQualityEvalBadge
+                                        account={account}
+                                        onClick={() => void openQualityEval(account)}
                                       />
                                     )}
                                     {(account.active_requests ?? 0) > 0 && (
@@ -5738,7 +5803,7 @@ export default function Accounts() {
                               <TableCell className="text-right">
                                 <div className="flex items-center justify-end gap-0.5">
                                   <Button
-                                    variant="ghost"
+	                                    variant="ghost"
                                     size="icon-sm"
                                     className="size-8"
                                     onClick={() => openSchedulerEditor(account)}
@@ -5762,8 +5827,19 @@ export default function Accounts() {
                                     onClick={() => setTestingAccount(account)}
                                     title={t("accounts.testConnection")}
                                   >
-                                    <Zap className="size-3.5" />
-                                  </Button>
+	                                    <Zap className="size-3.5" />
+	                                  </Button>
+	                                  {!account.openai_responses_api && (
+	                                    <Button
+	                                      variant="ghost"
+	                                      size="icon-sm"
+	                                      className="size-8"
+	                                      onClick={() => void openQualityEval(account)}
+	                                      title={t("accounts.qualityEval")}
+	                                    >
+	                                      <FlaskConical className="size-3.5" />
+	                                    </Button>
+	                                  )}
                                   <Button
                                     variant="ghost"
                                     size="icon-sm"
@@ -6437,6 +6513,82 @@ export default function Accounts() {
           </Modal>
 
           <Modal
+            show={Boolean(qualityEvalAccount)}
+            title={t("accounts.qualityEvalTitle")}
+            contentClassName="sm:max-w-[760px]"
+            bodyClassName="space-y-4"
+            onClose={() => {
+              if (!qualityEvalRunning) setQualityEvalAccount(null);
+            }}
+            footer={
+              <Button
+                type="button"
+                variant="outline"
+                disabled={qualityEvalRunning}
+                onClick={() => setQualityEvalAccount(null)}
+              >
+                {t("common.close")}
+              </Button>
+            }
+          >
+            <div className="rounded-lg border bg-muted/20 p-3 text-xs leading-relaxed text-muted-foreground">
+              <div className="font-semibold text-foreground">
+                {qualityEvalAccount?.email || qualityEvalAccount?.name || `#${qualityEvalAccount?.id}`}
+              </div>
+              {t("accounts.qualityEvalDescription")}
+            </div>
+            <div className="grid gap-2 sm:grid-cols-3">
+              <Button type="button" variant="outline" disabled={qualityEvalRunning} onClick={() => void runQualityEval("juice")}>
+                {qualityEvalRunning ? <RefreshCw className="size-3.5 animate-spin" /> : <FlaskConical className="size-3.5" />}
+                {t("accounts.qualityEvalJuice")}
+              </Button>
+              <Button type="button" variant="outline" disabled={qualityEvalRunning} onClick={() => void runQualityEval("candy")}>
+                {t("accounts.qualityEvalCandy")}
+              </Button>
+              <Button type="button" disabled={qualityEvalRunning} onClick={() => void runQualityEval("full")}>
+                {t("accounts.qualityEvalFull")}
+              </Button>
+            </div>
+            {qualityEvalSamples.length > 0 && (
+              <div className="space-y-2">
+                <div className="text-xs font-semibold">{t("accounts.qualityEvalProgress")}</div>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  {qualityEvalSamples.map((sample) => (
+                    <QualityEvalSampleCard key={`${sample.test_kind}-${sample.sample_index}`} sample={sample} />
+                  ))}
+                </div>
+              </div>
+            )}
+            <div className="space-y-2">
+              <div className="text-xs font-semibold">{t("accounts.qualityEvalHistory")}</div>
+              {qualityEvalLoading ? (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground"><RefreshCw className="size-3.5 animate-spin" />{t("common.loading")}</div>
+              ) : qualityEvalHistory.length === 0 ? (
+                <div className="rounded-lg border border-dashed p-4 text-center text-xs text-muted-foreground">{t("accounts.qualityEvalEmpty")}</div>
+              ) : (
+                <div className="max-h-[420px] space-y-2 overflow-y-auto pr-1">
+                  {qualityEvalHistory.map((batch) => (
+                    <details key={batch.id} className="rounded-lg border bg-card p-3">
+                      <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 text-xs">
+                        <QualityEvalStatusBadge status={batch.status} />
+                        <span className="font-semibold">{batch.model} · {batch.reasoning_effort}</span>
+                        {batch.juice_requested > 0 && <span>Juice {batch.juice_correct}/{batch.juice_requested}</span>}
+                        {batch.candy_requested > 0 && <span>Candy {batch.candy_correct}/{batch.candy_requested}</span>}
+                        <span className="ml-auto text-muted-foreground">{formatRelativeTime(batch.created_at)}</span>
+                      </summary>
+                      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                        {(batch.samples ?? []).map((sample) => (
+                          <QualityEvalSampleCard key={sample.id ?? `${sample.test_kind}-${sample.sample_index}`} sample={sample} />
+                        ))}
+                      </div>
+                    </details>
+                  ))}
+                </div>
+              )}
+            </div>
+          </Modal>
+
+          <Modal
             show={showImportPicker}
             title={t("accounts.importTitle")}
             contentClassName="sm:max-w-[640px]"
@@ -6893,6 +7045,10 @@ export default function Accounts() {
               if (!detailAccount) return;
               setTestingAccount(detailAccount);
             }}
+            onQualityEval={() => {
+              if (!detailAccount) return;
+              void openQualityEval(detailAccount);
+            }}
             onRefresh={() => {
               if (!detailAccount) return;
               void handleRefresh(detailAccount);
@@ -6931,7 +7087,7 @@ export default function Accounts() {
             onClose={closeManualScoreBonus}
             footer={
               <>
-                {(manualBonusAccount?.manual_score_bonus ?? 0) > 0 && (
+                {(manualBonusAccount?.manual_score_bonus ?? 0) !== 0 && (
                   <Button
                     type="button"
                     variant="outline"
@@ -6971,8 +7127,8 @@ export default function Accounts() {
                 </span>
                 <Input
                   type="number"
-                  min={1}
-                  max={200}
+                  min={-400}
+                  max={400}
                   step={1}
                   value={manualBonusInput}
                   disabled={manualBonusSubmitting}
@@ -10888,6 +11044,49 @@ function SchedulerChip({
       <span>{label}</span>
       <span className="tabular-nums">{value}</span>
     </span>
+  );
+}
+
+function QualityEvalStatusBadge({ status }: { status: QualityEvalBatch["status"] }) {
+  const { t } = useTranslation();
+  const style = {
+    running: "bg-blue-500/10 text-blue-700 dark:text-blue-300",
+    normal: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+    suspected: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+    degraded: "bg-red-500/10 text-red-700 dark:text-red-300",
+    incomplete: "bg-slate-500/10 text-slate-700 dark:text-slate-300",
+  }[status];
+  return (
+    <span className={`rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${style}`}>
+      {t(`accounts.qualityEvalStatus.${status}`)}
+    </span>
+  );
+}
+
+function QualityEvalSampleCard({ sample }: { sample: QualityEvalSample }) {
+  const answer = sample.raw_answer || sample.error_message || "-";
+  return (
+    <div className="min-w-0 rounded-lg border bg-muted/15 p-2.5 text-[11px]">
+      <div className="mb-1.5 flex items-center gap-2">
+        <span className="font-semibold uppercase">{sample.test_kind} #{sample.sample_index}</span>
+        <span className={sample.graded ? (sample.correct ? "text-emerald-600" : "text-red-600") : "text-slate-500"}>
+          {sample.graded ? (sample.correct ? "✓" : "✗") : "?"}
+        </span>
+        <span className="ml-auto tabular-nums text-muted-foreground">
+          {sample.first_token_ms || "-"}ms / {sample.duration_ms || "-"}ms
+        </span>
+      </div>
+      <pre className="max-h-24 overflow-auto whitespace-pre-wrap break-all rounded bg-background/70 p-2 font-mono text-[10px] leading-relaxed">
+        {answer}
+      </pre>
+      <div className="mt-1.5 flex flex-wrap gap-x-3 text-muted-foreground">
+        <span>in {sample.input_tokens}</span>
+        <span>out {sample.output_tokens}</span>
+        <span>reason {sample.reasoning_tokens}</span>
+        {sample.attempt_count > 1 && <span>attempts {sample.attempt_count}</span>}
+        {sample.parsed_answer && <span className="font-mono">parsed {sample.parsed_answer}</span>}
+      </div>
+    </div>
   );
 }
 

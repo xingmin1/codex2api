@@ -281,7 +281,9 @@ func main() {
 	store.TriggerRecoveryProbeAsync()
 	store.TriggerCheapProbeAsync()
 	store.TriggerAutoCleanupAsync()
+	adminHandler.StartQualityEvalScheduler()
 	defer store.Stop()
+	defer adminHandler.StopQualityEvalScheduler()
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
@@ -453,6 +455,7 @@ func main() {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)
 	}
 	wsKeepalive.Stop()
+	adminHandler.StopQualityEvalScheduler()
 	store.Stop()
 	wsrelay.ShutdownExecutor()
 	proxy.CloseErrorLogger()

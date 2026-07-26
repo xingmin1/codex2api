@@ -76,6 +76,15 @@ type Handler struct {
 	// 串行化同一账号的并发重置，避免重复消耗与次数计数竞态。
 	resetCreditLocks sync.Map
 
+	// 质量检测按账号串行，周期任务由独立可取消上下文管理。
+	qualityEvalAccountLocks sync.Map
+	qualityEvalStartOnce    sync.Once
+	qualityEvalStopOnce     sync.Once
+	qualityEvalCancel       context.CancelFunc
+	qualityEvalWG           sync.WaitGroup
+	qualityEvalExecute      func(context.Context, *auth.Account, []byte) (*http.Response, error)
+	qualityEvalLeaseOwner   string
+
 	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
 	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
 	mergeDuplicateMu sync.Mutex
@@ -388,6 +397,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.PUT("/accounts/:id/manual-score-bonus", h.SetAccountManualScoreBonus)
 	api.DELETE("/accounts/:id/manual-score-bonus", h.ClearAccountManualScoreBonus)
+	api.POST("/accounts/:id/quality-eval", h.RunAccountQualityEval)
+	api.GET("/accounts/:id/quality-eval", h.ListAccountQualityEvals)
+	api.GET("/quality-eval/config", h.GetQualityEvalConfig)
+	api.PUT("/quality-eval/config", h.UpdateQualityEvalConfig)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
 	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
@@ -742,6 +755,7 @@ type accountResponse struct {
 	Billed7d                             *float64                         `json:"billed_7d"`
 	ScoreBreakdown                       schedulerBreakdownResponse       `json:"scheduler_breakdown"`
 	FirstTokenStats                      *database.AccountFirstTokenStats `json:"first_token_stats,omitempty"`
+	LatestQualityEval                    *database.QualityEvalBatch       `json:"latest_quality_eval,omitempty"`
 	LastUnauthorizedAt                   string                           `json:"last_unauthorized_at,omitempty"`
 	LastRateLimitedAt                    string                           `json:"last_rate_limited_at,omitempty"`
 	LastTimeoutAt                        string                           `json:"last_timeout_at,omitempty"`
@@ -851,6 +865,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		log.Printf("批量获取账号首字统计失败: %v", statsErr)
 		firstTokenStats = nil
 	}
+	latestQualityEvals, qualityEvalErr := h.db.GetLatestQualityEvalBatches(ctx)
+	if qualityEvalErr != nil {
+		log.Printf("批量获取账号质量检测摘要失败: %v", qualityEvalErr)
+		latestQualityEvals = nil
+	}
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
@@ -915,7 +934,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			statsCopy := stats
 			resp.FirstTokenStats = &statsCopy
 		}
-		if row.ManualScoreBonus > 0 && row.ManualScoreBonusUntil.Valid && time.Now().Before(row.ManualScoreBonusUntil.Time) {
+		if latest, ok := latestQualityEvals[row.ID]; ok {
+			latestCopy := latest
+			resp.LatestQualityEval = &latestCopy
+		}
+		if row.ManualScoreBonus != 0 && row.ManualScoreBonusUntil.Valid && time.Now().Before(row.ManualScoreBonusUntil.Time) {
 			resp.ManualScoreBonus = row.ManualScoreBonus
 			resp.ManualScoreBonusUntil = row.ManualScoreBonusUntil.Time.Format(time.RFC3339)
 			resp.ManualScoreBonusRemainingSeconds = max(int64(time.Until(row.ManualScoreBonusUntil.Time).Seconds()), 0)
@@ -1007,7 +1030,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
 			}
 			resp.ManualScoreBonus = debug.ManualScoreBonus
-			if debug.ManualScoreBonus > 0 && !debug.ManualScoreBonusUntil.IsZero() {
+			if debug.ManualScoreBonus != 0 && !debug.ManualScoreBonusUntil.IsZero() {
 				resp.ManualScoreBonusUntil = debug.ManualScoreBonusUntil.Format(time.RFC3339)
 				resp.ManualScoreBonusRemainingSeconds = max(int64(time.Until(debug.ManualScoreBonusUntil).Seconds()), 0)
 			} else {
@@ -1188,7 +1211,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 const (
 	defaultManualScoreBonusDuration = 30 * time.Minute
 	maxManualScoreBonusDuration     = 24 * time.Hour
-	maxManualScoreBonus             = 200
+	minManualScoreBonus             = -400
+	maxManualScoreBonus             = 400
 )
 
 type setAccountManualScoreBonusRequest struct {
@@ -1200,7 +1224,7 @@ func (h *Handler) writeAccountManualScoreBonus(c *gin.Context, account *auth.Acc
 	debug := account.GetSchedulerDebugSnapshot(int64(h.store.GetMaxConcurrency()))
 	remainingSeconds := int64(0)
 	until := ""
-	if debug.ManualScoreBonus > 0 && !debug.ManualScoreBonusUntil.IsZero() {
+	if debug.ManualScoreBonus != 0 && !debug.ManualScoreBonusUntil.IsZero() {
 		remainingSeconds = max(int64(time.Until(debug.ManualScoreBonusUntil).Seconds()), 0)
 		until = debug.ManualScoreBonusUntil.Format(time.RFC3339)
 	}
@@ -1212,7 +1236,7 @@ func (h *Handler) writeAccountManualScoreBonus(c *gin.Context, account *auth.Acc
 	})
 }
 
-// SetAccountManualScoreBonus 替换账号当前的临时调度加分。
+// SetAccountManualScoreBonus 替换账号当前的临时调度分调整。
 func (h *Handler) SetAccountManualScoreBonus(c *gin.Context) {
 	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || accountID <= 0 {
@@ -1230,8 +1254,8 @@ func (h *Handler) SetAccountManualScoreBonus(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "请求参数格式错误")
 		return
 	}
-	if req.Bonus < 1 || req.Bonus > maxManualScoreBonus {
-		writeError(c, http.StatusBadRequest, "临时加分必须在 1 到 200 之间")
+	if req.Bonus < minManualScoreBonus || req.Bonus > maxManualScoreBonus {
+		writeError(c, http.StatusBadRequest, "临时调度分必须在 -400 到 400 之间")
 		return
 	}
 	duration := time.Duration(req.DurationSeconds) * time.Second
@@ -1239,7 +1263,7 @@ func (h *Handler) SetAccountManualScoreBonus(c *gin.Context) {
 		duration = defaultManualScoreBonusDuration
 	}
 	if duration <= 0 || duration > maxManualScoreBonusDuration {
-		writeError(c, http.StatusBadRequest, "临时加分持续时间必须大于 0 且不超过 24 小时")
+		writeError(c, http.StatusBadRequest, "临时调度分持续时间必须大于 0 且不超过 24 小时")
 		return
 	}
 
@@ -1258,7 +1282,7 @@ func (h *Handler) SetAccountManualScoreBonus(c *gin.Context) {
 	h.writeAccountManualScoreBonus(c, account)
 }
 
-// ClearAccountManualScoreBonus 提前清除账号的临时调度加分。
+// ClearAccountManualScoreBonus 提前清除账号的临时调度分调整。
 func (h *Handler) ClearAccountManualScoreBonus(c *gin.Context) {
 	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || accountID <= 0 {

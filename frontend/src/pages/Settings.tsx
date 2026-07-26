@@ -7,7 +7,7 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
-import type { FastTierPolicy, HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '../types'
+import type { FastTierPolicy, HealthResponse, ModelInfo, QualityEvalConfig, SiteBranding, SystemSettings } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, sanitizeBrandingImage, sanitizeBrandingLogo, useBranding } from '../branding'
@@ -1244,8 +1244,17 @@ export default function Settings() {
     smart_pacing_windows: '5h,7d',
     ignore_usage_limit_status: false,
   })
+  const [qualityEvalConfig, setQualityEvalConfig] = useState<QualityEvalConfig>({
+    auto_enabled: false,
+    interval_minutes: 60,
+    lookback_hours: 5,
+    top_accounts: 5,
+    min_requests: 50,
+    batch_concurrency: 1,
+  })
   const lazyModeActive = settingsForm.lazy_mode
   const [savingSettings, setSavingSettings] = useState(false)
+  const [savingQualityEvalConfig, setSavingQualityEvalConfig] = useState(false)
   const [autoSaveStatus, setAutoSaveStatus] = useState<AutoSaveStatus>('idle')
   const [autoSaveError, setAutoSaveError] = useState('')
   const [testingImageStorage, setTestingImageStorage] = useState(false)
@@ -1387,8 +1396,11 @@ export default function Settings() {
   }, [autoSaveSettingsPatch])
 
   const loadSettingsData = useCallback(async () => {
-    const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
+    const [health, settings, modelsResp, qualityConfig] = await Promise.all([
+      api.getHealth(), api.getSettings(), api.getModels(), api.getQualityEvalConfig(),
+    ])
     commitSettingsForm(settings)
+    setQualityEvalConfig(qualityConfig)
     const branding = {
       site_name: settings.site_name,
       site_logo: settings.site_logo,
@@ -1424,8 +1436,8 @@ export default function Settings() {
     setSavingSettings(true)
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
-      const updated = await api.updateSettings(normalizeLazySettingsForm(settingsForm))
-      commitSettingsForm(updated)
+	      const updated = await api.updateSettings(normalizeLazySettingsForm(settingsForm))
+	      commitSettingsForm(updated)
       const branding = {
         site_name: updated.site_name,
         site_logo: updated.site_logo,
@@ -1454,6 +1466,19 @@ export default function Settings() {
       showToast(`${t('settings.saveFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
       setSavingSettings(false)
+    }
+  }
+
+  const handleSaveQualityEvalConfig = async () => {
+    setSavingQualityEvalConfig(true)
+    try {
+      const updated = await api.updateQualityEvalConfig(qualityEvalConfig)
+      setQualityEvalConfig(updated)
+      showToast(t('settings.qualityEvalSaved'))
+    } catch (error) {
+      showToast(`${t('settings.qualityEvalSaveFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setSavingQualityEvalConfig(false)
     }
   }
 
@@ -2221,9 +2246,46 @@ export default function Settings() {
                       }}
                     />
                   </SettingField>
-                </div>
-              </div>
-            </SettingsCard>
+	                </div>
+	                <div className="border-t border-border pt-4">
+	                  <div className="mb-3 text-sm font-semibold">{t('settings.qualityEvalTitle')}</div>
+	                  <div className={SETTINGS_FIELD_GRID}>
+	                    <SettingField label={t('settings.qualityEvalEnabled')} description={t('settings.qualityEvalEnabledDesc')} layout="switch">
+	                      <Switch
+	                        checked={qualityEvalConfig.auto_enabled}
+	                        onCheckedChange={(checked) => setQualityEvalConfig((value) => ({ ...value, auto_enabled: checked }))}
+	                      />
+	                    </SettingField>
+	                    <SettingField label={t('settings.qualityEvalInterval')} suffix={t('settings.unit.min')}>
+	                      <Input type="number" min={60} max={1440} value={qualityEvalConfig.interval_minutes}
+	                        onChange={(event) => setQualityEvalConfig((value) => ({ ...value, interval_minutes: Math.min(1440, Math.max(60, Number(event.target.value) || 60)) }))} />
+	                    </SettingField>
+	                    <SettingField label={t('settings.qualityEvalLookback')} suffix={t('settings.unit.hour')}>
+	                      <Input type="number" min={1} max={168} value={qualityEvalConfig.lookback_hours}
+	                        onChange={(event) => setQualityEvalConfig((value) => ({ ...value, lookback_hours: Math.min(168, Math.max(1, Number(event.target.value) || 1)) }))} />
+	                    </SettingField>
+	                    <SettingField label={t('settings.qualityEvalTopAccounts')}>
+	                      <Input type="number" min={1} max={20} value={qualityEvalConfig.top_accounts}
+	                        onChange={(event) => setQualityEvalConfig((value) => ({ ...value, top_accounts: Math.min(20, Math.max(1, Number(event.target.value) || 1)) }))} />
+	                    </SettingField>
+	                    <SettingField label={t('settings.qualityEvalMinRequests')}>
+	                      <Input type="number" min={1} max={1000000} value={qualityEvalConfig.min_requests}
+	                        onChange={(event) => setQualityEvalConfig((value) => ({ ...value, min_requests: Math.min(1000000, Math.max(1, Number(event.target.value) || 1)) }))} />
+	                    </SettingField>
+	                    <SettingField label={t('settings.qualityEvalBatchConcurrency')} suffix={t('settings.unit.concurrency')}>
+	                      <Input type="number" min={1} max={5} value={qualityEvalConfig.batch_concurrency}
+	                        onChange={(event) => setQualityEvalConfig((value) => ({ ...value, batch_concurrency: Math.min(5, Math.max(1, Number(event.target.value) || 1)) }))} />
+		                    </SettingField>
+		                  </div>
+		                  <div className="mt-3 flex justify-end">
+		                    <Button type="button" size="sm" disabled={savingQualityEvalConfig} onClick={() => void handleSaveQualityEvalConfig()}>
+		                      {savingQualityEvalConfig ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
+		                      {t('settings.qualityEvalSave')}
+		                    </Button>
+		                  </div>
+		                </div>
+	              </div>
+	            </SettingsCard>
           </div>
 
           <SettingsCard title={t('settings.schedulingStrategy')} icon={<Layers className="size-4" />}>

@@ -39,6 +39,62 @@ export interface AccountFirstTokenStats {
   long: AccountFirstTokenWindowStats
 }
 
+export type QualityEvalKind = 'juice' | 'candy' | 'full'
+export type QualityEvalStatus = 'running' | 'normal' | 'suspected' | 'degraded' | 'incomplete'
+
+export interface QualityEvalSample {
+  id?: number
+  batch_id: number
+  account_id: number
+  test_kind: Exclude<QualityEvalKind, 'full'>
+  sample_index: number
+  attempt_count: number
+  model: string
+  reasoning_effort: string
+  attempt_answers?: string[]
+  raw_answer: string
+  parsed_answer: string
+  graded: boolean
+  correct: boolean
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  first_token_ms: number
+  duration_ms: number
+  error_message?: string
+  created_at: ISODateString
+}
+
+export interface QualityEvalBatch {
+  id: number
+  account_id: number
+  trigger_source: 'manual' | 'auto'
+  test_kind: QualityEvalKind
+  scheduled_hour?: ISODateString
+  model: string
+  reasoning_effort: string
+  status: QualityEvalStatus
+  juice_requested: number
+  juice_graded: number
+  juice_correct: number
+  candy_requested: number
+  candy_graded: number
+  candy_correct: number
+  started_at: ISODateString
+  finished_at?: ISODateString
+  created_at: ISODateString
+  samples?: QualityEvalSample[]
+}
+
+export interface QualityEvalConfig {
+  auto_enabled: boolean
+  interval_minutes: number
+  lookback_hours: number
+  top_accounts: number
+  min_requests: number
+  batch_concurrency: number
+}
+
 export interface AccountRow {
   id: number
   name: string
@@ -144,6 +200,7 @@ export interface AccountRow {
   dispatch_count_limit?: number | null
   scheduler_priority?: number | null
   first_token_stats?: AccountFirstTokenStats
+  latest_quality_eval?: QualityEvalBatch
   dispatch_count_used?: number
   dispatch_count_reset_at?: ISODateString
   dispatch_count_limited?: boolean

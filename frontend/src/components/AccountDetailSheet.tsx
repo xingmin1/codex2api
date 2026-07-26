@@ -112,6 +112,7 @@ export interface AccountDetailSheetProps {
   onManualScoreBonus: () => void;
   onUsage: () => void;
   onTest: () => void;
+  onQualityEval: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
   onToggleEnabled: () => void;
@@ -138,6 +139,7 @@ export default function AccountDetailSheet({
   onManualScoreBonus,
   onUsage,
   onTest,
+  onQualityEval,
   onRefresh,
   onGenerateAuthJson,
   onToggleEnabled,
@@ -547,6 +549,12 @@ export default function AccountDetailSheet({
                 <FlaskConical className="size-3.5" />
                 {t("accounts.testConnection")}
               </Button>
+              {!account.openai_responses_api && (
+                <Button type="button" variant="outline" size="sm" onClick={onQualityEval}>
+                  <FlaskConical className="size-3.5" />
+                  {t("accounts.qualityEval")}
+                </Button>
+              )}
               <Button
                 type="button"
                 variant="outline"

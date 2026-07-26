@@ -77,7 +77,7 @@ func TestSetAccountManualScoreBonusDefaultsReplacesAndClears(t *testing.T) {
 		t.Fatalf("默认 30 分钟到期时间 = %q, err=%v", firstPayload.Until, err)
 	}
 
-	replacement := invokeManualScoreBonusHandler(t, handler.SetAccountManualScoreBonus, http.MethodPut, accountID, `{"bonus":20,"duration_seconds":60}`)
+	replacement := invokeManualScoreBonusHandler(t, handler.SetAccountManualScoreBonus, http.MethodPut, accountID, `{"bonus":-400,"duration_seconds":60}`)
 	if replacement.Code != http.StatusOK {
 		t.Fatalf("替换设置 status = %d, want 200: %s", replacement.Code, replacement.Body.String())
 	}
@@ -88,22 +88,22 @@ func TestSetAccountManualScoreBonusDefaultsReplacesAndClears(t *testing.T) {
 	if err := json.Unmarshal(replacement.Body.Bytes(), &replacementPayload); err != nil {
 		t.Fatalf("解析替换设置响应返回错误: %v", err)
 	}
-	if replacementPayload.Bonus != 20 || replacementPayload.RemainingSeconds < 50 || replacementPayload.RemainingSeconds > 60 {
-		t.Fatalf("替换设置响应 = %#v, want bonus=20 remaining≈60", replacementPayload)
+	if replacementPayload.Bonus != -400 || replacementPayload.RemainingSeconds < 50 || replacementPayload.RemainingSeconds > 60 {
+		t.Fatalf("替换设置响应 = %#v, want bonus=-400 remaining≈60", replacementPayload)
 	}
 	snapshot := store.FindByID(accountID).GetSchedulerDebugSnapshot(2)
-	if snapshot.ManualScoreBonus != 20 || snapshot.Breakdown.ManualScoreBonus != 20 {
-		t.Fatalf("运行时加分 = %#v, want 20", snapshot)
+	if snapshot.ManualScoreBonus != -400 || snapshot.Breakdown.ManualScoreBonus != -400 {
+		t.Fatalf("运行时临时分 = %#v, want -400", snapshot)
 	}
 	rows, err := db.ListActive(context.Background())
 	if err != nil {
 		t.Fatalf("ListActive 返回错误: %v", err)
 	}
-	if len(rows) != 1 || rows[0].ManualScoreBonus != 20 || !rows[0].ManualScoreBonusUntil.Valid {
-		t.Fatalf("数据库加分 = %#v, want bonus=20 with expiry", rows)
+	if len(rows) != 1 || rows[0].ManualScoreBonus != -400 || !rows[0].ManualScoreBonusUntil.Valid {
+		t.Fatalf("数据库临时分 = %#v, want bonus=-400 with expiry", rows)
 	}
 
-	cleared := invokeManualScoreBonusHandler(t, handler.ClearAccountManualScoreBonus, http.MethodDelete, accountID, "")
+	cleared := invokeManualScoreBonusHandler(t, handler.SetAccountManualScoreBonus, http.MethodPut, accountID, `{"bonus":0}`)
 	if cleared.Code != http.StatusOK {
 		t.Fatalf("清除 status = %d, want 200: %s", cleared.Code, cleared.Body.String())
 	}
@@ -124,8 +124,8 @@ func TestSetAccountManualScoreBonusRejectsInvalidBounds(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler, _, _, accountID := newManualScoreBonusTestHandler(t)
 	cases := []string{
-		`{"bonus":0}`,
-		`{"bonus":201}`,
+		`{"bonus":401}`,
+		`{"bonus":-401}`,
 		`{"bonus":1,"duration_seconds":-1}`,
 		`{"bonus":1,"duration_seconds":86401}`,
 	}

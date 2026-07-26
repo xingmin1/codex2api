@@ -9,7 +9,7 @@ interface AccountManualScoreBonusBadgeProps {
   className?: string;
 }
 
-/** 显示会随绝对到期时间自动消失的账号临时加分徽标。 */
+/** 显示会随绝对到期时间自动消失的账号临时调度分徽标。 */
 export default function AccountManualScoreBonusBadge({
   account,
   onClick,
@@ -22,7 +22,8 @@ export default function AccountManualScoreBonusBadge({
     return Number.isFinite(parsed) ? parsed : 0;
   }, [account.manual_score_bonus_until]);
   const [now, setNow] = useState(Date.now());
-  const active = (account.manual_score_bonus ?? 0) > 0 && expiresAt > now;
+  const bonus = account.manual_score_bonus ?? 0;
+  const active = bonus !== 0 && expiresAt > now;
 
   useEffect(() => {
     if (!active) return;
@@ -45,7 +46,7 @@ export default function AccountManualScoreBonusBadge({
     >
       {active
         ? t("accounts.manualScoreBonusActive", {
-            bonus: account.manual_score_bonus,
+            bonus: bonus > 0 ? `+${bonus}` : String(bonus),
             minutes: remainingMinutes,
           })
         : t("accounts.manualScoreBonus")}

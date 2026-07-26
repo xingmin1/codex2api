@@ -251,10 +251,10 @@ func (db *DB) GetAccountsFirstTokenStats(ctx context.Context, now time.Time) (ma
 	return result, rows.Err()
 }
 
-// UpdateAccountManualScoreBonus 持久化账号临时调度加分，bonus 为零时清除。
+// UpdateAccountManualScoreBonus 持久化账号临时调度分调整，bonus 为零时清除。
 func (db *DB) UpdateAccountManualScoreBonus(ctx context.Context, accountID int64, bonus int64, until time.Time) error {
 	var untilValue interface{}
-	if bonus > 0 && !until.IsZero() {
+	if bonus != 0 && !until.IsZero() {
 		untilValue = db.timeArg(until)
 	} else {
 		bonus = 0
@@ -277,7 +277,7 @@ func (db *DB) UpdateAccountManualScoreBonus(ctx context.Context, accountID int64
 	return nil
 }
 
-// ClearExpiredAccountManualScoreBonuses 清理数据库中已经到期的临时加分。
+// ClearExpiredAccountManualScoreBonuses 清理数据库中已经到期的临时调度分。
 func (db *DB) ClearExpiredAccountManualScoreBonuses(ctx context.Context, now time.Time) error {
 	_, err := db.conn.ExecContext(ctx, `
 		UPDATE accounts

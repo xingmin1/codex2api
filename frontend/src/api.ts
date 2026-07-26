@@ -38,6 +38,9 @@ import type {
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
   PublicAPIKeyUsageResponse,
+  QualityEvalBatch,
+  QualityEvalConfig,
+  QualityEvalKind,
   RecycleBinAccountsResponse,
   ResetCreditsDetailResponse,
   RuntimeStatusResponse,
@@ -216,6 +219,20 @@ async function requestBlob(path: string, options: RequestInit = {}): Promise<Blo
   return res.blob()
 }
 
+async function requestStream(path: string, options: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(options.headers)
+  headers.set('Content-Type', 'application/json')
+  const adminKey = getAdminKey()
+  if (adminKey) headers.set('X-Admin-Key', adminKey)
+  const response = await fetch(BASE + path, { ...options, cache: 'no-store', headers })
+  if (!response.ok) {
+    const body = await response.text()
+    if (response.status === 401) resetAdminAuthState()
+    throw new Error(extractAdminErrorMessage(body, response.status))
+  }
+  return response
+}
+
 function buildOpsErrorSearchParams(params: {
   start: string
   end: string
@@ -311,6 +328,19 @@ export const api = {
       manual_score_bonus_remaining_seconds: number
       dispatch_score: number
     }>(`/accounts/${id}/manual-score-bonus`, { method: 'DELETE' }),
+  runAccountQualityEval: (id: number, kind: QualityEvalKind) =>
+    requestStream(`/accounts/${id}/quality-eval`, {
+      method: 'POST',
+      body: JSON.stringify({ kind }),
+    }),
+  getAccountQualityEvals: (id: number) =>
+    request<{ batches: QualityEvalBatch[] }>(`/accounts/${id}/quality-eval`),
+  getQualityEvalConfig: () => request<QualityEvalConfig>('/quality-eval/config'),
+  updateQualityEvalConfig: (config: QualityEvalConfig) =>
+    request<QualityEvalConfig>('/quality-eval/config', {
+      method: 'PUT',
+      body: JSON.stringify(config),
+    }),
   listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
   createAccountGroup: (data: CreateAccountGroupRequest) =>
     request<{ id: number; message: string }>('/account-groups', { method: 'POST', body: JSON.stringify(data) }),

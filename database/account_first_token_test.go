@@ -125,7 +125,7 @@ func TestAccountManualScoreBonusPersistsReplacesAndExpires(t *testing.T) {
 		t.Fatalf("首次设置返回错误: %v", err)
 	}
 	replacementUntil := now.Add(time.Hour)
-	if err := db.UpdateAccountManualScoreBonus(ctx, activeID, 20, replacementUntil); err != nil {
+	if err := db.UpdateAccountManualScoreBonus(ctx, activeID, -400, replacementUntil); err != nil {
 		t.Fatalf("替换设置返回错误: %v", err)
 	}
 	if err := db.UpdateAccountManualScoreBonus(ctx, expiredID, 100, now.Add(-time.Minute)); err != nil {
@@ -150,7 +150,7 @@ func TestAccountManualScoreBonusPersistsReplacesAndExpires(t *testing.T) {
 			t.Fatalf("账号 %d 加分=(%d,%v), want (%d,%v)", accountID, bonus, parsed.Valid, wantBonus, wantUntil)
 		}
 	}
-	assertBonus(activeID, 20, true)
+	assertBonus(activeID, -400, true)
 	assertBonus(expiredID, 0, false)
 
 	if err := db.UpdateAccountManualScoreBonus(ctx, activeID, 0, time.Time{}); err != nil {
