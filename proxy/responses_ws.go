@@ -413,8 +413,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			ttftGuard.Stop()
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 
-			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+			if !cyberPolicy && !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
 				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
 				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
 				if rawChanged || codexChanged {
@@ -435,15 +437,15 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				}
 			}
 
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, true, false, "http")
-			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
-				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy, false, failureKind)
+			if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 			}
@@ -453,10 +455,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := codex429Decision{}
 			shouldRetry := sameAccountRetry
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 				if silentRetryEnabled && transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest) < maxRetries {
-					shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+					shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				}
 			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
@@ -1005,6 +1007,9 @@ func responsesWSUpstreamAPIError(statusCode int, body []byte) *api.APIError {
 	}
 	errCode := api.ErrCodeUpstreamError
 	errType := api.ErrorTypeUpstream
+	if upstreamCyberPolicyCode(body) != "" {
+		return api.NewAPIError(api.ErrorCode(upstreamErrorKindCyberPolicy), message, api.ErrorTypePermission)
+	}
 	switch statusCode {
 	case http.StatusTooManyRequests:
 		errCode = api.ErrCodeRateLimitReached

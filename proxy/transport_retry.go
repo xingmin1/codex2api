@@ -67,12 +67,16 @@ func (t *sameAccountRetryTarget) take(store *auth.Store, apiKeyID int64, filter 
 
 func sameAccountStreamRetryEligible(_ bool, outcome streamOutcome, wroteAnyBody bool, requestErr, writeErr error) bool {
 	return outcome.logStatusCode != http.StatusOK &&
+		outcome.failureKind != upstreamErrorKindCyberPolicy &&
 		!wroteAnyBody &&
 		requestErr == nil &&
 		writeErr == nil
 }
 
 func (t *transportRetryTracker) shouldRetryForRequest(handler *Handler, account *auth.Account, compact, eligible, timedOut bool, failureKind string) (bool, int, int) {
+	if failureKind == upstreamErrorKindCyberPolicy {
+		return false, 0, 0
+	}
 	if !compact {
 		return t.shouldRetrySameAccount(handler, account, eligible, timedOut, failureKind)
 	}
@@ -106,8 +110,8 @@ func (t *transportRetryTracker) stateMachineAttempt(attempt int, compact bool) i
 	return attempt - used
 }
 
-func (t *transportRetryTracker) shouldRetrySameAccount(handler *Handler, account *auth.Account, eligible, timedOut bool, _ string) (bool, int, int) {
-	if handler == nil || handler.store == nil || account == nil || !eligible || timedOut {
+func (t *transportRetryTracker) shouldRetrySameAccount(handler *Handler, account *auth.Account, eligible, timedOut bool, failureKind string) (bool, int, int) {
+	if handler == nil || handler.store == nil || account == nil || !eligible || timedOut || failureKind == upstreamErrorKindCyberPolicy {
 		return false, 0, 0
 	}
 

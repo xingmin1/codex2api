@@ -31,6 +31,36 @@ func sendAnthropicError(c *gin.Context, statusCode int, errType, message string)
 	})
 }
 
+func sendAnthropicCyberPolicyError(c *gin.Context, statusCode int, message string) {
+	c.JSON(statusCode, gin.H{
+		"type": "error",
+		"error": gin.H{
+			"type":    "permission_error",
+			"message": message,
+			"code":    upstreamErrorKindCyberPolicy,
+		},
+	})
+}
+
+func writeAnthropicCyberPolicyStreamError(c *gin.Context, message string) error {
+	payload, err := json.Marshal(gin.H{
+		"type": "error",
+		"error": gin.H{
+			"type":    "permission_error",
+			"message": message,
+			"code":    upstreamErrorKindCyberPolicy,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", payload); err != nil {
+		return err
+	}
+	c.Writer.Flush()
+	return nil
+}
+
 // sendAnthropicStreamError 在流式模式中发送错误事件
 func sendAnthropicStreamError(c *gin.Context, errType, message string) {
 	payload, err := json.Marshal(gin.H{
@@ -318,17 +348,19 @@ func (h *Handler) Messages(c *gin.Context) {
 			ttftGuard.Stop()
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, true, false, "http")
-			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
-				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, !cyberPolicy, false, failureKind)
+			if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry && !ShouldIgnoreFailureCooldown(account) {
+			if !sameAccountRetry && !cyberPolicy && !ShouldIgnoreFailureCooldown(account) {
 				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 					h.store.PersistUsageSnapshot(account, usagePct)
 				}
 			}
 			h.store.Release(account)
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 			}
@@ -338,9 +370,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
 			decision := codex429Decision{}
 			shouldRetry := sameAccountRetry
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
@@ -380,6 +412,10 @@ func (h *Handler) Messages(c *gin.Context) {
 			// 原样以 401 透传会让客户端误判自己的 key 失效（issue #323），改写为 503。
 			if resp.StatusCode == http.StatusUnauthorized && !isMissingScopeUnauthorized(errBody) {
 				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "账号池暂无可用账号（上游账号鉴权失效），请稍后重试")
+				return
+			}
+			if cyberPolicy {
+				sendAnthropicCyberPolicyError(c, resp.StatusCode, usageLogErrorMessage(resp.StatusCode, errBody))
 				return
 			}
 			errType := mapHTTPStatusToAnthropicError(resp.StatusCode)
@@ -459,6 +495,10 @@ func (h *Handler) Messages(c *gin.Context) {
 				if eventType == "response.failed" {
 					terminalFailurePayload = append([]byte(nil), data...)
 					gotTerminal = true
+					if upstreamCyberPolicyCode(responseFailedErrorBody(terminalFailurePayload)) != "" {
+						pendingFirstTokenEvents.Reset()
+						return false
+					}
 				}
 
 				// 翻译并写入
@@ -558,6 +598,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		ttftGuard.Stop()
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
+			h.logUpstreamCyberPolicy(c, "/v1/messages", model, responseFailedErrorBody(terminalFailurePayload))
 		}
 		if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
 			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -605,11 +646,16 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		if !sameAccountStreamRetry && !isStream {
-			if anthropicResp != nil {
+			if outcome.failureKind == upstreamErrorKindCyberPolicy {
+				sendAnthropicCyberPolicyError(c, streamFailureClientStatus(outcome), outcome.failureMessage)
+			} else if anthropicResp != nil {
 				c.JSON(http.StatusOK, anthropicResp)
 			} else {
 				sendAnthropicError(c, http.StatusBadGateway, "api_error", "No complete response received from upstream")
 			}
+		}
+		if !sameAccountStreamRetry && isStream && outcome.failureKind == upstreamErrorKindCyberPolicy && c.Request.Context().Err() == nil && writeErr == nil {
+			writeErr = writeAnthropicCyberPolicyStreamError(c, outcome.failureMessage)
 		}
 
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)

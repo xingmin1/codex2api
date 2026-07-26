@@ -944,7 +944,10 @@ func extractServiceTier(body []byte) string {
 	return gjson.GetBytes(body, "serviceTier").String()
 }
 
-const upstreamErrorKindMessageTooBig = "message_too_big"
+const (
+	upstreamErrorKindCyberPolicy   = "cyber_policy"
+	upstreamErrorKindMessageTooBig = "message_too_big"
+)
 
 func isWebsocketMessageTooBigError(err error) bool {
 	if err == nil {
@@ -1017,7 +1020,7 @@ func classifyHTTPFailureForAccount(account *auth.Account, statusCode int) string
 }
 
 func (h *Handler) reportUpstreamAttemptFailure(account *auth.Account, kind string, latency time.Duration) {
-	if h == nil || h.store == nil || account == nil {
+	if h == nil || h.store == nil || account == nil || kind == upstreamErrorKindCyberPolicy {
 		return
 	}
 	if account.IsOpenAIResponsesAPI() {
@@ -1047,6 +1050,7 @@ func isCloudflareOriginResponseTimeout(statusCode int, body []byte) bool {
 
 func shouldFallbackToLongCompactAccount(statusCode int, body []byte, account *auth.Account) bool {
 	return isCloudflareOriginResponseTimeout(statusCode, body) &&
+		upstreamCyberPolicyCode(body) == "" &&
 		!accountHasTag(account, longCompactAccountTag)
 }
 
@@ -1121,6 +1125,13 @@ func classifyResponseFailedOutcomeForAccount(account *auth.Account, payload []by
 		message = "上游返回 response.failed"
 	}
 	kind := upstreamErrorKindForAccount(account, statusCode, payload, codex429Decision{})
+	if kind == upstreamErrorKindCyberPolicy {
+		return streamOutcome{
+			logStatusCode:  statusCode,
+			failureKind:    kind,
+			failureMessage: message,
+		}
+	}
 	if kind == "" {
 		if statusCode >= 500 {
 			kind = "server"
@@ -1167,14 +1178,14 @@ func responseFailedErrorBody(payload []byte) []byte {
 // （额度耗尽/限流/5xx/401）。用于在首包前透明换号，避免把可恢复的失败帧直接下发给
 // WebSocket 客户端而触发反复 Reconnecting。非可重试故障（如 invalid_request）仍照常透传。
 func responseFailedRetryable(payload []byte) bool {
-	if len(payload) == 0 {
+	if len(payload) == 0 || upstreamCyberPolicyCode(responseFailedErrorBody(payload)) != "" {
 		return false
 	}
 	return classifyResponseFailedOutcome(payload).penalize
 }
 
 func (h *Handler) applyResponseFailedCooldown(account *auth.Account, payload []byte, resp *http.Response, model string) codex429Decision {
-	if h == nil || account == nil || len(payload) == 0 {
+	if h == nil || account == nil || len(payload) == 0 || upstreamCyberPolicyCode(responseFailedErrorBody(payload)) != "" {
 		return codex429Decision{}
 	}
 	body := responseFailedErrorBody(payload)
@@ -1205,6 +1216,8 @@ func responseFailedStatusCode(payload []byte) int {
 		gjson.GetBytes(payload, "error.type").String(),
 	}, " "))
 	switch {
+	case upstreamCyberPolicyCode(responseFailedErrorBody(payload)) != "":
+		return http.StatusForbidden
 	case strings.Contains(codeOrType, "usage_limit"):
 		return http.StatusTooManyRequests
 	case strings.Contains(codeOrType, "rate_limit"):
@@ -1232,7 +1245,7 @@ func responseFailedStatusCode(payload []byte) int {
 }
 
 func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries int, wroteAnyBody bool, ctxErr, writeErr error) bool {
-	if attempt >= maxRetries {
+	if attempt >= maxRetries || outcome.failureKind == upstreamErrorKindCyberPolicy {
 		return false
 	}
 	if !outcome.penalize {
@@ -1252,8 +1265,22 @@ func streamFailureClientStatus(outcome streamOutcome) int {
 	return statusCode
 }
 
+func streamFailureClientError(outcome streamOutcome) gin.H {
+	errInfo := gin.H{
+		"message": outcome.failureMessage,
+		"type":    "upstream_error",
+	}
+	if outcome.failureKind == upstreamErrorKindCyberPolicy {
+		errInfo["code"] = upstreamErrorKindCyberPolicy
+	}
+	return errInfo
+}
+
 func shouldSuppressRetryableResponseFailedBeforeFirstToken(eventType string, terminalFailurePayload []byte, ttftRecorded bool, wroteAnyBody bool, attempt int, maxRetries int, ctxErr, writeErr error) bool {
 	if eventType != "response.failed" {
+		return false
+	}
+	if upstreamCyberPolicyCode(responseFailedErrorBody(terminalFailurePayload)) != "" {
 		return false
 	}
 	if ttftRecorded || wroteAnyBody || ctxErr != nil || writeErr != nil {
@@ -1654,7 +1681,10 @@ func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries
 	return true
 }
 
-func shouldRetryHTTPStatusForAccount(account *auth.Account, statusCode int, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
+func shouldRetryHTTPStatusForAccount(account *auth.Account, statusCode int, body []byte, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
+	if upstreamCyberPolicyCode(body) != "" {
+		return false
+	}
 	if account != nil && account.IsOpenAIResponsesAPI() && statusCode == http.StatusTooManyRequests {
 		return shouldRetryHTTPStatus(http.StatusBadGateway, generalRetries, nil, maxGeneralRetries, 0)
 	}
@@ -1676,14 +1706,14 @@ func shouldRetryRequestError(err error, generalRetries *int, maxGeneralRetries i
 }
 
 func shouldPersistTransientUpstreamStatus(statusCode int, body []byte) bool {
-	if IsUsageLimitReachedError(body) {
+	if IsUsageLimitReachedError(body) || upstreamCyberPolicyCode(body) != "" {
 		return false
 	}
 	return statusCode >= http.StatusInternalServerError && statusCode < 600
 }
 
 func isCompactRelayBadResponseStatusCode(statusCode int, body []byte) bool {
-	if statusCode != http.StatusBadRequest || len(body) == 0 {
+	if statusCode != http.StatusBadRequest || len(body) == 0 || upstreamCyberPolicyCode(body) != "" {
 		return false
 	}
 	code := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()))
@@ -1975,6 +2005,9 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 }
 
 func upstreamErrorKindForAccount(account *auth.Account, statusCode int, body []byte, decision codex429Decision) string {
+	if upstreamCyberPolicyCode(body) != "" {
+		return upstreamErrorKindCyberPolicy
+	}
 	if account != nil && account.IsOpenAIResponsesAPI() && statusCode >= 400 {
 		return "upstream"
 	}
@@ -2428,11 +2461,13 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					sendTransientRetryCanceled(c)
 					return
 				}
+				cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+				failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 
 				compatibilityRetry := false
 				compatibilityHandled := false
 				compatibilityReport := encryptedContentCompatibilityReport{}
-				if encryptedCompatibilityEnabled && !encryptedContentCompatibilityRetried {
+				if !cyberPolicy && encryptedCompatibilityEnabled && !encryptedContentCompatibilityRetried {
 					repairedBody, report := repairResponsesEncryptedContentForError(upstreamBody, resp.StatusCode, errBody)
 					compatibilityHandled = report.Handled
 					if report.Changed {
@@ -2447,7 +2482,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 
 				explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
 				_, compatibilityRepairAlreadyUsed := encryptedContentCompatibilityBodies[account.ID()]
-				if !encryptedCompatibilityEnabled && !compatibilityRetry && !compatibilityHandled && !compatibilityRepairAlreadyUsed && shouldStripEncryptedContentForFailure(explicitInvalidEncryptedContent) {
+				if !cyberPolicy && !encryptedCompatibilityEnabled && !compatibilityRetry && !compatibilityHandled && !compatibilityRepairAlreadyUsed && shouldStripEncryptedContentForFailure(explicitInvalidEncryptedContent) {
 					message := "OpenAI Responses 上游返回错误且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
 					if explicitInvalidEncryptedContent {
 						message = "OpenAI Responses 上游拒绝 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
@@ -2462,13 +2497,13 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 
 				sameAccountRetry, sameAccountFailures, sameAccountLimit := false, 0, 0
 				if !compatibilityRetry {
-					sameAccountRetry, sameAccountFailures, sameAccountLimit = transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, true, false, "http")
+					sameAccountRetry, sameAccountFailures, sameAccountLimit = transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy, false, failureKind)
 				}
-				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
-					h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+					h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
-				if !sameAccountRetry && !compatibilityRetry {
+				if !sameAccountRetry && !compatibilityRetry && !cyberPolicy {
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					retryExclusions.MarkHard(account.ID())
 				}
@@ -2478,9 +2513,9 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 				decision := codex429Decision{}
 				shouldRetry := sameAccountRetry || compatibilityRetry
-				if !sameAccountRetry && !compatibilityRetry {
+				if !sameAccountRetry && !compatibilityRetry && !cyberPolicy {
 					decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-					shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+					shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				}
 				persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody)
 				if !sameAccountRetry && !compatibilityRetry && persistentTransient && !shouldRetry {
@@ -2608,7 +2643,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 						terminalFailurePayload = append([]byte(nil), data...)
 						gotTerminal = true
 					}
-					if eventType == "response.failed" && encryptedCompatibilityBuffering && !wroteAnyBody {
+					if eventType == "response.failed" && upstreamCyberPolicyCode(responseFailedErrorBody(terminalFailurePayload)) == "" && encryptedCompatibilityBuffering && !wroteAnyBody {
 						statusCode := responseFailedStatusCode(terminalFailurePayload)
 						repairedBody, report := repairResponsesEncryptedContentForError(upstreamBody, statusCode, terminalFailurePayload)
 						compatibilityHandled = report.Handled
@@ -2679,7 +2714,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
 					gotTerminal = true
-					if encryptedCompatibilityEnabled && !encryptedContentCompatibilityRetried && responsesPayloadIsFailed(respBody) {
+					if upstreamCyberPolicyCode(responseFailedErrorBody(respBody)) == "" && encryptedCompatibilityEnabled && !encryptedContentCompatibilityRetried && responsesPayloadIsFailed(respBody) {
 						statusCode := responseFailedStatusCode(respBody)
 						repairedBody, report := repairResponsesEncryptedContentForError(upstreamBody, statusCode, respBody)
 						compatibilityHandled = report.Handled
@@ -2773,7 +2808,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
 				c.Header("Content-Type", "application/json; charset=utf-8")
 				c.JSON(streamFailureClientStatus(outcome), gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					"error": streamFailureClientError(outcome),
 				})
 			}
 			if !sameAccountStreamRetry && !isStream && readErr != nil {
@@ -3013,9 +3048,11 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				sendTransientRetryCanceled(c)
 				return
 			}
+			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 
 			explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
-			if shouldStripEncryptedContentForFailure(explicitInvalidEncryptedContent) {
+			if !cyberPolicy && shouldStripEncryptedContentForFailure(explicitInvalidEncryptedContent) {
 				message := "上游返回错误且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d, /v1/responses)"
 				if explicitInvalidEncryptedContent {
 					message = "上游拒绝 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d, /v1/responses)"
@@ -3028,15 +3065,15 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				}
 			}
 
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, true, false, "http")
-			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
-				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy, false, failureKind)
+			if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 			}
@@ -3046,9 +3083,9 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
 			decision := codex429Decision{}
 			shouldRetry := sameAccountRetry
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody)
 			if !sameAccountRetry && persistentTransient && !shouldRetry {
@@ -3438,12 +3475,12 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
 			c.Header("Content-Type", "application/json; charset=utf-8")
 			c.JSON(streamFailureClientStatus(outcome), gin.H{
-				"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+				"error": streamFailureClientError(outcome),
 			})
 		} else if !sameAccountStreamRetry && !isStream {
 			if len(terminalFailurePayload) > 0 {
 				c.JSON(logStatusCode, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					"error": streamFailureClientError(outcome),
 				})
 			} else if responseJSON != nil {
 				c.Data(http.StatusOK, "application/json", responseJSON)
@@ -3864,10 +3901,12 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 			if resp.StatusCode != http.StatusOK {
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+				failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 
-				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, true, true, false, "http")
+				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, true, !cyberPolicy, false, failureKind)
 				fallbackToLongCompact := !sameAccountRetry && shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
-				if !fallbackToLongCompact {
+				if !cyberPolicy && !fallbackToLongCompact {
 					explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
 					if shouldStripCompactEncryptedContentForFailure(explicitInvalidEncryptedContent) {
 						message := "OpenAI Responses compact 上游返回错误且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
@@ -3878,11 +3917,11 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
-					h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+					h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
-				if !sameAccountRetry {
+				if !sameAccountRetry && !cyberPolicy {
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					excludeAccounts[account.ID()] = true
 				}
@@ -3891,9 +3930,9 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 				decision := codex429Decision{}
 				shouldRetry := sameAccountRetry
-				if !sameAccountRetry {
+				if !sameAccountRetry && !cyberPolicy {
 					decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-					shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+					shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				}
 				persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody) || isCompactRelayBadResponseStatusCode(resp.StatusCode, errBody)
 				if !sameAccountRetry && persistentTransient && !shouldRetry {
@@ -4158,10 +4197,12 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 		if resp.StatusCode != http.StatusOK {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, true, true, false, "http")
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, true, !cyberPolicy, false, failureKind)
 			fallbackToLongCompact := !sameAccountRetry && shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
-			if !fallbackToLongCompact {
+			if !cyberPolicy && !fallbackToLongCompact {
 				explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
 				if shouldStripCompactEncryptedContentForFailure(explicitInvalidEncryptedContent) {
 					message := "compact 上游返回错误且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d)"
@@ -4172,14 +4213,14 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 				}
 			}
 
-			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
-				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				excludeAccounts[account.ID()] = true
 			}
@@ -4188,9 +4229,9 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", logModel, errBody)
 			decision := codex429Decision{}
 			shouldRetry := sameAccountRetry
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			persistentTransient := shouldPersistTransientUpstreamStatus(resp.StatusCode, errBody) || isCompactRelayBadResponseStatusCode(resp.StatusCode, errBody)
 			if !sameAccountRetry && persistentTransient && !shouldRetry {
@@ -4639,15 +4680,17 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			ttftGuard.Stop()
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, true, false, "http")
-			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
-				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, !cyberPolicy, false, failureKind)
+			if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 			}
@@ -4657,9 +4700,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			h.logUpstreamCyberPolicy(c, "/v1/chat/completions", logModel, errBody)
 			decision := codex429Decision{}
 			shouldRetry := sameAccountRetry
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, attemptEffectiveModel)
-				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
@@ -4956,12 +4999,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			// 避免下游中转/计费方把它当成功并按预估 input token 计费(与回调内 reset 呼应)。
 			c.Header("Content-Type", "application/json; charset=utf-8")
 			c.JSON(logStatusCode, gin.H{
-				"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+				"error": streamFailureClientError(outcome),
 			})
 		} else if !sameAccountStreamRetry && !isStream {
 			if len(terminalFailurePayload) > 0 {
 				c.JSON(logStatusCode, gin.H{
-					"error": gin.H{"message": outcome.failureMessage, "type": "upstream_error"},
+					"error": streamFailureClientError(outcome),
 				})
 			} else if compactResult != nil {
 				c.Data(http.StatusOK, "application/json", compactResult)
@@ -5420,7 +5463,7 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 }
 
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
-	if account == nil || account.IsOpenAIResponsesAPI() {
+	if account == nil || account.IsOpenAIResponsesAPI() || upstreamCyberPolicyCode(body) != "" {
 		return codex429Decision{}
 	}
 	ignoreFailureCooldown := shouldIgnoreAccountFailureCooldown(account)
@@ -5710,6 +5753,20 @@ func (h *Handler) sendUpstreamError(c *gin.Context, statusCode int, body []byte)
 
 // sendFinalUpstreamError 重试用尽后的最终错误响应：识别 usage_limit_reached 改写为 503，其余透传
 func (h *Handler) sendFinalUpstreamError(c *gin.Context, statusCode int, body []byte) {
+	if upstreamCyberPolicyCode(body) != "" {
+		message := usageLogErrorMessage(statusCode, body)
+		if strings.TrimSpace(message) == "" {
+			message = "上游因 cyber_policy 拒绝请求"
+		}
+		c.JSON(statusCode, gin.H{
+			"error": gin.H{
+				"message": message,
+				"type":    "upstream_error",
+				"code":    upstreamErrorKindCyberPolicy,
+			},
+		})
+		return
+	}
 	if details, ok := parseUsageLimitDetails(body); ok {
 		if details.resetsInSeconds > 0 {
 			c.Header("Retry-After", fmt.Sprintf("%d", details.resetsInSeconds))

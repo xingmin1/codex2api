@@ -127,13 +127,13 @@ func (h *Handler) logPromptFilterVerdict(c *gin.Context, endpoint string, model 
 }
 
 func (h *Handler) logUpstreamCyberPolicy(c *gin.Context, endpoint string, model string, body []byte) {
+	if !markUpstreamCyberPolicy(c, body) {
+		return
+	}
 	if h == nil || h.store == nil {
 		return
 	}
-	errorCode := upstreamCyberPolicyCode(body)
-	if errorCode == "" {
-		return
-	}
+	errorCode := upstreamErrorKindCyberPolicy
 	cfg := h.store.GetPromptFilterConfig()
 	verdict := promptfilter.Verdict{
 		Enabled:   true,
@@ -147,6 +147,14 @@ func (h *Handler) logUpstreamCyberPolicy(c *gin.Context, endpoint string, model 
 		FullText: promptfilter.RedactSensitive(string(body)),
 	}
 	h.logPromptFilterVerdict(c, endpoint, model, "upstream_cyber_policy", errorCode, verdict)
+}
+
+func markUpstreamCyberPolicy(c *gin.Context, body []byte) bool {
+	if upstreamCyberPolicyCode(body) == "" {
+		return false
+	}
+	blockClientRequestReplay(c, clientRequestReplayStopCyberPolicy)
+	return true
 }
 
 func upstreamCyberPolicyCode(body []byte) string {

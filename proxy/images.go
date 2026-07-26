@@ -1451,26 +1451,28 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			lastRequestErr = nil
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, true, false, "http")
-			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
-				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, !cyberPolicy, false, failureKind)
+			if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry && !ShouldIgnoreFailureCooldown(account) {
+			if !sameAccountRetry && !cyberPolicy && !ShouldIgnoreFailureCooldown(account) {
 				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
 					h.store.PersistUsageSnapshot(account, usagePct)
 				}
 			}
 			h.store.Release(account)
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				excludeAccounts[account.ID()] = true
 			}
 			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody)
 			decision := codex429Decision{}
 			shouldRetry := sameAccountRetry
-			if !sameAccountRetry {
+			if !sameAccountRetry && !cyberPolicy {
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
-				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),

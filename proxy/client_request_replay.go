@@ -18,7 +18,10 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-const clientRequestReplayManagedKey = "client_request_replay_managed"
+const (
+	clientRequestReplayManagedKey     = "client_request_replay_managed"
+	clientRequestReplayBlockReasonKey = "client_request_replay_block_reason"
+)
 
 type clientRequestReplayStopReason string
 
@@ -28,6 +31,7 @@ const (
 	clientRequestReplayStopMaxDuration clientRequestReplayStopReason = "max_duration"
 	clientRequestReplayStopClientGone  clientRequestReplayStopReason = "client_closed"
 	clientRequestReplayStopWriteFailed clientRequestReplayStopReason = "write_failed"
+	clientRequestReplayStopCyberPolicy clientRequestReplayStopReason = "cyber_policy"
 )
 
 type clientRequestReplayControllerContextKey struct{}
@@ -382,16 +386,22 @@ func (d *clientRequestReplayDelivery) commitSSEFailure(status int, body []byte, 
 	if strings.TrimSpace(message) == "" {
 		message = fmt.Sprintf("HTTP %d", status)
 	}
+	errorCode := "client_request_replay_exhausted"
+	errorType := "server_error"
+	if reason == clientRequestReplayStopCyberPolicy {
+		errorCode = string(clientRequestReplayStopCyberPolicy)
+		errorType = "upstream_error"
+	}
 	payload, _ := json.Marshal(gin.H{
 		"type": "response.failed",
 		"response": gin.H{
 			"status": "failed",
 			"error": gin.H{
-				"code":        "client_request_replay_exhausted",
+				"code":        errorCode,
 				"message":     message,
 				"status_code": status,
 				"stop_reason": string(reason),
-				"type":        "server_error",
+				"type":        errorType,
 			},
 		},
 	})
@@ -562,6 +572,22 @@ func clientRequestReplayManaged(c *gin.Context) bool {
 	return enabled
 }
 
+func blockClientRequestReplay(c *gin.Context, reason clientRequestReplayStopReason) {
+	if c == nil || reason == "" {
+		return
+	}
+	c.Set(clientRequestReplayBlockReasonKey, reason)
+}
+
+func clientRequestReplayBlockReason(c *gin.Context) clientRequestReplayStopReason {
+	if c == nil {
+		return ""
+	}
+	reason, _ := c.Get(clientRequestReplayBlockReasonKey)
+	blocked, _ := reason.(clientRequestReplayStopReason)
+	return blocked
+}
+
 func (h *Handler) handleWithClientRequestReplay(c *gin.Context, endpoint string, attempt func(*gin.Context)) {
 	if h == nil || h.store == nil || !h.store.ClientRequestReplayEnabled() {
 		attempt(c)
@@ -660,6 +686,14 @@ func (h *Handler) handleWithClientRequestReplay(c *gin.Context, endpoint string,
 		c.Writer = downstream
 		lastStatus = writer.status
 
+		if blockedReason := clientRequestReplayBlockReason(c); blockedReason != "" {
+			controller.stop(blockedReason)
+			stopHeartbeat()
+			if delivery.hasBusinessStarted() {
+				return
+			}
+			break
+		}
 		if delivery.hasBusinessStarted() {
 			stopHeartbeat()
 			controller.succeed()

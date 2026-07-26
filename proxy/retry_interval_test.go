@@ -174,7 +174,7 @@ func TestRelay429UsesGeneralRetryBudget(t *testing.T) {
 	}
 	generalRetries := 0
 	rateLimitRetries := 0
-	if !shouldRetryHTTPStatusForAccount(account, http.StatusTooManyRequests, &generalRetries, &rateLimitRetries, 2, 1) {
+	if !shouldRetryHTTPStatusForAccount(account, http.StatusTooManyRequests, nil, &generalRetries, &rateLimitRetries, 2, 1) {
 		t.Fatal("relay 429 should use the ordinary retry path")
 	}
 	if generalRetries != 1 || rateLimitRetries != 0 {

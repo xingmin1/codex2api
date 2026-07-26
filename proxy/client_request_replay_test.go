@@ -15,6 +15,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 func newClientReplayTestHandler(t *testing.T, maxRetries, keepaliveSeconds int) *Handler {
@@ -158,6 +159,97 @@ func TestResponsesClientReplayReentersExistingSelectionAfterResponseFailed(t *te
 	_, _, _, _, _, _, _, failures := accounts[0].FailureToleranceSnapshot()
 	if failures == 0 {
 		t.Fatal("被隐藏的失败轮仍应进入账号失败时间窗")
+	}
+}
+
+func TestResponsesCyberPolicyStopsInnerAndWholeRequestReplay(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var upstreamAttempts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamAttempts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, `{"error":{"status_code":502,"code":"cyber_policy","message":"cyber security risk detected"}}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                  4,
+		MaxRetries:                      5,
+		MaxRateLimitRetries:             5,
+		ClientRequestReplayEnabled:      true,
+		ClientRequestReplayMaxRetries:   5,
+		ClientRequestReplayKeepaliveSec: 0,
+	})
+	store.SetTransportRetryPolicy("hybrid")
+	store.SetTransportSameAccountRetries(2)
+	accounts := []*auth.Account{
+		{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: upstream.URL, APIKey: "sk-first", Models: []string{"gpt-5.6-sol"}, PlanType: "api"},
+		{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: upstream.URL, APIKey: "sk-second", Models: []string{"gpt-5.6-sol"}, PlanType: "api"},
+	}
+	for _, account := range accounts {
+		store.AddAccount(account)
+	}
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	c, recorder := newClientReplayTestContext(t, true)
+	body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":"hi"}`)
+	setRawRequestBody(c, body)
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+
+	handler.Responses(c)
+
+	if got := upstreamAttempts.Load(); got != 1 {
+		t.Fatalf("upstream attempts = %d, want exactly 1", got)
+	}
+	if recorder.Code != http.StatusBadGateway || gjson.Get(recorder.Body.String(), "error.code").String() != upstreamErrorKindCyberPolicy {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	for _, account := range accounts {
+		_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
+		if failures != 0 || account.HasActiveCooldown() {
+			t.Fatalf("account %d was penalized: failures=%d cooldown=%v", account.ID(), failures, account.HasActiveCooldown())
+		}
+	}
+}
+
+func TestResponsesCyberPolicyResponseFailedStopsReplay(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var upstreamAttempts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamAttempts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"status_code":400,"code":"cyber_policy","message":"blocked by cyber policy"}}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	store := newOpenAIResponsesRelayStore(upstream.URL)
+	store.SetMaxRetries(5)
+	store.SetMaxRateLimitRetries(5)
+	store.SetTransportRetryPolicy("hybrid")
+	store.SetTransportSameAccountRetries(2)
+	store.SetClientRequestReplayEnabled(true)
+	store.SetClientRequestReplayMaxRetries(5)
+	store.SetClientRequestReplayKeepaliveSeconds(0)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	c, recorder := newClientReplayTestContext(t, true)
+	body := []byte(`{"model":"gpt-4.1-direct","stream":true,"input":"hi"}`)
+	setRawRequestBody(c, body)
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+
+	handler.Responses(c)
+
+	if got := upstreamAttempts.Load(); got != 1 {
+		t.Fatalf("upstream attempts = %d, want exactly 1", got)
+	}
+	if recorder.Code != http.StatusBadRequest || gjson.Get(recorder.Body.String(), "error.code").String() != upstreamErrorKindCyberPolicy {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	account := store.Accounts()[0]
+	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
+	if failures != 0 || account.HasActiveCooldown() {
+		t.Fatalf("account was penalized: failures=%d cooldown=%v", failures, account.HasActiveCooldown())
 	}
 }
 
@@ -670,6 +762,23 @@ func TestClientRequestReplayKeepaliveAndFinalSSEFailure(t *testing.T) {
 	}
 	if !strings.Contains(body, "response.failed") || !strings.Contains(body, "quota temporarily unavailable") {
 		t.Fatalf("保活后最终错误未转换为 SSE: %s", body)
+	}
+}
+
+func TestClientRequestReplayKeepalivePreservesCyberPolicyFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	delivery := newClientRequestReplayDelivery(c.Writer, nil, true)
+
+	if err := delivery.writeKeepalive(); err != nil {
+		t.Fatalf("writeKeepalive: %v", err)
+	}
+	delivery.commitSSEFailure(http.StatusForbidden, []byte(`{"error":{"code":"cyber_policy","message":"blocked"}}`), clientRequestReplayStopCyberPolicy)
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"code":"cyber_policy"`) || strings.Contains(body, "client_request_replay_exhausted") {
+		t.Fatalf("cyber_policy SSE failure was not preserved: %s", body)
 	}
 }
 

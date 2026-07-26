@@ -1,16 +1,20 @@
 package proxy
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // TestUpstreamCyberPolicyCodeDetectsResponseFailed 覆盖 #258：cyber_policy 封禁在
@@ -56,6 +60,108 @@ func TestUpstreamCyberPolicyCodeDetectsResponseFailed(t *testing.T) {
 				t.Fatalf("upstreamCyberPolicyCode = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestCyberPolicyIsTerminalAndDoesNotPenalizeAccount(t *testing.T) {
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example.com",
+		APIKey:       "sk-test",
+	}
+	payload := []byte(`{"type":"response.failed","response":{"error":{"status_code":502,"code":"cyber_policy","message":"cyber security risk detected"}}}`)
+	outcome := classifyResponseFailedOutcomeForAccount(account, payload)
+	if outcome.failureKind != upstreamErrorKindCyberPolicy || outcome.penalize {
+		t.Fatalf("outcome = %+v, want terminal non-penalized cyber_policy", outcome)
+	}
+	if responseFailedStatusCode([]byte(`{"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"blocked"}}}`)) != http.StatusForbidden {
+		t.Fatal("cyber_policy without status_code must map to HTTP 403")
+	}
+	if responseFailedRetryable(payload) {
+		t.Fatal("cyber_policy response.failed must not be retryable")
+	}
+
+	generalRetries, rateLimitRetries := 0, 0
+	body := responseFailedErrorBody(payload)
+	if shouldRetryHTTPStatusForAccount(account, http.StatusBadGateway, body, &generalRetries, &rateLimitRetries, 5, 5) {
+		t.Fatal("cyber_policy HTTP failure must not consume a retry")
+	}
+	if generalRetries != 0 || rateLimitRetries != 0 {
+		t.Fatalf("retry budgets changed: general=%d rate_limit=%d", generalRetries, rateLimitRetries)
+	}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	store.SetTransportRetryPolicy("sticky")
+	if retry, _, _ := newTransportRetryTracker().shouldRetrySameAccount(handler, account, true, false, upstreamErrorKindCyberPolicy); retry {
+		t.Fatal("cyber_policy must bypass sticky same-account retry")
+	}
+	handler.reportUpstreamAttemptFailure(account, upstreamErrorKindCyberPolicy, time.Millisecond)
+	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
+	if failures != 0 {
+		t.Fatalf("cyber_policy failure count = %d, want 0", failures)
+	}
+}
+
+func TestCyberPolicyDownstreamErrorsPreserveCode(t *testing.T) {
+	body := []byte(`{"error":{"code":"cyber_policy","message":"blocked"}}`)
+	wsErr := responsesWSUpstreamAPIError(http.StatusForbidden, body)
+	if string(wsErr.Code) != upstreamErrorKindCyberPolicy || wsErr.Type != "permission_error" {
+		t.Fatalf("WebSocket error = %+v", wsErr)
+	}
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	sendAnthropicCyberPolicyError(ctx, http.StatusForbidden, "blocked")
+	if got := gjson.Get(recorder.Body.String(), "error.code").String(); got != upstreamErrorKindCyberPolicy {
+		t.Fatalf("Anthropic error code = %q, body=%s", got, recorder.Body.String())
+	}
+
+	streamRecorder := httptest.NewRecorder()
+	streamCtx, _ := gin.CreateTestContext(streamRecorder)
+	if err := writeAnthropicCyberPolicyStreamError(streamCtx, "blocked"); err != nil {
+		t.Fatalf("writeAnthropicCyberPolicyStreamError: %v", err)
+	}
+	if body := streamRecorder.Body.String(); !strings.Contains(body, `event: error`) || !strings.Contains(body, `"code":"cyber_policy"`) {
+		t.Fatalf("Anthropic stream error body = %s", body)
+	}
+}
+
+func TestMessagesCyberPolicyStreamStopsRetryAndReturnsError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var upstreamAttempts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamAttempts.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"code":"cyber_policy","message":"blocked by cyber policy"}}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	store := newOpenAIResponsesRelayStore(upstream.URL)
+	store.SetMaxRetries(5)
+	store.SetTransportRetryPolicy("hybrid")
+	store.SetTransportSameAccountRetries(2)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"gpt-4.1-direct","stream":true,"max_tokens":128,"messages":[{"role":"user","content":"hi"}]}`))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.Messages(ctx)
+
+	if got := upstreamAttempts.Load(); got != 1 {
+		t.Fatalf("upstream attempts = %d, want exactly 1", got)
+	}
+	if body := recorder.Body.String(); recorder.Code != http.StatusOK || !strings.Contains(body, `event: error`) || !strings.Contains(body, `"code":"cyber_policy"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, body)
+	}
+	account := store.Accounts()[0]
+	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
+	if failures != 0 || account.HasActiveCooldown() {
+		t.Fatalf("account was penalized: failures=%d cooldown=%v", failures, account.HasActiveCooldown())
 	}
 }
 
