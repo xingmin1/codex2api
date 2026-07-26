@@ -61,6 +61,11 @@ func isFirstTokenPayload(data []byte) bool {
 	return isFirstTokenResult(gjson.ParseBytes(data))
 }
 
+// IsFirstTokenPayload 判断 Responses 事件是否包含首个可观测模型产出。
+func IsFirstTokenPayload(data []byte) bool {
+	return isFirstTokenPayload(data)
+}
+
 func isFirstTokenResult(parsed gjson.Result) bool {
 	eventType := strings.TrimSpace(parsed.Get("type").String())
 	switch eventType {

@@ -205,6 +205,8 @@ type Account struct {
 	LastCheapProbeError      string
 	CheapProbeRecoveryBonus  float64
 	CheapProbeBonusUntil     time.Time
+	ManualScoreBonus         int64
+	ManualScoreBonusUntil    time.Time
 
 	// 滑动窗口成功率（最近 N 次请求）
 	RecentResults    [20]uint8 // 1=成功, 0=失败
@@ -307,6 +309,7 @@ type SchedulerBreakdown struct {
 	UsageUrgencyBonus7d float64
 	ExpiryUrgencyBonus  float64
 	CheapProbeBonus     float64
+	ManualScoreBonus    float64
 	LatencyPenalty      float64
 	SuccessRatePenalty  float64 // 滑动窗口成功率惩罚
 }
@@ -318,6 +321,8 @@ type SchedulerDebugSnapshot struct {
 	DispatchScore            float64
 	ScoreBiasOverride        *int64
 	ScoreBiasEffective       int64
+	ManualScoreBonus         int64
+	ManualScoreBonusUntil    time.Time
 	BaseConcurrencyOverride  *int64
 	BaseConcurrencyEffective int64
 	DynamicConcurrencyLimit  int64
@@ -1158,6 +1163,21 @@ func (a *Account) effectiveScoreBiasLocked(now time.Time, tier AccountHealthTier
 	return defaultScoreBiasForPlan(a.PlanType)
 }
 
+func (a *Account) activeManualScoreBonusLocked(now time.Time) int64 {
+	if a.ManualScoreBonus <= 0 || a.ManualScoreBonusUntil.IsZero() || !now.Before(a.ManualScoreBonusUntil) {
+		return 0
+	}
+	return a.ManualScoreBonus
+}
+
+func (a *Account) clearExpiredManualScoreBonusLocked(now time.Time) {
+	if a.ManualScoreBonusUntil.IsZero() || now.Before(a.ManualScoreBonusUntil) {
+		return
+	}
+	a.ManualScoreBonus = 0
+	a.ManualScoreBonusUntil = time.Time{}
+}
+
 // expiryUrgencyBonusLocked 在订阅快到期时给账号加分,促使调度器优先消耗它。
 // <= 3d 紧急(+60) / <= 7d 警告(+25) / 其它(0)。已过期/free/api 不加分。
 func (a *Account) expiryUrgencyBonusLocked(now time.Time) float64 {
@@ -1184,6 +1204,7 @@ func (a *Account) expiryUrgencyBonusLocked(now time.Time) float64 {
 
 func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	now := time.Now()
+	a.clearExpiredManualScoreBonusLocked(now)
 	breakdown := a.schedulerBreakdownLocked(now)
 	score := 100.0 -
 		breakdown.UnauthorizedPenalty -
@@ -1235,8 +1256,9 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 		breakdown.UsageUrgencyBonus5h = a.premium5hUsageUrgencyBonusLocked(now)
 		breakdown.UsageUrgencyBonus7d = a.premium7dUsageUrgencyBonusLocked(now)
 		breakdown.ExpiryUrgencyBonus = a.expiryUrgencyBonusLocked(now)
+		breakdown.ManualScoreBonus = float64(a.activeManualScoreBonusLocked(now))
 	}
-	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d + breakdown.ExpiryUrgencyBonus + breakdown.CheapProbeBonus - a.quotaAutoPause5hGuardDispatchPenaltyLocked(now)
+	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d + breakdown.ExpiryUrgencyBonus + breakdown.CheapProbeBonus + breakdown.ManualScoreBonus - a.quotaAutoPause5hGuardDispatchPenaltyLocked(now)
 
 	a.HealthTier = tier
 	a.SchedulerScore = score
@@ -2414,6 +2436,7 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 		breakdown.UsageUrgencyBonus5h = a.premium5hUsageUrgencyBonusLocked(now)
 		breakdown.UsageUrgencyBonus7d = a.premium7dUsageUrgencyBonusLocked(now)
 		breakdown.ExpiryUrgencyBonus = a.expiryUrgencyBonusLocked(now)
+		breakdown.ManualScoreBonus = float64(a.activeManualScoreBonusLocked(now))
 	}
 	return SchedulerDebugSnapshot{
 		HealthTier:               string(a.HealthTier),
@@ -2421,6 +2444,8 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 		DispatchScore:            a.DispatchScore,
 		ScoreBiasOverride:        cloneInt64Ptr(a.ScoreBiasOverride),
 		ScoreBiasEffective:       a.ScoreBiasEffective,
+		ManualScoreBonus:         a.activeManualScoreBonusLocked(now),
+		ManualScoreBonusUntil:    a.ManualScoreBonusUntil,
 		BaseConcurrencyOverride:  cloneInt64Ptr(a.BaseConcurrencyOverride),
 		BaseConcurrencyEffective: a.BaseConcurrencyEffective,
 		DynamicConcurrencyLimit:  a.DynamicConcurrencyLimit,
@@ -2791,16 +2816,16 @@ type Store struct {
 	fastTierPolicy                atomic.Value // Fast Tier 出站策略: preserve / force_fast / filter_fast
 
 	// 重试间隔与上游错误重试策略（issue #331）
-	retryIntervalMS              atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
-	transportRetryPolicy         atomic.Value // 上游错误重试策略: rotate / sticky / hybrid
-	transportSameAccountRetries  atomic.Int64 // hybrid 下每个账号额外同号重试次数
-	compactSameAccountRetries    atomic.Int64 // compact 首账号额外同号重试次数
+	retryIntervalMS                atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
+	transportRetryPolicy           atomic.Value // 上游错误重试策略: rotate / sticky / hybrid
+	transportSameAccountRetries    atomic.Int64 // hybrid 下每个账号额外同号重试次数
+	compactSameAccountRetries      atomic.Int64 // compact 首账号额外同号重试次数
 	clientRequestReplayEnabled     atomic.Bool  // 响应提交前模拟客户端重发整个请求
 	clientRequestReplayRetries     atomic.Int64 // 原始请求失败后的额外重发次数
 	clientRequestReplayMaxDuration atomic.Int64 // 首个业务输出前的总预算秒数
 	clientRequestReplayBaseDelay   atomic.Int64 // 指数退避基础间隔毫秒数
 	clientRequestReplayMaxDelay    atomic.Int64 // 指数退避最大间隔秒数
-	clientRequestReplayKeepalive atomic.Int64 // 下游 SSE 保活间隔秒数，0 表示关闭
+	clientRequestReplayKeepalive   atomic.Int64 // 下游 SSE 保活间隔秒数，0 表示关闭
 
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
@@ -4311,6 +4336,9 @@ func (s *Store) Init(ctx context.Context) error {
 
 // loadFromDB 从数据库加载账号
 func (s *Store) loadFromDB(ctx context.Context) error {
+	if err := s.db.ClearExpiredAccountManualScoreBonuses(ctx, time.Now()); err != nil {
+		log.Printf("清理过期临时调度加分失败: %v", err)
+	}
 	rows, err := s.db.ListActive(ctx)
 	if err != nil {
 		return fmt.Errorf("从数据库加载账号失败: %w", err)
@@ -4398,6 +4426,10 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
 	account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
+	if row.ManualScoreBonus > 0 && row.ManualScoreBonusUntil.Valid && time.Now().Before(row.ManualScoreBonusUntil.Time) {
+		account.ManualScoreBonus = row.ManualScoreBonus
+		account.ManualScoreBonusUntil = row.ManualScoreBonusUntil.Time
+	}
 	account.setAllowedAPIKeyIDsLocked(row.GetCredentialInt64Slice("allowed_api_key_ids"))
 	account.Tags = cloneStringSlice(row.Tags)
 	if row.Locked {
@@ -4658,6 +4690,13 @@ func (s *Store) StartBackgroundRefresh() {
 				resetCheapProbeTimer()
 			case <-autoCleanupTicker.C:
 				s.TriggerAutoCleanupAsync()
+				if s.db != nil {
+					go func() {
+						if err := s.db.ClearExpiredAccountManualScoreBonuses(context.Background(), time.Now()); err != nil {
+							log.Printf("清理过期临时调度加分失败: %v", err)
+						}
+					}()
+				}
 			case <-fullUsageCleanupTicker.C:
 				if s.GetAutoCleanFullUsage() && !s.GetLazyMode() {
 					go s.CleanFullUsageAccounts(context.Background())
@@ -6373,6 +6412,27 @@ func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, ba
 	if skipWarmTier != nil {
 		acc.SkipWarmTier = *skipWarmTier
 	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	s.markCheapProbeTopologyChanged()
+	return true
+}
+
+// ApplyAccountManualScoreBonus 替换账号的临时调度加分并立即重算；bonus 为零时清除。
+func (s *Store) ApplyAccountManualScoreBonus(dbID int64, bonus int64, until time.Time) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	if bonus <= 0 || until.IsZero() || !time.Now().Before(until) {
+		bonus = 0
+		until = time.Time{}
+	}
+
+	acc.mu.Lock()
+	acc.ManualScoreBonus = bonus
+	acc.ManualScoreBonusUntil = until
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)

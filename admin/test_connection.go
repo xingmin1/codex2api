@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -161,7 +162,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	gotTerminal := false
 	sentTerminal := false
 	var lastUpstreamEvent []byte
+	observeFirstToken := h.newAccountFirstTokenObserver(account, database.FirstTokenSourceManualProbe, testModel, start)
 	readErr := proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
+		observeFirstToken(data)
 		lastUpstreamEvent = append(lastUpstreamEvent[:0], data...)
 		eventType := gjson.GetBytes(data, "type").String()
 
@@ -947,7 +950,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 				return "rate_limited", msg
 			}
 		}
-		status, msg := h.readBatchTestStreamResult(testCtx, acc, resp, testModel)
+		status, msg := h.readBatchTestStreamResult(testCtx, acc, resp, testModel, start)
 		if status != "success" {
 			return status, msg
 		}
@@ -1020,6 +1023,7 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 		return "failed", modelErr.Error()
 	}
 	payload := buildConnectionTestPayload(h.store, testModel)
+	start := time.Now()
 
 	var resp *http.Response
 	var err error
@@ -1045,7 +1049,7 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 				return "rate_limited", msg
 			}
 		}
-		return readRecycleBinTestStream(testCtx, resp)
+		return h.readRecycleBinTestStream(testCtx, acc, resp, testModel, start)
 	case http.StatusUnauthorized:
 		body, _ := readBatchTestErrorBody(testCtx, resp.Body)
 		return "banned", fmt.Sprintf("上游返回 401: %s", truncate(string(body), 300))
@@ -1066,14 +1070,16 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 
 // readRecycleBinTestStream 读取测试 SSE 流并判定结果；与
 // readBatchTestStreamResult 等价，但不回写任何账号状态。
-func readRecycleBinTestStream(ctx context.Context, resp *http.Response) (string, string) {
+func (h *Handler) readRecycleBinTestStream(ctx context.Context, acc *auth.Account, resp *http.Response, model string, startedAt time.Time) (string, string) {
 	hasContent := false
 	gotTerminal := false
 	resultStatus := ""
 	resultMessage := ""
 	var lastUpstreamEvent []byte
+	observeFirstToken := h.newAccountFirstTokenObserver(acc, database.FirstTokenSourceManualProbe, model, startedAt)
 
 	readErr := proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
+		observeFirstToken(data)
 		lastUpstreamEvent = append(lastUpstreamEvent[:0], data...)
 		switch gjson.GetBytes(data, "type").String() {
 		case "response.output_text.delta":
@@ -1184,14 +1190,16 @@ func (h *Handler) batchTestWhamPreflight(ctx context.Context, acc *auth.Account)
 	return "", "", false
 }
 
-func (h *Handler) readBatchTestStreamResult(ctx context.Context, acc *auth.Account, resp *http.Response, model string) (string, string) {
+func (h *Handler) readBatchTestStreamResult(ctx context.Context, acc *auth.Account, resp *http.Response, model string, startedAt time.Time) (string, string) {
 	hasContent := false
 	gotTerminal := false
 	resultStatus := ""
 	resultMessage := ""
 	var lastUpstreamEvent []byte
+	observeFirstToken := h.newAccountFirstTokenObserver(acc, database.FirstTokenSourceManualProbe, model, startedAt)
 
 	readErr := proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
+		observeFirstToken(data)
 		lastUpstreamEvent = append(lastUpstreamEvent[:0], data...)
 		eventType := gjson.GetBytes(data, "type").String()
 

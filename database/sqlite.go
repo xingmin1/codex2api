@@ -100,6 +100,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			cooldown_until TIMESTAMP NULL,
 			score_bias_override INTEGER NULL,
 			base_concurrency_override INTEGER NULL,
+			manual_score_bonus INTEGER NOT NULL DEFAULT 0,
+			manual_score_bonus_until TIMESTAMP NULL,
 			skip_warm_tier INTEGER DEFAULT 0,
 			error_message TEXT DEFAULT '',
 			deleted_at TIMESTAMP NULL,
@@ -144,6 +146,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			image_format TEXT DEFAULT '',
 			image_size TEXT DEFAULT '',
 			error_message TEXT DEFAULT ''
+			);`,
+		`CREATE TABLE IF NOT EXISTS account_first_token_samples (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			account_id INTEGER NOT NULL,
+			source TEXT NOT NULL,
+			model TEXT DEFAULT '',
+			first_token_ms INTEGER NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);`,
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -388,6 +398,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"accounts", "cooldown_until", "TIMESTAMP NULL"},
 		{"accounts", "score_bias_override", "INTEGER NULL"},
 		{"accounts", "base_concurrency_override", "INTEGER NULL"},
+		{"accounts", "manual_score_bonus", "INTEGER NOT NULL DEFAULT 0"},
+		{"accounts", "manual_score_bonus_until", "TIMESTAMP NULL"},
 		{"accounts", "tags", "TEXT DEFAULT '[]'"},
 		{"accounts", "deleted_at", "TIMESTAMP NULL"},
 		{"usage_logs", "input_tokens", "INTEGER DEFAULT 0"},
@@ -577,6 +589,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_created_at ON usage_logs(account_id, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_first_token_account_created ON account_first_token_samples(account_id, created_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_account_first_token_created ON account_first_token_samples(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_api_key_created_at ON usage_logs(api_key_id, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_api_keys_expires_at ON api_keys(expires_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_account_group_members_group ON account_group_members(group_id);`,

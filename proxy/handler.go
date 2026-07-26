@@ -723,7 +723,26 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateClientIPFromRequest(c, input)
 	populateCompactUsageMetaFromRequest(c, input)
 	markCyberPolicyUsageKind(input)
+	h.recordAccountFirstTokenSample(input)
 	h.logUsage(input)
+}
+
+func (h *Handler) recordAccountFirstTokenSample(input *database.UsageLogInput) {
+	if h == nil || h.db == nil || input == nil || input.AccountID <= 0 || input.FirstTokenMs <= 0 {
+		return
+	}
+	model := input.EffectiveModel
+	if model == "" {
+		model = input.Model
+	}
+	if err := h.db.InsertAccountFirstTokenSample(context.Background(), &database.AccountFirstTokenSample{
+		AccountID:    input.AccountID,
+		Source:       database.FirstTokenSourceNormal,
+		Model:        model,
+		FirstTokenMs: input.FirstTokenMs,
+	}); err != nil {
+		log.Printf("记录账号首字样本失败 (account %d): %v", input.AccountID, err)
+	}
 }
 
 func (h *Handler) logSameAccountRetryRequestError(c *gin.Context, input *database.UsageLogInput, attempt int, kind string, err error) {

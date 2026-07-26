@@ -101,6 +101,8 @@ import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
 import AccountHealthBar from "../components/AccountHealthBar";
 import AccountDetailSheet from "../components/AccountDetailSheet";
+import AccountFirstTokenStatsView from "../components/AccountFirstTokenStatsView";
+import AccountManualScoreBonusBadge from "../components/AccountManualScoreBonusBadge";
 import CodexInviteView from "../components/CodexInviteView";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
@@ -130,6 +132,7 @@ const ACCOUNT_TABLE_COLUMNS = [
   "plan",
   "status",
   "requests",
+  "firstToken",
   "usage",
   "priceMultiplier",
   "billed",
@@ -991,6 +994,12 @@ export default function Accounts() {
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null);
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null);
   const [detailAccountId, setDetailAccountId] = useState<number | null>(null);
+  const [manualBonusAccount, setManualBonusAccount] =
+    useState<AccountRow | null>(null);
+  const [manualBonusInput, setManualBonusInput] = useState("30");
+  const [manualBonusDurationInput, setManualBonusDurationInput] =
+    useState("30");
+  const [manualBonusSubmitting, setManualBonusSubmitting] = useState(false);
   const [editingAccount, setEditingAccount] = useState<AccountRow | null>(null);
   const [editSubmitting, setEditSubmitting] = useState(false);
   const [editTab, setEditTab] = useState<"scheduler" | "account">("scheduler");
@@ -2054,6 +2063,90 @@ export default function Accounts() {
   const closeAccountDetail = useCallback(() => {
     setDetailAccountId(null);
   }, []);
+  const openManualScoreBonus = useCallback((account: AccountRow) => {
+    setManualBonusAccount(account);
+    setManualBonusInput(
+      (account.manual_score_bonus ?? 0) > 0
+        ? String(account.manual_score_bonus)
+        : "30",
+    );
+    setManualBonusDurationInput("30");
+  }, []);
+  const closeManualScoreBonus = useCallback(() => {
+    if (manualBonusSubmitting) return;
+    setManualBonusAccount(null);
+  }, [manualBonusSubmitting]);
+  const saveManualScoreBonus = useCallback(async () => {
+    if (!manualBonusAccount || manualBonusSubmitting) return;
+    const bonus = Number(manualBonusInput);
+    const durationMinutes = Number(manualBonusDurationInput);
+    if (!Number.isInteger(bonus) || bonus < 1 || bonus > 200) {
+      showToast(t("accounts.manualScoreBonusRange"), "error");
+      return;
+    }
+    if (
+      !Number.isInteger(durationMinutes) ||
+      durationMinutes < 1 ||
+      durationMinutes > 1440
+    ) {
+      showToast(t("accounts.manualScoreBonusDurationRange"), "error");
+      return;
+    }
+
+    setManualBonusSubmitting(true);
+    try {
+      await api.setAccountManualScoreBonus(
+        manualBonusAccount.id,
+        bonus,
+        durationMinutes * 60,
+      );
+      await reloadSilently();
+      setManualBonusAccount(null);
+      showToast(t("accounts.manualScoreBonusSaved"));
+    } catch (error) {
+      showToast(
+        t("accounts.manualScoreBonusFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setManualBonusSubmitting(false);
+    }
+  }, [
+    manualBonusAccount,
+    manualBonusDurationInput,
+    manualBonusInput,
+    manualBonusSubmitting,
+    reloadSilently,
+    showToast,
+    t,
+  ]);
+  const clearManualScoreBonus = useCallback(async () => {
+    if (!manualBonusAccount || manualBonusSubmitting) return;
+    setManualBonusSubmitting(true);
+    try {
+      await api.clearAccountManualScoreBonus(manualBonusAccount.id);
+      await reloadSilently();
+      setManualBonusAccount(null);
+      showToast(t("accounts.manualScoreBonusCleared"));
+    } catch (error) {
+      showToast(
+        t("accounts.manualScoreBonusFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setManualBonusSubmitting(false);
+    }
+  }, [
+    manualBonusAccount,
+    manualBonusSubmitting,
+    reloadSilently,
+    showToast,
+    t,
+  ]);
   const goDetailPrev = useCallback(() => {
     if (detailNavIndex <= 0) return;
     setDetailAccountId(sortedAccounts[detailNavIndex - 1]?.id ?? null);
@@ -4838,9 +4931,10 @@ export default function Accounts() {
                       plan: t("accounts.plan"),
                       tags: t("accounts.tagsLabel"),
                       groups: t("accounts.groupsLabel"),
-		                      status: t("accounts.status"),
-		                      requests: t("accounts.requests"),
-		                      usage: t("accounts.usage"),
+			                      status: t("accounts.status"),
+			                      requests: t("accounts.requests"),
+			                      firstToken: t("accounts.firstTokenColumn"),
+			                      usage: t("accounts.usage"),
 		                      priceMultiplier: t("accounts.priceMultiplierShort"),
 		                      billed: t("accounts.billed"),
                       priority: t("accounts.schedulerPriorityColumn"),
@@ -5245,6 +5339,11 @@ export default function Accounts() {
                               : ""}
                           </TableHead>
                         )}
+                        {visibleColumns.firstToken && (
+                          <TableHead className="text-[13px] font-semibold">
+                            {t("accounts.firstTokenColumn")}
+                          </TableHead>
+                        )}
                         {visibleColumns.usage && (
                           <TableHead
                             className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
@@ -5523,6 +5622,15 @@ export default function Accounts() {
                                       errorMessage={account.error_message}
                                     />
                                     <AccountStatusCountdown account={account} />
+                                    {(account.manual_score_bonus ?? 0) > 0 && (
+                                      <AccountManualScoreBonusBadge
+                                        account={account}
+                                        className="h-6"
+                                        onClick={() => {
+                                          openManualScoreBonus(account);
+                                        }}
+                                      />
+                                    )}
                                     {(account.active_requests ?? 0) > 0 && (
                                       <span
                                         className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 dark:text-blue-400"
@@ -5566,6 +5674,13 @@ export default function Accounts() {
                                     </div>
                                   )}
                                 </div>
+                              </TableCell>
+                            )}
+                            {visibleColumns.firstToken && (
+                              <TableCell>
+                                <AccountFirstTokenStatsView
+                                  stats={account.first_token_stats}
+                                />
                               </TableCell>
                             )}
                             {visibleColumns.usage && (
@@ -6766,6 +6881,10 @@ export default function Accounts() {
               if (!detailAccount) return;
               openSchedulerEditor(detailAccount);
             }}
+            onManualScoreBonus={() => {
+              if (!detailAccount) return;
+              openManualScoreBonus(detailAccount);
+            }}
             onUsage={() => {
               if (!detailAccount) return;
               setUsageAccount(detailAccount);
@@ -6803,6 +6922,101 @@ export default function Accounts() {
               void handleDelete(detailAccount);
             }}
           />
+
+          <Modal
+            show={Boolean(manualBonusAccount)}
+            title={t("accounts.manualScoreBonusTitle")}
+            contentClassName="sm:max-w-[420px]"
+            bodyClassName="space-y-4"
+            onClose={closeManualScoreBonus}
+            footer={
+              <>
+                {(manualBonusAccount?.manual_score_bonus ?? 0) > 0 && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={manualBonusSubmitting}
+                    onClick={() => void clearManualScoreBonus()}
+                  >
+                    {t("accounts.manualScoreBonusClear")}
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={manualBonusSubmitting}
+                  onClick={closeManualScoreBonus}
+                >
+                  {t("common.cancel")}
+                </Button>
+                <Button
+                  type="button"
+                  disabled={manualBonusSubmitting}
+                  onClick={() => void saveManualScoreBonus()}
+                >
+                  {manualBonusSubmitting
+                    ? t("common.saving")
+                    : t("common.save")}
+                </Button>
+              </>
+            }
+          >
+            <p className="text-[13px] leading-relaxed text-muted-foreground">
+              {t("accounts.manualScoreBonusDescription")}
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="space-y-1.5">
+                <span className="text-xs font-semibold text-muted-foreground">
+                  {t("accounts.manualScoreBonusValue")}
+                </span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={200}
+                  step={1}
+                  value={manualBonusInput}
+                  disabled={manualBonusSubmitting}
+                  onChange={(event) => setManualBonusInput(event.target.value)}
+                />
+              </label>
+              <label className="space-y-1.5">
+                <span className="text-xs font-semibold text-muted-foreground">
+                  {t("accounts.manualScoreBonusDuration")}
+                </span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  step={1}
+                  value={manualBonusDurationInput}
+                  disabled={manualBonusSubmitting}
+                  onChange={(event) =>
+                    setManualBonusDurationInput(event.target.value)
+                  }
+                />
+              </label>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {[30, 60, 360, 1440].map((minutes) => (
+                <Button
+                  key={minutes}
+                  type="button"
+                  variant={
+                    manualBonusDurationInput === String(minutes)
+                      ? "secondary"
+                      : "outline"
+                  }
+                  size="xs"
+                  disabled={manualBonusSubmitting}
+                  onClick={() =>
+                    setManualBonusDurationInput(String(minutes))
+                  }
+                >
+                  {minutes < 60 ? `${minutes}m` : `${minutes / 60}h`}
+                </Button>
+              ))}
+            </div>
+          </Modal>
 
           <Modal
             show={Boolean(editingAccount)}

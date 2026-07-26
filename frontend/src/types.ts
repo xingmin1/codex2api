@@ -25,6 +25,20 @@ export interface AccountUsageWindow {
   user_billed?: number
 }
 
+export interface AccountFirstTokenWindowStats {
+  window_seconds: number
+  sample_limit?: number
+  average_ms: number
+  maximum_ms: number
+  sample_count: number
+  last_sample_at?: ISODateString
+}
+
+export interface AccountFirstTokenStats {
+  short: AccountFirstTokenWindowStats
+  long: AccountFirstTokenWindowStats
+}
+
 export interface AccountRow {
   id: number
   name: string
@@ -49,6 +63,9 @@ export interface AccountRow {
   dispatch_score?: number
   score_bias_override?: number | null
   score_bias_effective?: number
+  manual_score_bonus?: number
+  manual_score_bonus_until?: ISODateString
+  manual_score_bonus_remaining_seconds?: number
   base_concurrency_override?: number | null
   base_concurrency_effective?: number
   skip_warm_tier?: boolean
@@ -67,6 +84,7 @@ export interface AccountRow {
     usage_urgency_bonus_5h?: number
     usage_urgency_bonus_7d?: number
     expiry_urgency_bonus?: number
+    manual_score_bonus?: number
     cheap_probe_bonus?: number
     latency_penalty: number
     success_rate_penalty?: number
@@ -125,6 +143,7 @@ export interface AccountRow {
   ignore_usage_limit_status_effective?: boolean
   dispatch_count_limit?: number | null
   scheduler_priority?: number | null
+  first_token_stats?: AccountFirstTokenStats
   dispatch_count_used?: number
   dispatch_count_reset_at?: ISODateString
   dispatch_count_limited?: boolean

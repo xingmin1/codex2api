@@ -294,6 +294,23 @@ export const api = {
     }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
+  setAccountManualScoreBonus: (id: number, bonus: number, durationSeconds = 1800) =>
+    request<{
+      manual_score_bonus: number
+      manual_score_bonus_until: string
+      manual_score_bonus_remaining_seconds: number
+      dispatch_score: number
+    }>(`/accounts/${id}/manual-score-bonus`, {
+      method: 'PUT',
+      body: JSON.stringify({ bonus, duration_seconds: durationSeconds }),
+    }),
+  clearAccountManualScoreBonus: (id: number) =>
+    request<{
+      manual_score_bonus: number
+      manual_score_bonus_until: string
+      manual_score_bonus_remaining_seconds: number
+      dispatch_score: number
+    }>(`/accounts/${id}/manual-score-bonus`, { method: 'DELETE' }),
   listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
   createAccountGroup: (data: CreateAccountGroupRequest) =>
     request<{ id: number; message: string }>('/account-groups', { method: 'POST', body: JSON.stringify(data) }),

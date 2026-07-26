@@ -66,6 +66,8 @@ type AccountRow struct {
 	SkipWarmTier            bool
 	ScoreBiasOverride       sql.NullInt64
 	BaseConcurrencyOverride sql.NullInt64
+	ManualScoreBonus        int64
+	ManualScoreBonusUntil   sql.NullTime
 	Tags                    []string
 	CreatedAt               time.Time
 	UpdatedAt               time.Time
@@ -224,10 +226,12 @@ type DB struct {
 	driver string
 
 	// 使用日志批量写入缓冲
-	logBuf  []usageLogEntry
-	logMu   sync.Mutex
-	logStop chan struct{}
-	logWg   sync.WaitGroup
+	logBuf              []usageLogEntry
+	firstTokenBuf       []AccountFirstTokenSample
+	logMu               sync.Mutex
+	logStop             chan struct{}
+	logWg               sync.WaitGroup
+	firstTokenCleanupAt int64
 
 	usageLogMode          atomic.Value // string: full|errors|off
 	usageLogBatchSize     int64
@@ -632,6 +636,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS score_bias_override INT NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS base_concurrency_override INT NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS manual_score_bonus INT NOT NULL DEFAULT 0;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS manual_score_bonus_until TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS image_quota_remaining INT NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS image_quota_total INT NULL;
@@ -698,6 +704,19 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_account_created_at ON usage_logs(account_id, created_at);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);
+
+	CREATE TABLE IF NOT EXISTS account_first_token_samples (
+		id             BIGSERIAL PRIMARY KEY,
+		account_id     BIGINT NOT NULL,
+		source         VARCHAR(32) NOT NULL,
+		model          VARCHAR(100) DEFAULT '',
+		first_token_ms INT NOT NULL,
+		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_account_first_token_account_created
+		ON account_first_token_samples(account_id, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_account_first_token_created
+		ON account_first_token_samples(created_at);
 
 	-- 增强字段（向后兼容 ALTER）
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS input_tokens INT DEFAULT 0;
@@ -2656,32 +2675,41 @@ func stopTimer(timer *time.Timer) {
 // flushLogs 将缓冲中的日志批量写入 PG
 func (db *DB) flushLogs() {
 	db.logMu.Lock()
-	if len(db.logBuf) == 0 {
+	if len(db.logBuf) == 0 && len(db.firstTokenBuf) == 0 {
 		db.logMu.Unlock()
 		return
 	}
-	batch := db.logBuf
+	usageBatch := db.logBuf
+	firstTokenBatch := db.firstTokenBuf
 	db.logBuf = make([]usageLogEntry, 0, db.GetUsageLogBatchSize())
+	db.firstTokenBuf = make([]AccountFirstTokenSample, 0, db.GetUsageLogBatchSize())
 	db.logMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
 
-	var err error
-	// 使用批处理插入优化性能
-	if db.driver == "postgres" {
-		err = db.batchInsertLogs(ctx, batch)
-	} else {
-		err = db.insertSQLiteUsageLogBatch(ctx, batch)
-	}
-	if err != nil {
-		log.Printf("批量写入日志失败，已重新放回缓冲区等待重试: %v", err)
-		db.requeueUsageLogBatch(batch)
-		return
+	if len(usageBatch) > 0 {
+		var err error
+		if db.driver == "postgres" {
+			err = db.batchInsertLogs(ctx, usageBatch)
+		} else {
+			err = db.insertSQLiteUsageLogBatch(ctx, usageBatch)
+		}
+		if err != nil {
+			log.Printf("批量写入日志失败，已重新放回缓冲区等待重试: %v", err)
+			db.requeueUsageLogBatch(usageBatch)
+		} else if len(usageBatch) > 10 {
+			log.Printf("批量写入 %d 条使用日志", len(usageBatch))
+		}
 	}
 
-	if len(batch) > 10 {
-		log.Printf("批量写入 %d 条使用日志", len(batch))
+	if len(firstTokenBatch) > 0 {
+		if err := db.insertAccountFirstTokenBatch(ctx, firstTokenBatch); err != nil {
+			log.Printf("批量写入首字样本失败，已重新放回缓冲区等待重试: %v", err)
+			db.requeueAccountFirstTokenBatch(firstTokenBatch)
+		} else if err := db.maybeCleanupAccountFirstTokenSamples(ctx, time.Now()); err != nil {
+			log.Printf("清理过期首字样本失败: %v", err)
+		}
 	}
 }
 
@@ -4417,7 +4445,7 @@ func (db *DB) getAccountsBilledSinceChunk(ctx context.Context, ids []int64, wind
 // ListActive 获取所有未删除账号。
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(manual_score_bonus, 0), manual_score_bonus_until, COALESCE(tags, '[]'), created_at, updated_at
 		FROM accounts
 		WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
 		ORDER BY id
@@ -4433,6 +4461,7 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		a := &AccountRow{}
 		var credRaw interface{}
 		var cooldownUntilRaw interface{}
+		var manualScoreBonusUntilRaw interface{}
 		var tagsRaw interface{}
 		var createdAtRaw interface{}
 		var updatedAtRaw interface{}
@@ -4454,6 +4483,8 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&a.SkipWarmTier,
 			&a.ScoreBiasOverride,
 			&a.BaseConcurrencyOverride,
+			&a.ManualScoreBonus,
+			&manualScoreBonusUntilRaw,
 			&tagsRaw,
 			&createdAtRaw,
 			&updatedAtRaw,
@@ -4465,6 +4496,10 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 		a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
 		if err != nil {
 			return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+		}
+		a.ManualScoreBonusUntil, err = parseDBNullTimeValue(manualScoreBonusUntilRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 manual_score_bonus_until 失败: %w", err)
 		}
 		a.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 		if err != nil {
@@ -4575,7 +4610,7 @@ func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool)
 		deletedFilter = ""
 	}
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(manual_score_bonus, 0), manual_score_bonus_until, COALESCE(tags, '[]'), created_at, updated_at
 		FROM accounts
 		WHERE id = $1 ` + deletedFilter + `
 		LIMIT 1
@@ -4583,6 +4618,7 @@ func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool)
 	a := &AccountRow{}
 	var credRaw interface{}
 	var cooldownUntilRaw interface{}
+	var manualScoreBonusUntilRaw interface{}
 	var tagsRaw interface{}
 	var createdAtRaw interface{}
 	var updatedAtRaw interface{}
@@ -4604,6 +4640,8 @@ func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool)
 		&a.SkipWarmTier,
 		&a.ScoreBiasOverride,
 		&a.BaseConcurrencyOverride,
+		&a.ManualScoreBonus,
+		&manualScoreBonusUntilRaw,
 		&tagsRaw,
 		&createdAtRaw,
 		&updatedAtRaw,
@@ -4619,6 +4657,10 @@ func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool)
 	a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
 	if err != nil {
 		return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+	}
+	a.ManualScoreBonusUntil, err = parseDBNullTimeValue(manualScoreBonusUntilRaw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 manual_score_bonus_until 失败: %w", err)
 	}
 	a.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 	if err != nil {

@@ -20,7 +20,9 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
+import AccountFirstTokenStatsView from "./AccountFirstTokenStatsView";
 import AccountHealthBar from "./AccountHealthBar";
+import AccountManualScoreBonusBadge from "./AccountManualScoreBonusBadge";
 import StatusBadge from "./StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -107,6 +109,7 @@ export interface AccountDetailSheetProps {
   onPrev?: () => void;
   onNext?: () => void;
   onEdit: () => void;
+  onManualScoreBonus: () => void;
   onUsage: () => void;
   onTest: () => void;
   onRefresh: () => void;
@@ -132,6 +135,7 @@ export default function AccountDetailSheet({
   onPrev,
   onNext,
   onEdit,
+  onManualScoreBonus,
   onUsage,
   onTest,
   onRefresh,
@@ -302,14 +306,21 @@ export default function AccountDetailSheet({
                   )}
                 </div>
 
-                <div className="text-[12px] text-muted-foreground">
-                  {t("accounts.healthSummary", {
-                    health: healthLabel,
-                    score: Math.round(
-                      account.dispatch_score ?? account.scheduler_score ?? 0,
-                    ),
-                    concurrency: account.dynamic_concurrency_limit ?? "-",
-                  })}
+                <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-muted-foreground">
+                  <span>
+                    {t("accounts.healthSummary", {
+                      health: healthLabel,
+                      score: Math.round(
+                        account.dispatch_score ?? account.scheduler_score ?? 0,
+                      ),
+                      concurrency: account.dynamic_concurrency_limit ?? "-",
+                    })}
+                  </span>
+                  <AccountManualScoreBonusBadge
+                    account={account}
+                    onClick={onManualScoreBonus}
+                    showEmpty
+                  />
                 </div>
 
                 <div className="space-y-1">
@@ -337,6 +348,13 @@ export default function AccountDetailSheet({
                   </div>
                 ) : null}
               </div>
+            </Section>
+
+            <Section title={t("accounts.firstTokenStats") }>
+              <AccountFirstTokenStatsView
+                stats={account.first_token_stats}
+                variant="detail"
+              />
             </Section>
 
             <Section
