@@ -412,16 +412,26 @@ func (h *Handler) qualityEvalAccount(accountID int64) (*auth.Account, error) {
 	if account == nil {
 		return nil, fmt.Errorf("账号不在运行时池中")
 	}
-	if account.IsOpenAIResponsesAPI() {
-		return nil, fmt.Errorf("Responses API 账号不支持固定 Codex 质量检测")
+	if !qualityEvalSupportedByAccount(account) {
+		return nil, fmt.Errorf("该 API 账号未配置质量检测模型 %s", qualityEvalModel)
 	}
-	if !account.IsAvailable() || strings.TrimSpace(account.GetAccessToken()) == "" {
+	if !account.IsAvailable() {
+		return nil, fmt.Errorf("账号当前不可用")
+	}
+	if !account.IsOpenAIResponsesAPI() && strings.TrimSpace(account.GetAccessToken()) == "" {
 		return nil, fmt.Errorf("账号当前不可用或缺少 Access Token")
 	}
 	if !isSupportedConnectionTestModel(qualityEvalModel) {
 		return nil, fmt.Errorf("服务当前未注册质量检测模型 %s", qualityEvalModel)
 	}
 	return account, nil
+}
+
+func qualityEvalSupportedByAccount(account *auth.Account) bool {
+	if account == nil {
+		return false
+	}
+	return !account.IsOpenAIResponsesAPI() || account.SupportsOpenAIResponsesModel(qualityEvalModel)
 }
 
 func (h *Handler) executeQualityEvalBatch(ctx context.Context, account *auth.Account, batch database.QualityEvalBatch, onSample func(database.QualityEvalSample)) database.QualityEvalBatch {
@@ -632,6 +642,9 @@ func (h *Handler) executeQualityEvalRequest(parent context.Context, account *aut
 	execute := h.qualityEvalExecute
 	if execute == nil {
 		execute = func(ctx context.Context, account *auth.Account, payload []byte) (*http.Response, error) {
+			if account.IsOpenAIResponsesAPI() {
+				return proxy.ExecuteOpenAIResponsesRequest(ctx, account, payload, h.store.ResolveProxyForAccount(account), nil)
+			}
 			return proxy.ExecuteRequest(ctx, account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil, false)
 		}
 	}

@@ -211,6 +211,10 @@ function getDefaultAccountVisibleColumns(): Record<
   ) as Record<AccountTableColumn, boolean>;
 }
 
+function accountSupportsQualityEval(account: AccountRow): boolean {
+  return account.quality_eval_supported ?? !account.openai_responses_api;
+}
+
 function getInitialAccountVisibleColumns(): Record<
   AccountTableColumn,
   boolean
@@ -5691,12 +5695,10 @@ export default function Accounts() {
                                         }}
                                       />
                                     )}
-	                                    {!account.openai_responses_api && (
-	                                      <AccountQualityEvalBadge
-	                                        account={account}
+	                                    <AccountQualityEvalBadge
+	                                      account={account}
                                         onClick={() => void openQualityEval(account)}
-                                      />
-                                    )}
+	                                    />
                                     {(account.active_requests ?? 0) > 0 && (
                                       <span
                                         className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 dark:text-blue-400"
@@ -5830,17 +5832,16 @@ export default function Accounts() {
                                   >
 	                                    <Zap className="size-3.5" />
 	                                  </Button>
-	                                  {!account.openai_responses_api && (
-	                                    <Button
-	                                      variant="ghost"
-	                                      size="icon-sm"
-	                                      className="size-8"
-	                                      onClick={() => void openQualityEval(account)}
-	                                      title={t("accounts.qualityEval")}
-	                                    >
-	                                      <FlaskConical className="size-3.5" />
-	                                    </Button>
-	                                  )}
+	                                  <Button
+	                                    variant="ghost"
+	                                    size="icon-sm"
+	                                    className="size-8"
+	                                    disabled={!accountSupportsQualityEval(account)}
+	                                    onClick={() => void openQualityEval(account)}
+	                                    title={t(accountSupportsQualityEval(account) ? "accounts.qualityEval" : "accounts.qualityEvalUnsupported")}
+	                                  >
+	                                    <FlaskConical className="size-3.5" />
+	                                  </Button>
                                   <Button
                                     variant="ghost"
                                     size="icon-sm"
@@ -6539,14 +6540,14 @@ export default function Accounts() {
               {t("accounts.qualityEvalDescription")}
             </div>
             <div className="grid gap-2 sm:grid-cols-3">
-              <Button type="button" variant="outline" disabled={qualityEvalRunning} onClick={() => void runQualityEval("juice")}>
+              <Button type="button" variant="outline" disabled={qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("juice")}>
                 {qualityEvalRunning ? <RefreshCw className="size-3.5 animate-spin" /> : <FlaskConical className="size-3.5" />}
                 {t("accounts.qualityEvalJuice")}
               </Button>
-              <Button type="button" variant="outline" disabled={qualityEvalRunning} onClick={() => void runQualityEval("candy")}>
+              <Button type="button" variant="outline" disabled={qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("candy")}>
                 {t("accounts.qualityEvalCandy")}
               </Button>
-              <Button type="button" disabled={qualityEvalRunning} onClick={() => void runQualityEval("full")}>
+              <Button type="button" disabled={qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("full")}>
                 {t("accounts.qualityEvalFull")}
               </Button>
             </div>
@@ -11617,12 +11618,10 @@ function AccountMobileCard({
                   detail={getAccountRateLimitWindow(account) ?? undefined}
                   errorMessage={account.error_message}
                 />
-                {!account.openai_responses_api && (
-                  <AccountQualityEvalBadge
-                    account={account}
-                    onClick={onQualityEval}
-                  />
-                )}
+                <AccountQualityEvalBadge
+                  account={account}
+                  onClick={onQualityEval}
+                />
               </div>
             </div>
 
@@ -11809,14 +11808,13 @@ function AccountMobileCard({
               onClick={onUsage}
               icon={<BarChart3 className="size-3.5" />}
             />
-            {!account.openai_responses_api && (
-              <AccountMobileActionButton
-                title={t("accounts.qualityEval")}
-                label={t("accounts.qualityEvalBadge")}
-                onClick={onQualityEval}
-                icon={<FlaskConical className="size-3.5" />}
-              />
-            )}
+            <AccountMobileActionButton
+              title={t(accountSupportsQualityEval(account) ? "accounts.qualityEval" : "accounts.qualityEvalUnsupported")}
+              label={t("accounts.qualityEvalBadge")}
+              disabled={!accountSupportsQualityEval(account)}
+              onClick={onQualityEval}
+              icon={<FlaskConical className="size-3.5" />}
+            />
             <AccountRowActionsMenu
               t={t}
 	              account={account}
@@ -11905,12 +11903,10 @@ function AccountMobileCard({
             </div>
 
           <div className="mt-2 flex min-h-6 min-w-0 flex-wrap items-center gap-1.5">
-            {!account.openai_responses_api && (
-              <AccountQualityEvalBadge
-                account={account}
-                onClick={onQualityEval}
-              />
-            )}
+            <AccountQualityEvalBadge
+              account={account}
+              onClick={onQualityEval}
+            />
             {account.at_only && (
               <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
                 {formatAccessTokenBadge(account)}
@@ -12051,14 +12047,13 @@ function AccountMobileCard({
           onClick={onUsage}
           icon={<BarChart3 className="size-3.5" />}
         />
-        {!account.openai_responses_api && (
-          <AccountMobileActionButton
-            title={t("accounts.qualityEval")}
-            label={t("accounts.qualityEvalBadge")}
-            onClick={onQualityEval}
-            icon={<FlaskConical className="size-3.5" />}
-          />
-        )}
+        <AccountMobileActionButton
+          title={t(accountSupportsQualityEval(account) ? "accounts.qualityEval" : "accounts.qualityEvalUnsupported")}
+          label={t("accounts.qualityEvalBadge")}
+          disabled={!accountSupportsQualityEval(account)}
+          onClick={onQualityEval}
+          icon={<FlaskConical className="size-3.5" />}
+        />
         <AccountRowActionsMenu
           t={t}
 	          account={account}

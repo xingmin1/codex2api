@@ -756,6 +756,7 @@ type accountResponse struct {
 	ScoreBreakdown                       schedulerBreakdownResponse       `json:"scheduler_breakdown"`
 	FirstTokenStats                      *database.AccountFirstTokenStats `json:"first_token_stats,omitempty"`
 	LatestQualityEval                    *database.QualityEvalBatch       `json:"latest_quality_eval,omitempty"`
+	QualityEvalSupported                 bool                             `json:"quality_eval_supported"`
 	LastUnauthorizedAt                   string                           `json:"last_unauthorized_at,omitempty"`
 	LastRateLimitedAt                    string                           `json:"last_rate_limited_at,omitempty"`
 	LastTimeoutAt                        string                           `json:"last_timeout_at,omitempty"`
@@ -929,6 +930,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Codex5HUsageUpdatedAt:    row.GetCredential("codex_5h_usage_updated_at"),
 			UsageLimitOverride:       ignoreUsageLimitStatusOverride,
 			UsageLimitEffective:      ignoreUsageLimitStatusEffective,
+			QualityEvalSupported:     !isOpenAIResponsesAccount,
 		}
 		if stats, ok := firstTokenStats[row.ID]; ok {
 			statsCopy := stats
@@ -992,6 +994,7 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		resp.CheapProbeBonusDurationMinutes = accountCheapProbeBonusDurationMinutes(row)
 		resp.SchedulerPriority = accountSchedulerPriority(row)
 		if acc, ok := accountMap[row.ID]; ok {
+			resp.QualityEvalSupported = qualityEvalSupportedByAccount(acc)
 			resp.UsageLimitOverride = acc.GetIgnoreUsageLimitStatusOverride()
 			resp.UsageLimitEffective = acc.IgnoresUsageLimitStatus()
 			resp.EncryptedContentCompat, resp.EncryptedContentCompatEffective = acc.EncryptedContentCompatibilityConfig()

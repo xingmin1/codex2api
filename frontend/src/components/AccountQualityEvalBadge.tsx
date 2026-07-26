@@ -20,6 +20,7 @@ interface AccountQualityEvalBadgeProps {
 export default function AccountQualityEvalBadge({ account, className, onClick }: AccountQualityEvalBadgeProps) {
   const { t } = useTranslation()
   const batch = account.latest_quality_eval
+  const supported = account.quality_eval_supported ?? !account.openai_responses_api
   const scores = batch
     ? [
         batch.juice_requested > 0
@@ -35,26 +36,35 @@ export default function AccountQualityEvalBadge({ account, className, onClick }:
       <span className="size-1.5 rounded-full bg-current" />
       <span>5.6 Max {scores}</span>
     </>
-  ) : (
+  ) : supported ? (
     <>
       <FlaskConical className="size-3" />
       <span>{t('accounts.qualityEvalBadge')}</span>
+    </>
+  ) : (
+    <>
+      <FlaskConical className="size-3" />
+      <span>{t('accounts.qualityEvalUnsupportedBadge')}</span>
     </>
   )
   const title = batch
     ? t(`accounts.qualityEvalStatus.${batch.status}`, {
         defaultValue: batch.status,
       })
-    : t('accounts.qualityEvalNotRun')
+    : supported
+      ? t('accounts.qualityEvalNotRun')
+      : t('accounts.qualityEvalUnsupported')
   const classes = cn(
     'inline-flex h-6 items-center gap-1 rounded-md px-1.5 text-[10px] font-semibold ring-1 ring-inset',
     batch
       ? statusClasses[batch.status] ?? statusClasses.incomplete
-      : 'bg-violet-500/10 text-violet-700 ring-violet-500/20 hover:bg-violet-500/15 dark:text-violet-300',
+      : supported
+        ? 'bg-violet-500/10 text-violet-700 ring-violet-500/20 hover:bg-violet-500/15 dark:text-violet-300'
+        : 'bg-slate-500/10 text-slate-500 ring-slate-500/20 dark:text-slate-400',
     className,
   )
 
-  if (onClick) {
+  if (onClick && (supported || batch)) {
     return <button type="button" className={classes} title={title} onClick={onClick}>{content}</button>
   }
   return <span className={classes} title={title}>{content}</span>

@@ -50,6 +50,77 @@ func TestBuildQualityEvalPayloadIsPinnedAndToolFree(t *testing.T) {
 	}
 }
 
+func TestQualityEvalSupportedByResponsesAPIAccountRequiresExactModel(t *testing.T) {
+	account := &auth.Account{
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://api.example.com",
+		APIKey:       "api-key",
+		Models:       []string{qualityEvalModel},
+	}
+	if !qualityEvalSupportedByAccount(account) {
+		t.Fatal("配置 gpt-5.6-sol 的 Responses API 账号应支持质量检测")
+	}
+	account.Models = []string{"gpt-5.5"}
+	if qualityEvalSupportedByAccount(account) {
+		t.Fatal("未配置 gpt-5.6-sol 的 Responses API 账号不应支持质量检测")
+	}
+	if !qualityEvalSupportedByAccount(&auth.Account{}) {
+		t.Fatal("普通 Codex 账号应支持质量检测")
+	}
+}
+
+func TestExecuteQualityEvalRequestUsesResponsesAPIAccount(t *testing.T) {
+	requestPayload := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("请求路径 = %q, want /v1/responses", r.URL.Path)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer api-key" {
+			t.Errorf("Authorization = %q", got)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("读取请求体失败: %v", err)
+		}
+		requestPayload <- body
+		response := qualityEvalHTTPResponse("21")
+		defer response.Body.Close()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(response.StatusCode)
+		_, _ = io.Copy(w, response.Body)
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: qualityEvalModel})
+	account := &auth.Account{
+		DBID:         88,
+		Status:       auth.StatusReady,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "api-key",
+		Models:       []string{qualityEvalModel},
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	result, err := handler.executeQualityEvalRequest(context.Background(), account, qualityEvalCandyPrompt)
+	if err != nil {
+		t.Fatalf("executeQualityEvalRequest 返回错误: %v", err)
+	}
+	if result.RawAnswer != "21" || result.FirstTokenMs <= 0 {
+		t.Fatalf("Responses API 流结果 = %#v", result)
+	}
+	payload := <-requestPayload
+	if gjson.GetBytes(payload, "model").String() != qualityEvalModel ||
+		gjson.GetBytes(payload, "reasoning.effort").String() != qualityEvalEffort ||
+		!gjson.GetBytes(payload, "stream").Bool() || gjson.GetBytes(payload, "store").Bool() ||
+		gjson.GetBytes(payload, "tools").Exists() {
+		t.Fatalf("Responses API 质量检测载荷不符合固定约束: %s", payload)
+	}
+	if account.GetTotalRequests() != 0 || account.GetActiveRequests() != 0 {
+		t.Fatalf("Responses API 质量检测污染请求统计: total=%d active=%d", account.GetTotalRequests(), account.GetActiveRequests())
+	}
+}
+
 func TestQualityEvalReferenceMatchers(t *testing.T) {
 	juiceCases := map[string]string{
 		"1.2300":        "1.2300",

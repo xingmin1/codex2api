@@ -201,6 +201,7 @@ export interface AccountRow {
   scheduler_priority?: number | null
   first_token_stats?: AccountFirstTokenStats
   latest_quality_eval?: QualityEvalBatch
+  quality_eval_supported?: boolean
   dispatch_count_used?: number
   dispatch_count_reset_at?: ISODateString
   dispatch_count_limited?: boolean

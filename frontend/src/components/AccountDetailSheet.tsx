@@ -181,6 +181,9 @@ export default function AccountDetailSheet({
       (authJsonExporting || account.at_only || account.openai_responses_api),
   );
   const resetCredits = account?.rate_limit_reset_credits ?? 0;
+  const qualityEvalSupported = Boolean(
+    account && (account.quality_eval_supported ?? !account.openai_responses_api),
+  );
   const healthLabel = (() => {
     switch (account?.health_tier) {
       case "healthy":
@@ -549,12 +552,17 @@ export default function AccountDetailSheet({
                 <FlaskConical className="size-3.5" />
                 {t("accounts.testConnection")}
               </Button>
-              {!account.openai_responses_api && (
-                <Button type="button" variant="outline" size="sm" onClick={onQualityEval}>
-                  <FlaskConical className="size-3.5" />
-                  {t("accounts.qualityEval")}
-                </Button>
-              )}
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={!qualityEvalSupported}
+                onClick={onQualityEval}
+                title={t(qualityEvalSupported ? "accounts.qualityEval" : "accounts.qualityEvalUnsupported")}
+              >
+                <FlaskConical className="size-3.5" />
+                {t("accounts.qualityEval")}
+              </Button>
               <Button
                 type="button"
                 variant="outline"
