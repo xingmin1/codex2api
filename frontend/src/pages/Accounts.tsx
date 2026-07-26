@@ -5283,6 +5283,7 @@ export default function Accounts() {
                           onEditGroups={() => openQuickGroupEditor(account)}
                           onUsage={() => setUsageAccount(account)}
                           onTest={() => setTestingAccount(account)}
+                          onQualityEval={() => void openQualityEval(account)}
                           onClone={() => void handleCloneAccount(account)}
                           onRefresh={() => void handleRefresh(account)}
                           onGenerateAuthJson={() =>
@@ -5690,9 +5691,9 @@ export default function Accounts() {
                                         }}
                                       />
                                     )}
-                                    {account.latest_quality_eval && (
-                                      <AccountQualityEvalBadge
-                                        account={account}
+	                                    {!account.openai_responses_api && (
+	                                      <AccountQualityEvalBadge
+	                                        account={account}
                                         onClick={() => void openQualityEval(account)}
                                       />
                                     )}
@@ -11466,6 +11467,7 @@ function AccountMobileCard({
   onEditGroups,
   onUsage,
   onTest,
+  onQualityEval,
   onClone,
   onRefresh,
   onGenerateAuthJson,
@@ -11495,6 +11497,7 @@ function AccountMobileCard({
   onEditGroups: () => void;
   onUsage: () => void;
   onTest: () => void;
+  onQualityEval: () => void;
   onClone: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
@@ -11608,12 +11611,18 @@ function AccountMobileCard({
                   })}
                 </div>
               </div>
-              <div className="shrink-0">
+              <div className="flex shrink-0 flex-col items-end gap-1.5">
                 <StatusBadge
                   status={account.status}
                   detail={getAccountRateLimitWindow(account) ?? undefined}
                   errorMessage={account.error_message}
                 />
+                {!account.openai_responses_api && (
+                  <AccountQualityEvalBadge
+                    account={account}
+                    onClick={onQualityEval}
+                  />
+                )}
               </div>
             </div>
 
@@ -11800,6 +11809,14 @@ function AccountMobileCard({
               onClick={onUsage}
               icon={<BarChart3 className="size-3.5" />}
             />
+            {!account.openai_responses_api && (
+              <AccountMobileActionButton
+                title={t("accounts.qualityEval")}
+                label={t("accounts.qualityEvalBadge")}
+                onClick={onQualityEval}
+                icon={<FlaskConical className="size-3.5" />}
+              />
+            )}
             <AccountRowActionsMenu
               t={t}
 	              account={account}
@@ -11888,6 +11905,12 @@ function AccountMobileCard({
             </div>
 
           <div className="mt-2 flex min-h-6 min-w-0 flex-wrap items-center gap-1.5">
+            {!account.openai_responses_api && (
+              <AccountQualityEvalBadge
+                account={account}
+                onClick={onQualityEval}
+              />
+            )}
             {account.at_only && (
               <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
                 {formatAccessTokenBadge(account)}
@@ -12028,6 +12051,14 @@ function AccountMobileCard({
           onClick={onUsage}
           icon={<BarChart3 className="size-3.5" />}
         />
+        {!account.openai_responses_api && (
+          <AccountMobileActionButton
+            title={t("accounts.qualityEval")}
+            label={t("accounts.qualityEvalBadge")}
+            onClick={onQualityEval}
+            icon={<FlaskConical className="size-3.5" />}
+          />
+        )}
         <AccountRowActionsMenu
           t={t}
 	          account={account}

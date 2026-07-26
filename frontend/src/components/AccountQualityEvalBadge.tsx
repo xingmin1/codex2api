@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next'
+import { FlaskConical } from 'lucide-react'
 import type { AccountRow, QualityEvalStatus } from '../types'
 import { cn } from '@/lib/utils'
 
@@ -19,23 +20,37 @@ interface AccountQualityEvalBadgeProps {
 export default function AccountQualityEvalBadge({ account, className, onClick }: AccountQualityEvalBadgeProps) {
   const { t } = useTranslation()
   const batch = account.latest_quality_eval
-  if (!batch) return null
-
-  const label = batch.candy_requested > 0
-    ? `${batch.candy_correct}/${batch.candy_requested}`
-    : `${batch.juice_correct}/${batch.juice_requested}`
-  const content = (
+  const scores = batch
+    ? [
+        batch.juice_requested > 0
+          ? `J ${batch.juice_correct}/${batch.juice_requested}`
+          : '',
+        batch.candy_requested > 0
+          ? `C ${batch.candy_correct}/${batch.candy_requested}`
+          : '',
+      ].filter(Boolean).join(' · ')
+    : ''
+  const content = batch ? (
     <>
       <span className="size-1.5 rounded-full bg-current" />
-      <span>5.6 Max {label}</span>
+      <span>5.6 Max {scores}</span>
+    </>
+  ) : (
+    <>
+      <FlaskConical className="size-3" />
+      <span>{t('accounts.qualityEvalBadge')}</span>
     </>
   )
-  const title = t(`accounts.qualityEvalStatus.${batch.status}`, {
-    defaultValue: batch.status,
-  })
+  const title = batch
+    ? t(`accounts.qualityEvalStatus.${batch.status}`, {
+        defaultValue: batch.status,
+      })
+    : t('accounts.qualityEvalNotRun')
   const classes = cn(
     'inline-flex h-6 items-center gap-1 rounded-md px-1.5 text-[10px] font-semibold ring-1 ring-inset',
-    statusClasses[batch.status] ?? statusClasses.incomplete,
+    batch
+      ? statusClasses[batch.status] ?? statusClasses.incomplete
+      : 'bg-violet-500/10 text-violet-700 ring-violet-500/20 hover:bg-violet-500/15 dark:text-violet-300',
     className,
   )
 
