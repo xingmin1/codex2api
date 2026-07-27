@@ -175,18 +175,20 @@ func TestQualityEvalCandidatesCountOnlyFirstAttemptsAndExclude499(t *testing.T) 
 			t.Fatalf("插入用量日志返回错误: %v", err)
 		}
 	}
-	for i := 0; i < 4; i++ {
-		insert(10, 200, 0, 0, now.Add(-time.Duration(i+1)*time.Minute))
-	}
 	for i := 0; i < 3; i++ {
-		insert(20, 500, 0, 0, now.Add(-time.Duration(i+1)*time.Minute))
+		insert(10, 200, 0, 1, now.Add(-time.Duration(i+1)*time.Minute))
+	}
+	insert(10, 200, 0, 0, now.Add(-4*time.Minute)) // 兼容字段引入前的首轮日志。
+	for i := 0; i < 3; i++ {
+		insert(20, 500, 0, 1, now.Add(-time.Duration(i+1)*time.Minute))
 	}
 	for i := 0; i < 5; i++ {
-		insert(30, 200, 0, 0, now.Add(-time.Duration(i+1)*time.Minute))
+		insert(30, 200, 0, 1, now.Add(-time.Duration(i+1)*time.Minute))
 	}
 	insert(20, 200, 1, 1, now.Add(-time.Minute))
-	insert(20, 499, 0, 0, now.Add(-time.Minute))
-	insert(20, 200, 0, 0, now.Add(-6*time.Hour))
+	insert(20, 200, 0, 2, now.Add(-time.Minute))
+	insert(20, 499, 0, 1, now.Add(-time.Minute))
+	insert(20, 200, 0, 1, now.Add(-6*time.Hour))
 
 	candidates, err := db.GetQualityEvalCandidates(ctx, now.Add(-5*time.Hour), now, 3, 5)
 	if err != nil {

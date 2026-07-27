@@ -322,6 +322,10 @@ func (h *Handler) runScheduledQualityEvals(ctx context.Context, now time.Time) {
 		log.Printf("筛选周期质量检测候选账号失败: %v", err)
 		return
 	}
+	if len(candidates) == 0 {
+		log.Printf("周期质量检测跳过: bucket=%s，过去 %d 小时没有账号达到 %d 次首轮非 499 请求",
+			bucket.Format(time.RFC3339), config.LookbackHours, config.MinRequests)
+	}
 	eligible := make([]*auth.Account, 0, config.TopAccounts)
 	for _, candidate := range candidates {
 		account, accountErr := h.qualityEvalAccount(candidate.AccountID)
@@ -332,6 +336,13 @@ func (h *Handler) runScheduledQualityEvals(ctx context.Context, now time.Time) {
 		if len(eligible) >= config.TopAccounts {
 			break
 		}
+	}
+	if len(candidates) > 0 && len(eligible) == 0 {
+		log.Printf("周期质量检测跳过: bucket=%s，%d 个流量候选账号均不满足可用性或模型要求",
+			bucket.Format(time.RFC3339), len(candidates))
+	} else if len(eligible) > 0 {
+		log.Printf("周期质量检测开始: bucket=%s candidates=%d eligible=%d",
+			bucket.Format(time.RFC3339), len(candidates), len(eligible))
 	}
 
 	semaphore := make(chan struct{}, config.BatchConcurrency)

@@ -337,6 +337,7 @@ func (db *DB) GetQualityEvalCandidates(ctx context.Context, start, end time.Time
 	if db.isSQLite() {
 		retryFalse = "COALESCE(usage_logs.is_retry_attempt, 0) = 0"
 	}
+	// 当前请求链使用从 1 开始的轮次编号；0 是该字段引入前的默认值，两者都表示首轮。
 	query := fmt.Sprintf(`
 		SELECT usage_logs.account_id, COUNT(*) AS request_count
 		FROM usage_logs
@@ -346,7 +347,7 @@ func (db *DB) GetQualityEvalCandidates(ctx context.Context, start, end time.Time
 			AND COALESCE(accounts.error_message, '') <> 'deleted'
 			AND usage_logs.status_code <> 499
 			AND %s
-			AND COALESCE(usage_logs.attempt_index, 0) = 0
+			AND COALESCE(usage_logs.attempt_index, 0) IN (0, 1)
 			AND usage_logs.account_id > 0
 		GROUP BY usage_logs.account_id
 		HAVING COUNT(*) >= $3
