@@ -123,6 +123,15 @@ func deltaEventHasContent(parsed gjson.Result) bool {
 		stringFieldHasValue(parsed, "partial_image")
 }
 
+func reasoningDeltaCharCount(parsed gjson.Result) int {
+	switch strings.TrimSpace(parsed.Get("type").String()) {
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		return len(parsed.Get("delta").String())
+	default:
+		return 0
+	}
+}
+
 func outputItemHasFirstTokenContent(item gjson.Result) bool {
 	if !item.Exists() {
 		return false

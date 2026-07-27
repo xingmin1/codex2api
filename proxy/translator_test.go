@@ -2431,6 +2431,22 @@ func TestStreamTranslator_TextOnly(t *testing.T) {
 	}
 }
 
+func TestStreamTranslator_IgnoresEmptyDeltas(t *testing.T) {
+	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
+	events := [][]byte{
+		[]byte(`{"type":"response.output_text.delta","delta":""}`),
+		[]byte(`{"type":"response.reasoning_summary_text.delta","delta":""}`),
+		[]byte(`{"type":"response.unknown.delta","delta":""}`),
+	}
+
+	for _, event := range events {
+		chunk, done := st.Translate(event)
+		if done || chunk != nil {
+			t.Fatalf("空增量不得提交下游业务流: event=%s chunk=%s done=%v", event, chunk, done)
+		}
+	}
+}
+
 func TestStreamTranslator_CachedTokenDetails(t *testing.T) {
 	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
 

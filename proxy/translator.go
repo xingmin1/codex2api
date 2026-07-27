@@ -3013,10 +3013,16 @@ func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) 
 	switch eventType {
 	case "response.output_text.delta":
 		delta := parsed.Get("delta").String()
+		if delta == "" {
+			return nil, false
+		}
 		return newContentChunk(st.ChunkID, st.Model, st.Created, delta), false
 
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		delta := parsed.Get("delta").String()
+		if delta == "" {
+			return nil, false
+		}
 		return newReasoningChunk(st.ChunkID, st.Model, st.Created, delta), false
 
 	case "response.output_item.added":
@@ -3054,6 +3060,9 @@ func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) 
 			return nil, false
 		}
 		delta := parsed.Get("delta").String()
+		if delta == "" {
+			return nil, false
+		}
 		return newToolCallDeltaChunk(st.ChunkID, st.Model, st.Created, tcIdx, delta), false
 
 	case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
@@ -3084,6 +3093,9 @@ func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) 
 
 	default:
 		if delta := parsed.Get("delta"); delta.Exists() && delta.Type == gjson.String {
+			if delta.String() == "" {
+				return nil, false
+			}
 			return newContentChunk(st.ChunkID, st.Model, st.Created, delta.String()), false
 		}
 		return nil, false

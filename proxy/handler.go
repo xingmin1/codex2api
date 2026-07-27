@@ -2607,6 +2607,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			ttftRecorded := false
 			gotTerminal := false
 			deltaCharCount := 0
+			reasoningCharCount := 0
 			var readErr error
 			var writeErr error
 			wroteAnyBody := false
@@ -2651,6 +2652,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					if eventType == "response.output_text.delta" {
 						deltaCharCount += len(parsed.Get("delta").String())
 					}
+					reasoningCharCount += reasoningDeltaCharCount(parsed)
 					if eventType == "response.completed" {
 						usage = extractUsageFromResult(parsed.Get("response.usage"))
 						if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -2836,7 +2838,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				})
 			}
 			if outcome.logStatusCode != http.StatusOK {
-				log.Printf("OpenAI Responses 流异常结束 (account %d, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
+				log.Printf("OpenAI Responses 流异常结束 (account %d, status %d): %s，上游已产生答案/工具约 %d 字符、推理约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount, reasoningCharCount)
 				if deltaCharCount > 0 {
 					estOutputTokens := deltaCharCount / 3
 					if estOutputTokens < 1 {
@@ -3173,6 +3175,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 		ttftRecorded := false
 		gotTerminal := false // 是否收到 response.completed 或 response.failed
 		deltaCharCount := 0  // 累计 delta 字符数（用于断流时估算 token）
+		reasoningCharCount := 0
 		var readErr error
 		var writeErr error
 		wroteAnyBody := false
@@ -3223,6 +3226,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				if eventType == "response.output_text.delta" {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
+				reasoningCharCount += reasoningDeltaCharCount(parsed)
 				if image, ok := extractImageFromOutputItemDone(data, logModel); ok {
 					imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 				}
@@ -3474,7 +3478,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
-			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
+			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，上游已产生答案/工具约 %d 字符、推理约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount, reasoningCharCount)
 			if deltaCharCount > 0 {
 				estOutputTokens := deltaCharCount / 3 // 粗略估算: 约 3 字符 = 1 token
 				if estOutputTokens < 1 {
@@ -4423,7 +4427,12 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 	}
 }
 
+// ChatCompletions 处理 OpenAI Chat Completions 兼容请求，并在业务输出前提供整请求代重发。
 func (h *Handler) ChatCompletions(c *gin.Context) {
+	h.handleWithClientRequestReplay(c, "/v1/chat/completions", h.chatCompletionsOnce)
+}
+
+func (h *Handler) chatCompletionsOnce(c *gin.Context) {
 	// 1. 读取请求体
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {
@@ -4776,6 +4785,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		ttftRecorded := false
 		gotTerminal := false // 是否收到 response.completed 或 response.failed
 		deltaCharCount := 0  // 累计 delta 字符数（用于断流时估算 token）
+		reasoningCharCount := 0
 		var readErr error
 		var writeErr error
 		wroteAnyBody := false
@@ -4826,6 +4836,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				if eventType == "response.output_text.delta" || isCodexToolInputDeltaEvent(eventType) {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
+				reasoningCharCount += reasoningDeltaCharCount(parsed)
 				if eventType == "response.completed" {
 					usage = extractUsageFromResult(parsed.Get("response.usage"))
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
@@ -4999,7 +5010,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
-			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
+			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，上游已产生答案/工具约 %d 字符、推理约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount, reasoningCharCount)
 			if deltaCharCount > 0 {
 				estOutputTokens := deltaCharCount / 3
 				if estOutputTokens < 1 {

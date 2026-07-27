@@ -103,8 +103,12 @@ func mapHTTPStatusToAnthropicError(statusCode int) string {
 
 // ==================== /v1/messages Handler ====================
 
-// Messages 处理 /v1/messages 请求（Anthropic Messages API → Codex Responses）
+// Messages 处理 Anthropic Messages 兼容请求，并在业务输出前提供整请求代重发。
 func (h *Handler) Messages(c *gin.Context) {
+	h.handleWithClientRequestReplay(c, "/v1/messages", h.messagesOnce)
+}
+
+func (h *Handler) messagesOnce(c *gin.Context) {
 	// 1. 读取请求体
 	rawBody, err := readRawRequestBody(c)
 	if err != nil {

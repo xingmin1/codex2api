@@ -162,6 +162,56 @@ func TestResponsesClientReplayReentersExistingSelectionAfterResponseFailed(t *te
 	}
 }
 
+func TestChatCompletionsClientReplayReentersAfterHTTPFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var upstreamAttempts atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempt := upstreamAttempts.Add(1)
+		if attempt == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"message":"temporary failure"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_chat_replayed"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"recovered"}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	store := newOpenAIResponsesRelayStore(upstream.URL)
+	store.SetMaxRetries(0)
+	store.SetMaxRateLimitRetries(0)
+	store.SetTransportRetryPolicy("rotate")
+	store.SetClientRequestReplayEnabled(true)
+	store.SetClientRequestReplayMaxRetries(1)
+	store.SetClientRequestReplayBaseIntervalMS(0)
+	store.SetClientRequestReplayKeepaliveSeconds(0)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-4.1-direct","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	setRawRequestBody(c, body)
+
+	handler.ChatCompletions(c)
+
+	if got := upstreamAttempts.Load(); got != 2 {
+		t.Fatalf("upstream attempts = %d, want 2", got)
+	}
+	responseBody := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(responseBody, "recovered") || !strings.HasSuffix(responseBody, "data: [DONE]\n\n") {
+		t.Fatalf("status=%d body=%s", recorder.Code, responseBody)
+	}
+	if strings.Contains(responseBody, "temporary failure") {
+		t.Fatalf("首轮 Chat 失败泄漏给客户端: %s", responseBody)
+	}
+}
+
 func TestResponsesCyberPolicyStopsInnerAndWholeRequestReplay(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	var upstreamAttempts atomic.Int32
@@ -271,6 +321,39 @@ func TestClientRequestReplayStopsAfterBusinessStreamStarts(t *testing.T) {
 	}
 	if !strings.Contains(recorder.Body.String(), "partial") || !strings.Contains(recorder.Body.String(), "response.failed") {
 		t.Fatalf("实时流未原样交付: %s", recorder.Body.String())
+	}
+}
+
+func TestClientRequestReplayRetriesAfterReasoningOnlyFailure(t *testing.T) {
+	handler := newClientReplayTestHandler(t, 1, 0)
+	c, recorder := newClientReplayTestContext(t, true)
+	attempts := 0
+
+	handler.handleWithClientRequestReplay(c, "/v1/responses", func(c *gin.Context) {
+		attempts++
+		c.Header("Content-Type", "text/event-stream")
+		if attempts == 1 {
+			for _, event := range []string{
+				`{"type":"response.created"}`,
+				`{"type":"response.reasoning_summary_text.delta","delta":"private partial reasoning"}`,
+				`{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error"}}}`,
+			} {
+				_, _ = c.Writer.Write([]byte("data: "))
+				_, _ = c.Writer.Write([]byte(event))
+				_, _ = c.Writer.Write([]byte("\n\n"))
+			}
+			c.Writer.Flush()
+			return
+		}
+		writeClientReplaySuccess(c)
+	})
+
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, `"delta":"ok"`) || strings.Contains(body, "private partial reasoning") || strings.Contains(body, "server_error") {
+		t.Fatalf("仅推理失败轮必须完整隐藏并重试: %s", body)
 	}
 }
 
@@ -749,7 +832,7 @@ func TestClientRequestReplayKeepaliveAndFinalSSEFailure(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	delivery := newClientRequestReplayDelivery(c.Writer, nil, true)
+	delivery := newClientRequestReplayDelivery(c.Writer, nil, clientRequestReplayProtocolResponses, true)
 
 	if err := delivery.writeKeepalive(); err != nil {
 		t.Fatalf("writeKeepalive: %v", err)
@@ -769,7 +852,7 @@ func TestClientRequestReplayKeepalivePreservesCyberPolicyFailure(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	delivery := newClientRequestReplayDelivery(c.Writer, nil, true)
+	delivery := newClientRequestReplayDelivery(c.Writer, nil, clientRequestReplayProtocolResponses, true)
 
 	if err := delivery.writeKeepalive(); err != nil {
 		t.Fatalf("writeKeepalive: %v", err)
@@ -786,12 +869,83 @@ func TestGenericClientRequestReplayKeepaliveUsesSSEComment(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	delivery := newClientRequestReplayDelivery(c.Writer, nil, false)
+	delivery := newClientRequestReplayDelivery(c.Writer, nil, clientRequestReplayProtocolResponses, false)
 
 	if err := delivery.writeKeepalive(); err != nil {
 		t.Fatalf("writeKeepalive: %v", err)
 	}
 	if got := recorder.Body.String(); got != string(genericClientReplayKeepalive) {
 		t.Fatalf("generic keepalive = %q, want %q", got, genericClientReplayKeepalive)
+	}
+}
+
+func TestChatClientRequestReplayKeepaliveEndsWithDone(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	delivery := newClientRequestReplayDelivery(c.Writer, nil, clientRequestReplayProtocolChat, true)
+
+	if err := delivery.writeKeepalive(); err != nil {
+		t.Fatalf("writeKeepalive: %v", err)
+	}
+	delivery.commitSSEFailure(http.StatusServiceUnavailable, []byte(`{"error":{"message":"upstream unavailable"}}`), clientRequestReplayStopMaxRetries)
+
+	body := recorder.Body.String()
+	if !strings.HasPrefix(body, string(genericClientReplayKeepalive)) {
+		t.Fatalf("Chat 保活必须使用 SSE 注释，不能注入 Responses 事件: %q", body)
+	}
+	if !strings.Contains(body, `"code":"client_request_replay_exhausted"`) || !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Fatalf("Chat 重发耗尽必须返回结构化错误并以 [DONE] 收尾: %q", body)
+	}
+}
+
+func TestMessagesClientRequestReplayKeepaliveEndsWithErrorEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	delivery := newClientRequestReplayDelivery(c.Writer, nil, clientRequestReplayProtocolMessages, false)
+
+	if err := delivery.writeKeepalive(); err != nil {
+		t.Fatalf("writeKeepalive: %v", err)
+	}
+	delivery.commitSSEFailure(http.StatusServiceUnavailable, []byte(`{"error":{"message":"upstream unavailable"}}`), clientRequestReplayStopMaxRetries)
+
+	body := recorder.Body.String()
+	if !strings.Contains(body, "event: error\n") || !strings.Contains(body, `"type":"overloaded_error"`) {
+		t.Fatalf("Messages 重发耗尽必须返回 Anthropic error 事件: %q", body)
+	}
+}
+
+func TestClientRequestReplayStreamDecision(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol clientRequestReplayProtocol
+		payload  string
+		commit   bool
+		failed   bool
+	}{
+		{"Responses 推理增量继续缓冲", clientRequestReplayProtocolResponses, `{"type":"response.reasoning_summary_text.delta","delta":"thinking"}`, false, false},
+		{"Responses 推理 item 完成继续缓冲", clientRequestReplayProtocolResponses, `{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"opaque"}}`, false, false},
+		{"Responses 答案增量提交", clientRequestReplayProtocolResponses, `{"type":"response.output_text.delta","delta":"answer"}`, true, false},
+		{"Responses 失败触发重试", clientRequestReplayProtocolResponses, `{"type":"response.failed","response":{"status":"failed"}}`, false, true},
+		{"Chat 推理增量继续缓冲", clientRequestReplayProtocolChat, `{"choices":[{"delta":{"reasoning":"thinking"}}]}`, false, false},
+		{"Chat 工具声明继续缓冲", clientRequestReplayProtocolChat, `{"choices":[{"delta":{"tool_calls":[{"function":{"name":"lookup","arguments":""}}]}}]}`, false, false},
+		{"Chat 工具参数提交", clientRequestReplayProtocolChat, `{"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{}"}}]}}]}`, true, false},
+		{"Chat 答案增量提交", clientRequestReplayProtocolChat, `{"choices":[{"delta":{"content":"answer"}}]}`, true, false},
+		{"Chat 错误触发重试", clientRequestReplayProtocolChat, `{"error":{"type":"upstream_error"}}`, false, true},
+		{"Messages thinking_delta 继续缓冲", clientRequestReplayProtocolMessages, `{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"thinking"}}`, false, false},
+		{"Messages 工具声明继续缓冲", clientRequestReplayProtocolMessages, `{"type":"content_block_start","content_block":{"type":"tool_use","name":"lookup"}}`, false, false},
+		{"Messages 工具参数提交", clientRequestReplayProtocolMessages, `{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{}"}}`, true, false},
+		{"Messages text_delta 提交", clientRequestReplayProtocolMessages, `{"type":"content_block_delta","delta":{"type":"text_delta","text":"answer"}}`, true, false},
+		{"Messages error 触发重试", clientRequestReplayProtocolMessages, `{"type":"error","error":{"type":"api_error"}}`, false, true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			commit, failed := clientRequestReplayStreamDecision(test.protocol, []byte(test.payload))
+			if commit != test.commit || failed != test.failed {
+				t.Fatalf("commit=%v failed=%v, want commit=%v failed=%v", commit, failed, test.commit, test.failed)
+			}
+		})
 	}
 }

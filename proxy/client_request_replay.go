@@ -25,6 +25,8 @@ const (
 
 type clientRequestReplayStopReason string
 
+type clientRequestReplayProtocol string
+
 const (
 	clientRequestReplayStopSuccess     clientRequestReplayStopReason = "success"
 	clientRequestReplayStopMaxRetries  clientRequestReplayStopReason = "max_retries"
@@ -32,6 +34,12 @@ const (
 	clientRequestReplayStopClientGone  clientRequestReplayStopReason = "client_closed"
 	clientRequestReplayStopWriteFailed clientRequestReplayStopReason = "write_failed"
 	clientRequestReplayStopCyberPolicy clientRequestReplayStopReason = "cyber_policy"
+)
+
+const (
+	clientRequestReplayProtocolResponses clientRequestReplayProtocol = "responses"
+	clientRequestReplayProtocolChat      clientRequestReplayProtocol = "chat_completions"
+	clientRequestReplayProtocolMessages  clientRequestReplayProtocol = "messages"
 )
 
 type clientRequestReplayControllerContextKey struct{}
@@ -226,6 +234,7 @@ type clientRequestReplayDelivery struct {
 	mu              sync.Mutex
 	downstream      gin.ResponseWriter
 	controller      *clientRequestReplayController
+	protocol        clientRequestReplayProtocol
 	codexClient     bool
 	keepaliveSent   bool
 	businessStarted bool
@@ -233,16 +242,23 @@ type clientRequestReplayDelivery struct {
 }
 
 type clientRequestReplayWriter struct {
-	delivery *clientRequestReplayDelivery
-	header   http.Header
-	status   int
-	size     int
-	stream   bool
-	buffer   bytes.Buffer
+	delivery        *clientRequestReplayDelivery
+	header          http.Header
+	status          int
+	size            int
+	stream          bool
+	streamCommitted bool
+	streamFailed    bool
+	buffer          bytes.Buffer
 }
 
-func newClientRequestReplayDelivery(downstream gin.ResponseWriter, controller *clientRequestReplayController, codexClient bool) *clientRequestReplayDelivery {
-	return &clientRequestReplayDelivery{downstream: downstream, controller: controller, codexClient: codexClient}
+func newClientRequestReplayDelivery(downstream gin.ResponseWriter, controller *clientRequestReplayController, protocol clientRequestReplayProtocol, codexClient bool) *clientRequestReplayDelivery {
+	return &clientRequestReplayDelivery{
+		downstream:  downstream,
+		controller:  controller,
+		protocol:    protocol,
+		codexClient: codexClient,
+	}
 }
 
 func newClientRequestReplayWriter(delivery *clientRequestReplayDelivery, stream bool) *clientRequestReplayWriter {
@@ -280,7 +296,7 @@ func (d *clientRequestReplayDelivery) writeKeepalive() error {
 		d.downstream.WriteHeader(http.StatusOK)
 	}
 	payload := genericClientReplayKeepalive
-	if d.codexClient {
+	if d.protocol == clientRequestReplayProtocolResponses && d.codexClient {
 		payload = codexClientReplayKeepalive
 	}
 	_, d.writeErr = d.downstream.Write(payload)
@@ -392,19 +408,13 @@ func (d *clientRequestReplayDelivery) commitSSEFailure(status int, body []byte, 
 		errorCode = string(clientRequestReplayStopCyberPolicy)
 		errorType = "upstream_error"
 	}
-	payload, _ := json.Marshal(gin.H{
-		"type": "response.failed",
-		"response": gin.H{
-			"status": "failed",
-			"error": gin.H{
-				"code":        errorCode,
-				"message":     message,
-				"status_code": status,
-				"stop_reason": string(reason),
-				"type":        errorType,
-			},
-		},
-	})
+	errorPayload := gin.H{
+		"code":        errorCode,
+		"message":     message,
+		"status_code": status,
+		"stop_reason": string(reason),
+		"type":        errorType,
+	}
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -416,13 +426,51 @@ func (d *clientRequestReplayDelivery) commitSSEFailure(status int, body []byte, 
 		d.downstream.WriteHeader(http.StatusOK)
 	}
 	if d.writeErr == nil {
-		_, d.writeErr = fmt.Fprintf(d.downstream, "event: response.failed\ndata: %s\n\n", payload)
+		d.writeErr = d.writeSSEFailure(errorPayload)
 		if d.writeErr != nil && d.controller != nil {
 			d.controller.stop(clientRequestReplayStopWriteFailed)
 		}
 	}
 	if d.writeErr == nil {
 		d.downstream.Flush()
+	}
+}
+
+func (d *clientRequestReplayDelivery) writeSSEFailure(errorPayload gin.H) error {
+	switch d.protocol {
+	case clientRequestReplayProtocolChat:
+		payload, _ := json.Marshal(gin.H{"error": errorPayload})
+		_, err := fmt.Fprintf(d.downstream, "data: %s\n\ndata: [DONE]\n\n", payload)
+		return err
+	case clientRequestReplayProtocolMessages:
+		anthropicError := gin.H{
+			"type":    "overloaded_error",
+			"message": errorPayload["message"],
+		}
+		payload, _ := json.Marshal(gin.H{"type": "error", "error": anthropicError})
+		_, err := fmt.Fprintf(d.downstream, "event: error\ndata: %s\n\n", payload)
+		return err
+	default:
+		payload, _ := json.Marshal(gin.H{
+			"type": "response.failed",
+			"response": gin.H{
+				"status": "failed",
+				"error":  errorPayload,
+			},
+		})
+		_, err := fmt.Fprintf(d.downstream, "event: response.failed\ndata: %s\n\n", payload)
+		return err
+	}
+}
+
+func clientRequestReplayProtocolForEndpoint(endpoint string) clientRequestReplayProtocol {
+	switch endpoint {
+	case "/v1/chat/completions":
+		return clientRequestReplayProtocolChat
+	case "/v1/messages":
+		return clientRequestReplayProtocolMessages
+	default:
+		return clientRequestReplayProtocolResponses
 	}
 }
 
@@ -448,13 +496,157 @@ func (w *clientRequestReplayWriter) Write(data []byte) (int, error) {
 		w.WriteHeaderNow()
 	}
 	if w.stream && w.status >= 200 && w.status < 300 {
-		n, err := w.delivery.writeBusiness(w.header, w.status, data)
-		w.size += n
-		return n, err
+		return w.writeStream(data)
 	}
 	n, err := w.buffer.Write(data)
 	w.size += n
 	return n, err
+}
+
+func (w *clientRequestReplayWriter) writeStream(data []byte) (int, error) {
+	if w.streamCommitted {
+		n, err := w.delivery.writeBusiness(w.header, w.status, data)
+		w.size += n
+		return n, err
+	}
+
+	_, _ = w.buffer.Write(data)
+	w.size += len(data)
+	commit, failed := clientRequestReplayStreamDecision(w.delivery.protocol, data)
+	w.streamFailed = w.streamFailed || failed
+	if w.streamFailed {
+		commit = false
+	}
+	if !commit && w.buffer.Len() <= completionBufferedSSEMaxBytes {
+		return len(data), nil
+	}
+
+	pending := append([]byte(nil), w.buffer.Bytes()...)
+	w.buffer.Reset()
+	w.streamCommitted = true
+	_, err := w.delivery.writeBusiness(w.header, w.status, pending)
+	if err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
+
+func clientRequestReplayStreamDecision(protocol clientRequestReplayProtocol, data []byte) (commit, failed bool) {
+	for _, payload := range replaySSEDataPayloads(data) {
+		if bytes.Equal(payload, []byte("[DONE]")) {
+			if !failed {
+				commit = true
+			}
+			continue
+		}
+		parsed := gjson.ParseBytes(payload)
+		switch protocol {
+		case clientRequestReplayProtocolChat:
+			if parsed.Get("error").Exists() {
+				failed = true
+				continue
+			}
+			if parsed.Get("choices.0.delta.content").String() != "" ||
+				chatReplayEventHasToolArguments(parsed) ||
+				parsed.Get("choices.0.finish_reason").String() != "" {
+				commit = true
+			}
+		case clientRequestReplayProtocolMessages:
+			eventType := parsed.Get("type").String()
+			if eventType == "error" {
+				failed = true
+				continue
+			}
+			if eventType == "message_stop" || anthropicReplayEventHasBusinessContent(parsed) {
+				commit = true
+			}
+		default:
+			eventType := parsed.Get("type").String()
+			switch eventType {
+			case "response.failed", "response.error", "error", "response.incomplete", "response.cancelled", "response.canceled":
+				failed = true
+			case "response.completed":
+				commit = true
+			default:
+				if responsesReplayEventHasBusinessContent(parsed) {
+					commit = true
+				}
+			}
+		}
+	}
+	return commit, failed
+}
+
+func chatReplayEventHasToolArguments(parsed gjson.Result) bool {
+	toolCalls := parsed.Get("choices.0.delta.tool_calls")
+	if !toolCalls.IsArray() {
+		return false
+	}
+	for _, toolCall := range toolCalls.Array() {
+		if toolCall.Get("function.arguments").String() != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func replaySSEDataPayloads(data []byte) [][]byte {
+	frames := bytes.Split(data, []byte("\n\n"))
+	payloads := make([][]byte, 0, len(frames))
+	for _, frame := range frames {
+		for _, line := range bytes.Split(frame, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			payload := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+			if len(payload) > 0 {
+				payloads = append(payloads, payload)
+			}
+		}
+	}
+	// immediate flush 策略会把一个 SSE 帧拆成 "data: "、JSON、"\n\n"
+	// 三次 Write。中间的 JSON 仍需单独识别，否则答案已经产生也会一直留在缓冲区。
+	if len(payloads) == 0 {
+		trimmed := bytes.TrimSpace(data)
+		if bytes.Equal(trimmed, []byte("[DONE]")) || gjson.ValidBytes(trimmed) {
+			payloads = append(payloads, trimmed)
+		}
+	}
+	return payloads
+}
+
+func responsesReplayEventHasBusinessContent(parsed gjson.Result) bool {
+	eventType := parsed.Get("type").String()
+	switch eventType {
+	case "response.output_text.delta", "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
+		return parsed.Get("delta").String() != ""
+	case "response.image_generation_call.partial_image":
+		return parsed.Get("partial_image_b64").String() != "" || parsed.Get("partial_image").String() != ""
+	case "response.output_item.done":
+		item := parsed.Get("item")
+		return item.Get("type").String() != "reasoning" && outputItemHasFirstTokenContent(item)
+	case "response.content_part.done":
+		return contentPartHasFirstTokenContent(parsed.Get("part"))
+	default:
+		return false
+	}
+}
+
+func anthropicReplayEventHasBusinessContent(parsed gjson.Result) bool {
+	switch parsed.Get("type").String() {
+	case "content_block_delta":
+		delta := parsed.Get("delta")
+		switch delta.Get("type").String() {
+		case "text_delta":
+			return delta.Get("text").String() != ""
+		case "input_json_delta":
+			return delta.Get("partial_json").String() != ""
+		}
+	case "message_delta":
+		return parsed.Get("delta.stop_reason").String() != ""
+	}
+	return false
 }
 
 func (w *clientRequestReplayWriter) WriteString(data string) (int, error) {
@@ -611,7 +803,8 @@ func (h *Handler) handleWithClientRequestReplay(c *gin.Context, endpoint string,
 	controller := newClientRequestReplayController(originalRequest.Context(), maxDuration)
 	defer controller.close()
 	codexClient := IsCodexStrictOfficialClientByHeaders(c.GetHeader("User-Agent"), c.GetHeader("Originator"))
-	delivery := newClientRequestReplayDelivery(downstream, controller, codexClient)
+	protocol := clientRequestReplayProtocolForEndpoint(endpoint)
+	delivery := newClientRequestReplayDelivery(downstream, controller, protocol, codexClient)
 	keepaliveSeconds := h.store.ClientRequestReplayKeepaliveSeconds()
 	attempts := 0
 	lastStatus := 0
