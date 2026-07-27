@@ -34,6 +34,7 @@ import type {
   QualityEvalBatch,
   QualityEvalKind,
   QualityEvalSample,
+  RunQualityEvalRequest,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -122,6 +123,22 @@ import AccountGroupFilterSelect, {
 import ChipInput from "../components/ChipInput";
 
 const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
+const QUALITY_EVAL_MIN_VALUE = 1;
+const QUALITY_EVAL_MAX_VALUE = 10;
+const DEFAULT_QUALITY_EVAL_INPUTS = {
+  juiceSamples: "2",
+  juiceConcurrency: "2",
+  candySamples: "3",
+  candyConcurrency: "3",
+};
+
+function parseQualityEvalInput(value: string): number | null {
+  if (!/^\d+$/.test(value.trim())) return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= QUALITY_EVAL_MIN_VALUE && parsed <= QUALITY_EVAL_MAX_VALUE
+    ? parsed
+    : null;
+}
 const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
 const ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY =
   "codex2api:accounts:email-domain-tags-visible";
@@ -1011,8 +1028,14 @@ export default function Accounts() {
   const [qualityEvalAccount, setQualityEvalAccount] = useState<AccountRow | null>(null);
   const [qualityEvalHistory, setQualityEvalHistory] = useState<QualityEvalBatch[]>([]);
   const [qualityEvalSamples, setQualityEvalSamples] = useState<QualityEvalSample[]>([]);
+  const [qualityEvalActiveTasks, setQualityEvalActiveTasks] = useState<string[]>([]);
   const [qualityEvalRunning, setQualityEvalRunning] = useState(false);
   const [qualityEvalLoading, setQualityEvalLoading] = useState(false);
+  const [qualityEvalInputs, setQualityEvalInputs] = useState(DEFAULT_QUALITY_EVAL_INPUTS);
+  const qualityEvalHistoryRequestRef = useRef(0);
+  const qualityEvalInputsValid = Object.values(qualityEvalInputs).every(
+    (value) => parseQualityEvalInput(value) !== null,
+  );
   const [editingAccount, setEditingAccount] = useState<AccountRow | null>(null);
   const [editSubmitting, setEditSubmitting] = useState(false);
   const [editTab, setEditTab] = useState<"scheduler" | "account">("scheduler");
@@ -2161,24 +2184,52 @@ export default function Accounts() {
     t,
   ]);
   const openQualityEval = useCallback(async (account: AccountRow) => {
+    const requestID = ++qualityEvalHistoryRequestRef.current;
     setQualityEvalAccount(account);
+    setQualityEvalHistory([]);
     setQualityEvalSamples([]);
+    setQualityEvalActiveTasks([]);
+    setQualityEvalInputs(DEFAULT_QUALITY_EVAL_INPUTS);
     setQualityEvalLoading(true);
     try {
       const response = await api.getAccountQualityEvals(account.id);
-      setQualityEvalHistory(response.batches ?? []);
+      if (qualityEvalHistoryRequestRef.current === requestID) {
+        setQualityEvalHistory(response.batches ?? []);
+      }
     } catch (error) {
-      showToast(t("accounts.qualityEvalHistoryFailed", { error: getErrorMessage(error) }), "error");
+      if (qualityEvalHistoryRequestRef.current === requestID) {
+        showToast(t("accounts.qualityEvalHistoryFailed", { error: getErrorMessage(error) }), "error");
+      }
     } finally {
-      setQualityEvalLoading(false);
+      if (qualityEvalHistoryRequestRef.current === requestID) {
+        setQualityEvalLoading(false);
+      }
     }
   }, [showToast, t]);
   const runQualityEval = useCallback(async (kind: QualityEvalKind) => {
     if (!qualityEvalAccount || qualityEvalRunning) return;
+    const parsedInputs = {
+      juiceSamples: parseQualityEvalInput(qualityEvalInputs.juiceSamples),
+      juiceConcurrency: parseQualityEvalInput(qualityEvalInputs.juiceConcurrency),
+      candySamples: parseQualityEvalInput(qualityEvalInputs.candySamples),
+      candyConcurrency: parseQualityEvalInput(qualityEvalInputs.candyConcurrency),
+    };
+    if (Object.values(parsedInputs).some((value) => value === null)) {
+      showToast(t("accounts.qualityEvalParameterError"), "error");
+      return;
+    }
+    const payload: RunQualityEvalRequest = {
+      kind,
+      juice_samples: parsedInputs.juiceSamples!,
+      juice_concurrency: parsedInputs.juiceConcurrency!,
+      candy_samples: parsedInputs.candySamples!,
+      candy_concurrency: parsedInputs.candyConcurrency!,
+    };
     setQualityEvalRunning(true);
     setQualityEvalSamples([]);
+    setQualityEvalActiveTasks([]);
     try {
-      const response = await api.runAccountQualityEval(qualityEvalAccount.id, kind);
+      const response = await api.runAccountQualityEval(qualityEvalAccount.id, payload);
       const reader = response.body?.getReader();
       if (!reader) throw new Error(t("accounts.qualityEvalNoStream"));
       const decoder = new TextDecoder();
@@ -2192,9 +2243,16 @@ export default function Accounts() {
         for (const frame of frames) {
           const payload = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
           if (!payload) continue;
-          const event = JSON.parse(payload) as { type: string; sample?: QualityEvalSample; batch?: QualityEvalBatch; error?: string };
-          if (event.sample) setQualityEvalSamples((samples) => [...samples, event.sample!]);
-          if (event.batch) completedBatch = event.batch;
+          const event = JSON.parse(payload) as { type: string; kind?: string; sample_index?: number; sample?: QualityEvalSample; batch?: QualityEvalBatch; error?: string };
+          const taskKey = event.kind && event.sample_index ? `${event.kind}-${event.sample_index}` : "";
+          if (event.type === "quality_eval_task_start" && taskKey) {
+            setQualityEvalActiveTasks((tasks) => tasks.includes(taskKey) ? tasks : [...tasks, taskKey]);
+          }
+          if (event.sample) {
+            setQualityEvalSamples((samples) => [...samples, event.sample!]);
+            setQualityEvalActiveTasks((tasks) => tasks.filter((task) => task !== `${event.sample!.test_kind}-${event.sample!.sample_index}`));
+          }
+          if (event.type === "quality_eval_complete" && event.batch) completedBatch = event.batch;
           if (event.error) throw new Error(event.error);
         }
         if (done) break;
@@ -2208,8 +2266,9 @@ export default function Accounts() {
       showToast(t("accounts.qualityEvalFailed", { error: getErrorMessage(error) }), "error");
     } finally {
       setQualityEvalRunning(false);
+      setQualityEvalActiveTasks([]);
     }
-  }, [qualityEvalAccount, qualityEvalRunning, reloadSilently, showToast, t]);
+  }, [qualityEvalAccount, qualityEvalInputs, qualityEvalRunning, reloadSilently, showToast, t]);
   const goDetailPrev = useCallback(() => {
     if (detailNavIndex <= 0) return;
     setDetailAccountId(sortedAccounts[detailNavIndex - 1]?.id ?? null);
@@ -6520,14 +6579,20 @@ export default function Accounts() {
             contentClassName="sm:max-w-[760px]"
             bodyClassName="space-y-4"
             onClose={() => {
-              if (!qualityEvalRunning) setQualityEvalAccount(null);
+              if (!qualityEvalRunning) {
+                qualityEvalHistoryRequestRef.current += 1;
+                setQualityEvalAccount(null);
+              }
             }}
             footer={
               <Button
                 type="button"
                 variant="outline"
                 disabled={qualityEvalRunning}
-                onClick={() => setQualityEvalAccount(null)}
+                onClick={() => {
+                  qualityEvalHistoryRequestRef.current += 1;
+                  setQualityEvalAccount(null);
+                }}
               >
                 {t("common.close")}
               </Button>
@@ -6539,18 +6604,53 @@ export default function Accounts() {
               </div>
               {t("accounts.qualityEvalDescription")}
             </div>
+            <div className="grid gap-3 rounded-lg border p-3 sm:grid-cols-2">
+              {([
+                ["juiceSamples", "accounts.qualityEvalJuiceSamples"],
+                ["juiceConcurrency", "accounts.qualityEvalJuiceConcurrency"],
+                ["candySamples", "accounts.qualityEvalCandySamples"],
+                ["candyConcurrency", "accounts.qualityEvalCandyConcurrency"],
+              ] as const).map(([field, label]) => (
+                <label key={field} className="space-y-1 text-xs">
+                  <span className="font-medium">{t(label)}</span>
+                  <Input
+                    type="number"
+                    min={QUALITY_EVAL_MIN_VALUE}
+                    max={QUALITY_EVAL_MAX_VALUE}
+                    step={1}
+                    disabled={qualityEvalRunning}
+                    value={qualityEvalInputs[field]}
+                    onChange={(event) => setQualityEvalInputs((current) => ({ ...current, [field]: event.target.value }))}
+                  />
+                </label>
+              ))}
+              {!qualityEvalInputsValid && (
+                <div className="text-xs text-destructive sm:col-span-2">{t("accounts.qualityEvalParameterError")}</div>
+              )}
+              <div className="text-[11px] text-muted-foreground sm:col-span-2">{t("accounts.qualityEvalConcurrencyHint")}</div>
+            </div>
             <div className="grid gap-2 sm:grid-cols-3">
-              <Button type="button" variant="outline" disabled={qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("juice")}>
+              <Button type="button" variant="outline" disabled={!qualityEvalInputsValid || qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("juice")}>
                 {qualityEvalRunning ? <RefreshCw className="size-3.5 animate-spin" /> : <FlaskConical className="size-3.5" />}
-                {t("accounts.qualityEvalJuice")}
+                {t("accounts.qualityEvalJuice", { count: qualityEvalInputs.juiceSamples })}
               </Button>
-              <Button type="button" variant="outline" disabled={qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("candy")}>
-                {t("accounts.qualityEvalCandy")}
+              <Button type="button" variant="outline" disabled={!qualityEvalInputsValid || qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("candy")}>
+                {t("accounts.qualityEvalCandy", { count: qualityEvalInputs.candySamples })}
               </Button>
-              <Button type="button" disabled={qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("full")}>
+              <Button type="button" disabled={!qualityEvalInputsValid || qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("full")}>
                 {t("accounts.qualityEvalFull")}
               </Button>
             </div>
+            {qualityEvalActiveTasks.length > 0 && (
+              <div className="flex flex-wrap gap-2 rounded-lg border bg-muted/20 p-3">
+                {qualityEvalActiveTasks.map((task) => (
+                  <span key={task} className="inline-flex items-center gap-1.5 rounded-md bg-blue-500/10 px-2 py-1 text-[11px] font-medium text-blue-700 dark:text-blue-300">
+                    <RefreshCw className="size-3 animate-spin" />
+                    {t("accounts.qualityEvalTaskRunning", { task: task.replace("-", " #") })}
+                  </span>
+                ))}
+              </div>
+            )}
             {qualityEvalSamples.length > 0 && (
               <div className="space-y-2">
                 <div className="text-xs font-semibold">{t("accounts.qualityEvalProgress")}</div>
@@ -6578,6 +6678,22 @@ export default function Accounts() {
                         {batch.candy_requested > 0 && <span>Candy {batch.candy_correct}/{batch.candy_requested}</span>}
                         <span className="ml-auto text-muted-foreground">{formatRelativeTime(batch.created_at)}</span>
                       </summary>
+                      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                        <span>{t(`accounts.qualityEvalSource${batch.trigger_source === "auto" ? "Auto" : "Manual"}`)}</span>
+                        <span>{t("accounts.qualityEvalRequestConfig", {
+                          juiceSamples: batch.juice_requested,
+                          juiceConcurrency: batch.juice_concurrency,
+                          candySamples: batch.candy_requested,
+                          candyConcurrency: batch.candy_concurrency,
+                        })}</span>
+                        <span>{t("accounts.qualityEvalReasoningSummary", {
+                          average: batch.reasoning_tokens_average.toFixed(1),
+                          maximum: batch.reasoning_tokens_maximum,
+                        })}</span>
+                      </div>
+                      {batch.error_message && (
+                        <div className="mt-2 rounded bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">{batch.error_message}</div>
+                      )}
                       <div className="mt-3 grid gap-2 sm:grid-cols-2">
                         {(batch.samples ?? []).map((sample) => (
                           <QualityEvalSampleCard key={sample.id ?? `${sample.test_kind}-${sample.sample_index}`} sample={sample} />
@@ -11085,9 +11201,14 @@ function QualityEvalSampleCard({ sample }: { sample: QualityEvalSample }) {
         <span>in {sample.input_tokens}</span>
         <span>out {sample.output_tokens}</span>
         <span>reason {sample.reasoning_tokens}</span>
+        {sample.http_status > 0 && <span>HTTP {sample.http_status}</span>}
+        {sample.terminal_status && <span>{sample.terminal_status}</span>}
         {sample.attempt_count > 1 && <span>attempts {sample.attempt_count}</span>}
         {sample.parsed_answer && <span className="font-mono">parsed {sample.parsed_answer}</span>}
       </div>
+      {sample.error_message && sample.raw_answer && (
+        <div className="mt-1.5 break-words text-red-600 dark:text-red-400">{sample.error_message}</div>
+      )}
     </div>
   );
 }

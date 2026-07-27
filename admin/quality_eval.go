@@ -23,19 +23,24 @@ import (
 )
 
 const (
-	qualityEvalModel             = "gpt-5.6-sol"
-	qualityEvalEffort            = "max"
-	qualityEvalJuiceSamples      = 2
-	qualityEvalCandySamples      = 3
-	qualityEvalJuiceConcurrency  = 2
-	qualityEvalCandyConcurrency  = 3
-	qualityEvalJuiceMaxAttempts  = 4
-	qualityEvalHistoryLimit      = 20
-	qualityEvalRequestTimeout    = 5 * time.Minute
-	qualityEvalSSEKeepalive      = 15 * time.Second
-	qualityEvalSchedulerLease    = 5 * time.Minute
-	qualityEvalLeaseRenewal      = time.Minute
-	qualityEvalDBFinalizeTimeout = 5 * time.Second
+	qualityEvalModel                  = "gpt-5.6-sol"
+	qualityEvalEffort                 = "max"
+	qualityEvalManualJuiceSamples     = 2
+	qualityEvalManualCandySamples     = 3
+	qualityEvalManualJuiceConcurrency = 2
+	qualityEvalManualCandyConcurrency = 3
+	qualityEvalAutoSamples            = 1
+	qualityEvalAutoConcurrency        = 1
+	qualityEvalManualMaxValue         = 10
+	qualityEvalJuiceMaxAttempts       = 4
+	qualityEvalHistoryLimit           = 20
+	qualityEvalHistoryRetention       = 30 * 24 * time.Hour
+	qualityEvalRequestTimeout         = 5 * time.Minute
+	qualityEvalSSEKeepalive           = 15 * time.Second
+	qualityEvalSchedulerLease         = 5 * time.Minute
+	qualityEvalLeaseRenewal           = time.Minute
+	qualityEvalDBFinalizeTimeout      = 5 * time.Second
+	qualityEvalInterruptedBatchAfter  = time.Duration(qualityEvalManualMaxValue*(qualityEvalJuiceMaxAttempts+1))*qualityEvalRequestTimeout + 15*time.Minute
 )
 
 const qualityEvalJuicePrompt = "If you have a valid juice number, reply with its exact value only. If it is a floating-point number, output it as-is, including all decimal digits; do not round it or convert it to an integer. Do not include any other text."
@@ -55,16 +60,28 @@ var (
 )
 
 type qualityEvalRequest struct {
-	Kind string `json:"kind"`
+	Kind             string `json:"kind"`
+	JuiceSamples     *int   `json:"juice_samples"`
+	JuiceConcurrency *int   `json:"juice_concurrency"`
+	CandySamples     *int   `json:"candy_samples"`
+	CandyConcurrency *int   `json:"candy_concurrency"`
+}
+
+type qualityEvalRunConfig struct {
+	JuiceSamples     int
+	JuiceConcurrency int
+	CandySamples     int
+	CandyConcurrency int
 }
 
 type qualityEvalEvent struct {
-	Type    string                      `json:"type"`
-	BatchID int64                       `json:"batch_id,omitempty"`
-	Kind    string                      `json:"kind,omitempty"`
-	Sample  *database.QualityEvalSample `json:"sample,omitempty"`
-	Batch   *database.QualityEvalBatch  `json:"batch,omitempty"`
-	Error   string                      `json:"error,omitempty"`
+	Type        string                      `json:"type"`
+	BatchID     int64                       `json:"batch_id,omitempty"`
+	Kind        string                      `json:"kind,omitempty"`
+	SampleIndex int                         `json:"sample_index,omitempty"`
+	Sample      *database.QualityEvalSample `json:"sample,omitempty"`
+	Batch       *database.QualityEvalBatch  `json:"batch,omitempty"`
+	Error       string                      `json:"error,omitempty"`
 }
 
 type qualityEvalStreamResult struct {
@@ -74,6 +91,8 @@ type qualityEvalStreamResult struct {
 	ReasoningTokens int
 	FirstTokenMs    int
 	DurationMs      int
+	HTTPStatus      int
+	TerminalStatus  string
 }
 
 // RunAccountQualityEval 对指定账号执行固定 gpt-5.6-sol Max 质量检测并以 SSE 返回进度。
@@ -95,6 +114,11 @@ func (h *Handler) RunAccountQualityEval(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "检测类型必须是 juice、candy 或 full"})
 		return
 	}
+	runConfig, err := manualQualityEvalRunConfig(kind, request)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	account, err := h.qualityEvalAccount(accountID)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -104,9 +128,14 @@ func (h *Handler) RunAccountQualityEval(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": "该账号已有质量检测正在运行"})
 		return
 	}
-	defer h.qualityEvalAccountLocks.Delete(accountID)
+	lockOwnedByHandler := true
+	defer func() {
+		if lockOwnedByHandler {
+			h.qualityEvalAccountLocks.Delete(accountID)
+		}
+	}()
 
-	batch := newQualityEvalBatch(accountID, database.QualityEvalTriggerManual, kind, nil)
+	batch := newQualityEvalBatch(accountID, database.QualityEvalTriggerManual, kind, nil, runConfig)
 	batchID, created, err := h.db.CreateQualityEvalBatch(c.Request.Context(), batch)
 	if err != nil || !created {
 		if err == nil {
@@ -122,16 +151,27 @@ func (h *Handler) RunAccountQualityEval(c *gin.Context) {
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
 	c.Writer.Flush()
-	sendQualityEvalEvent(c, qualityEvalEvent{Type: "quality_eval_start", BatchID: batchID, Kind: kind})
+	sendQualityEvalEvent(c, qualityEvalEvent{Type: "quality_eval_start", BatchID: batchID, Kind: kind, Batch: &batch})
 
-	events := make(chan qualityEvalEvent)
+	requestContext := c.Request.Context()
+	events := make(chan qualityEvalEvent, qualityEvalManualMaxValue*4+2)
 	go func() {
-		completed := h.executeQualityEvalBatch(c.Request.Context(), account, batch, func(sample database.QualityEvalSample) {
-			events <- qualityEvalEvent{Type: "quality_eval_sample", BatchID: batchID, Kind: sample.TestKind, Sample: &sample}
+		defer h.qualityEvalAccountLocks.Delete(accountID)
+		emit := func(event qualityEvalEvent) {
+			select {
+			case events <- event:
+			case <-requestContext.Done():
+			}
+		}
+		completed := h.executeQualityEvalBatch(requestContext, account, batch, func(sample database.QualityEvalSample) {
+			emit(qualityEvalEvent{Type: "quality_eval_sample", BatchID: batchID, Kind: sample.TestKind, SampleIndex: sample.SampleIndex, Sample: &sample})
+		}, func(kind string, sampleIndex int) {
+			emit(qualityEvalEvent{Type: "quality_eval_task_start", BatchID: batchID, Kind: kind, SampleIndex: sampleIndex})
 		})
-		events <- qualityEvalEvent{Type: "quality_eval_complete", BatchID: batchID, Batch: &completed}
+		emit(qualityEvalEvent{Type: "quality_eval_complete", BatchID: batchID, Batch: &completed})
 		close(events)
 	}()
+	lockOwnedByHandler = false
 	keepalive := time.NewTicker(qualityEvalSSEKeepalive)
 	defer keepalive.Stop()
 	for {
@@ -144,6 +184,8 @@ func (h *Handler) RunAccountQualityEval(c *gin.Context) {
 		case <-keepalive.C:
 			_, _ = fmt.Fprint(c.Writer, ": keepalive\n\n")
 			c.Writer.Flush()
+		case <-c.Request.Context().Done():
+			return
 		}
 	}
 }
@@ -170,7 +212,7 @@ func (h *Handler) GetQualityEvalConfig(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "读取质量检测配置失败: "+err.Error())
 		return
 	}
-	c.JSON(http.StatusOK, config)
+	c.JSON(http.StatusOK, h.qualityEvalConfigResponse(config))
 }
 
 // UpdateQualityEvalConfig 校验并保存周期质量检测配置。
@@ -186,7 +228,16 @@ func (h *Handler) UpdateQualityEvalConfig(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "保存质量检测配置失败: "+err.Error())
 		return
 	}
-	c.JSON(http.StatusOK, saved)
+	c.JSON(http.StatusOK, h.qualityEvalConfigResponse(saved))
+}
+
+func (h *Handler) qualityEvalConfigResponse(config database.QualityEvalConfig) database.QualityEvalConfig {
+	config.AutoRunnable = h != nil && h.db != nil && h.db.GetUsageLogMode() == database.UsageLogModeFull
+	config.AutoSkipReason = ""
+	if !config.AutoRunnable {
+		config.AutoSkipReason = "自动排名需要 usage_log_mode=full；手动检测不受影响"
+	}
+	return config
 }
 
 // StartQualityEvalScheduler 启动默认关闭的周期质量检测任务。
@@ -200,7 +251,7 @@ func (h *Handler) StartQualityEvalScheduler() {
 		if h.qualityEvalLeaseOwner == "" {
 			h.qualityEvalLeaseOwner = uuid.NewString()
 		}
-		if err := h.db.MarkInterruptedQualityEvalBatches(ctx, time.Now().Add(-45*time.Minute)); err != nil {
+		if err := h.db.MarkInterruptedQualityEvalBatches(ctx, time.Now().Add(-qualityEvalInterruptedBatchAfter)); err != nil {
 			log.Printf("标记中断质量检测批次失败: %v", err)
 		}
 		h.qualityEvalWG.Add(1)
@@ -224,7 +275,10 @@ func (h *Handler) StopQualityEvalScheduler() {
 func (h *Handler) qualityEvalSchedulerLoop(ctx context.Context) {
 	defer h.qualityEvalWG.Done()
 	ticker := time.NewTicker(time.Minute)
+	cleanupTicker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
+	defer cleanupTicker.Stop()
+	h.cleanupQualityEvalHistory(ctx, time.Now())
 	h.runScheduledQualityEvals(ctx, time.Now())
 	for {
 		select {
@@ -232,7 +286,15 @@ func (h *Handler) qualityEvalSchedulerLoop(ctx context.Context) {
 			return
 		case now := <-ticker.C:
 			h.runScheduledQualityEvals(ctx, now)
+		case now := <-cleanupTicker.C:
+			h.cleanupQualityEvalHistory(ctx, now)
 		}
+	}
+}
+
+func (h *Handler) cleanupQualityEvalHistory(ctx context.Context, now time.Time) {
+	if err := h.db.DeleteQualityEvalHistoryBefore(ctx, now.Add(-qualityEvalHistoryRetention)); err != nil {
+		log.Printf("清理过期质量检测历史失败: %v", err)
 	}
 }
 
@@ -316,6 +378,11 @@ func (h *Handler) runScheduledQualityEvals(ctx context.Context, now time.Time) {
 			log.Printf("完成周期质量检测调度桶失败: %v", completeErr)
 		}
 	}()
+	if h.db.GetUsageLogMode() != database.UsageLogModeFull {
+		log.Printf("周期质量检测跳过: bucket=%s，自动排名需要 usage_log_mode=full", bucket.Format(time.RFC3339))
+		scheduleStatus = database.QualityEvalStatusNormal
+		return
+	}
 
 	candidates, err := h.db.GetQualityEvalCandidates(leaseCtx, now.Add(-time.Duration(config.LookbackHours)*time.Hour), now, config.MinRequests, h.store.AccountCount())
 	if err != nil {
@@ -362,7 +429,7 @@ func (h *Handler) runScheduledQualityEvals(ctx context.Context, now time.Time) {
 				orchestrationFailed.Store(true)
 				return
 			}
-			batch := newQualityEvalBatch(account.DBID, database.QualityEvalTriggerAuto, database.QualityEvalKindFull, &bucket)
+			batch := newQualityEvalBatch(account.DBID, database.QualityEvalTriggerAuto, database.QualityEvalKindFull, &bucket, automaticQualityEvalRunConfig())
 			batchID, created, createErr := h.db.CreateQualityEvalBatch(leaseCtx, batch)
 			if createErr != nil {
 				orchestrationFailed.Store(true)
@@ -373,7 +440,7 @@ func (h *Handler) runScheduledQualityEvals(ctx context.Context, now time.Time) {
 				return
 			}
 			batch.ID = batchID
-			completed := h.executeQualityEvalBatch(leaseCtx, account, batch, nil)
+			completed := h.executeQualityEvalBatch(leaseCtx, account, batch, nil, nil)
 			log.Printf("[账号 %d] 周期质量检测完成: batch=%d status=%s juice=%d/%d candy=%d/%d",
 				account.DBID, completed.ID, completed.Status, completed.JuiceCorrect, completed.JuiceGraded,
 				completed.CandyCorrect, completed.CandyGraded)
@@ -385,22 +452,70 @@ func (h *Handler) runScheduledQualityEvals(ctx context.Context, now time.Time) {
 	}
 }
 
-func newQualityEvalBatch(accountID int64, source, kind string, scheduledHour *time.Time) database.QualityEvalBatch {
+func manualQualityEvalRunConfig(kind string, request qualityEvalRequest) (qualityEvalRunConfig, error) {
+	config := qualityEvalRunConfig{
+		JuiceSamples:     qualityEvalManualJuiceSamples,
+		JuiceConcurrency: qualityEvalManualJuiceConcurrency,
+		CandySamples:     qualityEvalManualCandySamples,
+		CandyConcurrency: qualityEvalManualCandyConcurrency,
+	}
+	values := []struct {
+		name   string
+		input  *int
+		target *int
+	}{
+		{name: "Juice 样本数", input: request.JuiceSamples, target: &config.JuiceSamples},
+		{name: "Juice 并发度", input: request.JuiceConcurrency, target: &config.JuiceConcurrency},
+		{name: "Candy 样本数", input: request.CandySamples, target: &config.CandySamples},
+		{name: "Candy 并发度", input: request.CandyConcurrency, target: &config.CandyConcurrency},
+	}
+	for _, value := range values {
+		if value.input == nil {
+			continue
+		}
+		if *value.input < 1 || *value.input > qualityEvalManualMaxValue {
+			return qualityEvalRunConfig{}, fmt.Errorf("%s必须在 1～%d 之间", value.name, qualityEvalManualMaxValue)
+		}
+		*value.target = *value.input
+	}
+	return qualityEvalRunConfigForKind(kind, config), nil
+}
+
+func automaticQualityEvalRunConfig() qualityEvalRunConfig {
+	return qualityEvalRunConfig{
+		JuiceSamples:     qualityEvalAutoSamples,
+		JuiceConcurrency: qualityEvalAutoConcurrency,
+		CandySamples:     qualityEvalAutoSamples,
+		CandyConcurrency: qualityEvalAutoConcurrency,
+	}
+}
+
+func qualityEvalRunConfigForKind(kind string, config qualityEvalRunConfig) qualityEvalRunConfig {
+	if kind != database.QualityEvalKindJuice && kind != database.QualityEvalKindFull {
+		config.JuiceSamples = 0
+		config.JuiceConcurrency = 0
+	}
+	if kind != database.QualityEvalKindCandy && kind != database.QualityEvalKindFull {
+		config.CandySamples = 0
+		config.CandyConcurrency = 0
+	}
+	return config
+}
+
+func newQualityEvalBatch(accountID int64, source, kind string, scheduledHour *time.Time, config qualityEvalRunConfig) database.QualityEvalBatch {
 	batch := database.QualityEvalBatch{
-		AccountID:       accountID,
-		TriggerSource:   source,
-		TestKind:        kind,
-		ScheduledHour:   scheduledHour,
-		Model:           qualityEvalModel,
-		ReasoningEffort: qualityEvalEffort,
-		Status:          database.QualityEvalStatusRunning,
-		StartedAt:       time.Now().UTC(),
-	}
-	if kind == database.QualityEvalKindJuice || kind == database.QualityEvalKindFull {
-		batch.JuiceRequested = qualityEvalJuiceSamples
-	}
-	if kind == database.QualityEvalKindCandy || kind == database.QualityEvalKindFull {
-		batch.CandyRequested = qualityEvalCandySamples
+		AccountID:        accountID,
+		TriggerSource:    source,
+		TestKind:         kind,
+		ScheduledHour:    scheduledHour,
+		Model:            qualityEvalModel,
+		ReasoningEffort:  qualityEvalEffort,
+		Status:           database.QualityEvalStatusRunning,
+		JuiceRequested:   config.JuiceSamples,
+		JuiceConcurrency: config.JuiceConcurrency,
+		CandyRequested:   config.CandySamples,
+		CandyConcurrency: config.CandyConcurrency,
+		StartedAt:        time.Now().UTC(),
 	}
 	return batch
 }
@@ -445,25 +560,31 @@ func qualityEvalSupportedByAccount(account *auth.Account) bool {
 	return !account.IsOpenAIResponsesAPI() || account.SupportsOpenAIResponsesModel(qualityEvalModel)
 }
 
-func (h *Handler) executeQualityEvalBatch(ctx context.Context, account *auth.Account, batch database.QualityEvalBatch, onSample func(database.QualityEvalSample)) database.QualityEvalBatch {
+func (h *Handler) executeQualityEvalBatch(ctx context.Context, account *auth.Account, batch database.QualityEvalBatch, onSample func(database.QualityEvalSample), onTaskStart func(string, int)) database.QualityEvalBatch {
 	hadPersistenceError := false
+	batchErrors := make([]string, 0)
 	consume := func(samples []database.QualityEvalSample) {
 		for _, sample := range samples {
 			sample.BatchID = batch.ID
 			sample.AccountID = batch.AccountID
+			persistCtx, persistCancel := context.WithTimeout(context.Background(), qualityEvalDBFinalizeTimeout)
 			if sample.FirstTokenMs > 0 {
 				source := database.FirstTokenSourceManualProbe
 				if batch.TriggerSource == database.QualityEvalTriggerAuto {
 					source = database.FirstTokenSourceAutoProbe
 				}
-				_ = h.db.InsertAccountFirstTokenSample(ctx, &database.AccountFirstTokenSample{
+				_ = h.db.InsertAccountFirstTokenSample(persistCtx, &database.AccountFirstTokenSample{
 					AccountID: batch.AccountID, Source: source, Model: qualityEvalModel,
 					FirstTokenMs: sample.FirstTokenMs, CreatedAt: sample.CreatedAt,
 				})
 			}
-			if err := h.db.InsertQualityEvalSample(ctx, sample); err != nil {
+			if err := h.db.InsertQualityEvalSample(persistCtx, sample); err != nil {
 				hadPersistenceError = true
 				log.Printf("[账号 %d] 保存质量检测样本失败: %v", batch.AccountID, err)
+			}
+			persistCancel()
+			if sample.ErrorMessage != "" {
+				batchErrors = append(batchErrors, fmt.Sprintf("%s[%d]: %s", sample.TestKind, sample.SampleIndex, sample.ErrorMessage))
 			}
 			if sample.Graded {
 				switch sample.TestKind {
@@ -485,11 +606,12 @@ func (h *Handler) executeQualityEvalBatch(ctx context.Context, account *auth.Acc
 		}
 	}
 	if batch.JuiceRequested > 0 {
-		consume(h.runQualityEvalSamples(ctx, account, database.QualityEvalKindJuice, batch.JuiceRequested, qualityEvalJuiceConcurrency))
+		consume(h.runQualityEvalSamples(ctx, account, database.QualityEvalKindJuice, batch.JuiceRequested, batch.JuiceConcurrency, onTaskStart))
 	}
 	if batch.CandyRequested > 0 {
-		consume(h.runQualityEvalSamples(ctx, account, database.QualityEvalKindCandy, batch.CandyRequested, qualityEvalCandyConcurrency))
+		consume(h.runQualityEvalSamples(ctx, account, database.QualityEvalKindCandy, batch.CandyRequested, batch.CandyConcurrency, onTaskStart))
 	}
+	batch.ErrorMessage = truncate(strings.Join(batchErrors, "; "), 4000)
 
 	batch.Status = classifyQualityEvalBatch(batch, hadPersistenceError)
 	finishedAt := time.Now().UTC()
@@ -507,19 +629,24 @@ func classifyQualityEvalBatch(batch database.QualityEvalBatch, persistenceError 
 	if persistenceError || batch.JuiceGraded < batch.JuiceRequested || batch.CandyGraded < batch.CandyRequested {
 		return database.QualityEvalStatusIncomplete
 	}
-	if (batch.CandyRequested > 0 && batch.CandyCorrect == 0) ||
-		(batch.JuiceRequested > 0 && batch.JuiceCorrect == 0) {
+	if batch.CandyRequested == 0 {
+		return database.QualityEvalStatusNormal
+	}
+	if batch.CandyCorrect == 0 {
 		return database.QualityEvalStatusDegraded
 	}
-	if batch.CandyCorrect == batch.CandyRequested && batch.JuiceCorrect == batch.JuiceRequested {
+	if batch.CandyCorrect == batch.CandyRequested {
 		return database.QualityEvalStatusNormal
 	}
 	return database.QualityEvalStatusSuspected
 }
 
-func (h *Handler) runQualityEvalSamples(ctx context.Context, account *auth.Account, kind string, count, concurrency int) []database.QualityEvalSample {
+func (h *Handler) runQualityEvalSamples(ctx context.Context, account *auth.Account, kind string, count, concurrency int, onTaskStart func(string, int)) []database.QualityEvalSample {
 	jobs := make(chan int)
 	results := make(chan database.QualityEvalSample, count)
+	if concurrency < 1 {
+		concurrency = 1
+	}
 	if concurrency > count {
 		concurrency = count
 	}
@@ -529,6 +656,9 @@ func (h *Handler) runQualityEvalSamples(ctx context.Context, account *auth.Accou
 		go func() {
 			defer wg.Done()
 			for index := range jobs {
+				if onTaskStart != nil {
+					onTaskStart(kind, index)
+				}
 				if kind == database.QualityEvalKindJuice {
 					results <- h.runJuiceQualityEval(ctx, account, index)
 				} else {
@@ -586,6 +716,8 @@ func (h *Handler) runJuiceQualityEval(ctx context.Context, account *auth.Account
 		sample.OutputTokens += result.OutputTokens
 		sample.ReasoningTokens += result.ReasoningTokens
 		sample.DurationMs += result.DurationMs
+		sample.HTTPStatus = result.HTTPStatus
+		sample.TerminalStatus = result.TerminalStatus
 		if result.FirstTokenMs > 0 {
 			sample.FirstTokenMs = result.FirstTokenMs
 		}
@@ -600,7 +732,7 @@ func (h *Handler) runJuiceQualityEval(ctx context.Context, account *auth.Account
 			return sample
 		}
 	}
-	sample.Graded = true
+	sample.ErrorMessage = "未从 Juice 回答中解析到数字"
 	return sample
 }
 
@@ -615,6 +747,8 @@ func (h *Handler) runCandyQualityEval(ctx context.Context, account *auth.Account
 	sample.ReasoningTokens = result.ReasoningTokens
 	sample.FirstTokenMs = result.FirstTokenMs
 	sample.DurationMs = result.DurationMs
+	sample.HTTPStatus = result.HTTPStatus
+	sample.TerminalStatus = result.TerminalStatus
 	if err != nil {
 		sample.ErrorMessage = err.Error()
 		return sample
@@ -666,10 +800,12 @@ func (h *Handler) executeQualityEvalRequest(parent context.Context, account *aut
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		return qualityEvalStreamResult{DurationMs: int(time.Since(startedAt).Milliseconds())},
+		return qualityEvalStreamResult{DurationMs: int(time.Since(startedAt).Milliseconds()), HTTPStatus: resp.StatusCode},
 			fmt.Errorf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 1000))
 	}
-	return readQualityEvalStream(resp.Body, startedAt)
+	result, err := readQualityEvalStream(resp.Body, startedAt)
+	result.HTTPStatus = resp.StatusCode
+	return result, err
 }
 
 func (h *Handler) acquireQualityEvalMaintenanceSlot(ctx context.Context, account *auth.Account) error {
@@ -716,7 +852,7 @@ func readQualityEvalStream(body io.Reader, startedAt time.Time) (qualityEvalStre
 			delta := gjson.GetBytes(data, "delta").String()
 			if delta != "" {
 				if result.FirstTokenMs == 0 {
-					result.FirstTokenMs = int(time.Since(startedAt).Milliseconds())
+					result.FirstTokenMs = max(int(time.Since(startedAt).Milliseconds()), 1)
 				}
 				deltas.WriteString(delta)
 			}
@@ -734,7 +870,11 @@ func readQualityEvalStream(body io.Reader, startedAt time.Time) (qualityEvalStre
 			terminal = true
 			response := gjson.GetBytes(data, "response")
 			status := response.Get("status").String()
-			if status == "failed" || status == "incomplete" {
+			result.TerminalStatus = status
+			if result.TerminalStatus == "" {
+				result.TerminalStatus = "completed"
+			}
+			if status != "" && status != "completed" {
 				streamError = formatUpstreamTestError(data, "上游返回 "+status)
 			}
 			if fallback == "" {
@@ -746,12 +886,13 @@ func readQualityEvalStream(body io.Reader, startedAt time.Time) (qualityEvalStre
 			return false
 		case "response.failed", "error":
 			terminal = true
+			result.TerminalStatus = eventType
 			streamError = formatUpstreamTestError(data, "上游返回 "+eventType)
 			return false
 		}
 		return true
 	})
-	result.DurationMs = int(time.Since(startedAt).Milliseconds())
+	result.DurationMs = max(int(time.Since(startedAt).Milliseconds()), 1)
 	result.RawAnswer = deltas.String()
 	if result.RawAnswer == "" {
 		result.RawAnswer = fallback

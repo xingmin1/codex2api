@@ -40,7 +40,7 @@ import type {
   PublicAPIKeyUsageResponse,
   QualityEvalBatch,
   QualityEvalConfig,
-  QualityEvalKind,
+  RunQualityEvalRequest,
   RecycleBinAccountsResponse,
   ResetCreditsDetailResponse,
   RuntimeStatusResponse,
@@ -328,10 +328,10 @@ export const api = {
       manual_score_bonus_remaining_seconds: number
       dispatch_score: number
     }>(`/accounts/${id}/manual-score-bonus`, { method: 'DELETE' }),
-  runAccountQualityEval: (id: number, kind: QualityEvalKind) =>
+  runAccountQualityEval: (id: number, payload: RunQualityEvalRequest) =>
     requestStream(`/accounts/${id}/quality-eval`, {
       method: 'POST',
-      body: JSON.stringify({ kind }),
+      body: JSON.stringify(payload),
     }),
   getAccountQualityEvals: (id: number) =>
     request<{ batches: QualityEvalBatch[] }>(`/accounts/${id}/quality-eval`),

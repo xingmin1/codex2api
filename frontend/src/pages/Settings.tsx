@@ -1251,6 +1251,8 @@ export default function Settings() {
     top_accounts: 5,
     min_requests: 50,
     batch_concurrency: 1,
+    auto_runnable: false,
+    auto_skip_reason: '',
   })
   const lazyModeActive = settingsForm.lazy_mode
   const [savingSettings, setSavingSettings] = useState(false)
@@ -2247,9 +2249,16 @@ export default function Settings() {
                     />
                   </SettingField>
 	                </div>
-	                <div className="border-t border-border pt-4">
-	                  <div className="mb-3 text-sm font-semibold">{t('settings.qualityEvalTitle')}</div>
-	                  <div className={SETTINGS_FIELD_GRID}>
+		                <div className="border-t border-border pt-4">
+		                  <div className="mb-3 text-sm font-semibold">{t('settings.qualityEvalTitle')}</div>
+		                  {qualityEvalConfig.auto_enabled && !qualityEvalConfig.auto_runnable && (
+		                    <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+		                      {t('settings.qualityEvalNotRunnable', {
+		                        reason: qualityEvalConfig.auto_skip_reason || 'usage_log_mode != full',
+		                      })}
+		                    </div>
+		                  )}
+		                  <div className={SETTINGS_FIELD_GRID}>
 	                    <SettingField label={t('settings.qualityEvalEnabled')} description={t('settings.qualityEvalEnabledDesc')} layout="switch">
 	                      <Switch
 	                        checked={qualityEvalConfig.auto_enabled}

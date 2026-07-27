@@ -42,6 +42,14 @@ export interface AccountFirstTokenStats {
 export type QualityEvalKind = 'juice' | 'candy' | 'full'
 export type QualityEvalStatus = 'running' | 'normal' | 'suspected' | 'degraded' | 'incomplete'
 
+export interface RunQualityEvalRequest {
+  kind: QualityEvalKind
+  juice_samples: number
+  juice_concurrency: number
+  candy_samples: number
+  candy_concurrency: number
+}
+
 export interface QualityEvalSample {
   id?: number
   batch_id: number
@@ -61,6 +69,8 @@ export interface QualityEvalSample {
   reasoning_tokens: number
   first_token_ms: number
   duration_ms: number
+  http_status: number
+  terminal_status?: string
   error_message?: string
   created_at: ISODateString
 }
@@ -74,12 +84,18 @@ export interface QualityEvalBatch {
   model: string
   reasoning_effort: string
   status: QualityEvalStatus
+  error_message?: string
   juice_requested: number
+  juice_concurrency: number
   juice_graded: number
   juice_correct: number
   candy_requested: number
+  candy_concurrency: number
   candy_graded: number
   candy_correct: number
+  latest_juice_value?: string
+  reasoning_tokens_average: number
+  reasoning_tokens_maximum: number
   started_at: ISODateString
   finished_at?: ISODateString
   created_at: ISODateString
@@ -93,6 +109,8 @@ export interface QualityEvalConfig {
   top_accounts: number
   min_requests: number
   batch_concurrency: number
+  auto_runnable: boolean
+  auto_skip_reason?: string
 }
 
 export interface AccountRow {

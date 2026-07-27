@@ -13,7 +13,7 @@ func TestQualityEvalBatchPersistsSamplesAndDeduplicatesScheduledHour(t *testing.
 	batch := QualityEvalBatch{
 		AccountID: 7, TriggerSource: QualityEvalTriggerAuto, TestKind: QualityEvalKindFull,
 		ScheduledHour: &now, Model: "gpt-5.6-sol", ReasoningEffort: "max",
-		JuiceRequested: 2, CandyRequested: 3, StartedAt: now,
+		JuiceRequested: 1, JuiceConcurrency: 1, CandyRequested: 1, CandyConcurrency: 1, StartedAt: now,
 	}
 	batchID, created, err := db.CreateQualityEvalBatch(ctx, batch)
 	if err != nil || !created || batchID <= 0 {
@@ -28,13 +28,14 @@ func TestQualityEvalBatchPersistsSamplesAndDeduplicatesScheduledHour(t *testing.
 		AttemptCount: 2, Model: "gpt-5.6-sol", ReasoningEffort: "max",
 		AttemptAnswers: []string{"none", "1.2500"}, RawAnswer: "1.2500", ParsedAnswer: "1.2500",
 		Graded: true, Correct: true, InputTokens: 10, OutputTokens: 2, ReasoningTokens: 8,
-		FirstTokenMs: 123, DurationMs: 456, CreatedAt: now.Add(time.Minute),
+		FirstTokenMs: 123, DurationMs: 456, HTTPStatus: 200, TerminalStatus: "completed", CreatedAt: now.Add(time.Minute),
 	}
 	if err := db.InsertQualityEvalSample(ctx, sample); err != nil {
 		t.Fatalf("InsertQualityEvalSample 返回错误: %v", err)
 	}
 	batch.ID = batchID
 	batch.Status = QualityEvalStatusIncomplete
+	batch.ErrorMessage = "candy[1]: upstream timeout"
 	batch.JuiceGraded = 1
 	batch.JuiceCorrect = 1
 	finishedAt := now.Add(2 * time.Minute)
@@ -48,12 +49,69 @@ func TestQualityEvalBatchPersistsSamplesAndDeduplicatesScheduledHour(t *testing.
 		t.Fatalf("历史 = %#v, err=%v", history, err)
 	}
 	got := history[0].Samples[0]
-	if got.ParsedAnswer != "1.2500" || len(got.AttemptAnswers) != 2 || got.AttemptAnswers[0] != "none" {
+	if got.ParsedAnswer != "1.2500" || len(got.AttemptAnswers) != 2 || got.AttemptAnswers[0] != "none" || got.HTTPStatus != 200 || got.TerminalStatus != "completed" {
 		t.Fatalf("样本原始字符串未完整保留: %#v", got)
+	}
+	if history[0].JuiceConcurrency != 1 || history[0].CandyConcurrency != 1 || history[0].ErrorMessage != batch.ErrorMessage || history[0].LatestJuiceValue != "1.2500" || history[0].ReasoningTokensAverage != 8 || history[0].ReasoningTokensMaximum != 8 {
+		t.Fatalf("批次参数或诊断汇总未完整保留: %#v", history[0])
 	}
 	latest, err := db.GetLatestQualityEvalBatches(ctx)
 	if err != nil || latest[7].Status != QualityEvalStatusIncomplete {
 		t.Fatalf("最新摘要 = %#v, err=%v", latest, err)
+	}
+}
+
+func TestDeleteQualityEvalHistoryBeforeKeepsCutoffAndNewerRows(t *testing.T) {
+	db := openFirstTokenTestDB(t)
+	ctx := context.Background()
+	cutoff := time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC)
+	create := func(accountID int64, startedAt time.Time) int64 {
+		t.Helper()
+		batch := QualityEvalBatch{
+			AccountID: accountID, TriggerSource: QualityEvalTriggerManual, TestKind: QualityEvalKindCandy,
+			Model: "gpt-5.6-sol", ReasoningEffort: "max", CandyRequested: 1, CandyConcurrency: 1,
+			StartedAt: startedAt,
+		}
+		id, created, err := db.CreateQualityEvalBatch(ctx, batch)
+		if err != nil || !created {
+			t.Fatalf("创建历史批次失败: id=%d created=%v err=%v", id, created, err)
+		}
+		if err := db.InsertQualityEvalSample(ctx, QualityEvalSample{
+			BatchID: id, AccountID: accountID, TestKind: QualityEvalKindCandy, SampleIndex: 1,
+			Model: "gpt-5.6-sol", ReasoningEffort: "max", CreatedAt: startedAt,
+		}); err != nil {
+			t.Fatalf("创建历史样本失败: %v", err)
+		}
+		return id
+	}
+	oldID := create(71, cutoff.Add(-time.Nanosecond))
+	boundaryID := create(72, cutoff)
+	newID := create(73, cutoff.Add(time.Nanosecond))
+	if claimed, err := db.TryCreateQualityEvalScheduleRun(ctx, cutoff.Add(-time.Hour)); err != nil || !claimed {
+		t.Fatalf("创建旧调度桶失败: claimed=%v err=%v", claimed, err)
+	}
+	if claimed, err := db.TryCreateQualityEvalScheduleRun(ctx, cutoff); err != nil || !claimed {
+		t.Fatalf("创建边界调度桶失败: claimed=%v err=%v", claimed, err)
+	}
+
+	if err := db.DeleteQualityEvalHistoryBefore(ctx, cutoff); err != nil {
+		t.Fatalf("DeleteQualityEvalHistoryBefore 返回错误: %v", err)
+	}
+	for _, tc := range []struct {
+		id   int64
+		want int
+	}{{oldID, 0}, {boundaryID, 1}, {newID, 1}} {
+		var count int
+		if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_quality_eval_batches WHERE id = $1`, tc.id).Scan(&count); err != nil || count != tc.want {
+			t.Fatalf("批次 %d 保留数 = %d, want %d, err=%v", tc.id, count, tc.want, err)
+		}
+	}
+	var samples, runs int
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM account_quality_eval_samples`).Scan(&samples); err != nil || samples != 2 {
+		t.Fatalf("清理后样本数 = %d, want 2, err=%v", samples, err)
+	}
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM quality_eval_schedule_runs`).Scan(&runs); err != nil || runs != 1 {
+		t.Fatalf("清理后调度桶数 = %d, want 1, err=%v", runs, err)
 	}
 }
 

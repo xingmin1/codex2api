@@ -363,6 +363,87 @@ export default function AccountDetailSheet({
             </Section>
 
             <Section
+              title={t("accounts.qualityEvalDiagnostics")}
+              action={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  disabled={!qualityEvalSupported}
+                  onClick={onQualityEval}
+                  className="h-7 text-[11px]"
+                >
+                  <FlaskConical className="size-3" />
+                  {t("accounts.qualityEvalRunNow")}
+                </Button>
+              }
+            >
+              {account.latest_quality_eval ? (
+                <div className="space-y-3 rounded-xl border border-border bg-card p-3">
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="rounded-md bg-primary/10 px-1.5 py-0.5 font-semibold text-primary">
+                      {t(`accounts.qualityEvalStatus.${account.latest_quality_eval.status}`, {
+                        defaultValue: account.latest_quality_eval.status,
+                      })}
+                    </span>
+                    <span className="font-medium">
+                      {account.latest_quality_eval.model} · {account.latest_quality_eval.reasoning_effort}
+                    </span>
+                    <span className="ml-auto text-muted-foreground">
+                      {formatRelativeTime(account.latest_quality_eval.created_at)}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <MetricCard label={t("accounts.qualityEvalLatestJuice")}>
+                      <span className="break-all font-mono text-xs">
+                        {account.latest_quality_eval.latest_juice_value || "—"}
+                      </span>
+                    </MetricCard>
+                    <MetricCard label={t("accounts.qualityEvalCandyAccuracy")}>
+                      <span className="tabular-nums">
+                        {account.latest_quality_eval.candy_requested > 0
+                          ? `${account.latest_quality_eval.candy_correct}/${account.latest_quality_eval.candy_requested}`
+                          : "—"}
+                      </span>
+                    </MetricCard>
+                    <MetricCard label={t("accounts.qualityEvalReasoningTokens")}>
+                      <span className="text-xs tabular-nums">
+                        {t("accounts.qualityEvalReasoningSummary", {
+                          average: account.latest_quality_eval.reasoning_tokens_average.toFixed(1),
+                          maximum: account.latest_quality_eval.reasoning_tokens_maximum,
+                        })}
+                      </span>
+                    </MetricCard>
+                  </div>
+                  <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                    <span>
+                      {t("accounts.qualityEvalSource")}: {t(`accounts.qualityEvalSource${account.latest_quality_eval.trigger_source === "auto" ? "Auto" : "Manual"}`)}
+                    </span>
+                    <span>
+                      {t("accounts.qualityEvalRequestConfig", {
+                        juiceSamples: account.latest_quality_eval.juice_requested,
+                        juiceConcurrency: account.latest_quality_eval.juice_concurrency,
+                        candySamples: account.latest_quality_eval.candy_requested,
+                        candyConcurrency: account.latest_quality_eval.candy_concurrency,
+                      })}
+                    </span>
+                  </div>
+                  {account.latest_quality_eval.error_message ? (
+                    <div className="rounded-lg bg-amber-500/10 px-2.5 py-2 text-xs text-amber-700 dark:text-amber-300">
+                      {account.latest_quality_eval.error_message}
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-dashed p-4 text-center text-xs text-muted-foreground">
+                  {qualityEvalSupported
+                    ? t("accounts.qualityEvalNotRun")
+                    : t("accounts.qualityEvalUnsupported")}
+                </div>
+              )}
+            </Section>
+
+            <Section
               title={t("accounts.usage")}
               action={
                 <Button

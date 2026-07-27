@@ -21,20 +21,16 @@ export default function AccountQualityEvalBadge({ account, className, onClick }:
   const { t } = useTranslation()
   const batch = account.latest_quality_eval
   const supported = account.quality_eval_supported ?? !account.openai_responses_api
-  const scores = batch
-    ? [
-        batch.juice_requested > 0
-          ? `J ${batch.juice_correct}/${batch.juice_requested}`
-          : '',
-        batch.candy_requested > 0
-          ? `C ${batch.candy_correct}/${batch.candy_requested}`
-          : '',
-      ].filter(Boolean).join(' · ')
+  const statusLabel = batch
+    ? t(`accounts.qualityEvalStatus.${batch.status}`, { defaultValue: batch.status })
+    : ''
+  const candyScore = batch?.candy_requested
+    ? `${batch.candy_correct}/${batch.candy_requested}`
     : ''
   const content = batch ? (
     <>
       <span className="size-1.5 rounded-full bg-current" />
-      <span>5.6 Max {scores}</span>
+      <span>{statusLabel}{candyScore ? ` ${candyScore}` : ''}</span>
     </>
   ) : supported ? (
     <>
@@ -48,9 +44,16 @@ export default function AccountQualityEvalBadge({ account, className, onClick }:
     </>
   )
   const title = batch
-    ? t(`accounts.qualityEvalStatus.${batch.status}`, {
-        defaultValue: batch.status,
-      })
+    ? [
+        `5.6 Max · ${statusLabel}${candyScore ? ` · Candy ${candyScore}` : ''}`,
+        batch.latest_juice_value ? `Juice ${batch.latest_juice_value}` : '',
+        t('accounts.qualityEvalReasoningSummary', {
+          average: batch.reasoning_tokens_average.toFixed(1),
+          maximum: batch.reasoning_tokens_maximum,
+        }),
+        `${batch.trigger_source === 'auto' ? t('accounts.qualityEvalSourceAuto') : t('accounts.qualityEvalSourceManual')} · ${new Date(batch.created_at).toLocaleString()}`,
+        batch.error_message || '',
+      ].filter(Boolean).join('\n')
     : supported
       ? t('accounts.qualityEvalNotRun')
       : t('accounts.qualityEvalUnsupported')

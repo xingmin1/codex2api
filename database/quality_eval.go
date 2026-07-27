@@ -26,12 +26,14 @@ const (
 
 // QualityEvalConfig 控制周期质量检测的候选范围与并发。
 type QualityEvalConfig struct {
-	AutoEnabled      bool `json:"auto_enabled"`
-	IntervalMinutes  int  `json:"interval_minutes"`
-	LookbackHours    int  `json:"lookback_hours"`
-	TopAccounts      int  `json:"top_accounts"`
-	MinRequests      int  `json:"min_requests"`
-	BatchConcurrency int  `json:"batch_concurrency"`
+	AutoEnabled      bool   `json:"auto_enabled"`
+	IntervalMinutes  int    `json:"interval_minutes"`
+	LookbackHours    int    `json:"lookback_hours"`
+	TopAccounts      int    `json:"top_accounts"`
+	MinRequests      int    `json:"min_requests"`
+	BatchConcurrency int    `json:"batch_concurrency"`
+	AutoRunnable     bool   `json:"auto_runnable"`
+	AutoSkipReason   string `json:"auto_skip_reason,omitempty"`
 }
 
 // DefaultQualityEvalConfig 返回默认关闭的质量检测配置。
@@ -82,24 +84,30 @@ func NormalizeQualityEvalConfig(config QualityEvalConfig) QualityEvalConfig {
 
 // QualityEvalBatch 是一次账号质量检测批次及其聚合结果。
 type QualityEvalBatch struct {
-	ID              int64               `json:"id"`
-	AccountID       int64               `json:"account_id"`
-	TriggerSource   string              `json:"trigger_source"`
-	TestKind        string              `json:"test_kind"`
-	ScheduledHour   *time.Time          `json:"scheduled_hour,omitempty"`
-	Model           string              `json:"model"`
-	ReasoningEffort string              `json:"reasoning_effort"`
-	Status          string              `json:"status"`
-	JuiceRequested  int                 `json:"juice_requested"`
-	JuiceGraded     int                 `json:"juice_graded"`
-	JuiceCorrect    int                 `json:"juice_correct"`
-	CandyRequested  int                 `json:"candy_requested"`
-	CandyGraded     int                 `json:"candy_graded"`
-	CandyCorrect    int                 `json:"candy_correct"`
-	StartedAt       time.Time           `json:"started_at"`
-	FinishedAt      *time.Time          `json:"finished_at,omitempty"`
-	CreatedAt       time.Time           `json:"created_at"`
-	Samples         []QualityEvalSample `json:"samples,omitempty"`
+	ID                     int64               `json:"id"`
+	AccountID              int64               `json:"account_id"`
+	TriggerSource          string              `json:"trigger_source"`
+	TestKind               string              `json:"test_kind"`
+	ScheduledHour          *time.Time          `json:"scheduled_hour,omitempty"`
+	Model                  string              `json:"model"`
+	ReasoningEffort        string              `json:"reasoning_effort"`
+	Status                 string              `json:"status"`
+	ErrorMessage           string              `json:"error_message,omitempty"`
+	JuiceRequested         int                 `json:"juice_requested"`
+	JuiceConcurrency       int                 `json:"juice_concurrency"`
+	JuiceGraded            int                 `json:"juice_graded"`
+	JuiceCorrect           int                 `json:"juice_correct"`
+	CandyRequested         int                 `json:"candy_requested"`
+	CandyConcurrency       int                 `json:"candy_concurrency"`
+	CandyGraded            int                 `json:"candy_graded"`
+	CandyCorrect           int                 `json:"candy_correct"`
+	LatestJuiceValue       string              `json:"latest_juice_value,omitempty"`
+	ReasoningTokensAverage float64             `json:"reasoning_tokens_average"`
+	ReasoningTokensMaximum int                 `json:"reasoning_tokens_maximum"`
+	StartedAt              time.Time           `json:"started_at"`
+	FinishedAt             *time.Time          `json:"finished_at,omitempty"`
+	CreatedAt              time.Time           `json:"created_at"`
+	Samples                []QualityEvalSample `json:"samples,omitempty"`
 }
 
 // QualityEvalSample 保存单个 Juice 或糖果请求的原始答案、判分和性能数据。
@@ -122,6 +130,8 @@ type QualityEvalSample struct {
 	ReasoningTokens int       `json:"reasoning_tokens"`
 	FirstTokenMs    int       `json:"first_token_ms"`
 	DurationMs      int       `json:"duration_ms"`
+	HTTPStatus      int       `json:"http_status"`
+	TerminalStatus  string    `json:"terminal_status,omitempty"`
 	ErrorMessage    string    `json:"error_message,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 }
@@ -145,12 +155,13 @@ func (db *DB) CreateQualityEvalBatch(ctx context.Context, batch QualityEvalBatch
 	row := db.conn.QueryRowContext(ctx, `
 		INSERT INTO account_quality_eval_batches (
 			account_id, trigger_source, test_kind, scheduled_hour, model, reasoning_effort,
-			status, juice_requested, candy_requested, started_at, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
+			status, error_message, juice_requested, juice_concurrency, candy_requested, candy_concurrency, started_at, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13)
 		ON CONFLICT (account_id, trigger_source, scheduled_hour) DO NOTHING
 		RETURNING id
 	`, batch.AccountID, batch.TriggerSource, batch.TestKind, scheduled, batch.Model, batch.ReasoningEffort,
-		QualityEvalStatusRunning, batch.JuiceRequested, batch.CandyRequested, db.timeArg(startedAt))
+		QualityEvalStatusRunning, batch.ErrorMessage, batch.JuiceRequested, batch.JuiceConcurrency,
+		batch.CandyRequested, batch.CandyConcurrency, db.timeArg(startedAt))
 	if err := row.Scan(&id); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, false, nil
@@ -174,13 +185,37 @@ func (db *DB) InsertQualityEvalSample(ctx context.Context, sample QualityEvalSam
 		INSERT INTO account_quality_eval_samples (
 			batch_id, account_id, test_kind, sample_index, attempt_count, model, reasoning_effort,
 			attempt_answers, raw_answer, parsed_answer, graded, correct, input_tokens, output_tokens,
-			reasoning_tokens, first_token_ms, duration_ms, error_message, created_at
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+			reasoning_tokens, first_token_ms, duration_ms, http_status, terminal_status, error_message, created_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 	`, sample.BatchID, sample.AccountID, sample.TestKind, sample.SampleIndex, sample.AttemptCount,
 		sample.Model, sample.ReasoningEffort, string(attemptAnswers), sample.RawAnswer, sample.ParsedAnswer, sample.Graded,
 		sample.Correct, sample.InputTokens, sample.OutputTokens, sample.ReasoningTokens,
-		sample.FirstTokenMs, sample.DurationMs, sample.ErrorMessage, db.timeArg(createdAt))
+		sample.FirstTokenMs, sample.DurationMs, sample.HTTPStatus, sample.TerminalStatus,
+		sample.ErrorMessage, db.timeArg(createdAt))
 	return err
+}
+
+// DeleteQualityEvalHistoryBefore 删除截止时间前的检测样本、批次和调度桶。
+func (db *DB) DeleteQualityEvalHistoryBefore(ctx context.Context, before time.Time) error {
+	tx, err := db.conn.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	cutoff := db.timeArg(before)
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM account_quality_eval_samples
+		WHERE batch_id IN (SELECT id FROM account_quality_eval_batches WHERE created_at < $1)
+	`, cutoff); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM account_quality_eval_batches WHERE created_at < $1`, cutoff); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM quality_eval_schedule_runs WHERE scheduled_hour < $1`, cutoff); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // CompleteQualityEvalBatch 写入批次聚合与最终分类。
@@ -197,10 +232,10 @@ func (db *DB) CompleteQualityEvalBatch(ctx context.Context, batch QualityEvalBat
 	}
 	_, err := db.conn.ExecContext(ctx, `
 		UPDATE account_quality_eval_batches
-		SET status = $1, juice_graded = $2, juice_correct = $3,
-			candy_graded = $4, candy_correct = $5, finished_at = $6
-		WHERE id = $7
-	`, status, batch.JuiceGraded, batch.JuiceCorrect, batch.CandyGraded, batch.CandyCorrect,
+		SET status = $1, error_message = $2, juice_graded = $3, juice_correct = $4,
+			candy_graded = $5, candy_correct = $6, finished_at = $7
+		WHERE id = $8
+	`, status, batch.ErrorMessage, batch.JuiceGraded, batch.JuiceCorrect, batch.CandyGraded, batch.CandyCorrect,
 		db.timeArg(finishedAt), batch.ID)
 	return err
 }
@@ -434,9 +469,20 @@ func (db *DB) ListAccountQualityEvalBatches(ctx context.Context, accountID int64
 
 const qualityEvalBatchSelect = `
 	SELECT b.id, b.account_id, b.trigger_source, b.test_kind, b.scheduled_hour,
-		b.model, b.reasoning_effort, b.status,
-		b.juice_requested, b.juice_graded, b.juice_correct,
-		b.candy_requested, b.candy_graded, b.candy_correct,
+		b.model, b.reasoning_effort, b.status, b.error_message,
+		b.juice_requested, b.juice_concurrency, b.juice_graded, b.juice_correct,
+		b.candy_requested, b.candy_concurrency, b.candy_graded, b.candy_correct,
+		COALESCE((
+			SELECT s.parsed_answer FROM account_quality_eval_samples s
+			WHERE s.batch_id = b.id AND s.test_kind = 'juice' AND s.parsed_answer <> ''
+			ORDER BY s.sample_index DESC, s.id DESC LIMIT 1
+		), ''),
+		CAST(COALESCE((
+			SELECT AVG(s.reasoning_tokens) FROM account_quality_eval_samples s WHERE s.batch_id = b.id
+		), 0) AS DOUBLE PRECISION),
+		COALESCE((
+			SELECT MAX(s.reasoning_tokens) FROM account_quality_eval_samples s WHERE s.batch_id = b.id
+		), 0),
 		b.started_at, b.finished_at, b.created_at
 	FROM account_quality_eval_batches b
 `
@@ -449,9 +495,10 @@ func scanQualityEvalBatch(scanner rowScanner) (QualityEvalBatch, error) {
 	var batch QualityEvalBatch
 	var scheduledRaw, startedRaw, finishedRaw, createdRaw interface{}
 	err := scanner.Scan(&batch.ID, &batch.AccountID, &batch.TriggerSource, &batch.TestKind, &scheduledRaw,
-		&batch.Model, &batch.ReasoningEffort, &batch.Status,
-		&batch.JuiceRequested, &batch.JuiceGraded, &batch.JuiceCorrect,
-		&batch.CandyRequested, &batch.CandyGraded, &batch.CandyCorrect,
+		&batch.Model, &batch.ReasoningEffort, &batch.Status, &batch.ErrorMessage,
+		&batch.JuiceRequested, &batch.JuiceConcurrency, &batch.JuiceGraded, &batch.JuiceCorrect,
+		&batch.CandyRequested, &batch.CandyConcurrency, &batch.CandyGraded, &batch.CandyCorrect,
+		&batch.LatestJuiceValue, &batch.ReasoningTokensAverage, &batch.ReasoningTokensMaximum,
 		&startedRaw, &finishedRaw, &createdRaw)
 	if err != nil {
 		return batch, err
@@ -478,7 +525,7 @@ func (db *DB) listQualityEvalSamples(ctx context.Context, batchID int64) ([]Qual
 		SELECT id, batch_id, account_id, test_kind, sample_index, attempt_count,
 			model, reasoning_effort, attempt_answers, raw_answer, parsed_answer, graded, correct,
 			input_tokens, output_tokens, reasoning_tokens, first_token_ms,
-			duration_ms, error_message, created_at
+			duration_ms, http_status, terminal_status, error_message, created_at
 		FROM account_quality_eval_samples
 		WHERE batch_id = $1
 		ORDER BY test_kind, sample_index
@@ -496,7 +543,8 @@ func (db *DB) listQualityEvalSamples(ctx context.Context, batchID int64) ([]Qual
 			&sample.SampleIndex, &sample.AttemptCount, &sample.Model, &sample.ReasoningEffort,
 			&attemptAnswersJSON, &sample.RawAnswer, &sample.ParsedAnswer, &sample.Graded, &sample.Correct,
 			&sample.InputTokens, &sample.OutputTokens, &sample.ReasoningTokens,
-			&sample.FirstTokenMs, &sample.DurationMs, &sample.ErrorMessage, &createdRaw); err != nil {
+			&sample.FirstTokenMs, &sample.DurationMs, &sample.HTTPStatus, &sample.TerminalStatus,
+			&sample.ErrorMessage, &createdRaw); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(attemptAnswersJSON), &sample.AttemptAnswers)

@@ -727,10 +727,13 @@ func (db *DB) migrate(ctx context.Context) error {
 		model            VARCHAR(100) NOT NULL,
 		reasoning_effort VARCHAR(20) NOT NULL,
 		status           VARCHAR(20) NOT NULL DEFAULT 'running',
+		error_message    TEXT NOT NULL DEFAULT '',
 		juice_requested  INT NOT NULL DEFAULT 0,
+		juice_concurrency INT NOT NULL DEFAULT 0,
 		juice_graded     INT NOT NULL DEFAULT 0,
 		juice_correct    INT NOT NULL DEFAULT 0,
 		candy_requested  INT NOT NULL DEFAULT 0,
+		candy_concurrency INT NOT NULL DEFAULT 0,
 		candy_graded     INT NOT NULL DEFAULT 0,
 		candy_correct    INT NOT NULL DEFAULT 0,
 		started_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -757,6 +760,8 @@ func (db *DB) migrate(ctx context.Context) error {
 		reasoning_tokens INT NOT NULL DEFAULT 0,
 		first_token_ms   INT NOT NULL DEFAULT 0,
 		duration_ms      INT NOT NULL DEFAULT 0,
+		http_status      INT NOT NULL DEFAULT 0,
+		terminal_status  VARCHAR(32) NOT NULL DEFAULT '',
 		error_message    TEXT NOT NULL DEFAULT '',
 		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 		UNIQUE(batch_id, test_kind, sample_index)
@@ -791,6 +796,11 @@ func (db *DB) migrate(ctx context.Context) error {
 		ON account_quality_eval_samples(batch_id, test_kind, sample_index);
 
 	-- 增强字段（向后兼容 ALTER）
+	ALTER TABLE account_quality_eval_batches ADD COLUMN IF NOT EXISTS juice_concurrency INT NOT NULL DEFAULT 0;
+	ALTER TABLE account_quality_eval_batches ADD COLUMN IF NOT EXISTS candy_concurrency INT NOT NULL DEFAULT 0;
+	ALTER TABLE account_quality_eval_batches ADD COLUMN IF NOT EXISTS error_message TEXT NOT NULL DEFAULT '';
+	ALTER TABLE account_quality_eval_samples ADD COLUMN IF NOT EXISTS http_status INT NOT NULL DEFAULT 0;
+	ALTER TABLE account_quality_eval_samples ADD COLUMN IF NOT EXISTS terminal_status VARCHAR(32) NOT NULL DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS input_tokens INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS output_tokens INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS reasoning_tokens INT DEFAULT 0;
