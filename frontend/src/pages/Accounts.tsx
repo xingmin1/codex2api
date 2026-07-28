@@ -1027,15 +1027,17 @@ export default function Accounts() {
   const [manualBonusSubmitting, setManualBonusSubmitting] = useState(false);
   const [qualityEvalAccount, setQualityEvalAccount] = useState<AccountRow | null>(null);
   const [qualityEvalHistory, setQualityEvalHistory] = useState<QualityEvalBatch[]>([]);
-  const [qualityEvalSamples, setQualityEvalSamples] = useState<QualityEvalSample[]>([]);
-  const [qualityEvalActiveTasks, setQualityEvalActiveTasks] = useState<string[]>([]);
-  const [qualityEvalRunning, setQualityEvalRunning] = useState(false);
+  const [qualityEvalSubmitting, setQualityEvalSubmitting] = useState(false);
   const [qualityEvalLoading, setQualityEvalLoading] = useState(false);
   const [qualityEvalInputs, setQualityEvalInputs] = useState(DEFAULT_QUALITY_EVAL_INPUTS);
   const qualityEvalHistoryRequestRef = useRef(0);
   const qualityEvalInputsValid = Object.values(qualityEvalInputs).every(
     (value) => parseQualityEvalInput(value) !== null,
   );
+  const qualityEvalRunning = qualityEvalHistory.some(
+    (batch) => batch.status === "running",
+  );
+  const qualityEvalBusy = qualityEvalLoading || qualityEvalSubmitting || qualityEvalRunning;
   const [editingAccount, setEditingAccount] = useState<AccountRow | null>(null);
   const [editSubmitting, setEditSubmitting] = useState(false);
   const [editTab, setEditTab] = useState<"scheduler" | "account">("scheduler");
@@ -2187,8 +2189,6 @@ export default function Accounts() {
     const requestID = ++qualityEvalHistoryRequestRef.current;
     setQualityEvalAccount(account);
     setQualityEvalHistory([]);
-    setQualityEvalSamples([]);
-    setQualityEvalActiveTasks([]);
     setQualityEvalInputs(DEFAULT_QUALITY_EVAL_INPUTS);
     setQualityEvalLoading(true);
     try {
@@ -2207,7 +2207,9 @@ export default function Accounts() {
     }
   }, [showToast, t]);
   const runQualityEval = useCallback(async (kind: QualityEvalKind) => {
-    if (!qualityEvalAccount || qualityEvalRunning) return;
+    if (!qualityEvalAccount || qualityEvalBusy) return;
+    const account = qualityEvalAccount;
+    const dialogRequestID = qualityEvalHistoryRequestRef.current;
     const parsedInputs = {
       juiceSamples: parseQualityEvalInput(qualityEvalInputs.juiceSamples),
       juiceConcurrency: parseQualityEvalInput(qualityEvalInputs.juiceConcurrency),
@@ -2225,50 +2227,21 @@ export default function Accounts() {
       candy_samples: parsedInputs.candySamples!,
       candy_concurrency: parsedInputs.candyConcurrency!,
     };
-    setQualityEvalRunning(true);
-    setQualityEvalSamples([]);
-    setQualityEvalActiveTasks([]);
+    setQualityEvalSubmitting(true);
     try {
-      const response = await api.runAccountQualityEval(qualityEvalAccount.id, payload);
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error(t("accounts.qualityEvalNoStream"));
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let completedBatch: QualityEvalBatch | null = null;
-      while (true) {
-        const { value, done } = await reader.read();
-        buffer += decoder.decode(value, { stream: !done });
-        const frames = buffer.split("\n\n");
-        buffer = frames.pop() ?? "";
-        for (const frame of frames) {
-          const payload = frame.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
-          if (!payload) continue;
-          const event = JSON.parse(payload) as { type: string; kind?: string; sample_index?: number; sample?: QualityEvalSample; batch?: QualityEvalBatch; error?: string };
-          const taskKey = event.kind && event.sample_index ? `${event.kind}-${event.sample_index}` : "";
-          if (event.type === "quality_eval_task_start" && taskKey) {
-            setQualityEvalActiveTasks((tasks) => tasks.includes(taskKey) ? tasks : [...tasks, taskKey]);
-          }
-          if (event.sample) {
-            setQualityEvalSamples((samples) => [...samples, event.sample!]);
-            setQualityEvalActiveTasks((tasks) => tasks.filter((task) => task !== `${event.sample!.test_kind}-${event.sample!.sample_index}`));
-          }
-          if (event.type === "quality_eval_complete" && event.batch) completedBatch = event.batch;
-          if (event.error) throw new Error(event.error);
-        }
-        if (done) break;
+      await api.runAccountQualityEval(account.id, payload);
+      if (qualityEvalHistoryRequestRef.current === dialogRequestID) {
+        qualityEvalHistoryRequestRef.current += 1;
+        setQualityEvalAccount(null);
       }
-      if (!completedBatch) throw new Error(t("accounts.qualityEvalMissingComplete"));
-      const history = await api.getAccountQualityEvals(qualityEvalAccount.id);
-      setQualityEvalHistory(history.batches ?? []);
-      await reloadSilently();
-      showToast(t("accounts.qualityEvalComplete", { status: completedBatch.status }));
+      showToast(t("accounts.qualityEvalStarted"));
+      void reloadSilently();
     } catch (error) {
       showToast(t("accounts.qualityEvalFailed", { error: getErrorMessage(error) }), "error");
     } finally {
-      setQualityEvalRunning(false);
-      setQualityEvalActiveTasks([]);
+      setQualityEvalSubmitting(false);
     }
-  }, [qualityEvalAccount, qualityEvalInputs, qualityEvalRunning, reloadSilently, showToast, t]);
+  }, [qualityEvalAccount, qualityEvalBusy, qualityEvalInputs, reloadSilently, showToast, t]);
   const goDetailPrev = useCallback(() => {
     if (detailNavIndex <= 0) return;
     setDetailAccountId(sortedAccounts[detailNavIndex - 1]?.id ?? null);
@@ -2310,7 +2283,7 @@ export default function Accounts() {
   }, [page, totalPages]);
 
   useEffect(() => {
-    if (!accounts.some((account) => account.status === "refreshing")) {
+    if (!accounts.some((account) => account.status === "refreshing" || account.latest_quality_eval?.status === "running")) {
       return;
     }
 
@@ -6579,16 +6552,13 @@ export default function Accounts() {
             contentClassName="sm:max-w-[760px]"
             bodyClassName="space-y-4"
             onClose={() => {
-              if (!qualityEvalRunning) {
-                qualityEvalHistoryRequestRef.current += 1;
-                setQualityEvalAccount(null);
-              }
+              qualityEvalHistoryRequestRef.current += 1;
+              setQualityEvalAccount(null);
             }}
             footer={
               <Button
                 type="button"
                 variant="outline"
-                disabled={qualityEvalRunning}
                 onClick={() => {
                   qualityEvalHistoryRequestRef.current += 1;
                   setQualityEvalAccount(null);
@@ -6618,7 +6588,7 @@ export default function Accounts() {
                     min={QUALITY_EVAL_MIN_VALUE}
                     max={QUALITY_EVAL_MAX_VALUE}
                     step={1}
-                    disabled={qualityEvalRunning}
+                    disabled={qualityEvalBusy}
                     value={qualityEvalInputs[field]}
                     onChange={(event) => setQualityEvalInputs((current) => ({ ...current, [field]: event.target.value }))}
                   />
@@ -6630,37 +6600,17 @@ export default function Accounts() {
               <div className="text-[11px] text-muted-foreground sm:col-span-2">{t("accounts.qualityEvalConcurrencyHint")}</div>
             </div>
             <div className="grid gap-2 sm:grid-cols-3">
-              <Button type="button" variant="outline" disabled={!qualityEvalInputsValid || qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("juice")}>
-                {qualityEvalRunning ? <RefreshCw className="size-3.5 animate-spin" /> : <FlaskConical className="size-3.5" />}
+              <Button type="button" variant="outline" disabled={!qualityEvalInputsValid || qualityEvalBusy || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("juice")}>
+                {qualityEvalBusy ? <RefreshCw className="size-3.5 animate-spin" /> : <FlaskConical className="size-3.5" />}
                 {t("accounts.qualityEvalJuice", { count: qualityEvalInputs.juiceSamples })}
               </Button>
-              <Button type="button" variant="outline" disabled={!qualityEvalInputsValid || qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("candy")}>
+              <Button type="button" variant="outline" disabled={!qualityEvalInputsValid || qualityEvalBusy || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("candy")}>
                 {t("accounts.qualityEvalCandy", { count: qualityEvalInputs.candySamples })}
               </Button>
-              <Button type="button" disabled={!qualityEvalInputsValid || qualityEvalRunning || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("full")}>
+              <Button type="button" disabled={!qualityEvalInputsValid || qualityEvalBusy || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("full")}>
                 {t("accounts.qualityEvalFull")}
               </Button>
             </div>
-            {qualityEvalActiveTasks.length > 0 && (
-              <div className="flex flex-wrap gap-2 rounded-lg border bg-muted/20 p-3">
-                {qualityEvalActiveTasks.map((task) => (
-                  <span key={task} className="inline-flex items-center gap-1.5 rounded-md bg-blue-500/10 px-2 py-1 text-[11px] font-medium text-blue-700 dark:text-blue-300">
-                    <RefreshCw className="size-3 animate-spin" />
-                    {t("accounts.qualityEvalTaskRunning", { task: task.replace("-", " #") })}
-                  </span>
-                ))}
-              </div>
-            )}
-            {qualityEvalSamples.length > 0 && (
-              <div className="space-y-2">
-                <div className="text-xs font-semibold">{t("accounts.qualityEvalProgress")}</div>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  {qualityEvalSamples.map((sample) => (
-                    <QualityEvalSampleCard key={`${sample.test_kind}-${sample.sample_index}`} sample={sample} />
-                  ))}
-                </div>
-              </div>
-            )}
             <div className="space-y-2">
               <div className="text-xs font-semibold">{t("accounts.qualityEvalHistory")}</div>
               {qualityEvalLoading ? (

@@ -76,11 +76,14 @@ type Handler struct {
 	// 串行化同一账号的并发重置，避免重复消耗与次数计数竞态。
 	resetCreditLocks sync.Map
 
-	// 质量检测按账号串行，周期任务由独立可取消上下文管理。
+	// 质量检测按账号串行，手动任务和周期任务共享可取消的服务生命周期。
 	qualityEvalAccountLocks sync.Map
 	qualityEvalStartOnce    sync.Once
 	qualityEvalStopOnce     sync.Once
+	qualityEvalLifecycleMu  sync.Mutex
+	qualityEvalContext      context.Context
 	qualityEvalCancel       context.CancelFunc
+	qualityEvalStopping     bool
 	qualityEvalWG           sync.WaitGroup
 	qualityEvalExecute      func(context.Context, *auth.Account, []byte) (*http.Response, error)
 	qualityEvalLeaseOwner   string

@@ -36,7 +36,6 @@ const (
 	qualityEvalHistoryLimit           = 20
 	qualityEvalHistoryRetention       = 30 * 24 * time.Hour
 	qualityEvalRequestTimeout         = 5 * time.Minute
-	qualityEvalSSEKeepalive           = 15 * time.Second
 	qualityEvalSchedulerLease         = 5 * time.Minute
 	qualityEvalLeaseRenewal           = time.Minute
 	qualityEvalDBFinalizeTimeout      = 5 * time.Second
@@ -74,16 +73,6 @@ type qualityEvalRunConfig struct {
 	CandyConcurrency int
 }
 
-type qualityEvalEvent struct {
-	Type        string                      `json:"type"`
-	BatchID     int64                       `json:"batch_id,omitempty"`
-	Kind        string                      `json:"kind,omitempty"`
-	SampleIndex int                         `json:"sample_index,omitempty"`
-	Sample      *database.QualityEvalSample `json:"sample,omitempty"`
-	Batch       *database.QualityEvalBatch  `json:"batch,omitempty"`
-	Error       string                      `json:"error,omitempty"`
-}
-
 type qualityEvalStreamResult struct {
 	RawAnswer       string
 	InputTokens     int
@@ -95,7 +84,7 @@ type qualityEvalStreamResult struct {
 	TerminalStatus  string
 }
 
-// RunAccountQualityEval 对指定账号执行固定 gpt-5.6-sol Max 质量检测并以 SSE 返回进度。
+// RunAccountQualityEval 创建指定账号的 gpt-5.6-sol Max 质量检测后台任务。
 func (h *Handler) RunAccountQualityEval(c *gin.Context) {
 	accountID, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || accountID <= 0 {
@@ -134,6 +123,17 @@ func (h *Handler) RunAccountQualityEval(c *gin.Context) {
 			h.qualityEvalAccountLocks.Delete(accountID)
 		}
 	}()
+	workerContext, workerDone, accepted := h.beginQualityEvalWorker()
+	if !accepted {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "服务正在关闭，无法启动质量检测"})
+		return
+	}
+	workerOwnedByHandler := true
+	defer func() {
+		if workerOwnedByHandler {
+			workerDone()
+		}
+	}()
 
 	batch := newQualityEvalBatch(accountID, database.QualityEvalTriggerManual, kind, nil, runConfig)
 	batchID, created, err := h.db.CreateQualityEvalBatch(c.Request.Context(), batch)
@@ -146,48 +146,17 @@ func (h *Handler) RunAccountQualityEval(c *gin.Context) {
 	}
 	batch.ID = batchID
 
-	c.Header("Content-Type", "text/event-stream")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-	c.Writer.Flush()
-	sendQualityEvalEvent(c, qualityEvalEvent{Type: "quality_eval_start", BatchID: batchID, Kind: kind, Batch: &batch})
-
-	requestContext := c.Request.Context()
-	events := make(chan qualityEvalEvent, qualityEvalManualMaxValue*4+2)
-	go func() {
-		defer h.qualityEvalAccountLocks.Delete(accountID)
-		emit := func(event qualityEvalEvent) {
-			select {
-			case events <- event:
-			case <-requestContext.Done():
-			}
-		}
-		completed := h.executeQualityEvalBatch(requestContext, account, batch, func(sample database.QualityEvalSample) {
-			emit(qualityEvalEvent{Type: "quality_eval_sample", BatchID: batchID, Kind: sample.TestKind, SampleIndex: sample.SampleIndex, Sample: &sample})
-		}, func(kind string, sampleIndex int) {
-			emit(qualityEvalEvent{Type: "quality_eval_task_start", BatchID: batchID, Kind: kind, SampleIndex: sampleIndex})
-		})
-		emit(qualityEvalEvent{Type: "quality_eval_complete", BatchID: batchID, Batch: &completed})
-		close(events)
-	}()
 	lockOwnedByHandler = false
-	keepalive := time.NewTicker(qualityEvalSSEKeepalive)
-	defer keepalive.Stop()
-	for {
-		select {
-		case event, ok := <-events:
-			if !ok {
-				return
-			}
-			sendQualityEvalEvent(c, event)
-		case <-keepalive.C:
-			_, _ = fmt.Fprint(c.Writer, ": keepalive\n\n")
-			c.Writer.Flush()
-		case <-c.Request.Context().Done():
-			return
-		}
-	}
+	workerOwnedByHandler = false
+	go func() {
+		defer workerDone()
+		defer h.qualityEvalAccountLocks.Delete(accountID)
+		completed := h.executeQualityEvalBatch(workerContext, account, batch, nil, nil)
+		log.Printf("[账号 %d] 手动质量检测后台任务完成: batch=%d status=%s juice=%d/%d candy=%d/%d",
+			accountID, completed.ID, completed.Status, completed.JuiceCorrect, completed.JuiceGraded,
+			completed.CandyCorrect, completed.CandyGraded)
+	}()
+	c.JSON(http.StatusAccepted, gin.H{"batch": batch})
 }
 
 // ListAccountQualityEvals 返回账号最近的质量检测批次和样本。
@@ -240,22 +209,45 @@ func (h *Handler) qualityEvalConfigResponse(config database.QualityEvalConfig) d
 	return config
 }
 
+func (h *Handler) beginQualityEvalWorker() (context.Context, func(), bool) {
+	if h == nil {
+		return nil, func() {}, false
+	}
+	h.qualityEvalLifecycleMu.Lock()
+	defer h.qualityEvalLifecycleMu.Unlock()
+	if h.qualityEvalStopping {
+		return nil, func() {}, false
+	}
+	if h.qualityEvalContext == nil {
+		h.qualityEvalContext, h.qualityEvalCancel = context.WithCancel(context.Background())
+	}
+	h.qualityEvalWG.Add(1)
+	var doneOnce sync.Once
+	return h.qualityEvalContext, func() {
+		doneOnce.Do(h.qualityEvalWG.Done)
+	}, true
+}
+
 // StartQualityEvalScheduler 启动默认关闭的周期质量检测任务。
 func (h *Handler) StartQualityEvalScheduler() {
 	if h == nil || h.db == nil || h.store == nil {
 		return
 	}
 	h.qualityEvalStartOnce.Do(func() {
-		ctx, cancel := context.WithCancel(context.Background())
-		h.qualityEvalCancel = cancel
+		ctx, done, accepted := h.beginQualityEvalWorker()
+		if !accepted {
+			return
+		}
 		if h.qualityEvalLeaseOwner == "" {
 			h.qualityEvalLeaseOwner = uuid.NewString()
 		}
 		if err := h.db.MarkInterruptedQualityEvalBatches(ctx, time.Now().Add(-qualityEvalInterruptedBatchAfter)); err != nil {
 			log.Printf("标记中断质量检测批次失败: %v", err)
 		}
-		h.qualityEvalWG.Add(1)
-		go h.qualityEvalSchedulerLoop(ctx)
+		go func() {
+			defer done()
+			h.qualityEvalSchedulerLoop(ctx)
+		}()
 	})
 }
 
@@ -265,15 +257,18 @@ func (h *Handler) StopQualityEvalScheduler() {
 		return
 	}
 	h.qualityEvalStopOnce.Do(func() {
-		if h.qualityEvalCancel != nil {
-			h.qualityEvalCancel()
+		h.qualityEvalLifecycleMu.Lock()
+		h.qualityEvalStopping = true
+		cancel := h.qualityEvalCancel
+		h.qualityEvalLifecycleMu.Unlock()
+		if cancel != nil {
+			cancel()
 		}
 		h.qualityEvalWG.Wait()
 	})
 }
 
 func (h *Handler) qualityEvalSchedulerLoop(ctx context.Context) {
-	defer h.qualityEvalWG.Done()
 	ticker := time.NewTicker(time.Minute)
 	cleanupTicker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
@@ -910,10 +905,4 @@ func readQualityEvalStream(body io.Reader, startedAt time.Time) (qualityEvalStre
 		return result, fmt.Errorf("上游流提前结束，未收到终止事件")
 	}
 	return result, nil
-}
-
-func sendQualityEvalEvent(c *gin.Context, event qualityEvalEvent) {
-	payload, _ := json.Marshal(event)
-	_, _ = fmt.Fprintf(c.Writer, "data: %s\n\n", payload)
-	c.Writer.Flush()
 }

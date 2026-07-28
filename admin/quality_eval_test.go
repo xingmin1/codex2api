@@ -28,6 +28,23 @@ func qualityEvalHTTPResponse(answer string) *http.Response {
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(stream)), Header: make(http.Header)}
 }
 
+func waitForQualityEvalBatch(t *testing.T, db *database.DB, accountID int64) database.QualityEvalBatch {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		history, err := db.ListAccountQualityEvalBatches(context.Background(), accountID, 20)
+		if err != nil {
+			t.Fatalf("读取质量检测批次失败: %v", err)
+		}
+		if len(history) > 0 && history[0].Status != database.QualityEvalStatusRunning {
+			return history[0]
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("等待后台质量检测完成超时")
+	return database.QualityEvalBatch{}
+}
+
 func TestBuildQualityEvalPayloadIsPinnedAndToolFree(t *testing.T) {
 	payload, err := buildQualityEvalPayload("prompt")
 	if err != nil {
@@ -389,6 +406,7 @@ func TestRunAccountQualityEvalCandyUsesThreeWorkersAndPersistsNormalBatch(t *tes
 	account := &auth.Account{DBID: accountID, AccessToken: "token", Status: auth.StatusReady, PlanType: "free"}
 	store.AddAccount(account)
 	handler := &Handler{db: db, store: store}
+	defer handler.StopQualityEvalScheduler()
 	var active int32
 	var peak int32
 	var calls int32
@@ -427,20 +445,20 @@ func TestRunAccountQualityEvalCandyUsesThreeWorkersAndPersistsNormalBatch(t *tes
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	handler.RunAccountQualityEval(ctx)
 
-	if recorder.Code != http.StatusOK || atomic.LoadInt32(&calls) != 3 || atomic.LoadInt32(&peak) != 3 {
-		t.Fatalf("SSE status/calls/peak = %d/%d/%d, body=%s", recorder.Code, calls, peak, recorder.Body.String())
+	if recorder.Code != http.StatusAccepted || !strings.Contains(recorder.Body.String(), `"status":"running"`) {
+		t.Fatalf("后台任务响应 = %d %s, want 202 running", recorder.Code, recorder.Body.String())
 	}
-	if strings.Count(recorder.Body.String(), `"type":"quality_eval_task_start"`) != 3 || strings.Count(recorder.Body.String(), `"type":"quality_eval_sample"`) != 3 || !strings.Contains(recorder.Body.String(), `"status":"normal"`) {
-		t.Fatalf("SSE 事件不完整: %s", recorder.Body.String())
+	completed := waitForQualityEvalBatch(t, db, accountID)
+	if atomic.LoadInt32(&calls) != 3 || atomic.LoadInt32(&peak) != 3 {
+		t.Fatalf("后台检测 calls/peak = %d/%d, want 3/3", calls, peak)
 	}
 	for _, payload := range payloads {
 		if gjson.GetBytes(payload, "model").String() != qualityEvalModel || gjson.GetBytes(payload, "reasoning.effort").String() != qualityEvalEffort || gjson.GetBytes(payload, "tools").Exists() {
 			t.Fatalf("并发请求未固定模型/effort/工具: %s", payload)
 		}
 	}
-	history, err := db.ListAccountQualityEvalBatches(context.Background(), accountID, 20)
-	if err != nil || len(history) != 1 || history[0].Status != database.QualityEvalStatusNormal || history[0].CandyCorrect != 3 {
-		t.Fatalf("持久化历史 = %#v, err=%v", history, err)
+	if completed.Status != database.QualityEvalStatusNormal || completed.CandyCorrect != 3 {
+		t.Fatalf("持久化批次 = %#v", completed)
 	}
 	if account.GetTotalRequests() != 0 || account.GetActiveRequests() != 0 {
 		t.Fatalf("质量检测污染账号请求统计: total=%d active=%d", account.GetTotalRequests(), account.GetActiveRequests())
@@ -455,6 +473,7 @@ func TestRunAccountQualityEvalUsesCustomSampleCountAndConcurrency(t *testing.T) 
 	account := &auth.Account{DBID: accountID, AccessToken: "token", Status: auth.StatusReady, PlanType: "free"}
 	store.AddAccount(account)
 	handler := &Handler{db: db, store: store}
+	defer handler.StopQualityEvalScheduler()
 	var active, peak, calls int32
 	firstPairStarted := make(chan struct{})
 	var closeOnce sync.Once
@@ -487,16 +506,19 @@ func TestRunAccountQualityEvalUsesCustomSampleCountAndConcurrency(t *testing.T) 
 	ctx.Request.Header.Set("Content-Type", "application/json")
 	handler.RunAccountQualityEval(ctx)
 
-	if recorder.Code != http.StatusOK || calls != 4 || peak != 2 {
-		t.Fatalf("自定义 SSE status/calls/peak = %d/%d/%d, body=%s", recorder.Code, calls, peak, recorder.Body.String())
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("自定义后台任务 status = %d, want 202 body=%s", recorder.Code, recorder.Body.String())
 	}
-	history, err := db.ListAccountQualityEvalBatches(context.Background(), accountID, 20)
-	if err != nil || len(history) != 1 || history[0].JuiceRequested != 0 || history[0].JuiceConcurrency != 0 || history[0].CandyRequested != 4 || history[0].CandyConcurrency != 2 || history[0].CandyCorrect != 4 {
-		t.Fatalf("自定义批次持久化 = %#v, err=%v", history, err)
+	completed := waitForQualityEvalBatch(t, db, accountID)
+	if calls != 4 || peak != 2 {
+		t.Fatalf("自定义后台任务 calls/peak = %d/%d, want 4/2", calls, peak)
+	}
+	if completed.JuiceRequested != 0 || completed.JuiceConcurrency != 0 || completed.CandyRequested != 4 || completed.CandyConcurrency != 2 || completed.CandyCorrect != 4 {
+		t.Fatalf("自定义批次持久化 = %#v", completed)
 	}
 }
 
-func TestRunAccountQualityEvalKeepsAccountLockUntilWorkerStopsAfterDisconnect(t *testing.T) {
+func TestRunAccountQualityEvalDetachesWorkerFromRequestAndKeepsAccountLock(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := newTestAdminDB(t)
 	accountID := insertTestAccount(t, db)
@@ -504,14 +526,20 @@ func TestRunAccountQualityEvalKeepsAccountLockUntilWorkerStopsAfterDisconnect(t 
 	account := &auth.Account{DBID: accountID, AccessToken: "token", Status: auth.StatusReady, PlanType: "free"}
 	store.AddAccount(account)
 	handler := &Handler{db: db, store: store}
+	defer handler.StopQualityEvalScheduler()
 	requestStarted := make(chan struct{})
 	releaseWorker := make(chan struct{})
+	workerCanceled := make(chan error, 1)
 	var startOnce sync.Once
 	handler.qualityEvalExecute = func(ctx context.Context, _ *auth.Account, _ []byte) (*http.Response, error) {
 		startOnce.Do(func() { close(requestStarted) })
-		<-ctx.Done()
-		<-releaseWorker
-		return nil, ctx.Err()
+		select {
+		case <-releaseWorker:
+			return qualityEvalHTTPResponse("21"), nil
+		case <-ctx.Done():
+			workerCanceled <- ctx.Err()
+			return nil, ctx.Err()
+		}
 	}
 
 	requestContext, cancelRequest := context.WithCancel(context.Background())
@@ -520,11 +548,10 @@ func TestRunAccountQualityEvalKeepsAccountLockUntilWorkerStopsAfterDisconnect(t 
 	firstContext.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(accountID, 10)}}
 	firstContext.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/1/quality-eval", bytes.NewBufferString(`{"kind":"candy"}`)).WithContext(requestContext)
 	firstContext.Request.Header.Set("Content-Type", "application/json")
-	firstHandlerDone := make(chan struct{})
-	go func() {
-		handler.RunAccountQualityEval(firstContext)
-		close(firstHandlerDone)
-	}()
+	handler.RunAccountQualityEval(firstContext)
+	if firstRecorder.Code != http.StatusAccepted {
+		t.Fatalf("首个后台任务状态码 = %d, want 202 body=%s", firstRecorder.Code, firstRecorder.Body.String())
+	}
 	select {
 	case <-requestStarted:
 	case <-time.After(2 * time.Second):
@@ -532,9 +559,9 @@ func TestRunAccountQualityEvalKeepsAccountLockUntilWorkerStopsAfterDisconnect(t 
 	}
 	cancelRequest()
 	select {
-	case <-firstHandlerDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("客户端断流后 HTTP handler 未退出")
+	case err := <-workerCanceled:
+		t.Fatalf("客户端请求结束取消了后台检测: %v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
 	if _, locked := handler.qualityEvalAccountLocks.Load(accountID); !locked {
 		t.Fatal("后台执行器尚未结束时账号锁被提前释放")
@@ -551,6 +578,10 @@ func TestRunAccountQualityEvalKeepsAccountLockUntilWorkerStopsAfterDisconnect(t 
 	}
 
 	close(releaseWorker)
+	completed := waitForQualityEvalBatch(t, db, accountID)
+	if completed.Status != database.QualityEvalStatusNormal || completed.CandyCorrect != 3 {
+		t.Fatalf("请求结束后后台批次未正常完成: %#v", completed)
+	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, locked := handler.qualityEvalAccountLocks.Load(accountID); !locked {
@@ -559,6 +590,53 @@ func TestRunAccountQualityEvalKeepsAccountLockUntilWorkerStopsAfterDisconnect(t 
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("后台执行器结束后账号锁未释放")
+}
+
+func TestStopQualityEvalSchedulerCancelsAndWaitsForManualWorker(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 1, TestConcurrency: 1, TestModel: qualityEvalModel})
+	account := &auth.Account{DBID: accountID, AccessToken: "token", Status: auth.StatusReady, PlanType: "free"}
+	store.AddAccount(account)
+	handler := &Handler{db: db, store: store}
+	workerStarted := make(chan struct{})
+	workerCanceled := make(chan struct{})
+	handler.qualityEvalExecute = func(ctx context.Context, _ *auth.Account, _ []byte) (*http.Response, error) {
+		close(workerStarted)
+		<-ctx.Done()
+		close(workerCanceled)
+		return nil, ctx.Err()
+	}
+
+	recorder := httptest.NewRecorder()
+	requestContext, _ := gin.CreateTestContext(recorder)
+	requestContext.Params = gin.Params{{Key: "id", Value: strconv.FormatInt(accountID, 10)}}
+	requestContext.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/1/quality-eval", bytes.NewBufferString(`{"kind":"candy","candy_samples":1,"candy_concurrency":1}`))
+	requestContext.Request.Header.Set("Content-Type", "application/json")
+	handler.RunAccountQualityEval(requestContext)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("后台任务状态码 = %d, want 202 body=%s", recorder.Code, recorder.Body.String())
+	}
+	select {
+	case <-workerStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("手动后台检测未启动")
+	}
+
+	handler.StopQualityEvalScheduler()
+	select {
+	case <-workerCanceled:
+	default:
+		t.Fatal("停止质量检测生命周期未取消手动后台检测")
+	}
+	completed := waitForQualityEvalBatch(t, db, accountID)
+	if completed.Status != database.QualityEvalStatusIncomplete {
+		t.Fatalf("被优雅停止取消的批次状态 = %s, want incomplete", completed.Status)
+	}
+	if _, locked := handler.qualityEvalAccountLocks.Load(accountID); locked {
+		t.Fatal("优雅停止返回后账号检测锁仍未释放")
+	}
 }
 
 func TestQualityEvalConcurrencySharesAccountCapacityWithNormalLoad(t *testing.T) {
