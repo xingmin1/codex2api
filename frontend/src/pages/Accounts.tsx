@@ -344,6 +344,14 @@ function persistAccountViewMode(mode: AccountViewMode) {
 const ACCOUNT_PAGE_MODE_KEY = "codex2api:accounts:page-mode";
 type AccountPageMode = "pool" | "personal";
 
+type AccountsPageData = {
+  accounts: AccountRow[];
+  apiKeys: APIKeyRow[];
+  opsOverview: OpsOverviewResponse | null;
+  lazyMode: boolean;
+  healthBars: Record<string, AccountHealthBucket[]>;
+};
+
 // 自用模式自动判定阈值：用户从未手动设置过时，号池账号数 < 该值则默认自用模式。
 const ACCOUNT_PERSONAL_MODE_AUTO_THRESHOLD = 10;
 
@@ -1257,6 +1265,8 @@ export default function Accounts() {
   const folderInputRef = useRef<HTMLInputElement>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
   const lazyModeRef = useRef<boolean | null>(null);
+  const accountsLoadSequenceRef = useRef(0);
+  const latestAccountsDataRef = useRef<AccountsPageData | null>(null);
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
   const ipApiLang = i18n.language?.startsWith("zh") ? "zh-CN" : "en";
@@ -1692,6 +1702,7 @@ export default function Accounts() {
   );
 
   const loadAccounts = useCallback(async (options?: LoadOptions) => {
+    const requestSequence = ++accountsLoadSequenceRef.current;
     const shouldLoadSettings = !options?.silent || lazyModeRef.current === null;
     const [
       accountsResponse,
@@ -1714,26 +1725,25 @@ export default function Accounts() {
           .then((res) => res.buckets)
           .catch((): Record<string, AccountHealthBucket[]> | null => null),
       ]);
+    const nextData: AccountsPageData = {
+      accounts: accountsResponse.accounts ?? [],
+      apiKeys: apiKeysResponse.keys ?? [],
+      opsOverview,
+      lazyMode: settings?.lazy_mode ?? lazyModeRef.current ?? false,
+      healthBars: healthBars ?? {},
+    };
+    if (requestSequence !== accountsLoadSequenceRef.current) {
+      return latestAccountsDataRef.current ?? nextData;
+    }
     if (settings) {
       lazyModeRef.current = settings.lazy_mode;
     }
     setAllGroups(groupsResponse.groups ?? []);
-    return {
-      accounts: accountsResponse.accounts ?? [],
-      apiKeys: apiKeysResponse.keys ?? [],
-      opsOverview,
-      lazyMode: lazyModeRef.current ?? false,
-      healthBars: healthBars ?? {},
-    };
+    latestAccountsDataRef.current = nextData;
+    return nextData;
   }, []);
 
-  const { data, loading, error, reload, reloadSilently } = useDataLoader<{
-    accounts: AccountRow[];
-    apiKeys: APIKeyRow[];
-    opsOverview: OpsOverviewResponse | null;
-    lazyMode: boolean;
-    healthBars: Record<string, AccountHealthBucket[]>;
-  }>({
+  const { data, loading, error, reload, reloadSilently } = useDataLoader<AccountsPageData>({
     initialData: {
       accounts: [],
       apiKeys: [],

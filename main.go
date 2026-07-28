@@ -283,7 +283,6 @@ func main() {
 	store.TriggerAutoCleanupAsync()
 	adminHandler.StartQualityEvalScheduler()
 	defer store.Stop()
-	defer adminHandler.StopQualityEvalScheduler()
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
@@ -451,11 +450,20 @@ func main() {
 	log.Printf("正在关闭，最多等待在途请求完成 %s...", cfg.GracefulShutdownTimeout)
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.GracefulShutdownTimeout)
 	defer cancelShutdown()
+	qualityEvalStopped := make(chan struct{})
+	go func() {
+		defer close(qualityEvalStopped)
+		adminHandler.StopQualityEvalScheduler()
+	}()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)
 	}
+	select {
+	case <-qualityEvalStopped:
+	case <-shutdownCtx.Done():
+		log.Printf("质量检测后台任务优雅关闭超时: %v", shutdownCtx.Err())
+	}
 	wsKeepalive.Stop()
-	adminHandler.StopQualityEvalScheduler()
 	store.Stop()
 	wsrelay.ShutdownExecutor()
 	proxy.CloseErrorLogger()
