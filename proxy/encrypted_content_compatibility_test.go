@@ -102,6 +102,134 @@ func TestRepairResponsesEncryptedContentForErrorFallsBackToReasoningOnly(t *test
 	}
 }
 
+func TestRepairResponsesEncryptedContentForErrorRemovesOnlyFunctionOutputEncryptedContent(t *testing.T) {
+	body := []byte(`{"input":[
+		{"type":"function_call_output","call_id":"call-1","output":[
+			{"type":"input_text","text":"keep"},
+			{"type":"encrypted_content","encrypted_content":"drop"}
+		]},
+		{"type":"custom_tool_call_output","call_id":"call-2","output":[
+			{"type":"encrypted_content","encrypted_content":"drop-too"}
+		]},
+		{"type":"compaction","encrypted_content":"keep-compaction"},
+		{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"keep-agent"}]}
+	]}`)
+	errorBody := []byte(`{"type":"response.failed","response":{"status":"failed","error":{
+		"code":"invalid_encrypted_content",
+		"param":"input[0].output[1].encrypted_content",
+		"message":"Invalid encrypted function output: encrypted_content could not be decrypted."
+	}}}`)
+
+	got, report := repairResponsesEncryptedContentForError(body, http.StatusBadRequest, errorBody)
+
+	if !report.Handled || !report.Changed || report.Strategy != "function-output" || report.Removed != 1 {
+		t.Fatalf("report = %+v, want targeted function output repair", report)
+	}
+	firstOutput := gjson.GetBytes(got, "input.0.output").Array()
+	if len(firstOutput) != 1 || firstOutput[0].Get("text").String() != "keep" {
+		t.Fatalf("mixed function output was not preserved correctly: %s", got)
+	}
+	if gjson.GetBytes(got, "input.0.call_id").String() != "call-1" || gjson.GetBytes(got, "input.1.call_id").String() != "call-2" {
+		t.Fatalf("call_id was not preserved: %s", got)
+	}
+	if output := gjson.GetBytes(got, "input.1.output"); !output.IsArray() || len(output.Array()) != 1 || output.Array()[0].Get("encrypted_content").String() != "drop-too" {
+		t.Fatalf("param-targeted repair should not modify unrelated function output: %s", got)
+	}
+	if gjson.GetBytes(got, "input.2.encrypted_content").String() != "keep-compaction" || gjson.GetBytes(got, "input.3.content.0.encrypted_content").String() != "keep-agent" {
+		t.Fatalf("protected state was changed: %s", got)
+	}
+}
+
+func TestRepairResponsesEncryptedContentForErrorDoesNotTreatGenericInvalidEncryptedContentAsFunctionOutput(t *testing.T) {
+	body := []byte(`{"input":[
+		{"type":"reasoning","encrypted_content":"drop-reasoning"},
+		{"type":"function_call_output","call_id":"call-1","output":[{"type":"encrypted_content","encrypted_content":"keep-function-output"}]},
+		{"type":"compaction","encrypted_content":"keep-compaction"}
+	]}`)
+	errorBody := []byte(`{"error":{"code":"invalid_encrypted_content","message":"Encrypted content could not be decrypted"}}`)
+
+	got, report := repairResponsesEncryptedContentForError(body, http.StatusBadRequest, errorBody)
+
+	if !report.Handled || !report.Changed || report.Strategy != "reasoning-replay" || report.Removed != 1 {
+		t.Fatalf("report = %+v, want existing reasoning fallback", report)
+	}
+	if gjson.GetBytes(got, "input.0.type").String() != "function_call_output" || gjson.GetBytes(got, "input.0.output.0.encrypted_content").String() != "keep-function-output" {
+		t.Fatalf("generic error should not strip function output encrypted content: %s", got)
+	}
+}
+
+func TestRepairResponsesEncryptedContentForErrorRequiresInvalidEncryptedContentForFunctionOutput(t *testing.T) {
+	body := []byte(`{"input":[{"type":"function_call_output","call_id":"call-1","output":[{"type":"encrypted_content","encrypted_content":"keep"}]}]}`)
+	errorBody := []byte(`{"error":{"code":"invalid_type","param":"input[0].output[0].encrypted_content","message":"Invalid encrypted function output"}}`)
+
+	got, report := repairResponsesEncryptedContentForError(body, http.StatusBadRequest, errorBody)
+
+	if report.Changed || string(got) != string(body) {
+		t.Fatalf("non invalid_encrypted_content function output error must not use dedicated repair: report=%+v body=%s", report, got)
+	}
+}
+
+func TestOfficialSSEResponseFailedFunctionOutputRepairUsesDerivedBadRequestStatus(t *testing.T) {
+	body := []byte(`{"input":[{"type":"function_call_output","call_id":"call-1","output":[{"type":"encrypted_content","encrypted_content":"drop"}]}]}`)
+	failure := []byte(`{"type":"response.failed","response":{"status":"failed","error":{
+		"code":"invalid_encrypted_content",
+		"message":"Invalid encrypted function output: encrypted_content could not be decrypted."
+	}}}`)
+
+	got, report := repairResponsesEncryptedContentForError(body, responseFailedStatusCode(failure), failure)
+
+	if !report.Handled || !report.Changed || report.Strategy != "function-output" {
+		t.Fatalf("report = %+v, want official SSE response.failed repair", report)
+	}
+	if output := gjson.GetBytes(got, "input.0.output"); !output.IsArray() || len(output.Array()) != 0 {
+		t.Fatalf("official SSE repair should keep function output with empty output array: %s", got)
+	}
+}
+
+func TestRepairResponsesEncryptedContentForErrorRecognizesFunctionOutputFromParamOnly(t *testing.T) {
+	body := []byte(`{"input":[
+		{"type":"message","role":"user","content":"keep"},
+		{"type":"function_call_output","call_id":"call-1","output":[{"type":"encrypted_content","encrypted_content":"drop"}]}
+	]}`)
+	errorBody := []byte(`{"error":{
+		"code":"invalid_encrypted_content",
+		"param":"input[1].output[0].encrypted_content",
+		"message":"Encrypted content could not be decrypted."
+	}}`)
+
+	got, report := repairResponsesEncryptedContentForError(body, http.StatusBadRequest, errorBody)
+
+	if !report.Handled || !report.Changed || report.Strategy != "function-output" || report.Removed != 1 {
+		t.Fatalf("report = %+v, want param-only function output repair", report)
+	}
+	if output := gjson.GetBytes(got, "input.1.output"); !output.IsArray() || len(output.Array()) != 0 {
+		t.Fatalf("param-only repair should produce empty function output array: %s", got)
+	}
+}
+
+func TestResponsesWebSocketRetryPayloadCanRepairRawAndCodexBodies(t *testing.T) {
+	rawBody := []byte(`{"input":[{"type":"function_call_output","call_id":"raw-call","output":[{"type":"encrypted_content","encrypted_content":"drop-raw"}]}]}`)
+	codexBody := []byte(`{"input":[{"type":"function_call_output","call_id":"codex-call","output":[{"type":"input_text","text":"keep"},{"type":"encrypted_content","encrypted_content":"drop-codex"}]}]}`)
+	failure := []byte(`{"type":"response.failed","response":{"status":"failed","error":{
+		"code":"invalid_encrypted_content",
+		"param":"input[0].output[0].encrypted_content",
+		"message":"Invalid encrypted function output: encrypted_content could not be decrypted."
+	}}}`)
+
+	repairedRaw, rawReport := repairResponsesEncryptedContentForError(rawBody, responseFailedStatusCode(failure), failure)
+	repairedCodex, codexReport := repairResponsesEncryptedContentForError(codexBody, responseFailedStatusCode(failure), failure)
+
+	if !rawReport.Changed || !codexReport.Changed || rawReport.Strategy != "function-output" || codexReport.Strategy != "function-output" {
+		t.Fatalf("reports = raw:%+v codex:%+v, want WS raw/codex repair", rawReport, codexReport)
+	}
+	if len(gjson.GetBytes(repairedRaw, "input.0.output").Array()) != 0 {
+		t.Fatalf("raw body was not sanitized to an empty function output array: %s", repairedRaw)
+	}
+	if output := gjson.GetBytes(repairedCodex, "input.0.output").Array(); len(output) != 1 || output[0].Get("text").String() != "keep" {
+		t.Fatalf("codex body did not preserve non-encrypted output content: %s", repairedCodex)
+	}
+}
+
 func TestRecoverableEncryptedContentErrorShapes(t *testing.T) {
 	tests := []struct {
 		name string

@@ -39,6 +39,7 @@ var errResponsesWSClientGone = errors.New("responses websocket client disconnect
 
 type responsesWSRetryableStreamError struct {
 	outcome             streamOutcome
+	failurePayload      []byte
 	sameAccountRetry    bool
 	sameAccountFailures int
 	sameAccountLimit    int
@@ -416,9 +417,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
 			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 
-			if !cyberPolicy && !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+			if !cyberPolicy && !invalidEncryptedContentRetried {
+				strippedRawBody, rawReport := repairResponsesEncryptedContentForError(rawBody, resp.StatusCode, errBody)
+				strippedCodexBody, codexReport := repairResponsesEncryptedContentForError(codexBody, resp.StatusCode, errBody)
+				rawChanged := rawReport.Changed
+				codexChanged := codexReport.Changed
 				if rawChanged || codexChanged {
 					invalidEncryptedContentRetried = true
 					if rawChanged {
@@ -428,11 +431,31 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 						codexBody = strippedCodexBody
 						expandedInputRaw = responsesInputRaw(codexBody)
 					}
-					log.Printf("Responses WebSocket upstream rejected encrypted_content, stripped encrypted reasoning context and retried once (attempt %d)", attempt+1)
+					log.Printf("Responses WebSocket upstream rejected encrypted_content, repaired request and retried once (attempt %d, raw_strategy=%s, codex_strategy=%s)", attempt+1, rawReport.Strategy, codexReport.Strategy)
 					if !isV2CompactionRequest {
 						h.store.Release(account)
-						h.store.UnbindSessionAffinity(affinityKey, account.ID())
+						sameAccountTarget.remember(account, proxyURL)
 						continue
+					}
+				}
+				if !rawReport.Handled && !codexReport.Handled && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+					strippedRawBody, rawChanged = stripInvalidEncryptedContentFromResponsesBody(rawBody)
+					strippedCodexBody, codexChanged = stripInvalidEncryptedContentFromResponsesBody(codexBody)
+					if rawChanged || codexChanged {
+						invalidEncryptedContentRetried = true
+						if rawChanged {
+							rawBody = strippedRawBody
+						}
+						if codexChanged {
+							codexBody = strippedCodexBody
+							expandedInputRaw = responsesInputRaw(codexBody)
+						}
+						log.Printf("Responses WebSocket upstream rejected encrypted_content, stripped encrypted reasoning context and retried once (attempt %d)", attempt+1)
+						if !isV2CompactionRequest {
+							h.store.Release(account)
+							h.store.UnbindSessionAffinity(affinityKey, account.ID())
+							continue
+						}
 					}
 				}
 			}
@@ -511,6 +534,33 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, isV2CompactionRequest, attempt, transportRetries); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
+				if len(retryErr.failurePayload) > 0 {
+					if !invalidEncryptedContentRetried {
+						statusCode := responseFailedStatusCode(retryErr.failurePayload)
+						repairedRawBody, rawReport := repairResponsesEncryptedContentForError(rawBody, statusCode, retryErr.failurePayload)
+						repairedCodexBody, codexReport := repairResponsesEncryptedContentForError(codexBody, statusCode, retryErr.failurePayload)
+						if rawReport.Changed || codexReport.Changed {
+							invalidEncryptedContentRetried = true
+							if rawReport.Changed {
+								rawBody = repairedRawBody
+							}
+							if codexReport.Changed {
+								codexBody = repairedCodexBody
+								expandedInputRaw = responsesInputRaw(codexBody)
+							}
+							sameAccountTarget.remember(account, proxyURL)
+							log.Printf("Responses WebSocket response.failed 命中 encrypted_content 兼容修复后同号重试一次 (attempt %d, raw_strategy=%s, codex_strategy=%s)", attempt+1, rawReport.Strategy, codexReport.Strategy)
+							if !h.waitBeforeRetry(c.Request.Context()) {
+								return errResponsesWSClientGone
+							}
+							continue
+						}
+					}
+					apiErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
+					clientErr := responsesWSClientUpstreamAPIError(apiErr, hideUpstreamErrors)
+					_ = writeResponsesWSError(conn, clientErr)
+					return newResponsesWSCloseError(responsesWSCloseCodeForStatus(retryErr.outcome.logStatusCode), clientErr.Message, apiErr)
+				}
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
 				if retryErr.sameAccountRetry {
 					sameAccountTarget.remember(account, proxyURL)
@@ -539,7 +589,6 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 						retryExclusions.MarkHard(account.ID())
 					}
 					log.Printf("Responses WebSocket upstream stream ended before first token, retrying (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), retryErr.outcome.failureMessage)
-					// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
 					if !isFirstTokenTimeoutOutcome(retryErr.outcome) && !h.waitBeforeRetry(c.Request.Context()) {
 						return errResponsesWSClientGone
 					}
@@ -711,6 +760,16 @@ func (h *Handler) streamResponsesWSUpstream(
 		// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 		// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 		h.logUpstreamCyberPolicy(c, "/v1/responses", model, responseFailedErrorBody(terminalFailurePayload))
+	}
+	if len(terminalFailurePayload) > 0 && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
+		if _, ok := recoverableEncryptedContentError(responseFailedStatusCode(terminalFailurePayload), terminalFailurePayload); ok {
+			resp.Body.Close()
+			h.store.Release(account)
+			return &responsesWSRetryableStreamError{
+				outcome:        outcome,
+				failurePayload: append([]byte(nil), terminalFailurePayload...),
+			}
+		}
 	}
 	if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
 		h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)

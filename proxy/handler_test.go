@@ -1346,8 +1346,8 @@ func TestResponsesEncryptedContentCompatibilityRetriesAfterStructuralFailure(t *
 		t.Fatalf("downstream should receive only the repaired success stream: status=%d body=%s", recorder.Code, responseBody)
 	}
 	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
-	if failures != 1 {
-		t.Fatalf("compatibility retry failure window count = %d, want 1", failures)
+	if failures != 0 {
+		t.Fatalf("compatibility retry failure window count = %d, want 0", failures)
 	}
 }
 
@@ -1386,8 +1386,58 @@ func TestResponsesEncryptedContentCompatibilityRetriesHTTPBadRequest(t *testing.
 		t.Fatalf("downstream should receive repaired HTTP success: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
-	if failures != 1 {
-		t.Fatalf("HTTP compatibility failure window count = %d, want 1", failures)
+	if failures != 0 {
+		t.Fatalf("HTTP compatibility failure window count = %d, want 0", failures)
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityRetriesRelaySSEFunctionOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	seenBodies := make([][]byte, 0, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		body, _ := io.ReadAll(r.Body)
+		seenBodies = append(seenBodies, append([]byte(nil), body...))
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempts == 1 {
+			_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_leaked"}}`+"\n\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"status_code":400,"code":"invalid_encrypted_content","message":"Encrypted function output content could not be decrypted or decoded."}}}`+"\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"ok"}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store, account := newEncryptedContentCompatibilityRelayStore(upstream.URL, true)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	body := `{"model":"gpt-5.6-sol","stream":true,"input":[{"role":"user","content":"continue"},{"type":"function_call_output","call_id":"call-1","output":[{"type":"input_text","text":"keep"},{"type":"encrypted_content","encrypted_content":"drop"}]},{"type":"compaction","encrypted_content":"preserved"}]}`
+	recorder := performEncryptedContentCompatibilityRequest(t, handler, body)
+
+	if attempts != 2 {
+		t.Fatalf("relay SSE function output compatibility attempts = %d, want 2", attempts)
+	}
+	if strings.Contains(recorder.Body.String(), "resp_leaked") || strings.Contains(recorder.Body.String(), "invalid_encrypted_content") {
+		t.Fatalf("first response.failed leaked downstream: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(seenBodies) != 2 {
+		t.Fatalf("seen bodies = %d, want 2", len(seenBodies))
+	}
+	retryBody := string(seenBodies[1])
+	for _, want := range []string{"call-1", "keep", "preserved"} {
+		if !strings.Contains(retryBody, want) {
+			t.Fatalf("retry body missing %q: %s", want, retryBody)
+		}
+	}
+	if strings.Contains(retryBody, "drop") {
+		t.Fatalf("retry body still contains encrypted function output: %s", retryBody)
+	}
+	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
+	if failures != 0 {
+		t.Fatalf("relay SSE function output failure window count = %d, want 0", failures)
 	}
 }
 
@@ -1475,8 +1525,8 @@ func TestResponsesEncryptedContentCompatibilityRetriesOnlyOnce(t *testing.T) {
 		t.Fatalf("second compatibility failure status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
 	}
 	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
-	if failures != 2 {
-		t.Fatalf("compatibility failure window count = %d, want 2", failures)
+	if failures != 1 {
+		t.Fatalf("compatibility failure window count = %d, want 1", failures)
 	}
 }
 

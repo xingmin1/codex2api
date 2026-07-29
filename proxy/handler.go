@@ -2230,6 +2230,32 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 		log.Printf(message, args...)
 		return true
 	}
+	repairEncryptedContentForRetry := func(statusCode int, errorBody []byte) (encryptedContentCompatibilityReport, bool) {
+		if encryptedContentCompatibilityRetried {
+			return encryptedContentCompatibilityReport{}, false
+		}
+		repairedRawBody, rawReport := repairResponsesEncryptedContentForError(rawBody, statusCode, errorBody)
+		repairedCodexBody, codexReport := repairResponsesEncryptedContentForError(codexBody, statusCode, errorBody)
+		if !rawReport.Changed && !codexReport.Changed {
+			if rawReport.Handled {
+				return rawReport, false
+			}
+			return codexReport, false
+		}
+		encryptedContentCompatibilityRetried = true
+		if rawReport.Changed {
+			rawBody = repairedRawBody
+			resetOpenAIResponsesBody()
+		}
+		if codexReport.Changed {
+			codexBody = repairedCodexBody
+			expandedInputRaw = responsesInputRaw(codexBody)
+		}
+		if rawReport.Changed {
+			return rawReport, true
+		}
+		return codexReport, true
+	}
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -2518,7 +2544,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				if !compatibilityRetry {
 					sameAccountRetry, sameAccountFailures, sameAccountLimit = transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy, false, failureKind)
 				}
-				if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				if failureKind != "" && !compatibilityRetry && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
 					h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
@@ -2772,7 +2798,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 			}
-			if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
+			if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !compatibilityRetry && !isFirstTokenTimeoutOutcome(outcome) {
 				h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
 			transparentStreamRetry := shouldTransparentRetryStream(outcome, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)
@@ -3071,9 +3097,20 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			}
 			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
 			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
+			compatibilityRetry := false
+			compatibilityReport := encryptedContentCompatibilityReport{}
+			if !cyberPolicy {
+				compatibilityReport, compatibilityRetry = repairEncryptedContentForRetry(resp.StatusCode, errBody)
+			}
+			if compatibilityRetry {
+				h.store.Release(account)
+				sameAccountTarget.remember(account, proxyURL)
+				log.Printf("账号 %d encrypted_content 兼容修复后同号重试一次 (attempt %d, strategy=%s, param=%q, /v1/responses)", account.ID(), attempt+1, compatibilityReport.Strategy, compatibilityReport.Param)
+				continue
+			}
 
 			explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
-			if !cyberPolicy && shouldStripEncryptedContentForFailure(explicitInvalidEncryptedContent) {
+			if !cyberPolicy && !compatibilityReport.Handled && shouldStripEncryptedContentForFailure(explicitInvalidEncryptedContent) {
 				message := "上游返回错误且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d, /v1/responses)"
 				if explicitInvalidEncryptedContent {
 					message = "上游拒绝 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d, status %d, account %d, /v1/responses)"
@@ -3087,7 +3124,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			}
 
 			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy, false, failureKind)
-			if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+			if failureKind != "" && !compatibilityRetry && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
 				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
 			if !sameAccountRetry && !cyberPolicy {
@@ -3419,7 +3456,19 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 		}
-		if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
+		compatibilityRetry := false
+		compatibilityReport := encryptedContentCompatibilityReport{}
+		if len(terminalFailurePayload) > 0 && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil && upstreamCyberPolicyCode(responseFailedErrorBody(terminalFailurePayload)) == "" {
+			compatibilityReport, compatibilityRetry = repairEncryptedContentForRetry(responseFailedStatusCode(terminalFailurePayload), terminalFailurePayload)
+			if compatibilityRetry {
+				resp.Body.Close()
+				h.store.Release(account)
+				sameAccountTarget.remember(account, proxyURL)
+				log.Printf("账号 %d encrypted_content 响应兼容修复后同号重试一次 (attempt %d, strategy=%s, param=%q, /v1/responses)", account.ID(), attempt+1, compatibilityReport.Strategy, compatibilityReport.Param)
+				continue
+			}
+		}
+		if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !compatibilityRetry && !isFirstTokenTimeoutOutcome(outcome) {
 			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 		}
 		transparentStreamRetry := shouldTransparentRetryStream(outcome, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)

@@ -26,7 +26,10 @@ type encryptedContentErrorInfo struct {
 	Message string
 }
 
-var encryptedContentInputIndexPattern = regexp.MustCompile(`(?i)input(?:\[(\d+)\]|\.(\d+))(?:\.[a-z_][a-z0-9_]*|\[\d+\])*\.encrypted_content`)
+var (
+	encryptedContentInputIndexPattern        = regexp.MustCompile(`(?i)input(?:\[(\d+)\]|\.(\d+))(?:\.[a-z_][a-z0-9_]*|\[\d+\])*\.encrypted_content`)
+	encryptedFunctionOutputInputIndexPattern = regexp.MustCompile(`(?i)input(?:\[(\d+)\]|\.(\d+))\.output(?:\[\d+\]|\.\d+)(?:\.[a-z_][a-z0-9_]*|\[\d+\])*\.encrypted_content`)
+)
 
 func prepareEncryptedContentCompatibilityRequest(body []byte) ([]byte, bool) {
 	var root map[string]any
@@ -112,6 +115,16 @@ func repairResponsesEncryptedContentForError(body []byte, statusCode int, errorB
 	if !ok {
 		return body, encryptedContentCompatibilityReport{}
 	}
+	if repaired, removed := removeEncryptedFunctionOutputContent(body, info); removed > 0 {
+		return repaired, encryptedContentCompatibilityReport{
+			Handled:  true,
+			Changed:  true,
+			Removed:  removed,
+			Param:    info.Param,
+			ItemType: "function_call_output",
+			Strategy: "function-output",
+		}
+	}
 	report := encryptedContentCompatibilityReport{
 		Handled: true,
 		Param:   info.Param,
@@ -143,6 +156,102 @@ func repairResponsesEncryptedContentForError(body []byte, statusCode int, errorB
 	report.Removed = removed
 	report.Strategy = "reasoning-replay"
 	return repaired, report
+}
+
+func removeEncryptedFunctionOutputContent(body []byte, info encryptedContentErrorInfo) ([]byte, int) {
+	if !isInvalidEncryptedFunctionOutputError(info) {
+		return body, 0
+	}
+
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil || root == nil {
+		return body, 0
+	}
+	input, ok := root["input"].([]any)
+	if !ok {
+		return body, 0
+	}
+
+	targetIndex, hasTargetIndex := encryptedContentOutputInputIndex(info)
+	removed := 0
+	for index, rawItem := range input {
+		item, ok := rawItem.(map[string]any)
+		if !ok || !isFunctionOutputItemType(strings.TrimSpace(firstNonEmptyAnyString(item["type"]))) {
+			continue
+		}
+		if hasTargetIndex && index != targetIndex {
+			continue
+		}
+		output, ok := item["output"].([]any)
+		if !ok {
+			continue
+		}
+		cleaned := make([]any, 0, len(output))
+		for _, rawContent := range output {
+			content, ok := rawContent.(map[string]any)
+			if ok && strings.TrimSpace(firstNonEmptyAnyString(content["type"])) == "encrypted_content" {
+				removed++
+				continue
+			}
+			cleaned = append(cleaned, rawContent)
+		}
+		if len(cleaned) != len(output) {
+			item["output"] = cleaned
+		}
+	}
+	if removed == 0 {
+		return body, 0
+	}
+
+	repaired, err := json.Marshal(root)
+	if err != nil {
+		return body, 0
+	}
+	return repaired, removed
+}
+
+func isInvalidEncryptedFunctionOutputError(info encryptedContentErrorInfo) bool {
+	code := strings.ToLower(strings.TrimSpace(info.Code))
+	if code != "invalid_encrypted_content" {
+		return false
+	}
+	haystack := strings.ToLower(info.Param + "\n" + info.Message)
+	if _, ok := encryptedContentOutputInputIndex(info); ok {
+		return true
+	}
+	mentionsEncrypted := strings.Contains(haystack, "encrypted_content") || strings.Contains(haystack, "encrypted content") || strings.Contains(haystack, "encrypted")
+	mentionsFunctionOutput := strings.Contains(haystack, "function_call_output") ||
+		strings.Contains(haystack, "custom_tool_call_output") ||
+		strings.Contains(haystack, "function output") ||
+		strings.Contains(haystack, "tool call output")
+	return mentionsEncrypted && mentionsFunctionOutput
+}
+
+func encryptedContentOutputInputIndex(info encryptedContentErrorInfo) (int, bool) {
+	for _, candidate := range []string{info.Param, info.Message} {
+		matches := encryptedFunctionOutputInputIndexPattern.FindStringSubmatch(candidate)
+		if len(matches) != 3 {
+			continue
+		}
+		rawIndex := matches[1]
+		if rawIndex == "" {
+			rawIndex = matches[2]
+		}
+		index, err := strconv.Atoi(rawIndex)
+		if err == nil {
+			return index, true
+		}
+	}
+	return 0, false
+}
+
+func isFunctionOutputItemType(itemType string) bool {
+	switch itemType {
+	case "function_call_output", "custom_tool_call_output":
+		return true
+	default:
+		return false
+	}
 }
 
 func removeTargetedEncryptedReplayItem(body []byte, index int) ([]byte, string, bool) {
