@@ -930,6 +930,77 @@ func normalizeResponsesInputMessageContent(body map[string]any) bool {
 	return modified
 }
 
+func normalizeCodexResponsesSystemInstructions(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	kept := make([]any, 0, len(inputItems))
+	systemInstructions := make([]string, 0)
+	modified := false
+	for _, raw := range inputItems {
+		item, ok := raw.(map[string]any)
+		if !ok || !isResponsesMessageInputItem(item) || strings.TrimSpace(firstNonEmptyAnyString(item["role"])) != "system" {
+			kept = append(kept, raw)
+			continue
+		}
+
+		text, textOnly := codexResponsesSystemInstructionText(item["content"])
+		if !textOnly {
+			item["role"] = "developer"
+			kept = append(kept, item)
+			modified = true
+			continue
+		}
+		if text := strings.TrimSpace(text); text != "" {
+			systemInstructions = append(systemInstructions, text)
+		}
+		modified = true
+	}
+	if !modified {
+		return false
+	}
+
+	instructions := make([]string, 0, len(systemInstructions)+1)
+	if existing, ok := body["instructions"].(string); ok && strings.TrimSpace(existing) != "" {
+		instructions = append(instructions, existing)
+	}
+	instructions = append(instructions, systemInstructions...)
+	body["instructions"] = strings.Join(instructions, "\n\n")
+	body["input"] = kept
+	return true
+}
+
+func codexResponsesSystemInstructionText(content any) (string, bool) {
+	switch typed := content.(type) {
+	case nil:
+		return "", true
+	case string:
+		return typed, true
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, raw := range typed {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				return "", false
+			}
+			partType := strings.TrimSpace(firstNonEmptyAnyString(part["type"]))
+			if partType != "" && partType != "text" && partType != "input_text" {
+				return "", false
+			}
+			text, ok := part["text"].(string)
+			if !ok {
+				return "", false
+			}
+			parts = append(parts, text)
+		}
+		return strings.Join(parts, "\n"), true
+	default:
+		return "", false
+	}
+}
+
 func isResponsesMessageInputItem(item map[string]any) bool {
 	itemType := strings.TrimSpace(firstNonEmptyAnyString(item["type"]))
 	if itemType == "message" {
@@ -1795,7 +1866,6 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 	moveTopLevelResponsesImageOptions(body)
 	normalizeResponsesImageGenerationTools(body, promptText)
-	applyResponsesImageGenerationBridgeInstructions(body)
 
 	// 6. 展开 previous_response_id（限定在请求归属的缓存命名空间，防跨用户注入）
 	prevID, _ := body["previous_response_id"].(string)
@@ -1814,6 +1884,10 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 	// 6b. 把 input[] 中的 compaction 项翻译为 developer message（上游不识别 compaction）
 	normalizeResponsesCompactionItems(body)
+	// OpenAI Responses 允许 system 消息，但 Codex 上游要求同级指令放在顶层
+	// instructions。转换仅发生在 Codex 准备路径，中转账号仍保留原始协议语义。
+	normalizeCodexResponsesSystemInstructions(body)
+	applyResponsesImageGenerationBridgeInstructions(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
 	normalizeResponsesToolCallArgumentTypes(body)
