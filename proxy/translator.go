@@ -1910,7 +1910,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
 		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
 		"logit_bias", "response_format", "serviceTier", "metadata",
-		"stream_options", "reasoning_effort", "truncation", "context_management",
+		"stream_options", "reasoning_effort", "truncation",
 		"disable_response_storage", "verbosity",
 		"prompt_cache_retention", "safety_identifier",
 	} {
@@ -1993,6 +1993,9 @@ func PrepareCompactResponsesBodyForOwner(rawBody []byte, owner string) ([]byte, 
 	body, _ = sjson.DeleteBytes(body, "include")
 	body, _ = sjson.DeleteBytes(body, "store")
 	body, _ = sjson.DeleteBytes(body, "stream")
+	// context_management 是 /responses 的服务端压缩控制字段；显式
+	// /responses/compact 端点执行一次独立压缩，不接受该字段。
+	body, _ = sjson.DeleteBytes(body, "context_management")
 	// 普通 /responses 请求携带的客户端指纹元数据,compact 端点不认识该参数
 	// (Unknown parameter: 'client_metadata')——body-signal 压缩提升会把普通
 	// 请求形状的 body 送进本函数,须在此剥除。

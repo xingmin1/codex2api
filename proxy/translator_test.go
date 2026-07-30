@@ -605,6 +605,56 @@ func TestCodexResponsesPreparersMoveZedSystemMessageToInstructions(t *testing.T)
 	}
 }
 
+func TestCodexResponsesPreparersPreserveNativeCompactionContract(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"context_management":[{"type":"compaction","compact_threshold":200000}],
+		"input":[
+			{"type":"compaction","encrypted_content":"opaque-compaction-state"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+	tests := []struct {
+		name                  string
+		prepare               func([]byte) ([]byte, string)
+		wantContextManagement bool
+	}{
+		{name: "http", prepare: PrepareResponsesBody, wantContextManagement: true},
+		{name: "websocket", prepare: PrepareResponsesWebSocketBody, wantContextManagement: true},
+		{name: "compact", prepare: PrepareCompactResponsesBody, wantContextManagement: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, expandedInputRaw := test.prepare(raw)
+
+			contextManagement := gjson.GetBytes(got, "context_management")
+			if contextManagement.Exists() != test.wantContextManagement {
+				t.Fatalf("context_management presence = %v, want %v; body=%s", contextManagement.Exists(), test.wantContextManagement, got)
+			}
+			if test.wantContextManagement {
+				if typ := contextManagement.Get("0.type").String(); typ != "compaction" {
+					t.Fatalf("context_management type = %q, want compaction; body=%s", typ, got)
+				}
+				if threshold := contextManagement.Get("0.compact_threshold").Int(); threshold != 200000 {
+					t.Fatalf("compact_threshold = %d, want 200000; body=%s", threshold, got)
+				}
+			}
+
+			if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "compaction" {
+				t.Fatalf("encrypted compaction item type = %q, want compaction; body=%s", typ, got)
+			}
+			if encrypted := gjson.GetBytes(got, "input.0.encrypted_content").String(); encrypted != "opaque-compaction-state" {
+				t.Fatalf("encrypted compaction state = %q, want preserved; body=%s", encrypted, got)
+			}
+			if encrypted := gjson.Get(expandedInputRaw, "0.encrypted_content").String(); encrypted != "opaque-compaction-state" {
+				t.Fatalf("expanded encrypted compaction state = %q, want preserved; expanded=%s", encrypted, expandedInputRaw)
+			}
+		})
+	}
+}
+
 func TestPrepareResponsesBodyAppendsOrderedSystemMessagesToExistingInstructions(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.6-sol",
