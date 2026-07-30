@@ -161,8 +161,8 @@ func TestRelayHTTPFailuresUseOneGenericKind(t *testing.T) {
 		}
 	}
 	outcome := classifyResponseFailedOutcomeForAccount(account, []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_value","message":"temporary"}}}`))
-	if outcome.failureKind != "upstream" || !outcome.penalize {
-		t.Fatalf("relay response.failed outcome = %+v, want generic penalized failure", outcome)
+	if outcome.failureKind != "upstream" || outcome.penalize || !outcome.deterministicClientError {
+		t.Fatalf("relay response.failed outcome = %+v, want generic non-penalized deterministic failure", outcome)
 	}
 }
 

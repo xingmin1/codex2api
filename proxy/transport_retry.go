@@ -66,15 +66,20 @@ func (t *sameAccountRetryTarget) take(store *auth.Store, apiKeyID int64, filter 
 }
 
 func sameAccountStreamRetryEligible(_ bool, outcome streamOutcome, wroteAnyBody bool, requestErr, writeErr error) bool {
-	return outcome.logStatusCode != http.StatusOK &&
-		outcome.failureKind != upstreamErrorKindCyberPolicy &&
-		!wroteAnyBody &&
-		requestErr == nil &&
-		writeErr == nil
+	if outcome.logStatusCode == http.StatusOK ||
+		outcome.failureKind == upstreamErrorKindCyberPolicy ||
+		outcome.failureKind == upstreamErrorKindUnsupportedTruncation ||
+		outcome.deterministicClientError ||
+		wroteAnyBody ||
+		requestErr != nil ||
+		writeErr != nil {
+		return false
+	}
+	return true
 }
 
 func (t *transportRetryTracker) shouldRetryForRequest(handler *Handler, account *auth.Account, compact, eligible, timedOut bool, failureKind string) (bool, int, int) {
-	if failureKind == upstreamErrorKindCyberPolicy {
+	if failureKind == upstreamErrorKindCyberPolicy || failureKind == upstreamErrorKindUnsupportedTruncation || failureKind == "client" {
 		return false, 0, 0
 	}
 	if !compact {
@@ -111,7 +116,8 @@ func (t *transportRetryTracker) stateMachineAttempt(attempt int, compact bool) i
 }
 
 func (t *transportRetryTracker) shouldRetrySameAccount(handler *Handler, account *auth.Account, eligible, timedOut bool, failureKind string) (bool, int, int) {
-	if handler == nil || handler.store == nil || account == nil || !eligible || timedOut || failureKind == upstreamErrorKindCyberPolicy {
+	if handler == nil || handler.store == nil || account == nil || !eligible || timedOut ||
+		failureKind == upstreamErrorKindCyberPolicy || failureKind == upstreamErrorKindUnsupportedTruncation {
 		return false, 0, 0
 	}
 

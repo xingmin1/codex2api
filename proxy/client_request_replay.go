@@ -28,12 +28,15 @@ type clientRequestReplayStopReason string
 type clientRequestReplayProtocol string
 
 const (
-	clientRequestReplayStopSuccess     clientRequestReplayStopReason = "success"
-	clientRequestReplayStopMaxRetries  clientRequestReplayStopReason = "max_retries"
-	clientRequestReplayStopMaxDuration clientRequestReplayStopReason = "max_duration"
-	clientRequestReplayStopClientGone  clientRequestReplayStopReason = "client_closed"
-	clientRequestReplayStopWriteFailed clientRequestReplayStopReason = "write_failed"
-	clientRequestReplayStopCyberPolicy clientRequestReplayStopReason = "cyber_policy"
+	clientRequestReplayStopSuccess               clientRequestReplayStopReason = "success"
+	clientRequestReplayStopMaxRetries            clientRequestReplayStopReason = "max_retries"
+	clientRequestReplayStopMaxDuration           clientRequestReplayStopReason = "max_duration"
+	clientRequestReplayStopClientGone            clientRequestReplayStopReason = "client_closed"
+	clientRequestReplayStopWriteFailed           clientRequestReplayStopReason = "write_failed"
+	clientRequestReplayStopCyberPolicy           clientRequestReplayStopReason = "cyber_policy"
+	clientRequestReplayStopInvalidCompaction     clientRequestReplayStopReason = "invalid_compaction_output"
+	clientRequestReplayStopUnsupportedTruncation clientRequestReplayStopReason = "unsupported_truncation"
+	clientRequestReplayStopDeterministicFailure  clientRequestReplayStopReason = "deterministic_upstream_failure"
 )
 
 const (
@@ -792,7 +795,7 @@ func (h *Handler) handleWithClientRequestReplay(c *gin.Context, endpoint string,
 		return
 	}
 	originalBody = append([]byte(nil), originalBody...)
-	stream := gjson.GetBytes(originalBody, "stream").Bool()
+	stream := endpoint != "/v1/responses/compact" && gjson.GetBytes(originalBody, "stream").Bool()
 	baseKeys := cloneGinKeys(c.Keys)
 	downstream := c.Writer
 	originalRequest := c.Request

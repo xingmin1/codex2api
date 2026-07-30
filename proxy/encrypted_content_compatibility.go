@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"regexp"
@@ -81,12 +82,63 @@ func responsesBodyHasEncryptedContent(body []byte) bool {
 }
 
 func responsesPayloadIsFailed(body []byte) bool {
+	if responsePayloadIsFailedJSON(body) {
+		return true
+	}
+	return responseFailedPayload(body) != nil
+}
+
+func responsePayloadIsFailedJSON(body []byte) bool {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "type").String()), "response.failed") {
+		return true
+	}
 	for _, path := range []string{"status", "response.status"} {
 		if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, path).String()), "failed") {
 			return true
 		}
 	}
 	return false
+}
+
+// responseFailedPayload 从 JSON 或标准 SSE framing 中提取失败事件，供 compact
+// 的 HTTP 200 兼容路径复用；普通 JSON 直接返回原始切片，避免改变调用方行为。
+func responseFailedPayload(body []byte) []byte {
+	if responsePayloadIsFailedJSON(body) {
+		return body
+	}
+
+	var dataLines [][]byte
+	flushEvent := func() []byte {
+		if len(dataLines) == 0 {
+			return nil
+		}
+		payload := bytes.Join(dataLines, []byte("\n"))
+		dataLines = dataLines[:0]
+		if responsePayloadIsFailedJSON(payload) {
+			return payload
+		}
+		return nil
+	}
+
+	for _, rawLine := range bytes.Split(body, []byte("\n")) {
+		line := bytes.TrimSpace(bytes.TrimSuffix(rawLine, []byte("\r")))
+		if len(line) == 0 {
+			if payload := flushEvent(); len(payload) > 0 {
+				return payload
+			}
+			continue
+		}
+		if bytes.HasPrefix(line, []byte(":")) || bytes.HasPrefix(line, []byte("event:")) {
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("data:")) {
+			dataLines = append(dataLines, bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:"))))
+		}
+	}
+	return flushEvent()
 }
 
 func valueHasEncryptedContent(value any) bool {
@@ -215,10 +267,10 @@ func isInvalidEncryptedFunctionOutputError(info encryptedContentErrorInfo) bool 
 	if code != "invalid_encrypted_content" {
 		return false
 	}
-	haystack := strings.ToLower(info.Param + "\n" + info.Message)
 	if _, ok := encryptedContentOutputInputIndex(info); ok {
 		return true
 	}
+	haystack := strings.ToLower(info.Param + "\n" + info.Message)
 	mentionsEncrypted := strings.Contains(haystack, "encrypted_content") || strings.Contains(haystack, "encrypted content") || strings.Contains(haystack, "encrypted")
 	mentionsFunctionOutput := strings.Contains(haystack, "function_call_output") ||
 		strings.Contains(haystack, "custom_tool_call_output") ||

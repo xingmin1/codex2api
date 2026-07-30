@@ -55,7 +55,8 @@ type Handler struct {
 	apiKeyGateMu sync.Mutex
 	apiKeyGate   *apiKeyConcurrencyLimiter
 
-	longCompactFallbacks sync.Map // map[string]int64，记录需要优先走长压缩池的 API Key / 会话
+	longCompactFallbacks        sync.Map // map[string]int64，记录需要优先走长压缩池的 API Key / 会话
+	nativeCompactionUnsupported sync.Map // map[string]int64，短期隔离返回无效 compact v2 输出的账号/模型
 }
 
 const (
@@ -1078,6 +1079,10 @@ type streamOutcome struct {
 	failureKind    string
 	failureMessage string
 	penalize       bool
+	// responseFailed 标记终止事件来自结构化 response.failed，而不是传输层断流。
+	responseFailed bool
+	// deterministicClientError 表示重试同一请求也不会改变结果的客户端错误。
+	deterministicClientError bool
 	// verifyAccountAuth 标记这是一次 WS 上游读流失败（如 close 1008 policy violation）。
 	// WS 通道下 token 失效表现为上游主动关闭而非 401，需异步跑一次探针确认账号鉴权状态，
 	// 命中 401 才按 unauthorized 冷却，避免失效账号不被封、反复被调度。
@@ -1149,6 +1154,7 @@ func classifyResponseFailedOutcomeForAccount(account *auth.Account, payload []by
 			logStatusCode:  statusCode,
 			failureKind:    kind,
 			failureMessage: message,
+			responseFailed: true,
 		}
 	}
 	if kind == "" {
@@ -1160,19 +1166,28 @@ func classifyResponseFailedOutcomeForAccount(account *auth.Account, payload []by
 	}
 	penalizeUnauthorized := statusCode == http.StatusUnauthorized && !shouldTreatUnauthorizedAsClientError(account, statusCode)
 	penalize := penalizeUnauthorized || statusCode == http.StatusTooManyRequests || statusCode >= 500
+	deterministicClientError := responseFailedIsDeterministicClientError(payload)
 	if account != nil && account.IsOpenAIResponsesAPI() {
+		// relay 的失败要进入上游失败统计，但确定性客户端错误不能因此变成可重试错误。
 		kind = "upstream"
-		penalize = true
+		if !deterministicClientError {
+			penalize = true
+		}
 	}
 	return streamOutcome{
-		logStatusCode:  statusCode,
-		failureKind:    kind,
-		failureMessage: message,
-		penalize:       penalize,
+		logStatusCode:            statusCode,
+		failureKind:              kind,
+		failureMessage:           message,
+		penalize:                 penalize,
+		responseFailed:           true,
+		deterministicClientError: deterministicClientError,
 	}
 }
 
 func responseFailedErrorBody(payload []byte) []byte {
+	if normalized := responseFailedPayload(payload); len(normalized) > 0 {
+		payload = normalized
+	}
 	if len(payload) == 0 {
 		return payload
 	}
@@ -1197,10 +1212,97 @@ func responseFailedErrorBody(payload []byte) []byte {
 // （额度耗尽/限流/5xx/401）。用于在首包前透明换号，避免把可恢复的失败帧直接下发给
 // WebSocket 客户端而触发反复 Reconnecting。非可重试故障（如 invalid_request）仍照常透传。
 func responseFailedRetryable(payload []byte) bool {
-	if len(payload) == 0 || upstreamCyberPolicyCode(responseFailedErrorBody(payload)) != "" {
+	if len(payload) == 0 || upstreamCyberPolicyCode(responseFailedErrorBody(payload)) != "" || isUnsupportedTruncationFailure(payload) {
 		return false
 	}
 	return classifyResponseFailedOutcome(payload).penalize
+}
+
+func deterministicClientErrorPayload(body []byte) bool {
+	body = responseFailedErrorBody(body)
+	if len(body) == 0 {
+		return false
+	}
+	var fields []string
+	for _, prefix := range []string{"error", "response.error", "response.status_details.error", "status_details.error"} {
+		for _, field := range []string{"code", "type", "param", "message"} {
+			if value := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, prefix+"."+field).String())); value != "" {
+				fields = append(fields, value)
+			}
+		}
+	}
+	haystack := strings.ToLower(strings.Join(fields, " "))
+	for _, marker := range []string{
+		"invalid_request",
+		"invalid_value",
+		"invalid_type",
+		"missing_required_parameter",
+		"context_length_exceeded",
+		"context_window_exceeded",
+		"model_not_found",
+		"invalid_model",
+		"unsupported_parameter",
+		"unknown_parameter",
+		"above_max_length",
+		"string_above_max_length",
+		"string_too_long",
+		"input_too_long",
+	} {
+		if strings.Contains(haystack, marker) {
+			return true
+		}
+	}
+	return strings.Contains(haystack, "context length") ||
+		strings.Contains(haystack, "context window") ||
+		strings.Contains(haystack, "model not found") ||
+		strings.Contains(haystack, "unsupported parameter") ||
+		strings.Contains(haystack, "unknown parameter") ||
+		strings.Contains(haystack, "invalid request") ||
+		strings.Contains(haystack, "input too long") ||
+		strings.Contains(haystack, "missing required parameter")
+}
+
+func isDeterministicClientHTTPError(statusCode int, body []byte) bool {
+	if statusCode < http.StatusBadRequest || statusCode >= http.StatusInternalServerError {
+		return false
+	}
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || statusCode == http.StatusTooManyRequests {
+		return false
+	}
+	if upstreamCyberPolicyCode(body) != "" || isUnsupportedTruncationError(statusCode, body) {
+		return false
+	}
+	// encrypted_content 的兼容修复应优先完成一次专用同号修复，不能被普通确定性错误逻辑截断。
+	if _, recoverable := recoverableEncryptedContentError(statusCode, body); recoverable {
+		return false
+	}
+	return deterministicClientErrorPayload(body)
+}
+
+func blockDeterministicClientHTTPReplay(c *gin.Context, statusCode int, body []byte) {
+	if isDeterministicClientHTTPError(statusCode, body) {
+		blockClientRequestReplay(c, clientRequestReplayStopDeterministicFailure)
+	}
+}
+
+func responseFailedIsDeterministicClientError(payload []byte) bool {
+	if len(payload) == 0 || upstreamCyberPolicyCode(responseFailedErrorBody(payload)) != "" {
+		return false
+	}
+	statusCode := responseFailedStatusCode(payload)
+	if statusCode != http.StatusBadRequest || isUnsupportedTruncationFailure(payload) {
+		return false
+	}
+	if _, recoverable := recoverableEncryptedContentError(statusCode, responseFailedErrorBody(payload)); recoverable {
+		return false
+	}
+	return deterministicClientErrorPayload(payload)
+}
+
+func blockDeterministicResponseFailureReplay(c *gin.Context, payload []byte) {
+	if responseFailedIsDeterministicClientError(payload) {
+		blockClientRequestReplay(c, clientRequestReplayStopDeterministicFailure)
+	}
 }
 
 func (h *Handler) applyResponseFailedCooldown(account *auth.Account, payload []byte, resp *http.Response, model string) codex429Decision {
@@ -1213,6 +1315,9 @@ func (h *Handler) applyResponseFailedCooldown(account *auth.Account, payload []b
 }
 
 func responseFailedStatusCode(payload []byte) int {
+	if normalized := responseFailedPayload(payload); len(normalized) > 0 {
+		payload = normalized
+	}
 	for _, path := range []string{
 		"response.status_code",
 		"response.error.status_code",
@@ -1701,7 +1806,13 @@ func shouldRetryHTTPStatus(statusCode int, generalRetries *int, rateLimitRetries
 }
 
 func shouldRetryHTTPStatusForAccount(account *auth.Account, statusCode int, body []byte, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int) bool {
+	if isUnsupportedTruncationError(statusCode, body) {
+		return false
+	}
 	if upstreamCyberPolicyCode(body) != "" {
+		return false
+	}
+	if isDeterministicClientHTTPError(statusCode, body) {
 		return false
 	}
 	if account != nil && account.IsOpenAIResponsesAPI() && statusCode == http.StatusTooManyRequests {
@@ -2182,7 +2293,16 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 		defer releaseAPIKeyConcurrency()
 	}
 	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	if routedFilter, truncationErr := routeResponsesByTruncationCapability(rawBody, h.store, accountFilter); truncationErr != nil {
+		sendUnsupportedTruncationRequestError(c, truncationErr)
+		return
+	} else {
+		accountFilter = routedFilter
+	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	if isV2CompactionRequest {
+		accountFilter = h.nativeCompactionAccountFilter(effectiveModel, accountFilter)
+	}
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -2191,6 +2311,8 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
+	var lastCompactionValidationErr error
+	compactionValidationRetries := 0
 	retryExclusions := newRetryAccountExclusions()
 	transportRetries := newTransportRetryTracker()
 	sameAccountTarget := sameAccountRetryTarget{}
@@ -2275,6 +2397,17 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
 		}
 		if account == nil {
+			if lastCompactionValidationErr != nil {
+				blockClientRequestReplay(c, clientRequestReplayStopInvalidCompaction)
+				c.JSON(http.StatusBadGateway, gin.H{
+					"error": gin.H{
+						"message": lastCompactionValidationErr.Error(),
+						"type":    "upstream_error",
+						"code":    upstreamErrorKindInvalidCompactionOutput,
+					},
+				})
+				return
+			}
 			if len(lastBody) > 0 && (clientRequestReplayManaged(c) || lastStatusCode == http.StatusTooManyRequests) {
 				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
@@ -2500,6 +2633,13 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
 
+				if isUnsupportedTruncationError(resp.StatusCode, errBody) {
+					h.finishUnsupportedTruncation(c, account, affinityKey, nil, resp.StatusCode, errBody, false)
+					return
+				}
+				deterministicClientError := isDeterministicClientHTTPError(resp.StatusCode, errBody)
+				blockDeterministicClientHTTPReplay(c, resp.StatusCode, errBody)
+
 				if downstreamRequestCanceled(c) {
 					h.store.Release(account)
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -2542,13 +2682,13 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 
 				sameAccountRetry, sameAccountFailures, sameAccountLimit := false, 0, 0
 				if !compatibilityRetry {
-					sameAccountRetry, sameAccountFailures, sameAccountLimit = transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy, false, failureKind)
+					sameAccountRetry, sameAccountFailures, sameAccountLimit = transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy && !deterministicClientError, false, failureKind)
 				}
-				if failureKind != "" && !compatibilityRetry && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+				if failureKind != "" && !compatibilityRetry && !deterministicClientError && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
 					h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
-				if !sameAccountRetry && !compatibilityRetry && !cyberPolicy {
+				if !sameAccountRetry && !compatibilityRetry && !cyberPolicy && !deterministicClientError {
 					h.store.UnbindSessionAffinity(affinityKey, account.ID())
 					retryExclusions.MarkHard(account.ID())
 				}
@@ -2645,6 +2785,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			compatibilityRetry := false
 			compatibilityHandled := false
 			compatibilityReport := encryptedContentCompatibilityReport{}
+			var compactionValidationErr error
 
 			if isStream {
 				c.Header("Content-Type", "text/event-stream")
@@ -2666,9 +2807,18 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
 				completionBuffer := newCompletionBufferedSSEWriter(isV2CompactionRequest)
+				compactionOutput := &remoteCompactionV2OutputTracker{}
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
+					if isV2CompactionRequest {
+						if err := compactionOutput.observeSSEEvent(parsed); err != nil {
+							compactionValidationErr = err
+							pendingFirstTokenEvents.Reset()
+							completionBuffer.discard()
+							return false
+						}
+					}
 					ttftGuard.MarkProgress(eventType)
 					isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 					if !ttftRecorded && isFirstToken {
@@ -2732,6 +2882,11 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 						}
 						wrote, err := completionBuffer.writeEvent(streamWriter, &pendingFirstTokenEvents, data, eventType, shouldDefer)
 						if err != nil {
+							if errors.Is(err, errRemoteCompactionV2BufferLimit) {
+								compactionValidationErr = err
+								pendingFirstTokenEvents.Reset()
+								return false
+							}
 							writeErr = err
 							clientGone = true
 						} else if wrote {
@@ -2761,7 +2916,14 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
 					gotTerminal = true
-					if upstreamCyberPolicyCode(responseFailedErrorBody(respBody)) == "" && encryptedCompatibilityEnabled && !encryptedContentCompatibilityRetried && responsesPayloadIsFailed(respBody) {
+					payloadFailed := responsesPayloadIsFailed(respBody)
+					if payloadFailed {
+						terminalFailurePayload = append([]byte(nil), respBody...)
+					}
+					if isV2CompactionRequest && !payloadFailed {
+						compactionValidationErr = validateRemoteCompactionV2ResponseJSON(respBody)
+					}
+					if upstreamCyberPolicyCode(responseFailedErrorBody(respBody)) == "" && encryptedCompatibilityEnabled && !encryptedContentCompatibilityRetried && payloadFailed {
 						statusCode := responseFailedStatusCode(respBody)
 						repairedBody, report := repairResponsesEncryptedContentForError(upstreamBody, statusCode, respBody)
 						compatibilityHandled = report.Handled
@@ -2775,7 +2937,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 							log.Printf("账号 %d encrypted_content 响应错误命中受保护的 %s，未删除压缩或子代理状态 (param=%q)", account.ID(), report.ItemType, report.Param)
 						}
 					}
-					if !compatibilityRetry {
+					if !payloadFailed && !compatibilityRetry && compactionValidationErr == nil {
 						contentType := resp.Header.Get("Content-Type")
 						if contentType == "" {
 							contentType = "application/json"
@@ -2787,21 +2949,34 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 
 			totalDuration := int(time.Since(start).Milliseconds())
 			outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+			if compactionValidationErr != nil {
+				outcome = invalidRemoteCompactionV2Outcome(compactionValidationErr)
+			}
 			if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
 				outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 			}
 			ttftGuard.Stop()
 			var responseFailedDecision codex429Decision
+			unsupportedTruncation := false
 			if len(terminalFailurePayload) > 0 {
 				outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
+				blockDeterministicResponseFailureReplay(c, terminalFailurePayload)
+				unsupportedTruncation = isUnsupportedTruncationPayload(terminalFailurePayload)
+				if unsupportedTruncation {
+					outcome = markUnsupportedTruncationOutcome(outcome)
+				}
 				// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 				// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 				h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
 			}
-			if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !compatibilityRetry && !isFirstTokenTimeoutOutcome(outcome) {
+			if unsupportedTruncation {
+				h.finishUnsupportedTruncation(c, account, affinityKey, resp, http.StatusBadRequest, terminalFailurePayload, wroteAnyBody)
+				return
+			}
+			if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !compatibilityRetry && compactionValidationErr == nil && !isFirstTokenTimeoutOutcome(outcome) {
 				h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			}
-			transparentStreamRetry := shouldTransparentRetryStream(outcome, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)
+			transparentStreamRetry := compactionValidationErr == nil && shouldTransparentRetryStream(outcome, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)
 			_, compatibilityRepairAlreadyUsed := encryptedContentCompatibilityBodies[account.ID()]
 			if !encryptedCompatibilityEnabled && !compatibilityRetry && !compatibilityHandled && !compatibilityRepairAlreadyUsed && transparentStreamRetry && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("OpenAI Responses 上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
 				if !isV2CompactionRequest {
@@ -2812,7 +2987,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			}
 			sameAccountStreamRetry := compatibilityRetry
 			sameAccountStreamFailures, sameAccountStreamLimit := 0, 0
-			if !compatibilityRetry {
+			if !compatibilityRetry && compactionValidationErr == nil {
 				sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit = transportRetries.shouldRetryForRequest(
 					h,
 					account,
@@ -2848,7 +3023,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				}
 				continue
 			}
-			if !sameAccountStreamRetry && isStream && !wroteAnyBody && c.Request.Context().Err() == nil &&
+			if compactionValidationErr == nil && !sameAccountStreamRetry && isStream && !wroteAnyBody && c.Request.Context().Err() == nil &&
 				(abortedForHTTPError || (isV2CompactionRequest && outcome.logStatusCode != http.StatusOK)) {
 				// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 				// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
@@ -2858,7 +3033,11 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					"error": streamFailureClientError(outcome),
 				})
 			}
-			if !sameAccountStreamRetry && !isStream && readErr != nil {
+			if compactionValidationErr == nil && !sameAccountStreamRetry && !isStream && len(terminalFailurePayload) > 0 {
+				c.JSON(outcome.logStatusCode, gin.H{
+					"error": streamFailureClientError(outcome),
+				})
+			} else if compactionValidationErr == nil && !sameAccountStreamRetry && !isStream && readErr != nil {
 				c.JSON(http.StatusBadGateway, gin.H{
 					"error": gin.H{"message": "读取 OpenAI Responses 响应失败", "type": "upstream_error"},
 				})
@@ -2912,9 +3091,35 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				logInput.CachedTokens = usage.CachedTokens
 			}
 			applyImageUsageLogInfo(logInput, imageLogInfo)
-			logInput.IsRetryAttempt = sameAccountStreamRetry
+			compactionValidationRetry := compactionValidationErr != nil && compactionValidationRetries < nativeCompactionSemanticRetryLimit
+			logInput.IsRetryAttempt = sameAccountStreamRetry || compactionValidationRetry
 			logInput.AttemptIndex = attempt + 1
 			h.logUsageForRequest(c, logInput)
+
+			if compactionValidationErr != nil {
+				log.Printf("OpenAI Responses 原生压缩返回无效输出，隔离账号并换号重试 (attempt %d, account %d, model %s): %v", attempt+1, account.ID(), attemptEffectiveModel, compactionValidationErr)
+				lastCompactionValidationErr = compactionValidationErr
+				if isRemoteCompactionSemanticValidationError(compactionValidationErr) {
+					h.rememberNativeCompactionUnsupported(account.ID(), attemptEffectiveModel)
+				}
+				resp.Body.Close()
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkHard(account.ID())
+				if compactionValidationRetry {
+					compactionValidationRetries++
+					continue
+				}
+				blockClientRequestReplay(c, clientRequestReplayStopInvalidCompaction)
+				c.JSON(http.StatusBadGateway, gin.H{
+					"error": gin.H{
+						"message": compactionValidationErr.Error(),
+						"type":    "upstream_error",
+						"code":    upstreamErrorKindInvalidCompactionOutput,
+					},
+				})
+				return
+			}
 
 			if sameAccountStreamRetry {
 				resp.Body.Close()
@@ -2945,6 +3150,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				h.store.ClearModelCooldown(account, attemptEffectiveModel)
 				h.store.ConfirmResponsesAvailable(account)
 				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+				h.clearAffinityAfterSuccessfulCompact(affinityKey, account.ID(), isV2CompactionRequest)
 			}
 			h.store.Release(account)
 			return
@@ -3089,6 +3295,13 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 
+			if isUnsupportedTruncationError(resp.StatusCode, errBody) {
+				h.finishUnsupportedTruncation(c, account, affinityKey, nil, resp.StatusCode, errBody, false)
+				return
+			}
+			deterministicClientError := isDeterministicClientHTTPError(resp.StatusCode, errBody)
+			blockDeterministicClientHTTPReplay(c, resp.StatusCode, errBody)
+
 			if downstreamRequestCanceled(c) {
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -3123,15 +3336,15 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				}
 			}
 
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy, false, failureKind)
-			if failureKind != "" && !compatibilityRetry && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy && !deterministicClientError, false, failureKind)
+			if failureKind != "" && !compatibilityRetry && !deterministicClientError && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
 				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry && !cyberPolicy {
+			if !sameAccountRetry && !cyberPolicy && !deterministicClientError {
 				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
-			if !sameAccountRetry && !cyberPolicy {
+			if !sameAccountRetry && !cyberPolicy && !deterministicClientError {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 			}
@@ -3222,6 +3435,8 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 		var responseJSON []byte
 		var imageLogInfo imageUsageLogInfo
 		var terminalFailurePayload []byte
+		var compactionValidationErr error
+		compactionOutput := &remoteCompactionV2OutputTracker{}
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -3250,6 +3465,14 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			forward := func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				if isV2CompactionRequest {
+					if err := compactionOutput.observeSSEEvent(parsed); err != nil {
+						compactionValidationErr = err
+						pendingFirstTokenEvents.Reset()
+						completionBuffer.discard()
+						return false
+					}
+				}
 
 				// TTFT: 记录第一个实际内容事件的时间
 				ttftGuard.MarkProgress(eventType)
@@ -3274,9 +3497,11 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
-					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
 					gotTerminal = true
+				}
+				if !isV2CompactionRequest {
+					// 普通响应可直接缓存；v2 压缩需等完成缓冲成功写入后再缓存。
+					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
 				}
 				if eventType == "response.failed" {
 					terminalFailurePayload = append([]byte(nil), data...)
@@ -3303,10 +3528,18 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
 					wrote, err := completionBuffer.writeEvent(streamWriter, &pendingFirstTokenEvents, data, eventType, shouldDefer)
 					if err != nil {
+						if errors.Is(err, errRemoteCompactionV2BufferLimit) {
+							compactionValidationErr = err
+							pendingFirstTokenEvents.Reset()
+							return false
+						}
 						writeErr = err
 						clientGone = true
 					} else if wrote {
 						wroteAnyBody = true
+						if isV2CompactionRequest && eventType == "response.completed" {
+							cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+						}
 					}
 				}
 				return eventType != "response.completed" && eventType != "response.failed"
@@ -3399,6 +3632,12 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				if outputItem, ok := extractResponseOutputItemDone(data, seenOutputItems); ok {
 					outputItems = append(outputItems, outputItem)
 				}
+				if isV2CompactionRequest {
+					if err := compactionOutput.observeSSEEvent(parsed); err != nil {
+						compactionValidationErr = err
+						return false
+					}
+				}
 				if imageOutput, ok := extractResponseImageGenerationOutput(data, seenImageOutputs); ok {
 					imageOutputs = append(imageOutputs, imageOutput)
 				}
@@ -3416,10 +3655,10 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
-					// 缓存响应上下文，供后续 previous_response_id 展开使用
-					cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
 					gotTerminal = true
 					lastResponseData = data
+					// SSE 回调入口已经在 response.completed 到达时完成 tracker 校验；
+					// 这里仅记录终态，避免重复观察同一终态导致 event_after_terminal。
 					return false
 				}
 				if eventType == "response.failed" {
@@ -3440,21 +3679,37 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(responseJSON)
 				}
 			}
+			if isV2CompactionRequest && compactionValidationErr == nil && len(terminalFailurePayload) == 0 {
+				compactionValidationErr = validateRemoteCompactionV2CompletedResponseJSON(responseJSON, compactionOutput)
+			}
 		}
 
 		// 断流检测 + token 估算
 		totalDuration := int(time.Since(start).Milliseconds())
 		outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+		if compactionValidationErr != nil {
+			outcome = invalidRemoteCompactionV2Outcome(compactionValidationErr)
+		}
 		if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
 			outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 		}
 		ttftGuard.Stop()
 		var responseFailedDecision codex429Decision
+		unsupportedTruncation := false
 		if len(terminalFailurePayload) > 0 {
 			outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
+			blockDeterministicResponseFailureReplay(c, terminalFailurePayload)
+			unsupportedTruncation = isUnsupportedTruncationPayload(terminalFailurePayload)
+			if unsupportedTruncation {
+				outcome = markUnsupportedTruncationOutcome(outcome)
+			}
 			// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 			// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, responseFailedErrorBody(terminalFailurePayload))
+		}
+		if unsupportedTruncation {
+			h.finishUnsupportedTruncation(c, account, affinityKey, resp, http.StatusBadRequest, terminalFailurePayload, wroteAnyBody)
+			return
 		}
 		compatibilityRetry := false
 		compatibilityReport := encryptedContentCompatibilityReport{}
@@ -3468,10 +3723,10 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				continue
 			}
 		}
-		if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !compatibilityRetry && !isFirstTokenTimeoutOutcome(outcome) {
+		if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !compatibilityRetry && compactionValidationErr == nil && !isFirstTokenTimeoutOutcome(outcome) {
 			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 		}
-		transparentStreamRetry := shouldTransparentRetryStream(outcome, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)
+		transparentStreamRetry := compactionValidationErr == nil && shouldTransparentRetryStream(outcome, transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest), maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr)
 		if transparentStreamRetry && shouldStripEncryptedContentForFailure(false) && stripEncryptedContentForRetry("上游流在首包前连续失败且请求含 encrypted_content，已移除加密上下文后优先用当前会话账号重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage) {
 			if !isV2CompactionRequest {
 				resp.Body.Close()
@@ -3479,14 +3734,17 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				continue
 			}
 		}
-		sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := transportRetries.shouldRetryForRequest(
-			h,
-			account,
-			isV2CompactionRequest,
-			sameAccountStreamRetryEligible(isV2CompactionRequest, outcome, wroteAnyBody, c.Request.Context().Err(), writeErr),
-			isFirstTokenTimeoutOutcome(outcome),
-			outcome.failureKind,
-		)
+		sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := false, 0, 0
+		if compactionValidationErr == nil {
+			sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit = transportRetries.shouldRetryForRequest(
+				h,
+				account,
+				isV2CompactionRequest,
+				sameAccountStreamRetryEligible(isV2CompactionRequest, outcome, wroteAnyBody, c.Request.Context().Err(), writeErr),
+				isFirstTokenTimeoutOutcome(outcome),
+				outcome.failureKind,
+			)
+		}
 		if outcome.verifyAccountAuth && !sameAccountStreamRetry {
 			h.store.VerifyAccountAuthAsync(account)
 		}
@@ -3540,7 +3798,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				}
 			}
 		}
-		if !sameAccountStreamRetry && isStream && !wroteAnyBody && c.Request.Context().Err() == nil &&
+		if compactionValidationErr == nil && !sameAccountStreamRetry && isStream && !wroteAnyBody && c.Request.Context().Err() == nil &&
 			(abortedForHTTPError || (isV2CompactionRequest && outcome.logStatusCode != http.StatusOK)) {
 			// 流式:首 token 前上游失败、未向下游写过任何内容,HTTP 200 header 尚未提交,
 			// 覆盖预设的 SSE Content-Type 后按真实错误码返回 JSON,
@@ -3549,7 +3807,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			c.JSON(streamFailureClientStatus(outcome), gin.H{
 				"error": streamFailureClientError(outcome),
 			})
-		} else if !sameAccountStreamRetry && !isStream {
+		} else if compactionValidationErr == nil && !sameAccountStreamRetry && !isStream {
 			if len(terminalFailurePayload) > 0 {
 				c.JSON(logStatusCode, gin.H{
 					"error": streamFailureClientError(outcome),
@@ -3598,9 +3856,35 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			logInput.CachedTokens = usage.CachedTokens
 		}
 		applyImageUsageLogInfo(logInput, imageLogInfo)
-		logInput.IsRetryAttempt = sameAccountStreamRetry
+		compactionValidationRetry := compactionValidationErr != nil && compactionValidationRetries < nativeCompactionSemanticRetryLimit
+		logInput.IsRetryAttempt = sameAccountStreamRetry || compactionValidationRetry
 		logInput.AttemptIndex = attempt + 1
 		h.logUsageForRequest(c, logInput)
+
+		if compactionValidationErr != nil {
+			log.Printf("Codex Responses 原生压缩返回无效输出，隔离账号并换号重试 (attempt %d, account %d, model %s): %v", attempt+1, account.ID(), effectiveModel, compactionValidationErr)
+			lastCompactionValidationErr = compactionValidationErr
+			if isRemoteCompactionSemanticValidationError(compactionValidationErr) {
+				h.rememberNativeCompactionUnsupported(account.ID(), attemptEffectiveModel)
+			}
+			resp.Body.Close()
+			h.store.Release(account)
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
+			retryExclusions.MarkHard(account.ID())
+			if compactionValidationRetry {
+				compactionValidationRetries++
+				continue
+			}
+			blockClientRequestReplay(c, clientRequestReplayStopInvalidCompaction)
+			c.JSON(http.StatusBadGateway, gin.H{
+				"error": gin.H{
+					"message": compactionValidationErr.Error(),
+					"type":    "upstream_error",
+					"code":    upstreamErrorKindInvalidCompactionOutput,
+				},
+			})
+			return
+		}
 
 		if sameAccountStreamRetry {
 			resp.Body.Close()
@@ -3736,6 +4020,12 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 	// compact 同时允许官方 Codex OAuth 账号与中转（OpenAI Responses API）账号：
 	// 中转账号会命中上游自身的 /responses/compact，使仅接入中转的用户也能压缩（issue #174）。
 	accountFilter := accountFilterForCompactResponsesModelWithOriginal(routingModel, effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
+	if routedFilter, truncationErr := routeResponsesByTruncationCapability(rawBody, h.store, accountFilter); truncationErr != nil {
+		sendUnsupportedTruncationRequestError(c, truncationErr)
+		return
+	} else {
+		accountFilter = routedFilter
+	}
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
 	longCompactFilter := longCompactAccountFilter(accountFilter)
 	longCompactPreferenceKey := longCompactFallbackPreferenceKey(apiKeyID, sessionID)
@@ -3756,6 +4046,7 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 	sameAccountTarget := sameAccountRetryTarget{}
 	transientRetry := transientUpstreamRetryState{}
 	encryptedContentStrippedRetried := false
+	encryptedContentCompatibilityRetried := false
 	encryptedContentFailureCount := 0
 	persistentEncryptedContentStripped := false
 	shouldStripCompactEncryptedContentForFailure := func(explicitInvalidEncryptedContent bool) bool {
@@ -3973,10 +4264,16 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 			if resp.StatusCode != http.StatusOK {
 				errBody, _ := io.ReadAll(resp.Body)
 				resp.Body.Close()
+				if isUnsupportedTruncationError(resp.StatusCode, errBody) {
+					h.finishUnsupportedTruncation(c, account, affinityKey, nil, resp.StatusCode, errBody, false)
+					return
+				}
+				deterministicClientError := isDeterministicClientHTTPError(resp.StatusCode, errBody)
+				blockDeterministicClientHTTPReplay(c, resp.StatusCode, errBody)
 				cyberPolicy := markUpstreamCyberPolicy(c, errBody)
 				failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 
-				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, true, !cyberPolicy, false, failureKind)
+				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, true, !cyberPolicy && !deterministicClientError, false, failureKind)
 				fallbackToLongCompact := !sameAccountRetry && shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
 				if !cyberPolicy && !fallbackToLongCompact {
 					explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
@@ -4128,6 +4425,113 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 				return
 			}
 
+			if responsesPayloadIsFailed(respBody) {
+				statusCode, failureBody, failureOutcome, deterministicClientError, unsupportedTruncation := compactResponseFailureDetails(account, respBody)
+				blockDeterministicResponseFailureReplay(c, respBody)
+				if unsupportedTruncation {
+					h.finishUnsupportedTruncation(c, account, affinityKey, nil, statusCode, failureBody, false)
+					return
+				}
+
+				compatibilityRetry := false
+				compatibilityHandled := false
+				compatibilityReport := encryptedContentCompatibilityReport{}
+				if failureOutcome.failureKind != upstreamErrorKindCyberPolicy && !encryptedContentCompatibilityRetried {
+					repairedBody, report := repairResponsesEncryptedContentForError(openAIResponsesBody, statusCode, respBody)
+					compatibilityHandled = report.Handled
+					if report.Changed {
+						encryptedContentCompatibilityRetried = true
+						openAIResponsesBody = repairedBody
+						compatibilityRetry = true
+						compatibilityReport = report
+					} else if report.Protected {
+						log.Printf("compact relay 账号 %d encrypted_content 错误命中受保护的 %s，未删除压缩或子代理状态 (param=%q)", account.ID(), report.ItemType, report.Param)
+					}
+				}
+				if !compatibilityRetry && !compatibilityHandled && failureOutcome.failureKind != upstreamErrorKindCyberPolicy {
+					explicitInvalidEncryptedContent := isInvalidEncryptedContentError(statusCode, failureBody)
+					if shouldStripCompactEncryptedContentForFailure(explicitInvalidEncryptedContent) {
+						stripCompactEncryptedContentForRetry("OpenAI Responses compact response.failed 命中 encrypted_content 兼容路径，已移除加密上下文后同号重试 (attempt %d, account %d)", attempt+1, account.ID())
+						compatibilityRetry = true
+					}
+				}
+				if compatibilityRetry {
+					h.store.Release(account)
+					sameAccountTarget.remember(account, proxyURL)
+					log.Printf("compact relay 账号 %d response.failed 兼容修复后同号重试一次 (attempt %d, strategy=%s, param=%q)", account.ID(), attempt+1, compatibilityReport.Strategy, compatibilityReport.Param)
+					if !h.waitBeforeRetry(c.Request.Context()) {
+						return
+					}
+					continue
+				}
+
+				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(
+					h,
+					account,
+					true,
+					!deterministicClientError && !unsupportedTruncation && failureOutcome.failureKind != upstreamErrorKindCyberPolicy,
+					false,
+					failureOutcome.failureKind,
+				)
+				if failureOutcome.failureKind != "" && !deterministicClientError && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+					h.reportUpstreamAttemptFailure(account, failureOutcome.failureKind, time.Duration(durationMs)*time.Millisecond)
+				}
+				decision := codex429Decision{}
+				shouldRetry := sameAccountRetry
+				if !sameAccountRetry && failureOutcome.failureKind != upstreamErrorKindCyberPolicy && !deterministicClientError {
+					decision = h.applyCooldownForModel(account, statusCode, failureBody, nil, attemptEffectiveModel)
+					shouldRetry = shouldRetryHTTPStatusForAccount(account, statusCode, failureBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				}
+				persistentTransient := shouldPersistTransientUpstreamStatus(statusCode, failureBody) || isCompactRelayBadResponseStatusCode(statusCode, failureBody)
+				if !sameAccountRetry && !deterministicClientError && persistentTransient && !shouldRetry {
+					shouldRetry = true
+				}
+				usageTiers := resolveUsageServiceTiers("", serviceTier)
+				h.logUsageForRequest(c, &database.UsageLogInput{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses/compact",
+					Model:                logModel,
+					EffectiveModel:       attemptLogEffectiveModel,
+					StatusCode:           statusCode,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					InboundEndpoint:      "/v1/responses/compact",
+					UpstreamEndpoint:     upstreamEndpoint,
+					ServiceTier:          usageTiers.ServiceTier,
+					RequestedServiceTier: usageTiers.RequestedServiceTier,
+					ActualServiceTier:    usageTiers.ActualServiceTier,
+					BillingServiceTier:   usageTiers.BillingServiceTier,
+					IsRetryAttempt:       shouldRetry,
+					AttemptIndex:         attempt + 1,
+					UpstreamErrorKind:    upstreamErrorKindForAccount(account, statusCode, failureBody, decision),
+					ErrorMessage:         usageLogErrorMessage(statusCode, failureBody),
+				})
+				h.store.Release(account)
+				if !sameAccountRetry {
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+					excludeAccounts[account.ID()] = true
+				}
+				if shouldRetry {
+					lastStatusCode = statusCode
+					lastBody = failureBody
+					if sameAccountRetry {
+						sameAccountTarget.remember(account, proxyURL)
+						logCompactSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses/compact-relay-response-failed")
+						transientRetry.clear()
+					} else if persistentTransient {
+						transientRetry.rememberHTTP(account.ID(), statusCode, failureBody, nil)
+					} else {
+						transientRetry.clear()
+					}
+					if !h.waitBeforeRetry(c.Request.Context()) {
+						return
+					}
+					continue
+				}
+				h.sendFinalUpstreamError(c, statusCode, failureBody)
+				return
+			}
+
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(durationMs)*time.Millisecond)
 			h.clearAffinityAfterSuccessfulCompact(affinityKey, account.ID(), true)
@@ -4270,9 +4674,11 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+			deterministicClientError := isDeterministicClientHTTPError(resp.StatusCode, errBody)
+			blockDeterministicClientHTTPReplay(c, resp.StatusCode, errBody)
 			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, true, !cyberPolicy, false, failureKind)
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, true, !cyberPolicy && !deterministicClientError, false, failureKind)
 			fallbackToLongCompact := !sameAccountRetry && shouldFallbackToLongCompactAccount(resp.StatusCode, errBody, account)
 			if !cyberPolicy && !fallbackToLongCompact {
 				explicitInvalidEncryptedContent := isInvalidEncryptedContentError(resp.StatusCode, errBody)
@@ -4285,14 +4691,14 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 				}
 			}
 
-			if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+			if failureKind != "" && !deterministicClientError && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
 				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry && !cyberPolicy {
+			if !sameAccountRetry && !cyberPolicy && !deterministicClientError {
 				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
-			if !sameAccountRetry && !cyberPolicy {
+			if !sameAccountRetry && !cyberPolicy && !deterministicClientError {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				excludeAccounts[account.ID()] = true
 			}
@@ -4428,6 +4834,11 @@ func (h *Handler) responsesCompactOnce(c *gin.Context) {
 				continue
 			}
 			api.SendErrorWithStatus(c, api.NewAPIError(api.ErrCodeUpstreamError, "Failed to read upstream response", api.ErrorTypeUpstream), http.StatusBadGateway)
+			return
+		}
+
+		if responsesPayloadIsFailed(respBody) {
+			h.finishCompactResponseFailure(c, account, affinityKey, nil, respBody)
 			return
 		}
 

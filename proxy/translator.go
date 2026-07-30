@@ -1910,12 +1910,15 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
 		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
 		"logit_bias", "response_format", "serviceTier", "metadata",
-		"stream_options", "reasoning_effort", "truncation", "context_management",
+		"stream_options", "reasoning_effort", "context_management",
 		"disable_response_storage", "verbosity",
 		"prompt_cache_retention", "safety_identifier",
 	} {
 		delete(body, field)
 	}
+	// Codex 上游不接受 truncation 字段。省略 disabled 不改变 Responses 的默认语义；
+	// auto 则必须保留到分发边界，由 Codex 路径明确拒绝，不能静默降级成 disabled。
+	normalizeCodexTruncation(body)
 	if !opts.preservePreviousResponseID {
 		delete(body, "previous_response_id")
 	}

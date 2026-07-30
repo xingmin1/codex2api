@@ -109,14 +109,48 @@ func TestClientRequestReplayRetriesNonStreamResponseFailed(t *testing.T) {
 	}
 }
 
-func TestResponsesClientReplayReentersExistingSelectionAfterResponseFailed(t *testing.T) {
+func TestResponsesClientReplayDoesNotReenterForDeterministicResponseFailed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"status_code":400,"code":"invalid_request_error","message":"invalid request"}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := newOpenAIResponsesRelayStore(upstream.URL)
+	store.SetMaxRetries(0)
+	store.SetMaxRateLimitRetries(0)
+	store.SetTransportRetryPolicy("rotate")
+	store.SetClientRequestReplayEnabled(true)
+	store.SetClientRequestReplayMaxRetries(3)
+	store.SetClientRequestReplayKeepaliveSeconds(0)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	c, recorder := newClientReplayTestContext(t, true)
+	body := []byte(`{"model":"gpt-4.1-direct","stream":true,"input":"hi"}`)
+	setRawRequestBody(c, body)
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+
+	handler.Responses(c)
+
+	if attempts != 1 {
+		t.Fatalf("upstream attempts = %d, want exactly 1", attempts)
+	}
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "invalid request") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestResponsesClientReplayReentersExistingSelectionAfterRetryableResponseFailed(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	attempts := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		attempts++
 		w.Header().Set("Content-Type", "text/event-stream")
 		if attempts == 1 {
-			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"status_code":400,"code":"invalid_request_error","message":"temporary relay failure"}}}`+"\n\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"status_code":429,"code":"rate_limit_exceeded","message":"temporary relay failure"}}}`+"\n\n")
 			return
 		}
 		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_replayed"}}`+"\n\n")

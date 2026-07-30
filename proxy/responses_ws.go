@@ -43,6 +43,7 @@ type responsesWSRetryableStreamError struct {
 	sameAccountRetry    bool
 	sameAccountFailures int
 	sameAccountLimit    int
+	invalidCompaction   bool
 }
 
 func (e *responsesWSRetryableStreamError) Error() string {
@@ -164,6 +165,12 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
 	}
 
+	if codexAutoTruncationRequested(rawBody) {
+		apiErr = unsupportedCodexTruncationAPIError()
+		_ = writeResponsesWSError(conn, apiErr)
+		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
+	}
+
 	if len(rawBody) > security.MaxRequestBodySize {
 		apiErr = api.NewAPIError(api.ErrCodeInvalidRequest, "请求体过大", api.ErrorTypeInvalidRequest)
 		_ = writeResponsesWSError(conn, apiErr)
@@ -226,6 +233,9 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 
 	accountFilter := accountFilterForModel(effectiveModel)
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	if isV2CompactionRequest {
+		accountFilter = h.nativeCompactionAccountFilter(effectiveModel, accountFilter)
+	}
 
 	wsRetrySettings := CurrentRuntimeSettings()
 	hideUpstreamErrors := wsRetrySettings.CodexWSHideErrors
@@ -244,6 +254,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	transportRetries := newTransportRetryTracker()
 	sameAccountTarget := sameAccountRetryTarget{}
 	invalidEncryptedContentRetried := false
+	compactionValidationRetries := 0
 	forceHTTPAfterWSMessageTooBig := false
 	var lastUpstreamCancel context.CancelFunc
 	defer func() {
@@ -414,7 +425,17 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			ttftGuard.Stop()
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			if isUnsupportedTruncationError(resp.StatusCode, errBody) {
+				blockClientRequestReplay(c, clientRequestReplayStopUnsupportedTruncation)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				h.store.Release(account)
+				apiErr := unsupportedTruncationAPIError(resp.StatusCode, errBody)
+				_ = writeResponsesWSError(conn, apiErr)
+				return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
+			}
 			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+			deterministicClientError := isDeterministicClientHTTPError(resp.StatusCode, errBody)
+			blockDeterministicClientHTTPReplay(c, resp.StatusCode, errBody)
 			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 
 			if !cyberPolicy && !invalidEncryptedContentRetried {
@@ -460,15 +481,15 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				}
 			}
 
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy, false, failureKind)
-			if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy && !deterministicClientError, false, failureKind)
+			if failureKind != "" && !deterministicClientError && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
 				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry && !cyberPolicy {
+			if !sameAccountRetry && !cyberPolicy && !deterministicClientError {
 				SyncCodexFailureUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
-			if !sameAccountRetry && !cyberPolicy {
+			if !sameAccountRetry && !cyberPolicy && !deterministicClientError {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
 			}
@@ -480,7 +501,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			shouldRetry := sameAccountRetry
 			if !sameAccountRetry && !cyberPolicy {
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-				if silentRetryEnabled && transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest) < maxRetries {
+				if !deterministicClientError && silentRetryEnabled && transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest) < maxRetries {
 					shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 				}
 			}
@@ -528,12 +549,26 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			apiErr = responsesWSUpstreamAPIError(resp.StatusCode, errBody)
 			clientErr := responsesWSClientUpstreamAPIError(apiErr, hideUpstreamErrors)
 			_ = writeResponsesWSError(conn, clientErr)
-			return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, apiErr)
+			return newResponsesWSCloseError(responsesWSCloseCodeForStatus(resp.StatusCode), clientErr.Message, apiErr)
 		}
 
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, isV2CompactionRequest, attempt, transportRetries); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, isV2CompactionRequest, compactionValidationRetries, attempt, transportRetries); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
+				if retryErr.invalidCompaction {
+					retryExclusions.MarkHard(account.ID())
+					lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
+					if compactionValidationRetries >= nativeCompactionSemanticRetryLimit {
+						clientErr := responsesWSClientUpstreamAPIError(lastRetryableUpstreamErr, hideUpstreamErrors)
+						_ = writeResponsesWSError(conn, clientErr)
+						return newResponsesWSCloseError(websocket.CloseTryAgainLater, clientErr.Message, lastRetryableUpstreamErr)
+					}
+					compactionValidationRetries++
+					if !h.waitBeforeRetry(c.Request.Context()) {
+						return errResponsesWSClientGone
+					}
+					continue
+				}
 				if len(retryErr.failurePayload) > 0 {
 					if !invalidEncryptedContentRetried {
 						statusCode := responseFailedStatusCode(retryErr.failurePayload)
@@ -631,6 +666,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	hideUpstreamErrors bool,
 	viaWebsocket bool,
 	isV2CompactionRequest bool,
+	compactionValidationRetries int,
 	attempt int,
 	transportRetries *transportRetryTracker,
 ) error {
@@ -653,6 +689,9 @@ func (h *Handler) streamResponsesWSUpstream(
 	var imageLogInfo imageUsageLogInfo
 	var terminalFailurePayload []byte
 	wroteAnyBody := false
+	var compactionValidationErr error
+	compactionOutput := &remoteCompactionV2OutputTracker{}
+	compactionBuffering := isV2CompactionRequest
 	// 首 token 前收到不可重试的 response.failed 时置位:不把原始失败帧透传给客户端,
 	// 循环外改写 error 帧并按错误类别用非正常 close code 关闭,
 	// 让下游中转/计费方明确感知失败,而不是把它当成一次正常结束的会话。
@@ -677,6 +716,14 @@ func (h *Handler) streamResponsesWSUpstream(
 	readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 		parsed := gjson.ParseBytes(data)
 		eventType := parsed.Get("type").String()
+		if isV2CompactionRequest && eventType == "response.output_item.done" {
+			if err := compactionOutput.observeSSEEvent(parsed); err != nil {
+				compactionValidationErr = err
+				pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
+				pendingFirstTokenBytes = 0
+				return false
+			}
+		}
 		ttftGuard.MarkProgress(eventType)
 		isFirstToken := isFirstTokenResultForMode(parsed, currentFirstTokenMode())
 		if !ttftRecorded && isFirstToken {
@@ -694,14 +741,55 @@ func (h *Handler) streamResponsesWSUpstream(
 			if tier := parsed.Get("response.service_tier").String(); tier != "" {
 				actualServiceTier = tier
 			}
-			cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
 			gotTerminal = true
+			if isV2CompactionRequest {
+				compactionValidationErr = compactionOutput.observeSSEEvent(parsed)
+				if compactionValidationErr != nil {
+					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
+					pendingFirstTokenBytes = 0
+					return false
+				}
+			}
+			if !isV2CompactionRequest {
+				cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+			}
 		}
 		if eventType == "response.failed" {
 			terminalFailurePayload = append([]byte(nil), data...)
 			gotTerminal = true
+			if isUnsupportedTruncationPayload(data) {
+				pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
+				pendingFirstTokenBytes = 0
+				abortedForErrorClose = true
+				return false
+			}
 		}
 		if !clientGone {
+			if compactionBuffering {
+				if eventType == "response.failed" {
+					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
+					pendingFirstTokenBytes = 0
+					abortedForErrorClose = true
+					return false
+				}
+				pendingFirstTokenMessages = append(pendingFirstTokenMessages, append([]byte(nil), data...))
+				pendingFirstTokenBytes += len(data)
+				if pendingFirstTokenBytes > completionBufferedSSEMaxBytes {
+					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
+					pendingFirstTokenBytes = 0
+					compactionValidationErr = errRemoteCompactionV2BufferLimit
+					return false
+				}
+				if eventType != "response.completed" {
+					return true
+				}
+				if !flushPendingFirstTokenMessages() {
+					return false
+				}
+				cacheCompletedResponse(respCacheOwner, []byte(expandedInputRaw), data)
+				compactionBuffering = false
+				return false
+			}
 			shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
 			if shouldDefer {
 				pendingFirstTokenMessages = append(pendingFirstTokenMessages, append([]byte(nil), data...))
@@ -750,39 +838,52 @@ func (h *Handler) streamResponsesWSUpstream(
 
 	totalDuration := int(time.Since(start).Milliseconds())
 	outcome := classifyStreamOutcome(c.Request.Context().Err(), readErr, writeErr, gotTerminal)
+	if compactionValidationErr != nil {
+		outcome = invalidRemoteCompactionV2Outcome(compactionValidationErr)
+	}
 	if ttftGuard.TimedOut() && !ttftRecorded && !gotTerminal {
 		outcome = firstTokenTimeoutOutcome(currentFirstTokenTimeout())
 	}
 	ttftGuard.Stop()
 	var responseFailedDecision codex429Decision
+	unsupportedTruncation := false
 	if len(terminalFailurePayload) > 0 {
 		outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
+		blockDeterministicResponseFailureReplay(c, terminalFailurePayload)
+		unsupportedTruncation = isUnsupportedTruncationPayload(terminalFailurePayload)
+		if unsupportedTruncation {
+			outcome = markUnsupportedTruncationOutcome(outcome)
+		}
 		// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 		// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 		h.logUpstreamCyberPolicy(c, "/v1/responses", model, responseFailedErrorBody(terminalFailurePayload))
 	}
 	if len(terminalFailurePayload) > 0 && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
-		if _, ok := recoverableEncryptedContentError(responseFailedStatusCode(terminalFailurePayload), terminalFailurePayload); ok {
+		if isUnsupportedTruncationPayload(terminalFailurePayload) {
+			blockClientRequestReplay(c, clientRequestReplayStopUnsupportedTruncation)
 			resp.Body.Close()
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			h.store.Release(account)
-			return &responsesWSRetryableStreamError{
-				outcome:        outcome,
-				failurePayload: append([]byte(nil), terminalFailurePayload...),
-			}
+			apiErr := unsupportedTruncationAPIError(responseFailedStatusCode(terminalFailurePayload), responseFailedErrorBody(terminalFailurePayload))
+			_ = writeResponsesWSError(conn, apiErr)
+			return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
 		}
 	}
-	if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
+	if account.IsOpenAIResponsesAPI() && outcome.failureKind != "" && !unsupportedTruncation && compactionValidationErr == nil && !isFirstTokenTimeoutOutcome(outcome) {
 		h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 	}
-	sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := transportRetries.shouldRetryForRequest(
-		h,
-		account,
-		isV2CompactionRequest,
-		sameAccountStreamRetryEligible(isV2CompactionRequest, outcome, wroteAnyBody, c.Request.Context().Err(), writeErr),
-		isFirstTokenTimeoutOutcome(outcome),
-		outcome.failureKind,
-	)
-	if len(terminalFailurePayload) > 0 && !sameAccountStreamRetry {
+	sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := false, 0, 0
+	if compactionValidationErr == nil {
+		sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit = transportRetries.shouldRetryForRequest(
+			h,
+			account,
+			isV2CompactionRequest,
+			sameAccountStreamRetryEligible(isV2CompactionRequest, outcome, wroteAnyBody, c.Request.Context().Err(), writeErr),
+			isFirstTokenTimeoutOutcome(outcome),
+			outcome.failureKind,
+		)
+	}
+	if len(terminalFailurePayload) > 0 && !sameAccountStreamRetry && !unsupportedTruncation {
 		responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
 		if responseFailedDecision.Reason != "" {
 			outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
@@ -794,6 +895,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		if sameAccountStreamRetry {
 			return &responsesWSRetryableStreamError{
 				outcome:             outcome,
+				failurePayload:      append([]byte(nil), terminalFailurePayload...),
 				sameAccountRetry:    true,
 				sameAccountFailures: sameAccountStreamFailures,
 				sameAccountLimit:    sameAccountStreamLimit,
@@ -802,7 +904,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		return &responsesWSRetryableStreamError{outcome: outcome}
 	}
-	if !sameAccountStreamRetry && silentRetryEnabled && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
+	if compactionValidationErr == nil && !sameAccountStreamRetry && silentRetryEnabled && outcome.penalize && !outcome.deterministicClientError && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
 		resp.Body.Close()
 		if !isFirstTokenTimeoutOutcome(outcome) && !account.IsOpenAIResponsesAPI() {
 			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -860,9 +962,23 @@ func (h *Handler) streamResponsesWSUpstream(
 		logInput.CachedTokens = usage.CachedTokens
 	}
 	applyImageUsageLogInfo(logInput, imageLogInfo)
-	logInput.IsRetryAttempt = sameAccountStreamRetry
+	compactionValidationRetry := compactionValidationErr != nil && !wroteAnyBody && compactionValidationRetries < nativeCompactionSemanticRetryLimit
+	logInput.IsRetryAttempt = sameAccountStreamRetry || compactionValidationRetry
 	logInput.AttemptIndex = attempt + 1
 	h.logUsageForRequest(c, logInput)
+	if compactionValidationErr != nil && !wroteAnyBody {
+		log.Printf("Responses WebSocket 原生压缩返回无效输出，隔离账号并换号重试 (attempt %d, account %d, model %s): %v", attempt+1, account.ID(), effectiveModel, compactionValidationErr)
+		if isRemoteCompactionSemanticValidationError(compactionValidationErr) {
+			h.rememberNativeCompactionUnsupported(account.ID(), effectiveModel)
+		}
+		resp.Body.Close()
+		h.store.Release(account)
+		h.store.UnbindSessionAffinity(affinityKey, account.ID())
+		return &responsesWSRetryableStreamError{
+			outcome:           outcome,
+			invalidCompaction: true,
+		}
+	}
 	if sameAccountStreamRetry {
 		resp.Body.Close()
 		h.store.Release(account)
@@ -892,6 +1008,12 @@ func (h *Handler) streamResponsesWSUpstream(
 
 	if writeErr != nil {
 		return errResponsesWSClientGone
+	}
+	if unsupportedTruncation {
+		blockClientRequestReplay(c, clientRequestReplayStopUnsupportedTruncation)
+		apiErr := unsupportedTruncationAPIError(responseFailedStatusCode(terminalFailurePayload), responseFailedErrorBody(terminalFailurePayload))
+		_ = writeResponsesWSError(conn, apiErr)
+		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, apiErr)
 	}
 	if abortedForErrorClose && !wroteAnyBody {
 		// 首 token 前上游失败且未向客户端写过任何帧:发结构化 error 帧后按错误类别

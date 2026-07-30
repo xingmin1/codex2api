@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -13,8 +14,9 @@ const (
 )
 
 var (
-	sseDataPrefix = []byte("data: ")
-	sseDataSuffix = []byte("\n\n")
+	sseDataPrefix                    = []byte("data: ")
+	sseDataSuffix                    = []byte("\n\n")
+	errRemoteCompactionV2BufferLimit = errors.New("remote compaction v2 response exceeded the completion buffer limit")
 )
 
 type streamFlushWriter struct {
@@ -27,8 +29,7 @@ type streamFlushWriter struct {
 }
 
 type completionBufferedSSEWriter struct {
-	buffer      bytes.Buffer
-	passthrough bool
+	buffer bytes.Buffer
 }
 
 func newStreamFlushWriter(writer io.Writer, flusher http.Flusher) *streamFlushWriter {
@@ -90,19 +91,18 @@ func (w *completionBufferedSSEWriter) writeEvent(streamWriter *streamFlushWriter
 	if w == nil {
 		return writeDeferredSSEData(streamWriter, pending, data, shouldDefer)
 	}
-	if w.passthrough {
-		return writeDeferredSSEData(streamWriter, nil, data, false)
-	}
-
 	appendSSEData(&w.buffer, data)
-	if eventType != "response.completed" && w.buffer.Len() <= completionBufferedSSEMaxBytes {
+	if w.buffer.Len() > completionBufferedSSEMaxBytes {
+		w.buffer.Reset()
+		return false, errRemoteCompactionV2BufferLimit
+	}
+	if eventType != "response.completed" {
 		return false, nil
 	}
 
 	// v2 压缩只有在 compaction 输出和 response.completed 同时到齐时才有效。
-	// 完整终态前不提交下游响应，断流后才能透明换号；极端超大响应超过上限时
-	// 退化为普通透传，避免并发压缩占用无界内存。
-	w.passthrough = true
+	// 完整终态前不提交下游响应，断流后才能透明换号；超过上限时失败关闭，
+	// 不能退化为透传，否则后续语义校验失败也无法撤回已经提交的 HTTP 200。
 	if err := streamWriter.WriteBytes(w.buffer.Bytes()); err != nil {
 		return false, err
 	}
