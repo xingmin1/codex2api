@@ -342,6 +342,22 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 
 首次启动时程序会自动写入默认设置。
 
+#### Responses 上下文缓存
+
+使用 `previous_response_id` 并在本地重建的 HTTP Responses 连续请求由每个进程内的有界 L1 缓存保护。默认保存 64 MiB 逻辑 JSON payload，单条 L1 准入上限为 8 MiB，最多 2,000 条，绝对 TTL 为 10 分钟，每条最多保留 200 个 raw item。
+
+设置页提供三个持久化的整数 MiB 预算：
+
+| 预算 | 默认值 | 可选范围 |
+| --- | --- | --- |
+| 本地 L1 总量 | 64 MiB | 8-4096 MiB |
+| 本地 L1 单条准入 | 8 MiB | 1-256 MiB，且不能超过总量 |
+| 后端重建 | 64 MiB | 8-512 MiB |
+
+Redis 模式下，共享上下文只要没有超过重建上限，即使大于 L1 准入预算也能直接服务本次请求，但不会提升到本地缓存。Memory 模式没有共享 response context 后备；依赖上下文被判定为超限或已淘汰时，连续请求可能返回 HTTP `409 response_context_unavailable`。共享后端暂时故障且没有可保留 `previous_response_id` 的 relay 后备账号时，依赖上下文的连续请求可能返回 HTTP `503`。
+
+每次成功修改预算都会生成只读 generation，各实例每 5 秒轮询一次并应用更新。运维页展示 effective/applied generation、同步状态、缓存逻辑字节与计数器、进程内存、Go heap 和 GC 次数。缓存逻辑字节不包含 Go/容器开销，也不是 RSS 或进程内存硬上限。滚动升级期间，新前端会兼容尚未返回这些设置或运维字段的旧后端。
+
 ### API Key 与管理密钥
 
 - **对外 API Key**：以数据库中的 API Keys 为准。如果没有配置任何 Key，则 `/v1/*` 跳过鉴权。
@@ -461,11 +477,12 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 | API 密钥 | `/admin/api-keys` | API Key 创建、查看、删除与调用凭据管理 |
 | 代理管理 | `/admin/proxies` | 代理池维护、账号代理分配与连通性管理 |
 | 生图工作台 | `/admin/images/studio` | 文生图、图生图、提示词模板、任务历史和服务器图库 |
+| 生图门户（非管理） | `/image-studio` | 用 API Key 登录的独立生图页，不进入管理后台；可在 API 密钥页开关 |
 | Prompt 检查 | `/admin/prompt-filter/overview` | Prompt 规则、触发日志、测试和处理模式配置 |
 | 使用统计 | `/admin/usage` | 请求日志、统计卡片、图表、日志清空 |
-| 运维概览 | `/admin/ops` | 运行态监控与系统概览 |
+| 运维概览 | `/admin/ops` | 运行态概览、上下文缓存逻辑指标、进程内存、Go heap 与 GC |
 | 调度看板 | `/admin/ops/scheduler` | 调度健康度、惩罚项和评分拆解 |
-| 系统设置 | `/admin/settings` | 业务运行参数与后台密钥配置 |
+| 系统设置 | `/admin/settings` | 业务运行参数、Responses 上下文缓存预算与后台密钥配置 |
 | 使用文档 | `/admin/docs` | Codex CLI / Claude Code 接入示例 |
 | API 文档 | `/admin/api-reference` | OpenAI 风格接口与管理接口参考 |
 
@@ -490,7 +507,7 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 
 ### 调度系统
 
-调度核心位于 `auth.Store`，将账号可用性、健康度、动态并发、历史错误和近期用量综合纳入选择。
+调度核心位于 `auth.Store`，将账号可用性、调度优先级、健康度、动态并发、历史错误和近期用量综合纳入选择。
 
 **运行时状态模型：**
 
@@ -498,14 +515,17 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 - `HealthTier`：`healthy` / `warm` / `risky` / `banned`
 - `SchedulerScore`：以 100 为基线的实时调度分
 - `DynamicConcurrencyLimit`：按健康层级动态收缩的并发上限
+- `SchedulerPriority`：严格的账号优先级；先比较优先级，再比较健康层级、调度分和当前负载
 
 **账号选择策略：**
 
 1. 过滤不可用账号（error / banned / 冷却中 / 无 AccessToken）
 2. 重算健康层级、调度分和动态并发
 3. 排除已达并发上限的账号
-4. 按 `healthy > warm > risky > banned` 排序，同层级按调度分和并发数择优
+4. 先按 `SchedulerPriority` 从高到低分层，再按 `healthy > warm > risky > banned` 排序；同优先级、同层级内按调度分和并发数择优
 5. 15% 概率随机打散，降低热点与饥饿
+
+多个最终用户共享同一个下游 API Key 时，可传 `X-Codex2API-Affinity-Key` 作为稳定的用户或对话标识。Codex2API 只将其哈希后用于本地账号亲和，不会转发给上游。
 
 **动态并发规则：**
 
@@ -515,6 +535,8 @@ curl -X POST http://localhost:8080/api/admin/oauth/exchange-code \
 | `warm` | 基础并发 ÷ 2（最少 1） |
 | `risky` | 固定 1 |
 | `banned` | 固定 0，不参与调度 |
+
+上游持久 WebSocket 连接池同样受账号当前 `DynamicConcurrencyLimit` 约束，连接复用不会突破账号的有效并发上限。
 
 **调度分惩罚/奖励：**
 

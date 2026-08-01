@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/codex2api/database"
-	"github.com/codex2api/internal/imageproc"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -38,17 +37,16 @@ func (h *Handler) RegisterExternalImageRoutes(r *gin.Engine, imageProxy *proxy.H
 
 func (h *Handler) CreateExternalImageJob(c *gin.Context) {
 	var req imageGenerationJobPayload
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
 		writeExternalImageError(c, http.StatusBadRequest, "Invalid request: body must be valid JSON")
 		return
 	}
-	imageCount := len(req.InputImages)
-	if imageCount < 1 {
-		imageCount = 1
+	bodyValue, _ := c.Get(gin.BodyBytesKey)
+	rawBody, _ := bodyValue.([]byte)
+	if len(rawBody) == 0 {
+		rawBody, _ = json.Marshal(req)
 	}
-	normalizeCtx, cancel := context.WithTimeout(c.Request.Context(), externalInputImageFetchTimeout*time.Duration(imageCount))
-	editMode, err := normalizeExternalImageJobPayload(normalizeCtx, &req)
-	cancel()
+	editMode, err := normalizeExternalImageJobFields(&req)
 	if err != nil {
 		writeExternalImageError(c, http.StatusBadRequest, "Invalid request: "+err.Error())
 		return
@@ -62,38 +60,38 @@ func (h *Handler) CreateExternalImageJob(c *gin.Context) {
 	}
 	req.APIKeyID = apiKey.ID
 	keyID, keyName, keyMasked := imageJobAPIKeyMeta(apiKey)
-	endpoint := "/v1/images/jobs"
-	if editMode {
-		endpoint = "/v1/images/jobs:edit"
-	}
-	if h.inspectImagePromptFilter(c, proxy.AppendImageStyleToPrompt(req.Prompt, req.Style), req.Model, keyID, keyName, keyMasked, endpoint, func(c *gin.Context) {
-		writeExternalImageError(c, http.StatusBadRequest, "Prompt was blocked by prompt filter")
-	}, true) {
-		return
-	}
-
 	imageProxy := h.imageProxy
 	if imageProxy == nil {
 		imageProxy = proxy.NewHandler(h.store, h.db, nil, nil)
 	}
-	// The in-process image handler intentionally does not run the /v1 auth
-	// middleware again. Enforce API-key limits and hold the concurrency slot here
-	// from enqueue through background completion so async jobs match /v1 policy
-	// without double-counting the same request.
-	if status, msg := imageProxy.EnforceAPIKeyLimits(c, req.Model); status != 0 {
+	if imageProxy.InspectPromptFilterOpenAI(c, rawBody, "/v1/images/jobs", req.Model, func(c *gin.Context) {
+		writeExternalImageError(c, http.StatusBadRequest, "Prompt was blocked by prompt filter")
+	}) {
+		return
+	}
+
+	// Remote image fetches and Base64 expansion are intentionally after prompt
+	// inspection. A blocked prompt must not consume network, image-processing,
+	// database, concurrency, or upstream resources.
+	imageCount := len(req.InputImages)
+	if imageCount < 1 {
+		imageCount = 1
+	}
+	normalizeCtx, cancel := context.WithTimeout(c.Request.Context(), externalInputImageFetchTimeout*time.Duration(imageCount))
+	err = normalizeExternalImageJobInputs(normalizeCtx, &req)
+	cancel()
+	if err != nil {
+		writeExternalImageError(c, http.StatusBadRequest, "Invalid request: "+err.Error())
+		return
+	}
+
+	// Preflight the whole batch so one accepted job cannot cross an RPM/RPD
+	// boundary. The in-process image handler acquires and releases concurrency
+	// for every actual upstream call.
+	if status, msg := imageProxy.EnforceAPIKeyLimitsForRequests(c, req.Model, req.N); status != 0 {
 		proxy.SendAPIKeyLimitError(c, status, msg)
 		return
 	}
-	releaseAPIKeyConcurrency, ok := imageProxy.AcquireAPIKeyConcurrency(c)
-	if !ok {
-		return
-	}
-	jobStarted := false
-	defer func() {
-		if !jobStarted && releaseAPIKeyConcurrency != nil {
-			releaseAPIKeyConcurrency()
-		}
-	}()
 
 	paramsJSON, _ := json.Marshal(req)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
@@ -127,11 +125,7 @@ func (h *Handler) CreateExternalImageJob(c *gin.Context) {
 		imageLogAPIKeyLabel(keyID, keyName, keyMasked),
 		len([]rune(req.Prompt)),
 	)
-	jobStarted = true
 	go func() {
-		if releaseAPIKeyConcurrency != nil {
-			defer releaseAPIKeyConcurrency()
-		}
 		if editMode {
 			h.runImageEditJob(jobID, req, apiKey)
 			return
@@ -174,7 +168,7 @@ func (h *Handler) GetExternalImageJob(c *gin.Context) {
 	c.JSON(http.StatusOK, externalImageJobResponse{Job: job})
 }
 
-func normalizeExternalImageJobPayload(ctx context.Context, req *imageGenerationJobPayload) (bool, error) {
+func normalizeExternalImageJobFields(req *imageGenerationJobPayload) (bool, error) {
 	if req == nil {
 		return false, fmt.Errorf("body is required")
 	}
@@ -197,7 +191,16 @@ func normalizeExternalImageJobPayload(ctx context.Context, req *imageGenerationJ
 	}
 	req.Background = normalizeOptionalImageParam(req.Background)
 	req.Style = normalizeOptionalImageParam(req.Style)
-	req.Upscale = imageproc.NormalizeUpscale(req.Upscale)
+	normalizedUpscale, err := normalizeImageJobUpscale(req.Model, req.Size, req.Upscale)
+	if err != nil {
+		return false, err
+	}
+	req.Upscale = normalizedUpscale
+	count, err := normalizeImageJobOutputCount(req.N)
+	if err != nil {
+		return false, err
+	}
+	req.N = count
 
 	images := make([]string, 0, len(req.InputImages))
 	for _, imageURL := range req.InputImages {
@@ -205,11 +208,7 @@ func normalizeExternalImageJobPayload(ctx context.Context, req *imageGenerationJ
 		if imageURL == "" {
 			continue
 		}
-		normalizedImage, err := normalizeExternalInputImage(ctx, imageURL)
-		if err != nil {
-			return false, err
-		}
-		images = append(images, normalizedImage)
+		images = append(images, imageURL)
 	}
 	req.InputImages = images
 	editMode := len(req.InputImages) > 0
@@ -217,6 +216,22 @@ func normalizeExternalImageJobPayload(ctx context.Context, req *imageGenerationJ
 		return false, fmt.Errorf("too many input_images (%d, max %d)", len(req.InputImages), proxy.MaxImageEditInputCount)
 	}
 	return editMode, nil
+}
+
+func normalizeExternalImageJobInputs(ctx context.Context, req *imageGenerationJobPayload) error {
+	if req == nil {
+		return fmt.Errorf("body is required")
+	}
+	images := make([]string, 0, len(req.InputImages))
+	for _, imageURL := range req.InputImages {
+		normalizedImage, err := normalizeExternalInputImage(ctx, imageURL)
+		if err != nil {
+			return err
+		}
+		images = append(images, normalizedImage)
+	}
+	req.InputImages = images
+	return nil
 }
 
 const (

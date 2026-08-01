@@ -56,4 +56,6 @@ jobs:
 
       - name: Run npm audit
         working-directory: frontend
-        run: npm audit --omit=dev --audit-level=high
+        # 等价于 npm audit --omit=dev --audit-level=high,额外支持逐条 advisory
+        # 的例外白名单(理由与复查时间写在脚本里)。
+        run: node scripts/audit-gate.mjs

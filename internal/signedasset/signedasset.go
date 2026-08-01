@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,8 +15,10 @@ import (
 )
 
 const (
-	imageAssetPathPrefix = "/p/img"
-	defaultImageAssetTTL = 24 * time.Hour
+	imageAssetPathPrefix       = "/p/img"
+	imageAssetPublicBaseURLEnv = "IMAGE_ASSET_PUBLIC_BASE_URL"
+	imageAssetSigningSecretEnv = "IMAGE_ASSET_SIGNING_SECRET"
+	defaultImageAssetTTL       = 24 * time.Hour
 )
 
 var (
@@ -36,9 +40,19 @@ func ImageAssetURLWithTTL(assetID int64, thumbKB int, ttl time.Duration) string 
 	exp := time.Now().Add(ttl).Unix()
 	sig := imageAssetSignature(assetID, exp, thumbKB)
 	if thumbKB > 0 {
-		return fmt.Sprintf("%s/%d?exp=%d&thumb_kb=%d&sig=%s", imageAssetPathPrefix, assetID, exp, thumbKB, sig)
+		return publicImageAssetURL(fmt.Sprintf("%s/%d?exp=%d&thumb_kb=%d&sig=%s", imageAssetPathPrefix, assetID, exp, thumbKB, sig))
 	}
-	return fmt.Sprintf("%s/%d?exp=%d&sig=%s", imageAssetPathPrefix, assetID, exp, sig)
+	return publicImageAssetURL(fmt.Sprintf("%s/%d?exp=%d&sig=%s", imageAssetPathPrefix, assetID, exp, sig))
+}
+
+func publicImageAssetURL(path string) string {
+	baseURL := strings.TrimRight(strings.TrimSpace(os.Getenv(imageAssetPublicBaseURLEnv)), "/")
+	parsed, err := url.Parse(baseURL)
+	if baseURL == "" || err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
+		return path
+	}
+	return baseURL + path
 }
 
 func VerifyImageAssetURL(assetID int64, exp int64, thumbKB int, sig string, now time.Time) bool {
@@ -68,6 +82,11 @@ func imageAssetSignature(assetID int64, exp int64, thumbKB int) string {
 
 func imageAssetSecret() []byte {
 	secretOnce.Do(func() {
+		if configured := strings.TrimSpace(os.Getenv(imageAssetSigningSecretEnv)); configured != "" {
+			digest := sha256.Sum256([]byte(configured))
+			secret = digest[:]
+			return
+		}
 		secret = make([]byte, 32)
 		if _, err := rand.Read(secret); err != nil {
 			panic(fmt.Sprintf("signedasset: generate image proxy secret: %v", err))

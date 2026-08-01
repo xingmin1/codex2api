@@ -3,12 +3,14 @@
 // 入口:enforceAPIKeyLimits()。在请求鉴权后、转发上游前调用。失败返回 (httpStatus, message),
 // handler 直接以该响应短路;成功则返回 (0, "")。
 //
-// 6 类限制:
+// 7 类限制:
 //   - ModelAllow / ModelDeny: O(1) string set,本机内存即可,无副作用。
 //   - RPM:  滑动 60s 内请求数。Redis INCR + EXPIRE 60s 计数器(没 Redis 时回退 DB 聚合 + 短缓存)。
 //   - RPD:  滑动 24h 内请求数。同上,EXPIRE 86400。
 //   - CostLimit5h / CostLimit7d:    滑动 5h / 7d 内 user_billed 累计。Redis 60s 缓存 + DB 聚合兜底。
 //   - TokenLimit5h / TokenLimit7d:  同 cost,聚合 total_tokens。
+//   - CostLimitDaily / TokenLimitDaily: 自然日(本地时区)累计,零点清零。缓存 key 带日期戳,
+//     午夜自动失效,不会把前一天的用量泄漏进新的一天。
 //
 // Redis 失效或不存在时一律退到 DB 聚合 + 1 分钟缓存,保证可用性优先。
 package proxy
@@ -55,9 +57,64 @@ func APIKeyRowFromContext(c *gin.Context) *database.APIKeyRow {
 	return apiKeyRowFromContext(c)
 }
 
+// payloadRuleIdentity 从鉴权 context 构造 payload 规则身份（供 api_key_*/group_* 匹配门与
+// service_tier 记账重算共用）。无鉴权身份时返回 nil（带身份门的规则将 fail-closed 不命中）。
+func (h *Handler) payloadRuleIdentity(c *gin.Context) *PayloadRuleIdentity {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return nil
+	}
+	id := &PayloadRuleIdentity{APIKeyID: row.ID, APIKeyName: strings.TrimSpace(row.Name)}
+	if h != nil && h.store != nil {
+		// 用 store 侧的允许组（组删除后会刷新，是权威源），再解析组名。
+		id.GroupIDs = h.store.GetAPIKeyAllowedGroups(row.ID)
+		id.GroupNames = h.store.ResolveGroupNames(id.GroupIDs)
+	}
+	return id
+}
+
 // EnforceAPIKeyLimits checks API key scoped model and rate/cost limits.
 func (h *Handler) EnforceAPIKeyLimits(c *gin.Context, model string) (int, string) {
 	return h.enforceAPIKeyLimits(c, model)
+}
+
+// EnforceAPIKeyLimitsForRequests performs the normal API-key checks and also
+// verifies that a batched request cannot cross the RPM/RPD boundary by issuing
+// multiple upstream calls after a single admission check. Each upstream call
+// still runs the normal handler checks and records its own usage entry.
+func (h *Handler) EnforceAPIKeyLimitsForRequests(c *gin.Context, model string, requests int) (int, string) {
+	if status, msg := h.enforceAPIKeyLimits(c, model); status != 0 {
+		return status, msg
+	}
+	if requests <= 1 {
+		return 0, ""
+	}
+	row := apiKeyRowFromContext(c)
+	if row == nil || row.ID <= 0 {
+		return 0, ""
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+	defer cancel()
+	if row.Limits.RPM > 0 {
+		count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpm", apiKeyRPMWindow)
+		if err == nil && apiKeyBatchWouldExceed(count, row.Limits.RPM, requests) {
+			return http.StatusTooManyRequests,
+				fmt.Sprintf("API key rate limit exceeded: batch of %d would exceed %d requests per minute", requests, row.Limits.RPM)
+		}
+	}
+	if row.Limits.RPD > 0 {
+		count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpd", apiKeyRPDWindow)
+		if err == nil && apiKeyBatchWouldExceed(count, row.Limits.RPD, requests) {
+			return http.StatusTooManyRequests,
+				fmt.Sprintf("API key rate limit exceeded: batch of %d would exceed %d requests per day", requests, row.Limits.RPD)
+		}
+	}
+	return 0, ""
+}
+
+func apiKeyBatchWouldExceed(current int64, limit, requests int) bool {
+	return limit > 0 && requests > 0 && current+int64(requests) > int64(limit)
 }
 
 // enforceAPIKeyLimits 检查 API Key 的所有限制条件。
@@ -86,8 +143,9 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		}
 	}
 
-	// 1b. 生图禁用 (本机校验:模型/端点/请求体意图,无 I/O)
-	if limits.DisableImageGeneration {
+	// 1b. 生图 block 策略 (本机校验:模型/端点/请求体意图,无 I/O)。
+	// strip 策略不在此短路——它在转发前改写请求体（见 stripResponsesImageGenerationCapabilities）。
+	if limits.ResolveImageGenerationPolicy() == database.ImageGenerationPolicyBlock {
 		if msg := checkAPIKeyImageGeneration(c, model); msg != "" {
 			return http.StatusForbidden, msg
 		}
@@ -114,7 +172,27 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		}
 	}
 
-	// 4. cost / token 5h & 7d
+	// 4. 自然日 cost / token (issue #460)。固定窗口:服务器本地时区零点清零,
+	// 与下面的滑动窗口不同,到点全额恢复,报错文案带重置时刻。
+	if limits.CostLimitDaily > 0 || limits.TokenLimitDaily > 0 {
+		dayStart := database.StartOfDay(time.Now())
+		usage, err := h.apiKeyDailyUsage(ctx, row.ID, dayStart)
+		if err == nil && usage != nil {
+			resetAt := dayStart.AddDate(0, 0, 1).Format(time.RFC3339)
+			if limits.CostLimitDaily > 0 && usage.UserBilled >= limits.CostLimitDaily {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key daily cost limit exceeded: $%.2f / $%.2f today (resets at %s)",
+						usage.UserBilled, limits.CostLimitDaily, resetAt)
+			}
+			if limits.TokenLimitDaily > 0 && usage.Tokens >= limits.TokenLimitDaily {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key daily token limit exceeded: %d / %d today (resets at %s)",
+						usage.Tokens, limits.TokenLimitDaily, resetAt)
+			}
+		}
+	}
+
+	// 5. cost / token 5h & 7d
 	if limits.CostLimit5h > 0 || limits.TokenLimit5h > 0 {
 		usage, err := h.apiKeyWindowUsage(ctx, row.ID, "5h", apiKey5hWindow)
 		if err == nil && usage != nil {
@@ -161,7 +239,40 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		}
 	}
 
+	// 6. 分组 / 账号维度预算 (issue #439)。reject 类超额在此短路;skip 类挂到
+	// gin context 上，由各 handler 的账号过滤链剔除对应候选。
+	if len(limits.ScopeLimits) > 0 {
+		gate, rejectMsg := h.evaluateAPIKeyScopeBudgets(ctx, row)
+		if rejectMsg != "" {
+			return http.StatusTooManyRequests, rejectMsg
+		}
+		if gate != nil {
+			c.Set(contextScopeBudgetGate, gate)
+		}
+	}
+
 	return 0, ""
+}
+
+// apiKeyImageGenerationPolicy 返回当前请求所属 API Key 的图片工具策略。
+// 无鉴权身份（内部路径）时返回 allow，不改写请求。
+func apiKeyImageGenerationPolicy(c *gin.Context) string {
+	row := apiKeyRowFromContext(c)
+	if row == nil {
+		return database.ImageGenerationPolicyAllow
+	}
+	return row.Limits.ResolveImageGenerationPolicy()
+}
+
+// applyImageGenerationStripPolicy 在 strip 策略下剥离请求体里的图片工具能力声明，
+// 把请求当作普通文本请求继续转发（issue #411）。应在请求体准备完成（含网关自动注入
+// 图片工具/桥接 instructions）之后调用，从而一并清理网关注入的能力声明。非 strip 策略
+// 原样返回。
+func applyImageGenerationStripPolicy(c *gin.Context, body []byte) []byte {
+	if apiKeyImageGenerationPolicy(c) != database.ImageGenerationPolicyStrip {
+		return body
+	}
+	return stripResponsesImageGenerationCapabilities(body)
 }
 
 // SendAPIKeyLimitError writes a standard /v1 API key limit error response.
@@ -246,6 +357,21 @@ func (h *Handler) apiKeyWindowRequests(ctx context.Context, apiKeyID int64, labe
 	}
 	h.writeAPIKeyLimitCache(ctx, cacheKey, usage)
 	return usage.Requests, nil
+}
+
+// apiKeyDailyUsage 返回某 API Key 当天(自 dayStart 起)的累计用量。
+// 缓存 key 编入日期戳,跨过午夜后旧缓存自然失效,新的一天从零开始。
+func (h *Handler) apiKeyDailyUsage(ctx context.Context, apiKeyID int64, dayStart time.Time) (*database.APIKeyWindowUsage, error) {
+	cacheKey := apiKeyLimitsCacheKey(apiKeyID, "usage", "daily:"+dayStart.Format("2006-01-02"))
+	if v, ok := h.readAPIKeyLimitCache(ctx, cacheKey); ok {
+		return v, nil
+	}
+	usage, err := h.db.GetAPIKeyUsageSince(ctx, apiKeyID, dayStart)
+	if err != nil {
+		return nil, err
+	}
+	h.writeAPIKeyLimitCache(ctx, cacheKey, usage)
+	return usage, nil
 }
 
 func (h *Handler) apiKeyWindowUsage(ctx context.Context, apiKeyID int64, label string, window time.Duration) (*database.APIKeyWindowUsage, error) {

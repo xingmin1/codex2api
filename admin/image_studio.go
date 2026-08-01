@@ -36,6 +36,9 @@ import (
 const defaultImageAssetDir = "/data/images"
 const maxInlineImageAssetCacheBytes = 64 * 1024 * 1024
 const defaultSignedImageThumbKB = 32
+const maxImageJobOutputCount = 4
+
+var errInvalidUpscaledImage = errors.New("invalid upscaled image")
 
 // thumbCache 跨请求复用缩略图。S3 后端读源图代价高，这里用 LRU 兜一下。
 var thumbCache = imagestore.NewThumbnailCache(0)
@@ -62,10 +65,21 @@ type imageGenerationJobPayload struct {
 	Background   string   `json:"background"`
 	Style        string   `json:"style"`
 	Upscale      string   `json:"upscale"`
+	N            int      `json:"n"`
 	APIKeyID     int64    `json:"api_key_id"`
 	TemplateID   int64    `json:"template_id"`
 	InputImages  []string `json:"input_images"`
 	External     bool     `json:"-"`
+}
+
+func normalizeImageJobOutputCount(value int) (int, error) {
+	if value == 0 {
+		return 1, nil
+	}
+	if value < 1 || value > maxImageJobOutputCount {
+		return 0, fmt.Errorf("n must be between 1 and %d", maxImageJobOutputCount)
+	}
+	return value, nil
 }
 
 type imageJobResponse struct {
@@ -278,7 +292,18 @@ func (h *Handler) CreateImageGenerationJob(c *gin.Context) {
 	}
 	req.Background = normalizeOptionalImageParam(req.Background)
 	req.Style = normalizeOptionalImageParam(req.Style)
-	req.Upscale = imageproc.NormalizeUpscale(req.Upscale)
+	normalizedUpscale, err := normalizeImageJobUpscale(req.Model, req.Size, req.Upscale)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Upscale = normalizedUpscale
+	count, err := normalizeImageJobOutputCount(req.N)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.N = count
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
@@ -363,7 +388,18 @@ func (h *Handler) CreateImageEditJob(c *gin.Context) {
 	}
 	req.Background = normalizeOptionalImageParam(req.Background)
 	req.Style = normalizeOptionalImageParam(req.Style)
-	req.Upscale = imageproc.NormalizeUpscale(req.Upscale)
+	normalizedUpscale, err := normalizeImageJobUpscale(req.Model, req.Size, req.Upscale)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.Upscale = normalizedUpscale
+	count, err := normalizeImageJobOutputCount(req.N)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	req.N = count
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
@@ -415,7 +451,7 @@ func (h *Handler) ListImageGenerationJobs(c *gin.Context) {
 	page, pageSize := paginationParams(c, 20)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
-	result, err := h.db.ListImageGenerationJobs(ctx, page, pageSize)
+	result, err := h.db.ListImageGenerationJobs(ctx, page, pageSize, 0)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -525,7 +561,7 @@ func (h *Handler) ListImageAssets(c *gin.Context) {
 	page, pageSize := paginationParams(c, 24)
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
-	result, err := h.db.ListImageAssets(ctx, page, pageSize)
+	result, err := h.db.ListImageAssets(ctx, page, pageSize, 0)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -795,8 +831,10 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 	if imageProxy == nil {
 		imageProxy = proxy.NewHandler(h.store, h.db, nil, nil)
 	}
-	responseJSON, upstreamStatus, err := imageProxy.GenerateImageOnceForAdmin(ctx, rawBody, apiKey)
-	if shouldFallbackImageJobToJPEG(req, upstreamStatus, err) {
+	responseJSON, upstreamStatus, partialErrors, err := runImageJobBatch(req.N, func() ([]byte, int, error) {
+		return imageProxy.GenerateImageOnceForAdmin(ctx, rawBody, apiKey)
+	})
+	if shouldFallbackImageJobToJPEG(req, upstreamStatus, err) && len(responseJSON) == 0 {
 		pngErr := err
 		pngStatus := upstreamStatus
 		fallbackReq := jpegFallbackImageJobRequest(req)
@@ -818,7 +856,9 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 			len([]rune(fallbackStyledPrompt)),
 			imageLogPromptSuffix(fallbackStyledPrompt, req.External),
 		)
-		responseJSON, upstreamStatus, err = imageProxy.GenerateImageOnceForAdmin(ctx, fallbackBody, apiKey)
+		responseJSON, upstreamStatus, partialErrors, err = runImageJobBatch(req.N, func() ([]byte, int, error) {
+			return imageProxy.GenerateImageOnceForAdmin(ctx, fallbackBody, apiKey)
+		})
 		if err == nil {
 			req = fallbackReq
 			rawBody = fallbackBody
@@ -855,18 +895,26 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 		len(responseJSON),
 	)
 
-	assets, err := h.saveImageJobAssets(ctx, jobID, req, responseJSON)
+	assets, assetWarnings, err := h.saveImageJobAssets(ctx, jobID, req, responseJSON)
 	if err != nil {
 		log.Printf("[image-studio] job=%d failed duration=%s stage=save_assets error=%s", jobID, imageLogDuration(durationMs), security.SanitizeLog(err.Error()))
 		_ = h.db.MarkImageJobFailed(ctx, jobID, err.Error(), durationMs)
 		return
 	}
+	partialErrors = append(partialErrors, assetWarnings...)
 	if len(assets) == 0 {
 		log.Printf("[image-studio] job=%d failed duration=%s stage=save_assets error=%s", jobID, imageLogDuration(durationMs), "上游未返回图片")
 		_ = h.db.MarkImageJobFailed(ctx, jobID, "上游未返回图片", durationMs)
 		return
 	}
-	if err := h.db.MarkImageJobSucceeded(ctx, jobID, durationMs); err != nil {
+	if len(partialErrors) > 0 {
+		warning := strings.Join(partialErrors, "; ")
+		if err := h.db.MarkImageJobSucceededWithWarning(ctx, jobID, warning, durationMs); err != nil {
+			logImageJobError(jobID, err)
+		}
+		log.Printf("[image-studio] job=%d partial_success requested=%d completed=%d warning=%s",
+			jobID, req.N, len(assets), security.SanitizeLog(warning))
+	} else if err := h.db.MarkImageJobSucceeded(ctx, jobID, durationMs); err != nil {
 		logImageJobError(jobID, err)
 	}
 	log.Printf("[image-studio] job=%d succeeded duration=%s assets=%d total_bytes=%d first_size=%s dir=%s",
@@ -938,8 +986,10 @@ func (h *Handler) runImageEditJob(jobID int64, req imageGenerationJobPayload, ap
 	if imageProxy == nil {
 		imageProxy = proxy.NewHandler(h.store, h.db, nil, nil)
 	}
-	responseJSON, upstreamStatus, err := imageProxy.GenerateImageEditForAdmin(ctx, rawBody, apiKey)
-	if shouldFallbackImageJobToJPEG(req, upstreamStatus, err) {
+	responseJSON, upstreamStatus, partialErrors, err := runImageJobBatch(req.N, func() ([]byte, int, error) {
+		return imageProxy.GenerateImageEditForAdmin(ctx, rawBody, apiKey)
+	})
+	if shouldFallbackImageJobToJPEG(req, upstreamStatus, err) && len(responseJSON) == 0 {
 		pngErr := err
 		pngStatus := upstreamStatus
 		fallbackReq := jpegFallbackImageJobRequest(req)
@@ -955,7 +1005,9 @@ func (h *Handler) runImageEditJob(jobID int64, req imageGenerationJobPayload, ap
 			pngStatus,
 			security.SanitizeLog(pngErr.Error()),
 		)
-		responseJSON, upstreamStatus, err = imageProxy.GenerateImageEditForAdmin(ctx, fallbackBody, apiKey)
+		responseJSON, upstreamStatus, partialErrors, err = runImageJobBatch(req.N, func() ([]byte, int, error) {
+			return imageProxy.GenerateImageEditForAdmin(ctx, fallbackBody, apiKey)
+		})
 		if err == nil {
 			req = fallbackReq
 			rawBody = fallbackBody
@@ -992,18 +1044,26 @@ func (h *Handler) runImageEditJob(jobID int64, req imageGenerationJobPayload, ap
 		len(responseJSON),
 	)
 
-	assets, err := h.saveImageJobAssets(ctx, jobID, req, responseJSON)
+	assets, assetWarnings, err := h.saveImageJobAssets(ctx, jobID, req, responseJSON)
 	if err != nil {
 		log.Printf("[image-studio] job=%d failed mode=edit duration=%s stage=save_assets error=%s", jobID, imageLogDuration(durationMs), security.SanitizeLog(err.Error()))
 		_ = h.db.MarkImageJobFailed(ctx, jobID, err.Error(), durationMs)
 		return
 	}
+	partialErrors = append(partialErrors, assetWarnings...)
 	if len(assets) == 0 {
 		log.Printf("[image-studio] job=%d failed mode=edit duration=%s stage=save_assets error=%s", jobID, imageLogDuration(durationMs), "上游未返回图片")
 		_ = h.db.MarkImageJobFailed(ctx, jobID, "上游未返回图片", durationMs)
 		return
 	}
-	if err := h.db.MarkImageJobSucceeded(ctx, jobID, durationMs); err != nil {
+	if len(partialErrors) > 0 {
+		warning := strings.Join(partialErrors, "; ")
+		if err := h.db.MarkImageJobSucceededWithWarning(ctx, jobID, warning, durationMs); err != nil {
+			logImageJobError(jobID, err)
+		}
+		log.Printf("[image-studio] job=%d partial_success mode=edit requested=%d completed=%d warning=%s",
+			jobID, req.N, len(assets), security.SanitizeLog(warning))
+	} else if err := h.db.MarkImageJobSucceeded(ctx, jobID, durationMs); err != nil {
 		logImageJobError(jobID, err)
 	}
 	log.Printf("[image-studio] job=%d succeeded mode=edit duration=%s assets=%d total_bytes=%d first_size=%s",
@@ -1034,6 +1094,57 @@ func buildAdminImageGenerationRequest(req imageGenerationJobPayload) ([]byte, er
 		body["background"] = req.Background
 	}
 	return json.Marshal(body)
+}
+
+func runImageJobBatch(count int, execute func() ([]byte, int, error)) ([]byte, int, []string, error) {
+	count, err := normalizeImageJobOutputCount(count)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	var combined map[string]any
+	var combinedData []any
+	var partialErrors []string
+	lastStatus := 0
+	successStatus := 0
+	for index := 0; index < count; index++ {
+		responseJSON, status, callErr := execute()
+		lastStatus = status
+		if callErr != nil {
+			partialErrors = append(partialErrors, fmt.Sprintf("output %d: %s", index+1, callErr.Error()))
+			continue
+		}
+		var response map[string]any
+		if err := json.Unmarshal(responseJSON, &response); err != nil {
+			partialErrors = append(partialErrors, fmt.Sprintf("output %d: invalid upstream response", index+1))
+			continue
+		}
+		data, ok := response["data"].([]any)
+		if !ok || len(data) == 0 {
+			partialErrors = append(partialErrors, fmt.Sprintf("output %d: upstream returned no image", index+1))
+			continue
+		}
+		if combined == nil {
+			combined = response
+		}
+		if successStatus == 0 {
+			successStatus = status
+		}
+		combinedData = append(combinedData, data...)
+	}
+	if len(combinedData) == 0 {
+		if len(partialErrors) == 0 {
+			return nil, lastStatus, nil, fmt.Errorf("upstream returned no image")
+		}
+		return nil, lastStatus, partialErrors, fmt.Errorf("%s", strings.Join(partialErrors, "; "))
+	}
+	combined["data"] = combinedData
+	combined["requested_n"] = count
+	combined["completed_n"] = len(combinedData)
+	result, err := json.Marshal(combined)
+	if err != nil {
+		return nil, lastStatus, partialErrors, err
+	}
+	return result, successStatus, partialErrors, nil
 }
 
 func shouldFallbackImageJobToJPEG(req imageGenerationJobPayload, upstreamStatus int, err error) bool {
@@ -1089,20 +1200,20 @@ func jpegFallbackImageJobRequest(req imageGenerationJobPayload) imageGenerationJ
 	return req
 }
 
-func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req imageGenerationJobPayload, responseJSON []byte) ([]database.ImageAsset, error) {
+func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req imageGenerationJobPayload, responseJSON []byte) ([]database.ImageAsset, []string, error) {
 	backend, err := imagestore.Primary()
 	if err != nil {
-		return nil, fmt.Errorf("图片存储未初始化: %w", err)
+		return nil, nil, fmt.Errorf("图片存储未初始化: %w", err)
 	}
 	if backend.Name() == imagestore.BackendLocal {
 		// LocalBackend 已在 Configure 时 mkdir，这里再保险一次以兼容 dir 在运行期被外部清理的情况。
 		if err := os.MkdirAll(imageAssetDir(), 0o755); err != nil {
-			return nil, fmt.Errorf("创建图库目录失败: %w", err)
+			return nil, nil, fmt.Errorf("创建图库目录失败: %w", err)
 		}
 	}
 	data := gjson.GetBytes(responseJSON, "data")
 	if !data.IsArray() {
-		return nil, fmt.Errorf("生图响应缺少 data")
+		return nil, nil, fmt.Errorf("生图响应缺少 data")
 	}
 	responseModel := firstNonEmpty(gjson.GetBytes(responseJSON, "model").String(), req.Model)
 	responseSize := firstNonEmpty(gjson.GetBytes(responseJSON, "size").String(), req.Size)
@@ -1110,14 +1221,24 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 	responseFormat := firstNonEmpty(gjson.GetBytes(responseJSON, "output_format").String(), req.OutputFormat, "png")
 
 	var saved []database.ImageAsset
+	var warnings []string
 	for idx, item := range data.Array() {
 		imageBytes, mimeType, format, err := decodeImageDataItem(item)
 		if err != nil {
-			return saved, err
+			return saved, warnings, err
 		}
 		if req.Upscale != "" {
-			upscaledBytes, upscaledMime, ok := h.upscaleImageJobAsset(ctx, jobID, idx+1, imageBytes, req.Upscale)
-			if ok {
+			upscaledBytes, upscaledMime, upscaleErr := h.upscaleImageJobAsset(ctx, jobID, idx+1, imageBytes, req.Upscale, req.Size)
+			if upscaleErr != nil {
+				if errors.Is(upscaleErr, errInvalidUpscaledImage) {
+					return saved, warnings, upscaleErr
+				}
+				warning := fmt.Sprintf("output %d: upscale degraded; original image preserved: %s", idx+1, security.SanitizeLog(upscaleErr.Error()))
+				warnings = append(warnings, warning)
+				log.Printf("[image-studio] job=%d asset_index=%d upscale_degraded scale=%s backend=%s error=%s",
+					jobID, idx+1, imageLogValue(req.Upscale), imageLogValue(imageUpscalerBackend()), security.SanitizeLog(upscaleErr.Error()))
+			}
+			if len(upscaledBytes) > 0 && upscaledMime != "" {
 				imageBytes = upscaledBytes
 				mimeType = upscaledMime
 				format = extensionFromMimeType(upscaledMime)
@@ -1143,7 +1264,7 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 		filename := fmt.Sprintf("%d-%02d-%s.%s", jobID, idx+1, uuid.NewString()[:8], safeImageExtension(format, mimeType))
 		storagePath, err := backend.Save(ctx, filename, imageBytes, mimeType)
 		if err != nil {
-			return saved, fmt.Errorf("保存图片失败: %w", err)
+			return saved, warnings, fmt.Errorf("保存图片失败: %w", err)
 		}
 		input := database.ImageAssetInput{
 			JobID:         jobID,
@@ -1164,11 +1285,11 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 		assetID, err := h.db.InsertImageAsset(ctx, input)
 		if err != nil {
 			_ = backend.Delete(ctx, storagePath)
-			return saved, err
+			return saved, warnings, err
 		}
 		asset, err := h.db.GetImageAsset(ctx, assetID)
 		if err != nil {
-			return saved, err
+			return saved, warnings, err
 		}
 		decorateImageAsset(asset)
 		saved = append(saved, *asset)
@@ -1184,64 +1305,70 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 			imageLogValue(asset.Model),
 		)
 	}
-	return saved, nil
+	return saved, warnings, nil
 }
 
-func (h *Handler) upscaleImageJobAsset(ctx context.Context, jobID int64, assetIndex int, imageBytes []byte, scale string) ([]byte, string, bool) {
+func (h *Handler) upscaleImageJobAsset(ctx context.Context, jobID int64, assetIndex int, imageBytes []byte, scale, requestedSize string) ([]byte, string, error) {
 	scale = imageproc.NormalizeUpscale(scale)
 	if scale == "" || len(imageBytes) == 0 {
-		return nil, "", false
+		return nil, "", nil
 	}
 	cache := imageproc.GlobalUpscaleCache()
-	key := imageproc.ComputeUpscaleCacheKey(imageBytes, scale)
+	key := imageproc.ComputeUpscaleCacheKey(imageBytes, scale) + "-" + strings.ToLower(strings.TrimSpace(requestedSize))
 	if data, contentType, ok := cache.Get(key); ok && contentType != "" {
-		return data, contentType, true
+		return data, contentType, nil
 	}
 
 	upscaleCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 	defer cancel()
 	if err := cache.Acquire(upscaleCtx); err != nil {
-		log.Printf("[image-studio] job=%d asset_index=%d local_upscale_skipped scale=%s error=%s",
+		log.Printf("[image-studio] job=%d asset_index=%d upscale_acquire_failed scale=%s backend=%s error=%s",
 			jobID,
 			assetIndex,
 			imageLogValue(scale),
+			imageLogValue(imageUpscalerBackend()),
 			security.SanitizeLog(err.Error()),
 		)
-		return nil, "", false
+		return nil, "", err
 	}
 	defer cache.Release()
 
 	if data, contentType, ok := cache.Get(key); ok && contentType != "" {
-		return data, contentType, true
+		return data, contentType, nil
 	}
 
 	beforeWidth, beforeHeight := imageDimensions(imageBytes)
-	upscaled, contentType, err := imageproc.DoUpscale(imageBytes, scale)
+	upscaled, contentType, method, err := upscaleImageBytes(upscaleCtx, imageBytes, scale, requestedSize)
 	if err != nil {
-		log.Printf("[image-studio] job=%d asset_index=%d local_upscale_failed scale=%s error=%s",
+		log.Printf("[image-studio] job=%d asset_index=%d upscale_failed scale=%s backend=%s error=%s",
 			jobID,
 			assetIndex,
 			imageLogValue(scale),
+			imageLogValue(imageUpscalerBackend()),
 			security.SanitizeLog(err.Error()),
 		)
-		return nil, "", false
+		return nil, "", err
 	}
 	if contentType == "" {
-		return nil, "", false
+		return nil, "", nil
+	}
+	afterWidth, afterHeight := imageDimensions(upscaled)
+	if len(upscaled) == 0 || afterWidth <= 0 || afterHeight <= 0 {
+		return nil, "", fmt.Errorf("%w: upscaler returned undecodable image data", errInvalidUpscaledImage)
 	}
 
 	cache.Put(key, upscaled, contentType)
-	afterWidth, afterHeight := imageDimensions(upscaled)
-	log.Printf("[image-studio] job=%d asset_index=%d local_upscale=%s from=%s to=%s bytes=%d->%d",
+	log.Printf("[image-studio] job=%d asset_index=%d upscale=%s method=%s from=%s to=%s bytes=%d->%d",
 		jobID,
 		assetIndex,
 		imageLogValue(scale),
+		imageLogValue(method),
 		imageLogDimensions(beforeWidth, beforeHeight),
 		imageLogDimensions(afterWidth, afterHeight),
 		len(imageBytes),
 		len(upscaled),
 	)
-	return upscaled, contentType, true
+	return upscaled, contentType, nil
 }
 
 func (h *Handler) resolveImageJobAPIKey(ctx context.Context, id int64) (*database.APIKeyRow, error) {
@@ -1328,6 +1455,50 @@ func normalizeImageStudioModel(model string) string {
 	default:
 		return "gpt-image-2"
 	}
+}
+
+func normalizeImageJobUpscale(model, size, upscale string) (string, error) {
+	rawUpscale := strings.ToLower(strings.TrimSpace(upscale))
+	if rawUpscale != "" {
+		normalized := imageproc.NormalizeUpscale(rawUpscale)
+		if normalized == "" {
+			return "", fmt.Errorf("upscale must be either 2k or 4k")
+		}
+		return normalized, nil
+	}
+
+	normalizedModel := strings.ToLower(strings.TrimSpace(model))
+	if strings.HasSuffix(normalizedModel, "-4k") {
+		return imageproc.Upscale4K, nil
+	}
+	if strings.HasSuffix(normalizedModel, "-2k") {
+		return imageproc.Upscale2K, nil
+	}
+
+	normalizedSize := strings.ToLower(strings.TrimSpace(size))
+	if normalizedSize == imageproc.Upscale4K {
+		return imageproc.Upscale4K, nil
+	}
+	if normalizedSize == imageproc.Upscale2K {
+		return imageproc.Upscale2K, nil
+	}
+	parts := strings.Split(normalizedSize, "x")
+	if len(parts) != 2 {
+		return "", nil
+	}
+	width, widthErr := strconv.Atoi(strings.TrimSpace(parts[0]))
+	height, heightErr := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 {
+		return "", nil
+	}
+	longEdge := max(width, height)
+	if longEdge > 2560 {
+		return imageproc.Upscale4K, nil
+	}
+	if longEdge >= 2048 {
+		return imageproc.Upscale2K, nil
+	}
+	return "", nil
 }
 
 func normalizeOptionalImageParam(value string) string {

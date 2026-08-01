@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/codex2api/security/promptfilter"
 	"github.com/tidwall/gjson"
 )
 
@@ -139,6 +140,33 @@ func TestWriteDeferredSSEDataFlushesLargeDeferredEventOnce(t *testing.T) {
 	}
 }
 
+func TestWriteDeferredSSEDataReportsActualOutputScannerDelivery(t *testing.T) {
+	cfg := promptfilter.DefaultConfig()
+	cfg.Enabled = true
+	cfg.Advanced.Output.Enabled = true
+	cfg.Advanced.Output.BufferBytes = 512
+	cfg.Advanced.Output.OverlapBytes = 64
+	var buf bytes.Buffer
+	writer := &streamFlushWriter{writer: &buf, outputScanner: promptfilter.NewOutputScanner(cfg)}
+	var pending bytes.Buffer
+
+	wrote, err := writeDeferredSSEData(writer, &pending, []byte(`{"type":"response.output_text.delta","delta":"hi"}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wrote || buf.Len() != 0 {
+		t.Fatalf("scanner-buffered event reported client delivery: wrote=%t bytes=%d", wrote, buf.Len())
+	}
+
+	wrote, err = writeDeferredSSEData(writer, &pending, []byte(`{"type":"response.completed"}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !wrote || buf.Len() == 0 {
+		t.Fatalf("terminal scanner release was not reported: wrote=%t bytes=%d", wrote, buf.Len())
+	}
+}
+
 func TestShouldSuppressRetryableResponseFailedBeforeFirstToken(t *testing.T) {
 	retryableFailed := []byte(`{"type":"response.failed","response":{"error":{"message":"rate limited","status_code":429,"code":"rate_limit_exceeded"}}}`)
 	nonRetryableFailed := []byte(`{"type":"response.failed","response":{"error":{"message":"bad request","status_code":400,"code":"invalid_request_error"}}}`)
@@ -166,6 +194,24 @@ func BenchmarkStreamFlushWriterWriteSSEData(b *testing.B) {
 		var buf bytes.Buffer
 		writer := &streamFlushWriter{writer: &buf}
 		if err := writer.WriteSSEData(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkReadSSEStream(b *testing.B) {
+	var input bytes.Buffer
+	for i := 0; i < 1024; i++ {
+		input.WriteString("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
+	}
+	input.WriteString("data: [DONE]\n\n")
+	payload := input.Bytes()
+
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := ReadSSEStream(bytes.NewReader(payload), func([]byte) bool { return true }); err != nil {
 			b.Fatal(err)
 		}
 	}

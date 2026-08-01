@@ -2422,7 +2422,11 @@ function HistoryJobCard({
           </div>
 
           {job.error_message && (
-            <div className="line-clamp-3 rounded-lg border border-red-500/20 bg-red-500/10 p-3 text-sm leading-6 text-red-700 dark:text-red-200">
+            <div className={`line-clamp-3 rounded-lg border p-3 text-sm leading-6 ${
+              job.status === 'failed'
+                ? 'border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-200'
+                : 'border-amber-500/25 bg-amber-500/10 text-amber-800 dark:text-amber-200'
+            }`}>
               {job.error_message}
             </div>
           )}

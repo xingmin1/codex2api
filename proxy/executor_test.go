@@ -16,6 +16,18 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+type maxChunkReader struct {
+	reader io.Reader
+	size   int
+}
+
+func (r *maxChunkReader) Read(p []byte) (int, error) {
+	if len(p) > r.size {
+		p = p[:r.size]
+	}
+	return r.reader.Read(p)
+}
+
 func TestReadSSEStream_MergesMultilineData(t *testing.T) {
 	input := strings.NewReader("data: {\"type\":\"response.output_text.delta\",\n" +
 		"data: \"delta\":\"hello\"}\n\n" +
@@ -35,6 +47,32 @@ func TestReadSSEStream_MergesMultilineData(t *testing.T) {
 	want := "{\"type\":\"response.output_text.delta\",\n\"delta\":\"hello\"}"
 	if events[0] != want {
 		t.Fatalf("unexpected merged event: got %q want %q", events[0], want)
+	}
+}
+
+func TestReadSSEStreamPreservesEventsAcrossReadBoundaries(t *testing.T) {
+	const eventCount = 2048
+
+	var input strings.Builder
+	for i := 0; i < eventCount; i++ {
+		input.WriteString("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n")
+	}
+	input.WriteString("data: [DONE]\n\n")
+
+	got := 0
+	reader := &maxChunkReader{reader: strings.NewReader(input.String()), size: 37}
+	err := ReadSSEStream(reader, func(data []byte) bool {
+		if string(data) != `{"type":"response.output_text.delta","delta":"hello"}` {
+			t.Fatalf("unexpected event %d: %q", got, data)
+		}
+		got++
+		return true
+	})
+	if err != nil {
+		t.Fatalf("ReadSSEStream returned error: %v", err)
+	}
+	if got != eventCount {
+		t.Fatalf("event count = %d, want %d", got, eventCount)
 	}
 }
 
@@ -72,7 +110,7 @@ func TestClassifyStreamOutcome(t *testing.T) {
 			readErr:      errors.New("websocket read error: websocket: close 1009 (message too big)"),
 			wantStatus:   logStatusUpstreamStreamBreak,
 			wantKind:     upstreamErrorKindMessageTooBig,
-			wantPenalize: true,
+			wantPenalize: false,
 		},
 		{
 			name:         "upstream early eof",
@@ -103,7 +141,7 @@ func TestShouldFallbackWebsocketMessageTooBigToHTTP(t *testing.T) {
 		logStatusCode:  logStatusUpstreamStreamBreak,
 		failureKind:    upstreamErrorKindMessageTooBig,
 		failureMessage: "上游流读取失败: websocket read error: websocket: close 1009 (message too big)",
-		penalize:       true,
+		penalize:       false,
 	}
 
 	if !shouldFallbackWebsocketMessageTooBigToHTTP(outcome, true, false, nil, nil) {
@@ -117,6 +155,23 @@ func TestShouldFallbackWebsocketMessageTooBigToHTTP(t *testing.T) {
 	}
 	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, true, false, context.Canceled, nil) {
 		t.Fatal("should not fall back after downstream context is canceled")
+	}
+}
+
+func TestWebsocketMessageTooBigSource(t *testing.T) {
+	readLimitErr := errors.New("websocket read error: websocket: read limit exceeded")
+	if got := classifyTransportFailure(readLimitErr); got != upstreamErrorKindMessageTooBig {
+		t.Fatalf("local read-limit failure kind = %q, want %q", got, upstreamErrorKindMessageTooBig)
+	}
+	outcome := classifyStreamOutcome(nil, readLimitErr, nil, false)
+	if outcome.failureKind != upstreamErrorKindMessageTooBig || outcome.penalize || outcome.verifyAccountAuth {
+		t.Fatalf("local read-limit outcome = %+v, want message-too-big without penalty or auth verification", outcome)
+	}
+	if got := websocketMessageTooBigSource(outcome.failureMessage); got != "local_read_limit" {
+		t.Fatalf("local read-limit source = %q", got)
+	}
+	if got := websocketMessageTooBigSource("websocket read error: websocket: close 1009 (message too big)"); got != "peer_close" {
+		t.Fatalf("peer close source = %q", got)
 	}
 }
 
@@ -369,6 +424,161 @@ func TestApplyCodexRequestHeadersForwardsAttestationOnlyWhenPresent(t *testing.T
 	applyCodexRequestHeaders(without, acc, "token-123", "cache-key-1", "api-key-1", nil, http.Header{})
 	if got := without.Header.Get("X-Oai-Attestation"); got != "" {
 		t.Fatalf("X-Oai-Attestation = %q, want empty (never fabricate)", got)
+	}
+}
+
+func TestApplyCodexRequestHeadersForwardsResponsesLiteOnlyWhenPresent(t *testing.T) {
+	const headerName = codexResponsesLiteHeader
+	acc := &auth.Account{DBID: 42, AccountID: "acct-42"}
+	downstreamHeaders := make(http.Header)
+	downstreamHeaders.Set(headerName, "true")
+
+	withLite, _ := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	applyCodexRequestHeaders(withLite, acc, "token-123", "cache-key-1", "api-key-1", nil, downstreamHeaders)
+	if got := withLite.Header.Get(headerName); got != "true" {
+		t.Fatalf("%s = %q, want true", headerName, got)
+	}
+
+	withoutLite, _ := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	applyCodexRequestHeaders(withoutLite, acc, "token-123", "cache-key-1", "api-key-1", nil, http.Header{})
+	if got := withoutLite.Header.Get(headerName); got != "" {
+		t.Fatalf("%s = %q, want empty when downstream omitted the signal", headerName, got)
+	}
+}
+
+func TestCodexResponsesLiteRequestedRequiresExplicitTrue(t *testing.T) {
+	headerTrue := make(http.Header)
+	headerTrue.Set(codexResponsesLiteHeader, " TRUE ")
+	headerFalse := make(http.Header)
+	headerFalse.Set(codexResponsesLiteHeader, "false")
+
+	tests := []struct {
+		name    string
+		body    []byte
+		headers http.Header
+		want    bool
+	}{
+		{name: "http header", body: []byte(`{"model":"gpt-5.4"}`), headers: headerTrue, want: true},
+		{name: "websocket metadata", body: []byte(`{"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"true"}}`), want: true},
+		{name: "false values", body: []byte(`{"client_metadata":{"ws_request_header_x_openai_internal_codex_responses_lite":"false"}}`), headers: headerFalse, want: false},
+		{name: "model name alone", body: []byte(`{"model":"gpt-5.6-sol"}`), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := codexResponsesLiteRequested(tt.body, tt.headers); got != tt.want {
+				t.Fatalf("codexResponsesLiteRequested() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPrepareCodexResponsesLiteTransportBridgesRequestScopedSignal(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"input":[{"type":"function_call","name":"run","namespace":"code_tools","arguments":"{}"}],
+		"client_metadata":{"other":"kept","ws_request_header_x_openai_internal_codex_responses_lite":"true"}
+	}`)
+	headers := make(http.Header)
+	headers.Set(codexResponsesLiteHeader, "true")
+
+	wsBody, wsHeaders := prepareCodexResponsesLiteTransport(body, headers, true, true)
+	if got := gjson.GetBytes(wsBody, codexResponsesLiteWSMetadataPath).String(); got != "true" {
+		t.Fatalf("WS Lite metadata = %q, want true; body=%s", got, wsBody)
+	}
+	if got := wsHeaders.Get(codexResponsesLiteHeader); got != "" {
+		t.Fatalf("WS handshake Lite header = %q, want empty", got)
+	}
+
+	httpBody, httpHeaders := prepareCodexResponsesLiteTransport(body, headers, false, true)
+	if got := httpHeaders.Get(codexResponsesLiteHeader); got != "true" {
+		t.Fatalf("HTTP Lite header = %q, want true", got)
+	}
+	if marker := gjson.GetBytes(httpBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
+		t.Fatalf("HTTP body retained WS-only Lite metadata: %s", httpBody)
+	}
+	if got := gjson.GetBytes(httpBody, "client_metadata.other").String(); got != "kept" {
+		t.Fatalf("unrelated client metadata = %q, want kept; body=%s", got, httpBody)
+	}
+	if got := gjson.GetBytes(httpBody, "input.0.namespace").String(); got != "code_tools" {
+		t.Fatalf("tool namespace = %q, want code_tools; body=%s", got, httpBody)
+	}
+	if got := headers.Get(codexResponsesLiteHeader); got != "true" {
+		t.Fatalf("caller headers were mutated: Lite header = %q", got)
+	}
+
+	nextWSBody, nextWSHeaders := prepareCodexResponsesLiteTransport([]byte(`{"model":"gpt-5.6-sol"}`), nil, true, false)
+	if marker := gjson.GetBytes(nextWSBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
+		t.Fatalf("non-Lite request inherited pooled WS metadata: %s", nextWSBody)
+	}
+	if got := nextWSHeaders.Get(codexResponsesLiteHeader); got != "" {
+		t.Fatalf("non-Lite request inherited pooled WS header: %q", got)
+	}
+
+	nonLiteHeaders := make(http.Header)
+	nonLiteHeaders.Set(codexResponsesLiteHeader, "false")
+	nonLiteBody := []byte(`{"model":"gpt-5.6-sol","client_metadata":{"other":"kept","ws_request_header_x_openai_internal_codex_responses_lite":"false"}}`)
+	nonLiteBody, nonLiteHeaders = prepareCodexResponsesLiteTransport(nonLiteBody, nonLiteHeaders, false, false)
+	if got := nonLiteHeaders.Get(codexResponsesLiteHeader); got != "" {
+		t.Fatalf("false Lite header was forwarded as %q", got)
+	}
+	if marker := gjson.GetBytes(nonLiteBody, codexResponsesLiteWSMetadataPath); marker.Exists() {
+		t.Fatalf("HTTP body retained false WS-only Lite metadata: %s", nonLiteBody)
+	}
+}
+
+func TestNormalizeCodexResponsesLiteBodyEnforcesUpstreamConstraints(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"parallel_tool_calls":true,
+		"reasoning":{"effort":"low"},
+		"tools":[{"type":"function","name":"run"},{"type":"image_generation","model":"gpt-image-2"}],
+		"instructions":"Base prompt.\n\n` + "<codex2api-codex-image-generation>\\nbridge text\\n</codex2api-codex-image-generation>" + `"
+	}`)
+
+	wsBody := normalizeCodexResponsesLiteBody(body, false)
+	if got := gjson.GetBytes(wsBody, "parallel_tool_calls").Bool(); got {
+		t.Fatalf("WS parallel_tool_calls = %v, want false", got)
+	}
+	if got := gjson.GetBytes(wsBody, "reasoning.context").String(); got != "all_turns" {
+		t.Fatalf("WS reasoning.context = %q, want all_turns", got)
+	}
+	if got := gjson.GetBytes(wsBody, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("WS reasoning.effort = %q, want low (preserved)", got)
+	}
+	if got := gjson.GetBytes(wsBody, "tools.#").Int(); got != 2 {
+		t.Fatalf("WS tools count = %d, want 2 (image tool kept on WS)", got)
+	}
+
+	httpBody := normalizeCodexResponsesLiteBody(body, true)
+	if got := gjson.GetBytes(httpBody, "tools.#").Int(); got != 1 {
+		t.Fatalf("HTTP tools count = %d, want 1; body=%s", got, httpBody)
+	}
+	if got := gjson.GetBytes(httpBody, "tools.0.type").String(); got != "function" {
+		t.Fatalf("HTTP surviving tool type = %q, want function", got)
+	}
+	if instructions := gjson.GetBytes(httpBody, "instructions").String(); instructions != "Base prompt." {
+		t.Fatalf("HTTP instructions = %q, want bridge text removed", instructions)
+	}
+}
+
+func TestNormalizeCodexResponsesLiteBodyStripsImageOnlyToolSet(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"tools":[{"type":"image_generation","model":"gpt-image-2"}],
+		"tool_choice":{"type":"image_generation"},
+		"instructions":"` + "<codex2api-codex-image-generation>\\nbridge text\\n</codex2api-codex-image-generation>" + `"
+	}`)
+
+	httpBody := normalizeCodexResponsesLiteBody(body, true)
+	if tools := gjson.GetBytes(httpBody, "tools"); tools.Exists() {
+		t.Fatalf("HTTP tools should be removed entirely, got %s", tools.Raw)
+	}
+	if choice := gjson.GetBytes(httpBody, "tool_choice"); choice.Exists() {
+		t.Fatalf("HTTP tool_choice should be removed, got %s", choice.Raw)
+	}
+	if instructions := gjson.GetBytes(httpBody, "instructions").String(); instructions != "" {
+		t.Fatalf("HTTP instructions = %q, want empty after bridge removal", instructions)
 	}
 }
 
@@ -703,6 +913,7 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 		version string
 		auth    string
 		accept  string
+		lite    string
 		body    []byte
 	}
 	results := make(chan result, 2)
@@ -715,6 +926,7 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 			version: r.Header.Get("Version"),
 			auth:    r.Header.Get("Authorization"),
 			accept:  r.Header.Get("Accept"),
+			lite:    r.Header.Get(codexResponsesLiteHeader),
 			body:    body,
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -729,13 +941,17 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 		APIKey:       "relay-token",
 	}
 
-	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", http.Header{"User-Agent": []string{"curl/8.0"}})
+	downstreamHeaders := make(http.Header)
+	downstreamHeaders.Set("User-Agent", "curl/8.0")
+	downstreamHeaders.Set(codexResponsesLiteHeader, "true")
+
+	resp, err := ExecuteOpenAIResponsesRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", downstreamHeaders)
 	if err != nil {
 		t.Fatalf("ExecuteOpenAIResponsesRequest() error = %v", err)
 	}
 	resp.Body.Close()
 
-	resp, err = ExecuteOpenAIResponsesCompactRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", nil)
+	resp, err = ExecuteOpenAIResponsesCompactRequest(context.Background(), account, []byte(`{"model":"gpt-5.4"}`), "", downstreamHeaders)
 	if err != nil {
 		t.Fatalf("ExecuteOpenAIResponsesCompactRequest() error = %v", err)
 	}
@@ -758,6 +974,9 @@ func TestOpenAIResponsesExecutorsDoNotLeakGoDefaultUserAgent(t *testing.T) {
 			}
 			if got.accept != "application/json, text/event-stream" {
 				t.Fatalf("%s Accept = %q", wantPath, got.accept)
+			}
+			if got.lite != "true" {
+				t.Fatalf("%s %s = %q, want true", wantPath, codexResponsesLiteHeader, got.lite)
 			}
 			if len(got.body) == 0 {
 				t.Fatalf("%s request body was empty", wantPath)
@@ -1050,6 +1269,129 @@ func TestResolveSessionIDPrefersContinuityHeaders(t *testing.T) {
 	if got := ResolveSessionID(headers, []byte(`{"prompt_cache_key":"body-key"}`)); got != "idempotency-key-1" {
 		t.Fatalf("ResolveSessionID() = %q, want %q", got, "idempotency-key-1")
 	}
+}
+
+func TestResolveSessionIDUsesLocalAffinityHeader(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"same prompt"}]}`)
+	baseHeaders := http.Header{"Authorization": []string{"Bearer shared-key"}}
+	headersA := baseHeaders.Clone()
+	headersA.Set("X-Codex2API-Affinity-Key", "user-a")
+	headersB := headersA.Clone()
+	headersB.Set("X-Codex2API-Affinity-Key", "user-b")
+
+	identityWithoutAffinity := resolveRequestSessionIdentity(baseHeaders, body)
+	identityA := resolveRequestSessionIdentity(headersA, body)
+	identityB := resolveRequestSessionIdentity(headersB, body)
+	if identityWithoutAffinity.hasDownstreamAffinity {
+		t.Fatal("request without the dedicated affinity header was marked as having one")
+	}
+	if identityWithoutAffinity.hasRequestFingerprint {
+		t.Fatal("plain request without a Codex fingerprint was marked as fingerprinted")
+	}
+	if !identityA.hasDownstreamAffinity || !identityB.hasDownstreamAffinity {
+		t.Fatal("request with the dedicated affinity header was not marked as having one")
+	}
+	if !identityA.hasRequestFingerprint || !identityB.hasRequestFingerprint {
+		t.Fatal("dedicated affinity header must count as a routing fingerprint")
+	}
+	idA := identityA.affinityID
+	idARepeat := ResolveSessionID(headersA, body)
+	idB := identityB.affinityID
+	if idA == "" || idA != idARepeat {
+		t.Fatalf("affinity id must be non-empty and stable: first=%q repeat=%q", idA, idARepeat)
+	}
+	if idA == idB {
+		t.Fatalf("different affinity headers produced the same id %q", idA)
+	}
+	if idA == "user-a" || idB == "user-b" {
+		t.Fatal("raw downstream affinity identifiers must not be retained")
+	}
+	if explicit := ResolveExplicitSessionID(headersA, body); explicit != "" {
+		t.Fatalf("local affinity header leaked into upstream explicit session id: %q", explicit)
+	}
+	if identityA.upstreamSeed != identityWithoutAffinity.upstreamSeed || identityB.upstreamSeed != identityWithoutAffinity.upstreamSeed {
+		t.Fatalf("local affinity changed upstream seed: without=%q a=%q b=%q", identityWithoutAffinity.upstreamSeed, identityA.upstreamSeed, identityB.upstreamSeed)
+	}
+	if identityA.explicitUpstreamID != "" || identityB.explicitUpstreamID != "" {
+		t.Fatalf("local affinity became an explicit upstream id: a=%q b=%q", identityA.explicitUpstreamID, identityB.explicitUpstreamID)
+	}
+}
+
+func TestResolveSessionIdentityTreatsBlankAffinityHeaderAsMissing(t *testing.T) {
+	headers := http.Header{"Authorization": []string{"Bearer shared-key"}}
+	headers.Set("X-Codex2API-Affinity-Key", "   ")
+	identity := resolveRequestSessionIdentity(headers, []byte(`{"model":"gpt-5.4","input":"hello"}`))
+	if identity.hasDownstreamAffinity {
+		t.Fatal("blank affinity header must be treated as missing")
+	}
+}
+
+func TestResolveSessionIdentityRecognizesCodexEngineFingerprint(t *testing.T) {
+	headers := http.Header{
+		"Authorization":      []string{"Bearer shared-key"},
+		"X-Codex-Turn-State": []string{"turn-state"},
+	}
+	identity := resolveRequestSessionIdentity(headers, []byte(`{"model":"gpt-5.4","input":"hello"}`))
+	if identity.hasDownstreamAffinity {
+		t.Fatal("Codex engine fingerprint must not be treated as the dedicated affinity header")
+	}
+	if !identity.hasRequestFingerprint {
+		t.Fatal("Codex engine fingerprint was not recognized for group routing")
+	}
+}
+
+func TestLocalAffinityDoesNotAffectPerAPIKeyHTTPUpstreamSessionID(t *testing.T) {
+	previousSettings := CurrentRuntimeSettings()
+	t.Cleanup(func() { ApplyRuntimeSettings(previousSettings) })
+	nextSettings := previousSettings
+	nextSettings.RequestIsolationMode = RequestIsolationModePerAPIKey
+	ApplyRuntimeSettings(nextSettings)
+
+	body := []byte(`{"model":"gpt-5.4","input":[{"role":"user","content":"same prompt"}]}`)
+	baseHeaders := http.Header{"Authorization": []string{"Bearer shared-key"}}
+	affinityHeaders := baseHeaders.Clone()
+	affinityHeaders.Set("X-Codex2API-Affinity-Key", "user-a")
+
+	withoutAffinity := resolveRequestSessionIdentity(baseHeaders, body)
+	withAffinity := resolveRequestSessionIdentity(affinityHeaders, body)
+	withoutUpstreamID := resolveUpstreamSessionID(7, withoutAffinity.upstreamSeed, withoutAffinity.explicitUpstreamID, false)
+	withUpstreamID := resolveUpstreamSessionID(7, withAffinity.upstreamSeed, withAffinity.explicitUpstreamID, false)
+	if withoutUpstreamID == "" || withUpstreamID != withoutUpstreamID {
+		t.Fatalf("per-api-key HTTP upstream id changed with local affinity: without=%q with=%q", withoutUpstreamID, withUpstreamID)
+	}
+	if withUpstreamID == withAffinity.affinityID {
+		t.Fatalf("local affinity id leaked as upstream id %q", withUpstreamID)
+	}
+}
+
+func TestLocalAffinityPreservesExplicitAndAPIKeyUpstreamSeeds(t *testing.T) {
+	t.Run("explicit session", func(t *testing.T) {
+		headers := http.Header{
+			"Authorization": []string{"Bearer shared-key"},
+			"Session_id":    []string{"explicit-session"},
+		}
+		headers.Set("X-Codex2API-Affinity-Key", "user-a")
+		identity := resolveRequestSessionIdentity(headers, []byte(`{"model":"gpt-5.4"}`))
+		if identity.upstreamSeed != "explicit-session" || identity.explicitUpstreamID != "explicit-session" {
+			t.Fatalf("explicit upstream identity changed: seed=%q explicit=%q", identity.upstreamSeed, identity.explicitUpstreamID)
+		}
+		if identity.affinityID == identity.upstreamSeed {
+			t.Fatalf("local affinity did not remain separate from explicit upstream seed %q", identity.upstreamSeed)
+		}
+	})
+
+	t.Run("api key fallback", func(t *testing.T) {
+		headers := http.Header{"Authorization": []string{"Bearer shared-key"}}
+		headers.Set("X-Codex2API-Affinity-Key", "user-a")
+		identity := resolveRequestSessionIdentity(headers, []byte(`{}`))
+		wantSeed := uuid.NewSHA1(uuid.NameSpaceOID, []byte("codex2api:prompt-cache:shared-key")).String()
+		if identity.upstreamSeed != wantSeed || identity.explicitUpstreamID != "" {
+			t.Fatalf("API-key upstream fallback changed: seed=%q explicit=%q want=%q", identity.upstreamSeed, identity.explicitUpstreamID, wantSeed)
+		}
+		if identity.affinityID == identity.upstreamSeed {
+			t.Fatalf("local affinity did not remain separate from API-key upstream seed %q", identity.upstreamSeed)
+		}
+	})
 }
 
 func TestResolveExplicitSessionIDDoesNotUseAPIKeyFallback(t *testing.T) {

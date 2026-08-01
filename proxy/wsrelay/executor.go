@@ -144,6 +144,10 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 
 	// 准备请求头
 	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders)
+	// Record the attempted handshake UA immediately so failed handshakes are
+	// still auditable. A reused connection replaces this below with the UA that
+	// was actually sent when that connection was established.
+	proxy.RecordUpstreamUserAgent(ctx, headers.Get("User-Agent"))
 
 	// Resin 反代：注入账号身份头
 	if proxy.IsResinEnabled() {
@@ -172,6 +176,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
+	acquireStart := time.Now()
 	if prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String()); prevRespID != "" {
 		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey); pwc != nil {
 			wc, pr, poolSessionID = pwc, ppr, slotKey
@@ -188,8 +193,13 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
 		}
 	}
+	// 取连耗时（busy 排队 + 探活 + 握手）计入本 attempt 的 ws_acquire_ms（issue #413）
+	proxy.AddWsAcquireDuration(ctx, time.Since(acquireStart))
 	if err2 != nil {
 		return nil, err2
+	}
+	if wc.upstreamUserAgentKnown {
+		proxy.RecordUpstreamUserAgent(ctx, wc.upstreamUserAgent)
 	}
 
 	// 发送请求，失败时最多重试 2 次（重建连接）。
@@ -207,9 +217,14 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		case <-time.After(time.Duration(retries+1) * 200 * time.Millisecond):
 		}
 
+		reacquireStart := time.Now()
 		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
+		proxy.AddWsAcquireDuration(ctx, time.Since(reacquireStart))
 		if err2 != nil {
 			return nil, err2
+		}
+		if wc.upstreamUserAgentKnown {
+			proxy.RecordUpstreamUserAgent(ctx, wc.upstreamUserAgent)
 		}
 		sendErr = e.sendRequest(wc, wsBody, pr.RequestID)
 	}
@@ -298,6 +313,10 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 		if version != "" {
 			headers.Set("Version", version)
 		}
+	} else {
+		// Keep an explicit empty header entry so net/http Request.Write suppresses
+		// its implicit Go-http-client/1.1 fallback during the WS handshake.
+		headers["User-Agent"] = []string{""}
 	}
 	if betaFeatures := strings.TrimSpace(ginHeaders.Get("X-Codex-Beta-Features")); betaFeatures != "" {
 		headers.Set("X-Codex-Beta-Features", betaFeatures)
@@ -644,6 +663,13 @@ func ExecuteRequestWebsocket(ctx context.Context, account *auth.Account, request
 	exec := GetExecutor()
 	wsResp, err := exec.ExecuteRequestViaWebsocket(ctx, account, requestBody, sessionID, proxyOverride, apiKey, deviceCfg, headers, poolRouteKey)
 	if err != nil {
+		// 握手阶段的上游 401（token 失效/撤销）还原成真实状态码的 HTTP 响应返回，
+		// 而不是 transport 错误：否则 401 在使用日志里只会以 598/transport 出现，
+		// 且账号既不触发 unauthorized 冷却也不触发鉴权探针，失效账号会一直留在
+		// 调度池里被反复拨号（对比 HTTP 路径的 401 直接可见并立即冷却）。
+		if resp, ok := handshakeUnauthorizedHTTPResponse(err); ok {
+			return resp, nil
+		}
 		return nil, err
 	}
 

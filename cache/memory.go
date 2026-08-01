@@ -29,12 +29,18 @@ type memoryRuntimeEntry struct {
 	expiresAt time.Time
 }
 
+type memoryLeaseEntry struct {
+	owner     string
+	expiresAt time.Time
+}
+
 // MemoryTokenCache 为单机轻量部署提供进程内 token 缓存和刷新锁。
 // 重启后缓存丢失属于预期行为。
 type MemoryTokenCache struct {
 	mu        sync.RWMutex
 	tokens    map[int64]memoryTokenEntry
 	locks     map[int64]time.Time
+	leases    map[string]memoryLeaseEntry
 	sessions  map[string]memorySessionAffinityEntry
 	responses map[string]memoryResponseContextEntry
 	runtime   map[string]memoryRuntimeEntry
@@ -49,6 +55,7 @@ func NewMemory(poolSize int) TokenCache {
 	tc := &MemoryTokenCache{
 		tokens:    make(map[int64]memoryTokenEntry),
 		locks:     make(map[int64]time.Time),
+		leases:    make(map[string]memoryLeaseEntry),
 		sessions:  make(map[string]memorySessionAffinityEntry),
 		responses: make(map[string]memoryResponseContextEntry),
 		runtime:   make(map[string]memoryRuntimeEntry),
@@ -74,6 +81,11 @@ func (tc *MemoryTokenCache) cleanupLoop() {
 		for id, until := range tc.locks {
 			if now.After(until) {
 				delete(tc.locks, id)
+			}
+		}
+		for key, entry := range tc.leases {
+			if now.After(entry.expiresAt) {
+				delete(tc.leases, key)
 			}
 		}
 		for key, entry := range tc.sessions {
@@ -197,6 +209,45 @@ func (tc *MemoryTokenCache) AcquireRefreshLock(ctx context.Context, accountID in
 func (tc *MemoryTokenCache) ReleaseRefreshLock(ctx context.Context, accountID int64) error {
 	tc.mu.Lock()
 	delete(tc.locks, accountID)
+	tc.mu.Unlock()
+	return nil
+}
+
+func memoryLeaseKey(namespace, key string) string {
+	return strings.TrimSpace(namespace) + "\x00" + strings.TrimSpace(key)
+}
+
+func (tc *MemoryTokenCache) AcquireLease(ctx context.Context, namespace, key, owner string, ttl time.Duration) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return false, fmt.Errorf("lease owner is empty")
+	}
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	leaseKey := memoryLeaseKey(namespace, key)
+	now := time.Now()
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if entry, ok := tc.leases[leaseKey]; ok && now.Before(entry.expiresAt) {
+		return false, nil
+	}
+	tc.leases[leaseKey] = memoryLeaseEntry{owner: owner, expiresAt: now.Add(ttl)}
+	return true, nil
+}
+
+func (tc *MemoryTokenCache) ReleaseLease(ctx context.Context, namespace, key, owner string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	leaseKey := memoryLeaseKey(namespace, key)
+	tc.mu.Lock()
+	if entry, ok := tc.leases[leaseKey]; ok && entry.owner == strings.TrimSpace(owner) {
+		delete(tc.leases, leaseKey)
+	}
 	tc.mu.Unlock()
 	return nil
 }
@@ -398,3 +449,53 @@ func (tc *MemoryTokenCache) DeleteRuntime(ctx context.Context, namespace string,
 	tc.mu.Unlock()
 	return nil
 }
+
+// IncrRuntimeCounters 在单锁内累加计数器。计数器以 JSON 对象存在 runtime 表里，
+// 语义与 Redis 的 HINCRBYFLOAT 一致，但只对本进程可见。
+func (tc *MemoryTokenCache) IncrRuntimeCounters(ctx context.Context, namespace string, key string, deltas map[string]float64, ttl time.Duration) error {
+	mapKey := runtimeMapKey(namespace, key)
+	if mapKey == "" || len(deltas) == 0 {
+		return nil
+	}
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	counters := make(map[string]float64)
+	if entry, ok := tc.runtime[mapKey]; ok {
+		if entry.expiresAt.IsZero() || time.Now().Before(entry.expiresAt) {
+			_ = json.Unmarshal(entry.value, &counters)
+		}
+	}
+	for field, delta := range deltas {
+		if delta == 0 {
+			continue
+		}
+		counters[field] += delta
+	}
+	encoded, err := json.Marshal(counters)
+	if err != nil {
+		return err
+	}
+	tc.runtime[mapKey] = memoryRuntimeEntry{
+		value:     encoded,
+		expiresAt: time.Now().Add(ttl),
+	}
+	return nil
+}
+
+func (tc *MemoryTokenCache) GetRuntimeCounters(ctx context.Context, namespace string, key string) (map[string]float64, error) {
+	raw, ok, err := tc.GetRuntime(ctx, namespace, key)
+	if err != nil || !ok || len(raw) == 0 {
+		return nil, err
+	}
+	counters := make(map[string]float64)
+	if err := json.Unmarshal(raw, &counters); err != nil {
+		return nil, nil
+	}
+	return counters, nil
+}
+
+// SharedAcrossInstances 报告进程内内存缓存不跨实例共享。
+func (tc *MemoryTokenCache) SharedAcrossInstances() bool { return false }

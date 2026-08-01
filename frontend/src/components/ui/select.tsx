@@ -2,6 +2,7 @@ import { Check, ChevronDown } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { cn } from '@/lib/utils'
+import { selectAutoScrollKey } from '@/lib/selectScroll'
 
 export interface SelectOption {
   label: string
@@ -77,6 +78,7 @@ export function Select({
   const listRef = useRef<HTMLDivElement>(null)
   const touchStartRef = useRef<{ x: number; y: number } | null>(null)
   const selectedOption = options.find((option) => option.value === value)
+  const autoScrollKey = selectAutoScrollKey(open, position !== null, value)
 
   const computePosition = useCallback(() => {
     const trigger = triggerRef.current
@@ -108,12 +110,12 @@ export function Select({
 
   // 打开后把当前选中项滚进可视区。
   useLayoutEffect(() => {
-    if (!open || !position) return
+    if (autoScrollKey === null) return
     const list = listRef.current
     if (!list) return
     const selected = list.querySelector<HTMLElement>('[aria-selected="true"]')
     selected?.scrollIntoView({ block: 'nearest' })
-  }, [open, position, value])
+  }, [autoScrollKey])
 
   useEffect(() => {
     if (!open) return
@@ -136,15 +138,23 @@ export function Select({
       }
     }
 
-    const handleReposition = () => computePosition()
+    const handleReposition = (event: Event) => {
+      const target = event.target
+      // list.scrollTop 的变化也会被 window capture 阶段收到；此时触发重定位
+      // 只会制造额外 render，并可能把用户重新拉回当前选中项。
+      if (target instanceof Node && dropdownRef.current?.contains(target)) return
+      computePosition()
+    }
 
     // 在 document capture 阶段手动滚动：晚于 React 挂载、与 remove-scroll 同阶段，
     // 即使其 preventDefault 了默认滚动，我们仍可通过改 scrollTop 完成滚动。
+    // 命中判断放宽到整个 dropdown（含滚动条 gutter、列表内边距等 list 子树之外的
+    // 区域），滚动仍作用于内部可滚动列表，避免鼠标停在边缘时滚不动。
     const handleWheel = (event: WheelEvent) => {
       const list = listRef.current
       if (!list) return
       const target = event.target as Node | null
-      if (!target || !list.contains(target)) return
+      if (!target || !dropdownRef.current?.contains(target)) return
       if (applyManualScroll(list, event.deltaX, event.deltaY)) {
         event.preventDefault()
       }
@@ -154,7 +164,7 @@ export function Select({
       const list = listRef.current
       if (!list) return
       const target = event.target as Node | null
-      if (!target || !list.contains(target)) return
+      if (!target || !dropdownRef.current?.contains(target)) return
       const touch = event.touches[0]
       if (!touch) return
       touchStartRef.current = { x: touch.clientX, y: touch.clientY }
@@ -165,7 +175,7 @@ export function Select({
       const start = touchStartRef.current
       if (!list || !start) return
       const target = event.target as Node | null
-      if (!target || !list.contains(target)) return
+      if (!target || !dropdownRef.current?.contains(target)) return
       const touch = event.touches[0]
       if (!touch) return
       const deltaX = start.x - touch.clientX
@@ -246,16 +256,17 @@ export function Select({
                 bottom: position.openUp ? window.innerHeight - position.top : undefined,
                 left: position.left,
                 width: position.width,
-                maxHeight: position.maxHeight,
+                // 高度约束交给内层可滚动列表单点控制，避免双重 maxHeight + flex 布局
+                // 让内层 clientHeight/scrollHeight 计算出现歧义、导致 wheel 判空滚不动。
               }}
               className={cn(
-                'pointer-events-auto z-[1000] flex flex-col overflow-hidden rounded-md border border-border bg-popover shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm'
+                'pointer-events-auto z-[1000] overflow-hidden rounded-md border border-border bg-popover shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm'
               )}
             >
               <div
                 ref={listRef}
                 className={cn(
-                  'min-h-0 flex-1 overscroll-contain overflow-x-hidden overflow-y-auto',
+                  'overscroll-contain overflow-x-hidden overflow-y-auto',
                   // 始终显示细滚动条，避免 macOS 叠加滚动条「看不见、以为不能滚」。
                   '[scrollbar-gutter:stable] [scrollbar-width:thin]',
                   '[&::-webkit-scrollbar]:w-1.5',

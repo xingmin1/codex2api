@@ -43,6 +43,8 @@ type oauthSession struct {
 	CodeVerifier string
 	RedirectURI  string
 	ProxyURL     string
+	ContactEmail string // 自助门户提交者的联系邮箱（仅自助流程写入，作为备注标识）
+	SelfService  bool   // 是否来自公开自助门户（决定待审核入池路径）
 	CreatedAt    time.Time
 
 	// 回调自动捕获字段
@@ -178,6 +180,14 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 		CreatedAt:    time.Now(),
 	})
 
+	c.JSON(http.StatusOK, gin.H{
+		"auth_url":   buildOAuthAuthorizeURL(redirectURI, state, codeVerifier),
+		"session_id": sessionID,
+	})
+}
+
+// buildOAuthAuthorizeURL 组装 Codex CLI PKCE 授权链接（admin 与公开自助门户共用）。
+func buildOAuthAuthorizeURL(redirectURI, state, codeVerifier string) string {
 	params := neturl.Values{}
 	params.Set("response_type", "code")
 	params.Set("client_id", oauthClientID)
@@ -188,11 +198,7 @@ func (h *Handler) GenerateOAuthURL(c *gin.Context) {
 	params.Set("code_challenge_method", "S256")
 	params.Set("id_token_add_organizations", "true")
 	params.Set("codex_cli_simplified_flow", "true")
-
-	c.JSON(http.StatusOK, gin.H{
-		"auth_url":   oauthAuthorizeURL + "?" + params.Encode(),
-		"session_id": sessionID,
-	})
+	return oauthAuthorizeURL + "?" + params.Encode()
 }
 
 // ExchangeOAuthCode 用授权码兑换 token，并写入新账号
@@ -309,16 +315,10 @@ func (h *Handler) findOAuthIdentityDuplicate(ctx context.Context, seed tokenCred
 		return 0, nil
 	}
 	seed = normalizeTokenCredentialSeed(seed)
-	// 身份键优先用工作区 ID；个人账号 JWT 可能只有 user_id，此时用它兜底，
-	// 否则 AT 轮换后按原文去重永远失配，同一账号会被重复导入。
-	identity := seed.accountID
-	if identity == "" {
-		identity = seed.userID
-	}
-	if seed.email == "" || identity == "" {
+	if seed.email == "" || seed.workspaceID == "" {
 		return 0, nil
 	}
-	id, err := h.db.FindActiveAccountByOAuthIdentity(ctx, seed.email, identity, excludeID)
+	id, err := h.db.FindActiveAccountByOAuthIdentity(ctx, seed.email, seed.workspaceID, excludeID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return 0, nil
@@ -330,7 +330,7 @@ func (h *Handler) findOAuthIdentityDuplicate(ctx context.Context, seed tokenCred
 
 func (h *Handler) upsertOAuthIdentityAccount(ctx context.Context, name, proxyURL string, seed tokenCredentialSeed, source string) (int64, bool, error) {
 	seed = normalizeTokenCredentialSeed(seed)
-	if seed.email == "" || (seed.accountID == "" && seed.userID == "") {
+	if seed.email == "" || seed.workspaceID == "" {
 		id, err := h.db.InsertAccountWithCredentials(ctx, name, tokenCredentialMap(seed), proxyURL)
 		if err != nil {
 			return 0, false, err
@@ -339,6 +339,8 @@ func (h *Handler) upsertOAuthIdentityAccount(ctx context.Context, name, proxyURL
 		h.loadInsertedTokenAccount(id, name, proxyURL, seed, source)
 		return id, false, nil
 	}
+	h.mergeDuplicateMu.Lock()
+	defer h.mergeDuplicateMu.Unlock()
 
 	if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, 0); err != nil {
 		return 0, false, err
@@ -420,7 +422,9 @@ func (h *Handler) triggerTokenAccountProbe(id int64, source string) {
 	if account := h.store.FindByID(id); account != nil && account.GetAccessToken() != "" {
 		h.triggerImportedAccountUsageProbe(id, source)
 	} else if !h.store.GetLazyMode() && !strings.HasPrefix(source, "import") {
-		go h.refreshImportedAccountAndProbe(id, source+"_refresh")
+		h.startDBBackgroundTask(func(ctx context.Context) {
+			h.refreshImportedAccountAndProbe(ctx, id, source+"_refresh")
+		})
 	}
 }
 
@@ -509,6 +513,10 @@ func (h *Handler) UpdateOAuthAccountCode(c *gin.Context) {
 		idToken:      tokenResp.IDToken,
 		expiresIn:    tokenResp.ExpiresIn,
 	})
+	if seed.email != "" && seed.workspaceID != "" {
+		h.mergeDuplicateMu.Lock()
+		defer h.mergeDuplicateMu.Unlock()
+	}
 	if duplicateID, err := h.findOAuthIdentityDuplicate(ctx, seed, id); err != nil {
 		writeInternalError(c, err)
 		return

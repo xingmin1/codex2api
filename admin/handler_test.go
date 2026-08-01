@@ -21,6 +21,7 @@ import (
 	"github.com/codex2api/cache"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
 
@@ -109,7 +110,7 @@ func TestSummarizeDashboardAccountsMatchesAccountPageBuckets(t *testing.T) {
 	rateLimited.SetCooldownWithReason(time.Hour, "rate_limited")
 	normal := &auth.Account{DBID: 5, Status: auth.StatusReady, AccessToken: "at-5"}
 
-	got := summarizeDashboardAccounts(rows, []*auth.Account{
+	got, _ := summarizeDashboardAccounts(rows, []*auth.Account{
 		activeFromStaleDB,
 		unauthorized,
 		disabled,
@@ -421,7 +422,7 @@ func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
 	handler := &Handler{
 		refreshAccount: func(_ context.Context, id int64) error {
 			if id == 8 {
-				return errors.New("账号 8 不存在")
+				return errors.New("token endpoint returned status 401")
 			}
 			return nil
 		},
@@ -445,6 +446,10 @@ func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
 		`"type":"progress"`,
 		`"type":"complete"`,
 		`"action":"batch_refresh"`,
+		`"status":"success"`,
+		`"status":"failed"`,
+		`"http_status":200`,
+		`"http_status":401`,
 		`"success":1`,
 		`"failed":1`,
 	} {
@@ -825,6 +830,116 @@ func TestGetUsageLogsRejectsInvalidAPIKeyID(t *testing.T) {
 	}
 }
 
+func TestGetUsageLogsRejectsInvalidCompactionFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	tests := []struct {
+		name      string
+		query     string
+		wantError string
+	}{
+		{
+			name:      "compact",
+			query:     "compact=maybe",
+			wantError: "compact 参数无效，需要 true 或 false",
+		},
+		{
+			name:      "compaction history",
+			query:     "has_compaction_history=1",
+			wantError: "has_compaction_history 参数无效，需要 true 或 false",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			handler := &Handler{}
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start=2026-01-01T00:00:00Z&end=2026-01-02T00:00:00Z&page=1&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ctx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+			}
+			assertErrorMessage(t, recorder, test.wantError)
+		})
+	}
+}
+
+func TestGetUsageLogsAppliesCompactionFilters(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	ctx := context.Background()
+	for _, input := range []*database.UsageLogInput{
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "trigger-only", StatusCode: http.StatusOK, Compact: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "history-only", StatusCode: http.StatusOK, HasCompactionHistory: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "both", StatusCode: http.StatusOK, Compact: true, HasCompactionHistory: true},
+		{AccountID: accountID, Endpoint: "/v1/responses", Model: "neither", StatusCode: http.StatusOK},
+	} {
+		if err := db.InsertUsageLog(ctx, input); err != nil {
+			t.Fatalf("InsertUsageLog(%s): %v", input.Model, err)
+		}
+	}
+	db.FlushUsageLogs()
+
+	handler := &Handler{db: db}
+	start := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	end := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	tests := []struct {
+		name       string
+		query      string
+		wantModels map[string]bool
+	}{
+		{
+			name:       "trigger",
+			query:      "compact=true",
+			wantModels: map[string]bool{"trigger-only": true, "both": true},
+		},
+		{
+			name:       "history",
+			query:      "has_compaction_history=true",
+			wantModels: map[string]bool{"history-only": true, "both": true},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = httptest.NewRequest(
+				http.MethodGet,
+				"/api/admin/usage/logs?start="+start+"&end="+end+"&page=1&page_size=20&"+test.query,
+				nil,
+			)
+
+			handler.GetUsageLogs(ginCtx)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+			}
+			var page database.UsageLogPage
+			if err := json.Unmarshal(recorder.Body.Bytes(), &page); err != nil {
+				t.Fatalf("decode response: %v", err)
+			}
+			if page.Total != int64(len(test.wantModels)) || len(page.Logs) != len(test.wantModels) {
+				t.Fatalf("total/logs = %d/%d, want %d; body=%s", page.Total, len(page.Logs), len(test.wantModels), recorder.Body.String())
+			}
+			for _, logRow := range page.Logs {
+				if !test.wantModels[logRow.Model] {
+					t.Fatalf("unexpected model %q for %s filter", logRow.Model, test.name)
+				}
+			}
+		})
+	}
+}
+
 func TestGetUsageLogsAllowsFiveHundredPageSize(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -959,6 +1074,487 @@ func TestRuntimeStatusRouteReturnsDependencySnapshot(t *testing.T) {
 	}
 }
 
+func TestUpdateSettingsPersistsAutoResetCreditsAcrossPartialUpdates(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	settings.ModelPricingOverrides = `{"gpt-5":{"input":1}}`
+	settings.ModelPricingSyncURL = "https://example.com/pricing.json"
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	update := func(body string) {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+
+		handler.UpdateSettings(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+		}
+	}
+
+	// 阈值必须能在开关关闭时先保存，避免启用后的即时扫描使用旧默认值。
+	update(`{"auto_reset_credits_before_expiry_min":90}`)
+	select {
+	case <-handler.autoResetCreditsWake:
+	default:
+		t.Fatal("threshold change did not queue an immediate scan")
+	}
+	beforeEnable := proxy.CurrentRuntimeSettings()
+	if beforeEnable.AutoResetCreditsEnabled {
+		t.Fatal("AutoResetCreditsEnabled = true before explicit enable")
+	}
+	if beforeEnable.AutoResetCreditsBeforeExpiryMin != 90 {
+		t.Fatalf("runtime threshold before enable = %d, want 90", beforeEnable.AutoResetCreditsBeforeExpiryMin)
+	}
+	update(`{"auto_reset_credits_enabled":true}`)
+	select {
+	case <-handler.autoResetCreditsWake:
+	default:
+		t.Fatal("enable change did not queue an immediate scan")
+	}
+	update(`{"auto_reset_credits_enabled":true,"auto_reset_credits_before_expiry_min":90}`)
+	select {
+	case <-handler.autoResetCreditsWake:
+		t.Fatal("same-value auto-reset settings queued another scan")
+	default:
+	}
+	update(`{"site_name":"Codex2API Test"}`)
+	for _, boundary := range []int{10, 10080, 90} {
+		update(fmt.Sprintf(`{"auto_reset_credits_before_expiry_min":%d}`, boundary))
+		if got := proxy.CurrentRuntimeSettings().AutoResetCreditsBeforeExpiryMin; got != boundary {
+			t.Fatalf("runtime boundary = %d, want %d", got, boundary)
+		}
+		select {
+		case <-handler.autoResetCreditsWake:
+		default:
+			t.Fatalf("boundary %d did not queue an immediate scan", boundary)
+		}
+	}
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted == nil {
+		t.Fatal("GetSystemSettings returned nil")
+	}
+	if !persisted.AutoResetCreditsEnabled {
+		t.Fatal("AutoResetCreditsEnabled = false, want true after unrelated partial update")
+	}
+	if persisted.AutoResetCreditsBeforeExpiryMin != 90 {
+		t.Fatalf("AutoResetCreditsBeforeExpiryMin = %d, want 90", persisted.AutoResetCreditsBeforeExpiryMin)
+	}
+	if persisted.ModelPricingOverrides != settings.ModelPricingOverrides {
+		t.Fatalf("ModelPricingOverrides = %q, want %q", persisted.ModelPricingOverrides, settings.ModelPricingOverrides)
+	}
+	if persisted.ModelPricingSyncURL != settings.ModelPricingSyncURL {
+		t.Fatalf("ModelPricingSyncURL = %q, want %q", persisted.ModelPricingSyncURL, settings.ModelPricingSyncURL)
+	}
+}
+
+func TestUpdateSettingsResponseIncludesRetrySettings(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"retry_interval_ms":2500,"transport_retry_policy":"sticky"}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response.RetryIntervalMS != 2500 {
+		t.Fatalf("retry_interval_ms = %d, want 2500", response.RetryIntervalMS)
+	}
+	if response.TransportRetryPolicy != "sticky" {
+		t.Fatalf("transport_retry_policy = %q, want sticky", response.TransportRetryPolicy)
+	}
+}
+
+func TestUpdateSettingsPersistsWeakNetworkMode(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(
+		http.MethodPut,
+		"/api/admin/settings",
+		strings.NewReader(`{"codex_ws_weak_network_mode":true}`),
+	)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var response settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if !response.CodexWSWeakNetworkMode {
+		t.Fatal("response codex_ws_weak_network_mode = false, want true")
+	}
+	if !proxy.CurrentRuntimeSettings().CodexWSWeakNetworkMode {
+		t.Fatal("runtime codex_ws_weak_network_mode = false, want true")
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted == nil || !persisted.CodexWSWeakNetworkMode {
+		t.Fatal("persisted codex_ws_weak_network_mode = false, want true")
+	}
+}
+
+func TestPromptFilterAdvancedSettingsRoundTripPreservesUnknownFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	settings.PromptFilterAdvancedConfig = `{
+		"normalization":{"enabled":true,"future_decoder":"v2"},
+		"guard":{"mode":"shadow","future_guard":{"enabled":true}},
+		"future_root":{"revision":7}
+	}`
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	newAPISecret := strings.Repeat("s", 32)
+	if err := db.SetPromptFilterNewAPISecret(context.Background(), newAPISecret); err != nil {
+		t.Fatalf("seed NewAPI secret: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	getAdvanced := func() string {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil)
+		handler.GetSettings(ctx)
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("GET status=%d body=%s", recorder.Code, recorder.Body.String())
+		}
+		var response settingsResponse
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode GET response: %v", err)
+		}
+		return response.PromptFilterAdvancedConfig
+	}
+
+	assertUnknownAdvancedFields(t, getAdvanced())
+
+	patchBytes, err := json.Marshal(map[string]string{
+		"prompt_filter_advanced_config": `{"guard":{"mode":"enforce"}}`,
+	})
+	if err != nil {
+		t.Fatalf("marshal update: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", bytes.NewReader(patchBytes))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+
+	var updateResponse settingsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &updateResponse); err != nil {
+		t.Fatalf("decode PUT response: %v", err)
+	}
+	assertUnknownAdvancedFields(t, updateResponse.PromptFilterAdvancedConfig)
+	assertAdvancedGuardMode(t, updateResponse.PromptFilterAdvancedConfig, "enforce")
+	assertUnknownAdvancedFields(t, getAdvanced())
+	assertAdvancedGuardMode(t, getAdvanced(), "enforce")
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	assertUnknownAdvancedFields(t, persisted.PromptFilterAdvancedConfig)
+	assertAdvancedGuardMode(t, persisted.PromptFilterAdvancedConfig, "enforce")
+	if got := store.GetPromptFilterConfig().Advanced.Guard.Mode; got != "enforce" {
+		t.Fatalf("runtime guard.mode = %q, want enforce", got)
+	}
+	if got := store.GetPromptFilterConfig().Advanced.NewAPI.Secret; got != newAPISecret {
+		t.Fatalf("runtime NewAPI secret changed during advanced update")
+	}
+	if strings.Contains(updateResponse.PromptFilterAdvancedConfig, newAPISecret) {
+		t.Fatal("NewAPI secret leaked into prompt_filter_advanced_config")
+	}
+
+	// An unrelated partial update must not reserialize the typed runtime config
+	// and erase fields unknown to this binary.
+	unrelated := httptest.NewRecorder()
+	unrelatedCtx, _ := gin.CreateTestContext(unrelated)
+	unrelatedCtx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(`{"site_name":"Raw Config Test"}`))
+	unrelatedCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(unrelatedCtx)
+	if unrelated.Code != http.StatusOK {
+		t.Fatalf("unrelated PUT status=%d body=%s", unrelated.Code, unrelated.Body.String())
+	}
+	persisted, err = db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings after unrelated update: %v", err)
+	}
+	assertUnknownAdvancedFields(t, persisted.PromptFilterAdvancedConfig)
+}
+
+func TestPromptFilterAdvancedSettingsRejectInvalidJSONWithoutReplacingLastValidState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	settings.PromptFilterAdvancedConfig = `{"guard":{"mode":"shadow"},"future_root":{"revision":9}}`
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	beforeRaw := store.GetPromptFilterAdvancedConfig()
+	beforeMode := store.GetPromptFilterConfig().Advanced.Guard.Mode
+	payload, err := json.Marshal(map[string]string{"prompt_filter_advanced_config": `{"guard":`})
+	if err != nil {
+		t.Fatalf("marshal invalid update: %v", err)
+	}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", bytes.NewReader(payload))
+	ctx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := store.GetPromptFilterAdvancedConfig(); got != beforeRaw {
+		t.Fatalf("runtime raw config changed after invalid JSON\nbefore=%s\nafter=%s", beforeRaw, got)
+	}
+	if got := store.GetPromptFilterConfig().Advanced.Guard.Mode; got != beforeMode {
+		t.Fatalf("runtime guard.mode = %q, want unchanged %q", got, beforeMode)
+	}
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted.PromptFilterAdvancedConfig != settings.PromptFilterAdvancedConfig {
+		t.Fatalf("persisted raw config changed after invalid JSON\nbefore=%s\nafter=%s", settings.PromptFilterAdvancedConfig, persisted.PromptFilterAdvancedConfig)
+	}
+}
+
+func assertUnknownAdvancedFields(t *testing.T, raw string) {
+	t.Helper()
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &root); err != nil {
+		t.Fatalf("decode advanced config: %v raw=%s", err, raw)
+	}
+	if _, ok := root["future_root"]; !ok {
+		t.Fatalf("future_root missing from %s", raw)
+	}
+	var normalization map[string]json.RawMessage
+	if err := json.Unmarshal(root["normalization"], &normalization); err != nil {
+		t.Fatalf("decode normalization: %v", err)
+	}
+	if _, ok := normalization["future_decoder"]; !ok {
+		t.Fatalf("future_decoder missing from %s", root["normalization"])
+	}
+	var guard map[string]json.RawMessage
+	if err := json.Unmarshal(root["guard"], &guard); err != nil {
+		t.Fatalf("decode guard: %v", err)
+	}
+	if _, ok := guard["future_guard"]; !ok {
+		t.Fatalf("future_guard missing from %s", root["guard"])
+	}
+}
+
+func assertAdvancedGuardMode(t *testing.T, raw, want string) {
+	t.Helper()
+	var document struct {
+		Guard struct {
+			Mode string `json:"mode"`
+		} `json:"guard"`
+	}
+	if err := json.Unmarshal([]byte(raw), &document); err != nil {
+		t.Fatalf("decode advanced config: %v", err)
+	}
+	if document.Guard.Mode != want {
+		t.Fatalf("guard.mode = %q, want %q raw=%s", document.Guard.Mode, want, raw)
+	}
+}
+
+func TestUpdateSettingsRejectsAutoResetCreditsWindowOutOfRange(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := &Handler{}
+
+	for _, value := range []int{9, 10081} {
+		recorder := httptest.NewRecorder()
+		ctx, _ := gin.CreateTestContext(recorder)
+		body := fmt.Sprintf(`{"auto_reset_credits_before_expiry_min":%d}`, value)
+		ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(body))
+		ctx.Request.Header.Set("Content-Type", "application/json")
+
+		handler.UpdateSettings(ctx)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("value=%d status=%d, want %d body=%s", value, recorder.Code, http.StatusBadRequest, recorder.Body.String())
+		}
+	}
+}
+
+func TestUpdateSettingsDoesNotEnableAutoResetCreditsWhenPersistenceFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	proxy.ApplyRuntimeSettingsFromSystem(settings)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	requestCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(`{"auto_reset_credits_enabled":true}`))
+	ctx.Request = request.WithContext(requestCtx)
+	ctx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.UpdateSettings(ctx)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d, want %d body=%s", recorder.Code, http.StatusInternalServerError, recorder.Body.String())
+	}
+	if current := proxy.CurrentRuntimeSettings(); current.AutoResetCreditsEnabled {
+		t.Fatal("AutoResetCreditsEnabled became true after persistence failure")
+	}
+}
+
+func TestAutoResetCreditsSettingsUseDatabaseAuthorityOnStaleInstance(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	previousRuntime := proxy.CurrentRuntimeSettings()
+	t.Cleanup(func() { proxy.ApplyRuntimeSettings(previousRuntime) })
+
+	db := newTestAdminDB(t)
+	tc := cache.NewMemory(4)
+	t.Cleanup(func() { _ = tc.Close() })
+	settings := defaultBootstrapSettings()
+	settings.AutoResetCreditsEnabled = false
+	settings.AutoResetCreditsBeforeExpiryMin = 60
+	if err := db.UpdateSystemSettings(context.Background(), settings); err != nil {
+		t.Fatalf("seed settings: %v", err)
+	}
+	store := auth.NewStore(db, tc, settings)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, db, tc, proxy.NewRateLimiter(settings.GlobalRPM), "admin-secret")
+
+	staleRuntime := proxy.DefaultRuntimeSettings()
+	staleRuntime.AutoResetCreditsEnabled = true
+	staleRuntime.AutoResetCreditsBeforeExpiryMin = 90
+	proxy.ApplyRuntimeSettings(staleRuntime)
+
+	getRecorder := httptest.NewRecorder()
+	getCtx, _ := gin.CreateTestContext(getRecorder)
+	getCtx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/settings", nil)
+	handler.GetSettings(getCtx)
+	if getRecorder.Code != http.StatusOK {
+		t.Fatalf("GET status=%d body=%s", getRecorder.Code, getRecorder.Body.String())
+	}
+	var response settingsResponse
+	if err := json.Unmarshal(getRecorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode GET settings: %v", err)
+	}
+	if response.AutoResetCreditsEnabled || response.AutoResetCreditsBeforeExpiryMin != 60 {
+		t.Fatalf("GET auto settings=(%v,%d), want DB authority (false,60)", response.AutoResetCreditsEnabled, response.AutoResetCreditsBeforeExpiryMin)
+	}
+
+	updateRecorder := httptest.NewRecorder()
+	updateCtx, _ := gin.CreateTestContext(updateRecorder)
+	updateCtx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(`{"site_name":"Stale Replica"}`))
+	updateCtx.Request.Header.Set("Content-Type", "application/json")
+	handler.UpdateSettings(updateCtx)
+	if updateRecorder.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", updateRecorder.Code, updateRecorder.Body.String())
+	}
+
+	persisted, err := db.GetSystemSettings(context.Background())
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if persisted.AutoResetCreditsEnabled || persisted.AutoResetCreditsBeforeExpiryMin != 60 {
+		t.Fatalf("persisted auto settings=(%v,%d), want (false,60)", persisted.AutoResetCreditsEnabled, persisted.AutoResetCreditsBeforeExpiryMin)
+	}
+	current := proxy.CurrentRuntimeSettings()
+	if current.AutoResetCreditsEnabled || current.AutoResetCreditsBeforeExpiryMin != 60 {
+		t.Fatalf("runtime auto settings=(%v,%d), want refreshed DB authority (false,60)", current.AutoResetCreditsEnabled, current.AutoResetCreditsBeforeExpiryMin)
+	}
+	select {
+	case <-handler.autoResetCreditsWake:
+		t.Fatal("unrelated stale-instance update queued an auto-reset scan")
+	default:
+	}
+}
+
 func TestUpdateAccountSchedulerRejectsInvalidID(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -1077,7 +1673,7 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 		{
 			name:    "base concurrency out of range",
 			body:    `{"base_concurrency_override":0}`,
-			message: "base_concurrency_override 超出范围，必须在 1..50 之间",
+			message: "base_concurrency_override 超出范围，必须 >= 1",
 		},
 		{
 			name:    "5h auto pause threshold out of range",
@@ -1637,7 +2233,7 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 	store.AddAccount(runtimeAccount2)
 	handler := &Handler{db: db, store: store}
 
-	body := fmt.Sprintf(`{"ids":[%d,%d,%d,%d],"enabled":false,"locked":true,"tags":["Ops","ops","blue"],"group_ids":[%d],"auto_pause_5h_threshold":0.8,"auto_pause_7d_disabled":true}`,
+	body := fmt.Sprintf(`{"ids":[%d,%d,%d,%d],"enabled":false,"locked":true,"tags":["Ops","ops","blue"],"group_ids":[%d],"score_bias_override":33,"base_concurrency_override":5,"scheduler_priority":7,"auto_pause_5h_threshold":0.8,"auto_pause_7d_disabled":true}`,
 		accountID1, accountID2, accountID1, accountID2+1000, groupID)
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
@@ -1676,6 +2272,15 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 		if len(row.Tags) != 2 || row.Tags[0] != "Ops" || row.Tags[1] != "blue" {
 			t.Fatalf("account %d tags = %v, want [Ops blue]", id, row.Tags)
 		}
+		if !row.ScoreBiasOverride.Valid || row.ScoreBiasOverride.Int64 != 33 {
+			t.Fatalf("account %d score_bias_override = %+v, want 33", id, row.ScoreBiasOverride)
+		}
+		if !row.BaseConcurrencyOverride.Valid || row.BaseConcurrencyOverride.Int64 != 5 {
+			t.Fatalf("account %d base_concurrency_override = %+v, want 5", id, row.BaseConcurrencyOverride)
+		}
+		if priority, ok := row.GetCredentialInt64("scheduler_priority"); !ok || priority != 7 {
+			t.Fatalf("account %d scheduler_priority = (%d, %t), want (7, true)", id, priority, ok)
+		}
 		threshold5h, ok := row.GetCredentialFloat64("auto_pause_5h_threshold")
 		if !ok || threshold5h != 0.8 {
 			t.Fatalf("account %d auto_pause_5h_threshold = (%v, %t), want (0.8, true)", id, threshold5h, ok)
@@ -1703,6 +2308,57 @@ func TestBatchUpdateAccountsPersistsMetadataAndSyncsRuntime(t *testing.T) {
 		t.Fatalf("runtime account 1 metadata tags=%v groups=%v", runtimeAccount1.Tags, runtimeAccount1.GroupIDs)
 	}
 	runtimeAccount1.Mu().RUnlock()
+	for _, account := range []*auth.Account{runtimeAccount1, runtimeAccount2} {
+		if scoreBias, ok := account.GetScoreBiasOverride(); !ok || scoreBias != 33 {
+			t.Fatalf("runtime account %d score bias = (%d, %t), want (33, true)", account.ID(), scoreBias, ok)
+		}
+		if baseConcurrency, ok := account.GetBaseConcurrencyOverride(); !ok || baseConcurrency != 5 {
+			t.Fatalf("runtime account %d base concurrency = (%d, %t), want (5, true)", account.ID(), baseConcurrency, ok)
+		}
+		if priority := account.GetSchedulerPriority(); priority != 7 {
+			t.Fatalf("runtime account %d scheduler priority = %d, want 7", account.ID(), priority)
+		}
+	}
+
+	resetRecorder := httptest.NewRecorder()
+	resetCtx, _ := gin.CreateTestContext(resetRecorder)
+	resetCtx.Request = httptest.NewRequest(
+		http.MethodPost,
+		"/api/admin/accounts/batch-update",
+		strings.NewReader(fmt.Sprintf(`{"ids":[%d,%d],"score_bias_override":null,"base_concurrency_override":null,"scheduler_priority":null}`, accountID1, accountID2)),
+	)
+	resetCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.BatchUpdateAccounts(resetCtx)
+	if resetRecorder.Code != http.StatusOK {
+		t.Fatalf("reset status = %d, want %d, body=%s", resetRecorder.Code, http.StatusOK, resetRecorder.Body.String())
+	}
+	rows, err = db.ListActive(ctx)
+	if err != nil {
+		t.Fatalf("ListActive after reset: %v", err)
+	}
+	for _, row := range rows {
+		if row.ID != accountID1 && row.ID != accountID2 {
+			continue
+		}
+		if row.ScoreBiasOverride.Valid || row.BaseConcurrencyOverride.Valid {
+			t.Fatalf("account %d overrides after reset = score %+v concurrency %+v, want null", row.ID, row.ScoreBiasOverride, row.BaseConcurrencyOverride)
+		}
+		if priority, _ := row.GetCredentialInt64("scheduler_priority"); priority != 0 {
+			t.Fatalf("account %d scheduler_priority after reset = %d, want 0", row.ID, priority)
+		}
+	}
+	for _, account := range []*auth.Account{runtimeAccount1, runtimeAccount2} {
+		if _, ok := account.GetScoreBiasOverride(); ok {
+			t.Fatalf("runtime account %d score bias still overridden after reset", account.ID())
+		}
+		if _, ok := account.GetBaseConcurrencyOverride(); ok {
+			t.Fatalf("runtime account %d base concurrency still overridden after reset", account.ID())
+		}
+		if priority := account.GetSchedulerPriority(); priority != 0 {
+			t.Fatalf("runtime account %d scheduler priority after reset = %d, want 0", account.ID(), priority)
+		}
+	}
 }
 
 func TestBatchUpdateAccountsRejectsMissingUpdateFields(t *testing.T) {
@@ -1968,6 +2624,7 @@ func TestRestoreAccountRejectsDuplicateOAuthIdentity(t *testing.T) {
 		"refresh_token": "rt-active",
 		"email":         "restore@example.com",
 		"account_id":    "acc-restore",
+		"workspace_id":  "workspace-restore",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert active: %v", err)
@@ -1976,6 +2633,7 @@ func TestRestoreAccountRejectsDuplicateOAuthIdentity(t *testing.T) {
 		"refresh_token": "rt-deleted",
 		"email":         "Restore@Example.com",
 		"account_id":    "acc-restore",
+		"workspace_id":  "workspace-restore",
 	}, "")
 	if err != nil {
 		t.Fatalf("Insert deleted: %v", err)

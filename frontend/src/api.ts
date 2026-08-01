@@ -1,12 +1,33 @@
 import type {
   AccountEventTrendPoint,
+  AccountPortalAuthURLResponse,
+  AccountPortalSubmitResponse,
   AccountUsageDetail,
   AddAccountRequest,
   AddATAccountRequest,
+  ImportAgentIdentityRequest,
+  ImportAgentIdentityResponse,
+  AgentIdentityBatchImportRequest,
+  AgentIdentityBatchImportResponse,
+  AgentIdentityImportItem,
   AddOpenAIResponsesAccountRequest,
+  AddGrokAccountRequest,
+  UpdateGrokAccountRequest,
+  FetchGrokModelsResponse,
+  GrokDeviceStartRequest,
+  GrokDeviceStartResponse,
+  GrokDevicePollRequest,
+  GrokDevicePollResponse,
+  GrokSSOImportRequest,
+  GrokSSOImportResponse,
+  GrokBatchImportRequest,
+  GrokBatchImportResponse,
   AdminErrorResponse,
   APIKeysResponse,
   APIKeyTokenStat,
+  APIKeyAccountStat,
+  APIKeyScopeUsageItem,
+  APIKeyScopeSummaryItem,
   AccountsResponse,
   ChartAggregation,
   CloneAccountRequest,
@@ -48,6 +69,7 @@ import type {
   SetupHintsResponse,
   CPAExportEntry,
   SystemSettings,
+  ObservedInstructionsResponse,
   UpdateAccountSchedulerRequest,
   UpdateAPIKeyRequest,
   UpdateOAuthAccountRequest,
@@ -173,6 +195,44 @@ async function requestPublic<T>(path: string, options: RequestInit = {}): Promis
   return (await res.json()) as T
 }
 
+// 公开账号自助门户:无鉴权头,错误体形如 {error:{message}}。
+// 单独实现以便解析嵌套的 message 并携带 HTTP 状态码(供 404「门户未开启」判定)。
+async function requestAccountPortal<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers)
+  if (options.body !== undefined && options.body !== null && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
+  const res = await fetch(path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+    headers,
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    let message = body.trim() || `HTTP ${res.status}`
+    try {
+      const parsed = JSON.parse(body) as { error?: { message?: string } | string; message?: string }
+      if (parsed && typeof parsed.error === 'object' && parsed.error?.message) {
+        message = parsed.error.message
+      } else if (typeof parsed.error === 'string' && parsed.error.trim()) {
+        message = parsed.error
+      } else if (typeof parsed.message === 'string' && parsed.message.trim()) {
+        message = parsed.message
+      }
+    } catch {
+      // 保留原始文本
+    }
+    const err = new Error(message) as Error & { status?: number }
+    err.status = res.status
+    throw err
+  }
+
+  const text = await res.text()
+  return (text ? JSON.parse(text) : undefined) as T
+}
+
 async function requestAPIKeyUsage<T>(path: string, apiKey: string, options: RequestInit = {}): Promise<T> {
   const headers = new Headers(options.headers)
   headers.set('Authorization', `Bearer ${apiKey}`)
@@ -189,6 +249,99 @@ async function requestAPIKeyUsage<T>(path: string, apiKey: string, options: Requ
   }
 
   return (await res.json()) as T
+}
+
+async function requestImageStudioPortal<T>(path: string, apiKey: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers)
+  headers.set('Authorization', `Bearer ${apiKey}`)
+  if (options.body && !(options.body instanceof FormData) && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
+
+  const res = await fetch('/api/image-studio' + path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+    headers,
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  if (res.status === 204) {
+    return undefined as T
+  }
+  const text = await res.text()
+  if (!text) {
+    return undefined as T
+  }
+  return JSON.parse(text) as T
+}
+
+async function requestImageStudioPortalBlob(path: string, apiKey: string, options: RequestInit = {}): Promise<Blob> {
+  const headers = new Headers(options.headers)
+  headers.set('Authorization', `Bearer ${apiKey}`)
+
+  const res = await fetch('/api/image-studio' + path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+    headers,
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  return res.blob()
+}
+
+/** 下载物：blob + 服务端在 Content-Disposition 里给出的文件名（可能为空）。 */
+export type NamedBlob = { blob: Blob; filename: string }
+
+/** parseContentDispositionFilename 取 Content-Disposition 里的 filename，取不到返回空串。 */
+function parseContentDispositionFilename(header: string | null): string {
+  if (!header) return ''
+  // RFC 5987 的 filename*=UTF-8''… 优先，其次普通 filename="…"。
+  const encoded = /filename\*=(?:UTF-8|utf-8)''([^;]+)/i.exec(header)
+  if (encoded?.[1]) {
+    try {
+      return decodeURIComponent(encoded[1].trim())
+    } catch {
+      // 编码不合法时退回普通 filename
+    }
+  }
+  const plain = /filename="?([^";]+)"?/i.exec(header)
+  return plain?.[1]?.trim() ?? ''
+}
+
+async function requestNamedBlob(path: string, options: RequestInit = {}): Promise<NamedBlob> {
+  const headers = new Headers(options.headers)
+
+  const adminKey = getAdminKey()
+  if (adminKey) {
+    headers.set('X-Admin-Key', adminKey)
+  }
+
+  const res = await fetch(BASE + path, {
+    ...options,
+    cache: options.cache ?? 'no-store',
+    headers,
+  })
+
+  if (!res.ok) {
+    const body = await res.text()
+    if (res.status === 401) {
+      resetAdminAuthState()
+    }
+    throw new Error(extractAdminErrorMessage(body, res.status))
+  }
+
+  return {
+    blob: await res.blob(),
+    filename: parseContentDispositionFilename(res.headers.get('Content-Disposition')),
+  }
 }
 
 async function requestBlob(path: string, options: RequestInit = {}): Promise<Blob> {
@@ -246,6 +399,18 @@ function buildOpsErrorSearchParams(params: {
 
 export const api = {
   getBranding: () => requestPublic<SiteBranding>('/api/branding'),
+  // 公开账号自助门户:生成 OpenAI 授权链接(无鉴权)。
+  generateAccountPortalAuthURL: (data: { contact_email: string }) =>
+    requestAccountPortal<AccountPortalAuthURLResponse>('/api/account-portal/generate-auth-url', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  // 公开账号自助门户:提交授权码(无鉴权)。
+  submitAccountPortalCode: (data: { session_id: string; code: string; state: string }) =>
+    requestAccountPortal<AccountPortalSubmitResponse>('/api/account-portal/submit-code', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getPublicAPIKeyUsage: (apiKey: string, range = '30d', params: { page?: number; pageSize?: number } = {}) => {
     const search = new URLSearchParams()
     search.set('range', range)
@@ -253,12 +418,57 @@ export const api = {
     if (params.pageSize) search.set('page_size', String(params.pageSize))
     return requestAPIKeyUsage<PublicAPIKeyUsageResponse>(`/summary?${search.toString()}`, apiKey)
   },
+  createPortalImageJob: (apiKey: string, data: CreateImageJobPayload) =>
+    requestImageStudioPortal<ImageJobResponse>('/jobs', apiKey, { method: 'POST', body: JSON.stringify(data) }),
+  createPortalImageEditJob: (apiKey: string, data: CreateImageJobPayload) =>
+    requestImageStudioPortal<ImageJobResponse>('/edit-jobs', apiKey, { method: 'POST', body: JSON.stringify(data) }),
+  getPortalImageJobs: (apiKey: string, params: { page?: number; pageSize?: number } = {}) => {
+    const sp = new URLSearchParams()
+    if (params.page) sp.set('page', String(params.page))
+    if (params.pageSize) sp.set('page_size', String(params.pageSize))
+    return requestImageStudioPortal<ImageJobsResponse>(`/jobs?${sp.toString()}`, apiKey)
+  },
+  getPortalImageJob: (apiKey: string, id: number, params: { includeCache?: boolean } = {}) => {
+    const sp = new URLSearchParams()
+    if (params.includeCache) sp.set('include_cache', '1')
+    const query = sp.toString()
+    return requestImageStudioPortal<ImageJobResponse>(`/jobs/${id}${query ? `?${query}` : ''}`, apiKey)
+  },
+  deletePortalImageJob: (apiKey: string, id: number) =>
+    requestImageStudioPortal<MessageResponse>(`/jobs/${id}`, apiKey, { method: 'DELETE' }),
+  getPortalImageAssets: (apiKey: string, params: { page?: number; pageSize?: number } = {}) => {
+    const sp = new URLSearchParams()
+    if (params.page) sp.set('page', String(params.page))
+    if (params.pageSize) sp.set('page_size', String(params.pageSize))
+    return requestImageStudioPortal<ImageAssetsResponse>(`/assets?${sp.toString()}`, apiKey)
+  },
+  getPortalImageAssetFile: (apiKey: string, id: number, download = false, thumbKB = 0) => {
+    const sp = new URLSearchParams()
+    if (download) sp.set('download', '1')
+    if (thumbKB > 0) sp.set('thumb_kb', String(thumbKB))
+    const query = sp.toString()
+    return requestImageStudioPortalBlob(`/assets/${id}/file${query ? `?${query}` : ''}`, apiKey)
+  },
+  deletePortalImageAsset: (apiKey: string, id: number) =>
+    requestImageStudioPortal<MessageResponse>(`/assets/${id}`, apiKey, { method: 'DELETE' }),
   getStats: () => request<StatsResponse>('/stats'),
-  getAccounts: () => request<AccountsResponse>('/accounts'),
+  // channel: 'codex' | 'grok' — server-side filter; omit for all accounts.
+  // view: 'lite' — 只返回身份/绑定字段,跳过用量富化(代理绑定弹窗等场景)。
+  getAccounts: (params: { channel?: 'codex' | 'grok'; view?: 'lite' } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.channel) searchParams.set('channel', params.channel)
+    if (params.view) searchParams.set('view', params.view)
+    const qs = searchParams.toString()
+    return request<AccountsResponse>(`/accounts${qs ? `?${qs}` : ''}`)
+  },
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
     request<CreateAccountResponse>('/accounts/at', { method: 'POST', body: JSON.stringify(data) }),
+  importCodexAgentIdentity: (data: ImportAgentIdentityRequest) =>
+    request<ImportAgentIdentityResponse>('/accounts/codex/agent-identity', { method: 'POST', body: JSON.stringify(data) }),
+  batchImportCodexAgentIdentity: (data: AgentIdentityBatchImportRequest) =>
+    request<AgentIdentityBatchImportResponse>('/accounts/codex/agent-identity/import', { method: 'POST', body: JSON.stringify(data) }),
   addOpenAIResponsesAccount: (data: AddOpenAIResponsesAccountRequest) =>
     request<CreateAccountResponse>('/accounts/openai-responses', { method: 'POST', body: JSON.stringify(data) }),
   fetchOpenAIResponsesModels: (data: FetchOpenAIResponsesModelsRequest) =>
@@ -267,8 +477,41 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/openai-responses`, { method: 'PATCH', body: JSON.stringify(data) }),
   cloneAccount: (id: number, data: CloneAccountRequest = {}) =>
     request<CreateAccountResponse>(`/accounts/${id}/clone`, { method: 'POST', body: JSON.stringify(data) }),
+  addGrokAccount: (data: AddGrokAccountRequest) =>
+    request<CreateAccountResponse>('/accounts/grok', { method: 'POST', body: JSON.stringify(data) }),
+  fetchGrokModels: (data: AddGrokAccountRequest) =>
+    request<FetchGrokModelsResponse>('/accounts/grok/models', { method: 'POST', body: JSON.stringify(data) }),
+  startGrokDeviceAuth: (data: GrokDeviceStartRequest = {}) =>
+    request<GrokDeviceStartResponse>('/accounts/grok/oauth/device/start', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  pollGrokDeviceAuth: (data: GrokDevicePollRequest) =>
+    request<GrokDevicePollResponse>('/accounts/grok/oauth/device/poll', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  importGrokSSO: (data: GrokSSOImportRequest) =>
+    request<GrokSSOImportResponse>('/accounts/grok/sso/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  batchImportGrokAccounts: (data: GrokBatchImportRequest) =>
+    request<GrokBatchImportResponse>('/accounts/grok/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  importGrokRefreshTokens: (data: GrokSSOImportRequest) =>
+    request<GrokSSOImportResponse>('/accounts/grok/refresh/import', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateGrokAccount: (id: number, data: UpdateGrokAccountRequest) =>
+    request<MessageResponse>(`/accounts/${id}/grok`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
+  updateAccountNote: (id: number, note: string) =>
+    request<MessageResponse>(`/accounts/${id}/note`, { method: 'PATCH', body: JSON.stringify({ note }) }),
   getRecycleBinAccounts: () =>
     request<RecycleBinAccountsResponse>('/accounts/recycle-bin'),
   restoreAccount: (id: number) =>
@@ -294,6 +537,18 @@ export const api = {
     }>(`/accounts/${id}/usage/refresh`, { method: 'POST' }),
   updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
     request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
+  // 设置 OAuth 账号的支持模型白名单;空数组表示清空(该账号可调度所有模型)。返回归一化后的白名单。
+  updateAccountModels: (id: number, models: string[]) =>
+    request<{ models: string[] }>(`/accounts/${id}/models`, { method: 'PATCH', body: JSON.stringify({ models }) }),
+  // 拉取该账号真实的上游模型清单(slug 列表,不落库),供白名单编辑器合并使用。
+  syncAccountModelsUpstream: (id: number) =>
+    request<{ models: string[] }>(`/accounts/${id}/models/sync-upstream`, { method: 'POST' }),
+  // 用账号自身凭据并发探测系统文本模型(已排除 image),返回确认可用的模型及每个模型的判定明细。只读不落库。
+  probeAccountModels: (id: number) =>
+    request<{
+      available: string[];
+      results: { model: string; outcome: string; detail?: string }[];
+    }>(`/accounts/${id}/models/probe`, { method: 'POST' }),
   listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
   createAccountGroup: (data: CreateAccountGroupRequest) =>
     request<{ id: number; message: string }>('/account-groups', { method: 'POST', body: JSON.stringify(data) }),
@@ -319,6 +574,10 @@ export const api = {
     request<InviteResponse>(`/accounts/${id}/invite`, { method: 'POST', body: JSON.stringify(data) }),
   batchResetStatus: (ids: number[]) =>
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
+  batchDeleteAccounts: (ids: number[]) =>
+    request<{ message: string; deleted: number; success: number; failed: number }>('/accounts/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
+  batchRefreshAccounts: (ids: number[]) =>
+    request<{ message: string; success: number; failed: number }>('/accounts/batch-refresh', { method: 'POST', body: JSON.stringify({ ids }) }),
   getAccountUsage: (id: number, days?: number) => {
     const search = new URLSearchParams()
     if (typeof days === 'number') search.set('days', String(days))
@@ -328,6 +587,9 @@ export const api = {
   updateAccountCredit: (id: number, data: { credit_enabled: boolean; credit_skip_usage_window: boolean }) =>
     request<MessageResponse>(`/accounts/${id}/credit`, { method: 'PATCH', body: JSON.stringify(data) }),
   getHealth: () => request<HealthResponse>('/health'),
+  getPromptFilterNewAPISecret: () => request<{ configured: boolean; source: 'none' | 'database' | 'environment'; masked: string; secret?: string }>('/prompt-filter/newapi-secret'),
+  generatePromptFilterNewAPISecret: () => request<{ configured: boolean; source: string; masked: string; secret: string }>('/prompt-filter/newapi-secret/generate', { method: 'POST' }),
+  replacePromptFilterNewAPISecret: (secret: string) => request<{ configured: boolean; source: string; masked: string; secret: string }>('/prompt-filter/newapi-secret', { method: 'PUT', body: JSON.stringify({ secret }) }),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
   getRuntimeStatus: () => request<RuntimeStatusResponse>('/runtime-status'),
   getSystemUpdate: () => request<SystemUpdateInfo>('/system/update', { timeoutMs: 20_000 }),
@@ -383,10 +645,11 @@ export const api = {
     const search = buildOpsErrorSearchParams(params)
     return requestBlob(`/ops/errors/export?${search.toString()}`)
   },
-  getUsageStats: (params: { start?: string; end?: string } = {}) => {
+  getUsageStats: (params: { start?: string; end?: string; channel?: string } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start) searchParams.set('start', params.start)
     if (params.end) searchParams.set('end', params.end)
+    if (params.channel) searchParams.set('channel', params.channel)
     const qs = searchParams.toString()
     return request<UsageStats>(qs ? `/usage/stats?${qs}` : '/usage/stats')
   },
@@ -399,6 +662,15 @@ export const api = {
       qs ? `/usage/api-keys?${qs}` : '/usage/api-keys',
     )
   },
+  getAPIKeyAccountStats: (id: number, params: { start?: string; end?: string } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.start) searchParams.set('start', params.start)
+    if (params.end) searchParams.set('end', params.end)
+    const qs = searchParams.toString()
+    return request<{ items: APIKeyAccountStat[] }>(
+      qs ? `/usage/api-keys/${id}/accounts?${qs}` : `/usage/api-keys/${id}/accounts`,
+    )
+  },
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start && params.end) {
@@ -409,7 +681,7 @@ export const api = {
     }
     return request<UsageLogsResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; accountId?: string; fast?: string; stream?: string; sortBy?: string; sortDir?: string }) => {
+  getUsageLogsPaged: (params: { start: string; end: string; page: number; pageSize?: number; email?: string; model?: string; endpoint?: string; apiKeyId?: string; accountId?: string; fast?: string; stream?: string; sortBy?: string; sortDir?: string; compact?: string; hasCompactionHistory?: string; channel?: string }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
@@ -424,13 +696,17 @@ export const api = {
     if (params.stream) searchParams.set('stream', params.stream)
     if (params.sortBy) searchParams.set('sort_by', params.sortBy)
     if (params.sortDir) searchParams.set('sort_dir', params.sortDir)
+    if (params.compact) searchParams.set('compact', params.compact)
+    if (params.hasCompactionHistory) searchParams.set('has_compaction_history', params.hasCompactionHistory)
+    if (params.channel) searchParams.set('channel', params.channel)
     return request<UsageLogsPagedResponse>(`/usage/logs?${searchParams.toString()}`)
   },
-  getChartData: (params: { start: string; end: string; bucketMinutes: number }) => {
+  getChartData: (params: { start: string; end: string; bucketMinutes: number; channel?: string }) => {
     const searchParams = new URLSearchParams()
     searchParams.set('start', params.start)
     searchParams.set('end', params.end)
     searchParams.set('bucket_minutes', String(params.bucketMinutes))
+    if (params.channel) searchParams.set('channel', params.channel)
     return request<ChartAggregation>(`/usage/chart-data?${searchParams.toString()}`)
   },
   getAccountEventTrend: (params: { start: string; end: string; bucketMinutes: number }) => {
@@ -450,6 +726,22 @@ export const api = {
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
   updateAPIKey: (id: number, data: UpdateAPIKeyRequest) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  resetAPIKeyQuota: (id: number) =>
+    request<MessageResponse>(`/keys/${id}/reset-quota`, { method: 'POST' }),
+  resetAllAPIKeyQuotas: () =>
+    request<MessageResponse & { reset_count: number }>('/keys/reset-all-quotas', { method: 'POST' }),
+  // 分组 / 账号维度限额的当前用量（issue #439）。
+  getAPIKeyScopeUsage: (id: number) =>
+    request<{ items: APIKeyScopeUsageItem[] }>(`/keys/${id}/scope-usage`),
+  // 列表页用的全量概览：一次拿到所有 Key 的 scope 预算占比。
+  getAPIKeysScopeSummary: () =>
+    request<{ summary: Record<string, APIKeyScopeSummaryItem[]> }>('/keys-scope-summary'),
+  // 重置某条 scope 的累计额度（累计额度不随时间回落，必须显式重置）。
+  resetAPIKeyScopeQuota: (id: number, data: { scope_type: 'group' | 'account'; scope_id: number }) =>
+    request<MessageResponse>(`/keys/${id}/scope-quota/reset`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   getImagePromptTemplates: (params: { q?: string; tag?: string } = {}) => {
     const sp = new URLSearchParams()
     if (params.q) sp.set('q', params.q)
@@ -500,6 +792,8 @@ export const api = {
     request<MessageResponse>('/usage/logs', { method: 'DELETE' }),
   getSetupHints: () => request<SetupHintsResponse>('/setup-hints'),
   getSettings: () => request<SystemSettings>('/settings'),
+  getObservedInstructions: () =>
+    request<ObservedInstructionsResponse>('/settings/observed-instructions'),
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
   uploadBackground: (file: File) => {
@@ -553,6 +847,12 @@ export const api = {
     request<PromptFilterRulePatternTestResponse>('/prompt-filter/rules/test', { method: 'POST', body: JSON.stringify(data) }),
   getPromptFilterRules: () =>
     request<PromptFilterRulesResponse>('/prompt-filter/rules'),
+  runPromptIntelligence: () =>
+    request<import('./types').PromptIntelligenceRun>('/prompt-filter/intelligence/run', { method: 'POST' }),
+  getPromptIntelligenceHistory: (page = 1, pageSize = 20) =>
+    request<import('./types').PromptIntelligenceHistoryResponse>(`/prompt-filter/intelligence/history?page=${page}&page_size=${pageSize}`),
+  addPromptIntelligenceRule: (candidate: import('./types').PromptIntelligenceCandidate) =>
+    request<{ added: number; updated: number }>('/prompt-filter/intelligence/rules', { method: 'POST', body: JSON.stringify(candidate) }),
   getModels: () => request<ModelsResponse>('/models'),
   syncModels: () => request<ModelSyncResponse>('/models/sync', { method: 'POST' }),
   syncCodexCLIVersion: () =>
@@ -590,6 +890,10 @@ export const api = {
     request<{ message: string; cleaned: number }>('/accounts/clean-rate-limited', { method: 'POST' }),
   cleanError: () =>
     request<{ message: string; cleaned: number }>('/accounts/clean-error', { method: 'POST' }),
+  cleanGrokBanned: () =>
+    request<{ message: string; cleaned: number }>('/accounts/grok/clean-banned', { method: 'POST' }),
+  cleanGrokError: () =>
+    request<{ message: string; cleaned: number }>('/accounts/grok/clean-error', { method: 'POST' }),
   exportAccounts: (params: { filter: 'healthy' | 'all'; ids?: number[] }) => {
     const sp = new URLSearchParams({ filter: params.filter })
     if (params.ids && params.ids.length > 0) sp.set('ids', params.ids.join(','))
@@ -604,6 +908,16 @@ export const api = {
   },
   downloadAccountAuthJSON: (id: number) =>
     requestBlob(`/accounts/${id}/auth-json`),
+  /**
+   * 导出 Grok 账号凭据。ids 为空则导出全部 Grok 账号。
+   * 单个账号返回裸 JSON，多个账号返回 ZIP（内部每账号一个 <邮箱>.json）。
+   * 文件名由服务端在 Content-Disposition 里给出，前端不再自行拼接。
+   */
+  exportGrokAccounts: (ids?: number[]) => {
+    const sp = new URLSearchParams({ filter: 'all' })
+    if (ids && ids.length > 0) sp.set('ids', ids.join(','))
+    return requestNamedBlob(`/accounts/grok/export?${sp.toString()}`)
+  },
   migrateAccounts: (data: { url: string; admin_key: string }) =>
     request<{ message: string; total: number; imported: number; duplicate: number; failed: number }>(
       '/accounts/migrate', { method: 'POST', body: JSON.stringify(data) }),
@@ -618,6 +932,10 @@ export const api = {
     request<MessageResponse>(`/proxies/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   batchDeleteProxies: (ids: number[]) =>
     request<{ message: string; deleted: number }>('/proxies/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
+  cleanErrorProxies: () =>
+    request<{ message: string; cleaned: number; unbound: number }>('/proxies/clean-error', { method: 'POST' }),
+  autoBalanceProxies: (data: { channel?: 'codex' | 'grok'; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
+    request<AutoBalanceProxiesResult>('/proxies/auto-balance', { method: 'POST', body: JSON.stringify(data) }),
   testProxy: (url: string, id?: number, lang?: string) =>
     request<ProxyTestResult>('/proxies/test', { method: 'POST', body: JSON.stringify({ url, id, lang }) }),
   // OAuth
@@ -638,10 +956,23 @@ export interface ProxyRow {
   test_ip: string
   test_location: string
   test_latency_ms: number
+  test_status: 'untested' | 'success' | 'error'
+  /** 绑定到该代理的账号数(服务端聚合,前端免拉全量账号)。 */
+  bound_count: number
+}
+
+export interface AutoBalanceProxiesResult {
+  message: string
+  assigned: number
+  kept: number
+  skipped: number
+  proxies_used?: number
+  distribution?: Array<{ proxy_id: number; label?: string; bound_count: number }>
 }
 
 export interface ProxyTestResult {
   success: boolean
+  conclusive?: boolean
   ip?: string
   country?: string
   region?: string
