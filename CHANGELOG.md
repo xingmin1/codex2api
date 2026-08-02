@@ -1,5 +1,14 @@
 # Changelog
 
+## v2.6.9-xmin.1 - 2026-08-02
+
+### Maintenance
+
+- **同步官方 v2.6.9 后续更新并更新发布包版本。** 在保留 native compaction、
+  `encrypted_content` 恢复、Responses system→instructions、同账号重试和 Fast Tier
+  等本地生产定制的同时，将发布包版本从 `2.5.2-xmin.14` 更新为
+  `2.6.9-xmin.1`。
+
 ## v2.6.9 - 2026-08-01
 
 ### Features
