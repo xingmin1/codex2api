@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -168,7 +169,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	gotTerminal := false
 	sentTerminal := false
 	var lastUpstreamEvent []byte
+	observeFirstToken := h.newAccountFirstTokenObserver(account, database.FirstTokenSourceManualProbe, testModel, start)
 	readErr := proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
+		observeFirstToken(data)
 		lastUpstreamEvent = append(lastUpstreamEvent[:0], data...)
 		eventType := gjson.GetBytes(data, "type").String()
 
@@ -958,7 +961,9 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		if msg, ok := batchTestContextFailure(testCtx, modelErr); ok {
 			return "failed", msg
 		}
-		h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
+		if !acc.IsOpenAIResponsesAPI() {
+			h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
+		}
 		return "failed", modelErr.Error()
 	}
 	payload := buildConnectionTestPayload(h.store, testModel)
@@ -978,7 +983,9 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			}
 			return "failed", msg
 		}
-		h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
+		if !acc.IsOpenAIResponsesAPI() {
+			h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
+		}
 		return "failed", err.Error()
 	}
 	defer resp.Body.Close()
@@ -992,7 +999,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 				return "rate_limited", msg
 			}
 		}
-		status, msg := h.readBatchTestStreamResult(testCtx, acc, resp, testModel)
+		status, msg := h.readBatchTestStreamResult(testCtx, acc, resp, testModel, start)
 		if status != "success" {
 			return status, msg
 		}
@@ -1010,6 +1017,9 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		if !proxy.ShouldIgnoreFailureCooldown(acc) {
 			h.store.MarkCooldownWithError(acc, 24*time.Hour, "unauthorized", fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
 		}
+		if acc.IsOpenAIResponsesAPI() {
+			return "failed", "API 中转上游返回 401"
+		}
 		return "banned", "上游返回 401: 账号授权失败"
 	case http.StatusTooManyRequests:
 		body, readErr := readBatchTestErrorBody(testCtx, resp.Body)
@@ -1019,9 +1029,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		// Grok 走 relay 但有 free-usage-exhausted 语义，须交给 Apply429Cooldown 识别耗尽
 		// （→ 24h usage_limited + 落权威用量快照），不能并入 relay 的 1 分钟 rate_limited。
 		if acc.IsRelayStyle() && !acc.IsGrokAPI() {
-			if !proxy.ShouldIgnoreFailureCooldown(acc) {
-				h.store.MarkCooldown(acc, time.Minute, "rate_limited")
-			}
+			return "failed", "API 中转上游返回 429"
 		} else {
 			if !acc.IsRelayStyle() {
 				proxy.SyncCodexFailureUsageState(h.store, acc, resp)
@@ -1039,7 +1047,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 			h.store.MarkCooldownWithErrorExactDuration(acc, 24*time.Hour, "unauthorized", msg)
 			return "banned", msg
 		}
-		if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
+		if !acc.IsOpenAIResponsesAPI() && shouldMarkBatchTestAccountError(resp.StatusCode, body) {
 			h.store.MarkError(acc, "批量测试"+msg)
 		}
 		return "failed", msg
@@ -1065,6 +1073,7 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 		return "failed", modelErr.Error()
 	}
 	payload := buildConnectionTestPayload(h.store, testModel)
+	start := time.Now()
 
 	var resp *http.Response
 	var err error
@@ -1090,7 +1099,7 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 				return "rate_limited", msg
 			}
 		}
-		return readRecycleBinTestStream(testCtx, resp)
+		return h.readRecycleBinTestStream(testCtx, acc, resp, testModel, start)
 	case http.StatusUnauthorized:
 		body, _ := readBatchTestErrorBody(testCtx, resp.Body)
 		return "banned", fmt.Sprintf("上游返回 401: %s", truncate(string(body), 300))
@@ -1111,14 +1120,16 @@ func (h *Handler) runRecycleBinSingleTest(ctx context.Context, acc *auth.Account
 
 // readRecycleBinTestStream 读取测试 SSE 流并判定结果；与
 // readBatchTestStreamResult 等价，但不回写任何账号状态。
-func readRecycleBinTestStream(ctx context.Context, resp *http.Response) (string, string) {
+func (h *Handler) readRecycleBinTestStream(ctx context.Context, acc *auth.Account, resp *http.Response, model string, startedAt time.Time) (string, string) {
 	hasContent := false
 	gotTerminal := false
 	resultStatus := ""
 	resultMessage := ""
 	var lastUpstreamEvent []byte
+	observeFirstToken := h.newAccountFirstTokenObserver(acc, database.FirstTokenSourceManualProbe, model, startedAt)
 
 	readErr := proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
+		observeFirstToken(data)
 		lastUpstreamEvent = append(lastUpstreamEvent[:0], data...)
 		switch gjson.GetBytes(data, "type").String() {
 		case "response.output_text.delta":
@@ -1231,14 +1242,16 @@ func (h *Handler) batchTestWhamPreflight(ctx context.Context, acc *auth.Account)
 	return "", "", false
 }
 
-func (h *Handler) readBatchTestStreamResult(ctx context.Context, acc *auth.Account, resp *http.Response, model string) (string, string) {
+func (h *Handler) readBatchTestStreamResult(ctx context.Context, acc *auth.Account, resp *http.Response, model string, startedAt time.Time) (string, string) {
 	hasContent := false
 	gotTerminal := false
 	resultStatus := ""
 	resultMessage := ""
 	var lastUpstreamEvent []byte
+	observeFirstToken := h.newAccountFirstTokenObserver(acc, database.FirstTokenSourceManualProbe, model, startedAt)
 
 	readErr := proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
+		observeFirstToken(data)
 		lastUpstreamEvent = append(lastUpstreamEvent[:0], data...)
 		eventType := gjson.GetBytes(data, "type").String()
 
@@ -1307,7 +1320,7 @@ func (h *Handler) readBatchTestStreamResult(ctx context.Context, acc *auth.Accou
 
 func (h *Handler) batchTestTerminalFailure(acc *auth.Account, resp *http.Response, model string, payload []byte, fallback string) (string, string) {
 	message := formatUpstreamTestError(payload, fallback)
-	if proxy.IsUsageLimitReachedError(payload) {
+	if !acc.IsOpenAIResponsesAPI() && proxy.IsUsageLimitReachedError(payload) {
 		proxy.Apply429Cooldown(h.store, acc, payload, resp, model)
 		return "rate_limited", message
 	}
@@ -1316,7 +1329,7 @@ func (h *Handler) batchTestTerminalFailure(acc *auth.Account, resp *http.Respons
 }
 
 func (h *Handler) markBatchTestStreamFailure(acc *auth.Account, message string) {
-	if h == nil || h.store == nil || acc == nil {
+	if h == nil || h.store == nil || acc == nil || acc.IsOpenAIResponsesAPI() {
 		return
 	}
 	switch acc.RuntimeStatus() {
@@ -1339,7 +1352,9 @@ func (h *Handler) handleBatchTestReadError(ctx context.Context, acc *auth.Accoun
 		}
 		return "failed", msg
 	}
-	h.store.MarkError(acc, "批量测试读取响应失败: "+err.Error())
+	if !acc.IsOpenAIResponsesAPI() {
+		h.store.MarkError(acc, "批量测试读取响应失败: "+err.Error())
+	}
 	return "failed", err.Error()
 }
 

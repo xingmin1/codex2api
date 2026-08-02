@@ -20,9 +20,11 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
+import AccountFirstTokenStatsView from "./AccountFirstTokenStatsView";
 import AccountHealthBar from "./AccountHealthBar";
 import ChannelLogo from "./ChannelLogo";
 import ModelLogo from "./ModelLogo";
+import AccountManualScoreBonusBadge from "./AccountManualScoreBonusBadge";
 import StatusBadge from "./StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -114,8 +116,10 @@ export interface AccountDetailSheetProps {
   onPrev?: () => void;
   onNext?: () => void;
   onEdit: () => void;
+  onManualScoreBonus?: () => void;
   onUsage: () => void;
   onTest: () => void;
+  onQualityEval?: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
   onToggleEnabled: () => void;
@@ -139,8 +143,10 @@ export default function AccountDetailSheet({
   onPrev,
   onNext,
   onEdit,
+  onManualScoreBonus,
   onUsage,
   onTest,
+  onQualityEval,
   onRefresh,
   onGenerateAuthJson,
   onToggleEnabled,
@@ -190,6 +196,11 @@ export default function AccountDetailSheet({
       (authJsonExporting || account.at_only || account.openai_responses_api),
   );
   const resetCredits = account?.rate_limit_reset_credits ?? 0;
+  const qualityEvalSupported = Boolean(
+    account &&
+      onQualityEval &&
+      (account.quality_eval_supported ?? !account.openai_responses_api),
+  );
   const healthLabel = (() => {
     switch (account?.health_tier) {
       case "healthy":
@@ -332,14 +343,23 @@ export default function AccountDetailSheet({
                   )}
                 </div>
 
-                <div className="text-[12px] text-muted-foreground">
-                  {t("accounts.healthSummary", {
-                    health: healthLabel,
-                    score: Math.round(
-                      account.dispatch_score ?? account.scheduler_score ?? 0,
-                    ),
-                    concurrency: account.dynamic_concurrency_limit ?? "-",
-                  })}
+                <div className="flex flex-wrap items-center gap-1.5 text-[12px] text-muted-foreground">
+                  <span>
+                    {t("accounts.healthSummary", {
+                      health: healthLabel,
+                      score: Math.round(
+                        account.dispatch_score ?? account.scheduler_score ?? 0,
+                      ),
+                      concurrency: account.dynamic_concurrency_limit ?? "-",
+                    })}
+                  </span>
+                  {onManualScoreBonus ? (
+                    <AccountManualScoreBonusBadge
+                      account={account}
+                      onClick={onManualScoreBonus}
+                      showEmpty
+                    />
+                  ) : null}
                 </div>
 
                 <div className="space-y-1">
@@ -367,6 +387,94 @@ export default function AccountDetailSheet({
                   </div>
                 ) : null}
               </div>
+            </Section>
+
+            <Section title={t("accounts.firstTokenStats") }>
+              <AccountFirstTokenStatsView
+                stats={account.first_token_stats}
+                variant="detail"
+              />
+            </Section>
+
+            <Section
+              title={t("accounts.qualityEvalDiagnostics")}
+              action={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  disabled={!qualityEvalSupported}
+                  onClick={onQualityEval}
+                  className="h-7 text-[11px]"
+                >
+                  <FlaskConical className="size-3" />
+                  {t("accounts.qualityEvalRunNow")}
+                </Button>
+              }
+            >
+              {account.latest_quality_eval ? (
+                <div className="space-y-3 rounded-xl border border-border bg-card p-3">
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <span className="rounded-md bg-primary/10 px-1.5 py-0.5 font-semibold text-primary">
+                      {t(`accounts.qualityEvalStatus.${account.latest_quality_eval.status}`, {
+                        defaultValue: account.latest_quality_eval.status,
+                      })}
+                    </span>
+                    <span className="font-medium">
+                      {account.latest_quality_eval.model} · {account.latest_quality_eval.reasoning_effort}
+                    </span>
+                    <span className="ml-auto text-muted-foreground">
+                      {formatRelativeTime(account.latest_quality_eval.created_at)}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    <MetricCard label={t("accounts.qualityEvalLatestJuice")}>
+                      <span className="break-all font-mono text-xs">
+                        {account.latest_quality_eval.latest_juice_value || "—"}
+                      </span>
+                    </MetricCard>
+                    <MetricCard label={t("accounts.qualityEvalCandyAccuracy")}>
+                      <span className="tabular-nums">
+                        {account.latest_quality_eval.candy_requested > 0
+                          ? `${account.latest_quality_eval.candy_correct}/${account.latest_quality_eval.candy_requested}`
+                          : "—"}
+                      </span>
+                    </MetricCard>
+                    <MetricCard label={t("accounts.qualityEvalReasoningTokens")}>
+                      <span className="text-xs tabular-nums">
+                        {t("accounts.qualityEvalReasoningSummary", {
+                          average: account.latest_quality_eval.reasoning_tokens_average.toFixed(1),
+                          maximum: account.latest_quality_eval.reasoning_tokens_maximum,
+                        })}
+                      </span>
+                    </MetricCard>
+                  </div>
+                  <div className="flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                    <span>
+                      {t("accounts.qualityEvalSource")}: {t(`accounts.qualityEvalSource${account.latest_quality_eval.trigger_source === "auto" ? "Auto" : "Manual"}`)}
+                    </span>
+                    <span>
+                      {t("accounts.qualityEvalRequestConfig", {
+                        juiceSamples: account.latest_quality_eval.juice_requested,
+                        juiceConcurrency: account.latest_quality_eval.juice_concurrency,
+                        candySamples: account.latest_quality_eval.candy_requested,
+                        candyConcurrency: account.latest_quality_eval.candy_concurrency,
+                      })}
+                    </span>
+                  </div>
+                  {account.latest_quality_eval.error_message ? (
+                    <div className="rounded-lg bg-amber-500/10 px-2.5 py-2 text-xs text-amber-700 dark:text-amber-300">
+                      {account.latest_quality_eval.error_message}
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <div className="rounded-xl border border-dashed p-4 text-center text-xs text-muted-foreground">
+                  {qualityEvalSupported
+                    ? t("accounts.qualityEvalNotRun")
+                    : t("accounts.qualityEvalUnsupported")}
+                </div>
+              )}
             </Section>
 
             <Section
@@ -585,6 +693,17 @@ export default function AccountDetailSheet({
               <Button type="button" variant="outline" size="sm" onClick={onTest}>
                 <FlaskConical className="size-3.5" />
                 {t("accounts.testConnection")}
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={!qualityEvalSupported}
+                onClick={onQualityEval}
+                title={t(qualityEvalSupported ? "accounts.qualityEval" : "accounts.qualityEvalUnsupported")}
+              >
+                <FlaskConical className="size-3.5" />
+                {t("accounts.qualityEval")}
               </Button>
               <Button
                 type="button"

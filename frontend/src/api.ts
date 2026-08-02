@@ -59,6 +59,9 @@ import type {
   PromptFilterRulesResponse,
   PromptFilterTestResponse,
   PublicAPIKeyUsageResponse,
+  QualityEvalBatch,
+  QualityEvalConfig,
+  RunQualityEvalRequest,
   RecycleBinAccountsResponse,
   ResetCreditsDetailResponse,
   RuntimeStatusResponse,
@@ -549,6 +552,36 @@ export const api = {
       available: string[];
       results: { model: string; outcome: string; detail?: string }[];
     }>(`/accounts/${id}/models/probe`, { method: 'POST' }),
+  setAccountManualScoreBonus: (id: number, bonus: number, durationSeconds = 1800) =>
+    request<{
+      manual_score_bonus: number
+      manual_score_bonus_until: string
+      manual_score_bonus_remaining_seconds: number
+      dispatch_score: number
+    }>(`/accounts/${id}/manual-score-bonus`, {
+      method: 'PUT',
+      body: JSON.stringify({ bonus, duration_seconds: durationSeconds }),
+    }),
+  clearAccountManualScoreBonus: (id: number) =>
+    request<{
+      manual_score_bonus: number
+      manual_score_bonus_until: string
+      manual_score_bonus_remaining_seconds: number
+      dispatch_score: number
+    }>(`/accounts/${id}/manual-score-bonus`, { method: 'DELETE' }),
+  runAccountQualityEval: (id: number, payload: RunQualityEvalRequest) =>
+    request<{ batch: QualityEvalBatch }>(`/accounts/${id}/quality-eval`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+  getAccountQualityEvals: (id: number) =>
+    request<{ batches: QualityEvalBatch[] }>(`/accounts/${id}/quality-eval`),
+  getQualityEvalConfig: () => request<QualityEvalConfig>('/quality-eval/config'),
+  updateQualityEvalConfig: (config: QualityEvalConfig) =>
+    request<QualityEvalConfig>('/quality-eval/config', {
+      method: 'PUT',
+      body: JSON.stringify(config),
+    }),
   listAccountGroups: () => request<AccountGroupsResponse>('/account-groups'),
   createAccountGroup: (data: CreateAccountGroupRequest) =>
     request<{ id: number; message: string }>('/account-groups', { method: 'POST', body: JSON.stringify(data) }),

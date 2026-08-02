@@ -7,7 +7,7 @@ import PageHeader from '../components/PageHeader'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
-import type { HealthResponse, ModelInfo, SiteBranding, SystemSettings } from '../types'
+import type { FastTierPolicy, HealthResponse, ModelInfo, QualityEvalConfig, SiteBranding, SystemSettings } from '../types'
 import { countPayloadRules } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
@@ -66,6 +66,7 @@ import {
   Image as ImageIcon,
   Layers,
   Link2,
+  Loader2,
   Palette,
   RefreshCw,
   Save,
@@ -163,6 +164,11 @@ const normalizeReasoningEffortValue = (effort: string) => {
 
 const normalizeBillingTierPolicyValue = (value?: string | null): 'actual' | 'requested' =>
   value === 'requested' ? 'requested' : 'actual'
+
+const normalizeFastTierPolicyValue = (value?: string | null): FastTierPolicy => {
+  if (value === 'force_fast' || value === 'filter_fast') return value
+  return 'preserve'
+}
 
 const normalizeFirstTokenModeValue = (value?: string | null): 'strict' | 'loose' =>
   value === 'loose' ? 'loose' : 'strict'
@@ -1118,6 +1124,7 @@ export default function Settings() {
     { label: t('settings.schedulerModeRemainingQuota'), value: 'remaining_quota' },
   ]
   const transportRetryPolicyOptions = [
+    { label: t('settings.transportRetryPolicyHybrid'), value: 'hybrid' },
     { label: t('settings.transportRetryPolicyRotate'), value: 'rotate' },
     { label: t('settings.transportRetryPolicySticky'), value: 'sticky' },
   ]
@@ -1146,6 +1153,11 @@ export default function Settings() {
     { label: t('settings.billingTierPolicyActual'), value: 'actual' },
     { label: t('settings.billingTierPolicyRequested'), value: 'requested' },
   ]
+  const fastTierPolicyOptions = [
+    { label: t('settings.fastTierPolicyPreserve'), value: 'preserve' },
+    { label: t('settings.fastTierPolicyForce'), value: 'force_fast' },
+    { label: t('settings.fastTierPolicyFilter'), value: 'filter_fast' },
+  ]
   const streamFlushPolicyOptions = [
     { label: t('settings.streamFlushImmediate'), value: 'immediate' },
     { label: t('settings.streamFlushCoalesce'), value: 'coalesce' },
@@ -1163,6 +1175,7 @@ export default function Settings() {
     const normalized = {
       ...cacheNormalized,
       billing_tier_policy: normalizeBillingTierPolicyValue(cacheNormalized.billing_tier_policy),
+      fast_tier_policy: normalizeFastTierPolicyValue(settings.fast_tier_policy),
       first_token_mode: normalizeFirstTokenModeValue(cacheNormalized.first_token_mode),
     }
     if (!normalized.lazy_mode) {
@@ -1204,6 +1217,8 @@ export default function Settings() {
 	    dispatch_max_multiplier: 0,
 	    failure_score_threshold: 3,
 	    failure_cooldown_threshold: 10,
+	    failure_tolerance_window_seconds: 60,
+	    failure_score_retroactive: false,
 	    lazy_mode: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
@@ -1244,7 +1259,17 @@ export default function Settings() {
     max_retries: 2,
     max_rate_limit_retries: 1,
     retry_interval_ms: 0,
-    transport_retry_policy: 'rotate',
+    transport_retry_policy: 'hybrid',
+    transport_same_account_retries: 2,
+    compact_same_account_retries: 2,
+    client_request_replay_enabled: true,
+    client_request_replay_max_retries: 5,
+    client_request_replay_max_duration_seconds: 600,
+    client_request_replay_retry_base_interval_ms: 1000,
+    client_request_replay_retry_max_interval_seconds: 30,
+    client_request_replay_keepalive_seconds: 15,
+    encrypted_content_compatibility_enabled: true,
+    fast_tier_policy: 'preserve',
     allow_remote_migration: false,
     database_driver: 'postgres',
     database_label: 'PostgreSQL',
@@ -1313,9 +1338,20 @@ export default function Settings() {
     smart_pacing_windows: '5h,7d',
     ignore_usage_limit_status: false,
   })
+  const [qualityEvalConfig, setQualityEvalConfig] = useState<QualityEvalConfig>({
+    auto_enabled: false,
+    interval_minutes: 60,
+    lookback_hours: 5,
+    top_accounts: 5,
+    min_requests: 50,
+    batch_concurrency: 1,
+    auto_runnable: false,
+    auto_skip_reason: '',
+  })
   const lazyModeActive = settingsForm.lazy_mode
   const responseCacheBudget = responseCacheBudgetFromSettings(settingsForm)
   const [savingSettings, setSavingSettings] = useState(false)
+  const [savingQualityEvalConfig, setSavingQualityEvalConfig] = useState(false)
   const [autoSaveStatus, setAutoSaveStatus] = useState<AutoSaveStatus>('idle')
   const [responseCacheValidationError, setResponseCacheValidationError] = useState<ResponseCacheBudgetValidationError | null>(null)
   const responseCacheValidationMessage = responseCacheValidationError
@@ -1504,8 +1540,11 @@ export default function Settings() {
   }
 
   const loadSettingsData = useCallback(async () => {
-    const [health, settings, modelsResp] = await Promise.all([api.getHealth(), api.getSettings(), api.getModels()])
+    const [health, settings, modelsResp, qualityConfig] = await Promise.all([
+      api.getHealth(), api.getSettings(), api.getModels(), api.getQualityEvalConfig(),
+    ])
     commitSettingsForm(settings)
+    setQualityEvalConfig(qualityConfig)
     const branding = {
       site_name: settings.site_name,
       site_logo: settings.site_logo,
@@ -1548,10 +1587,10 @@ export default function Settings() {
     setSavingSettings(true)
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
-      const updated = await api.updateSettings(
-        buildWritableSettingsPayload(normalized),
-      )
-      commitSettingsForm(updated)
+	      const updated = await api.updateSettings(
+      buildWritableSettingsPayload(normalized),
+    )
+	      commitSettingsForm(updated)
       const branding = {
         site_name: updated.site_name,
         site_logo: updated.site_logo,
@@ -1580,6 +1619,19 @@ export default function Settings() {
       showToast(`${t('settings.saveFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
       setSavingSettings(false)
+    }
+  }
+
+  const handleSaveQualityEvalConfig = async () => {
+    setSavingQualityEvalConfig(true)
+    try {
+      const updated = await api.updateQualityEvalConfig(qualityEvalConfig)
+      setQualityEvalConfig(updated)
+      showToast(t('settings.qualityEvalSaved'))
+    } catch (error) {
+      showToast(`${t('settings.qualityEvalSaveFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setSavingQualityEvalConfig(false)
     }
   }
 
@@ -2054,9 +2106,84 @@ export default function Settings() {
                 </SettingField>
                 <SettingField label={t('settings.transportRetryPolicy')} description={t('settings.transportRetryPolicyDesc')}>
                   <Select
-                    value={settingsForm.transport_retry_policy || 'rotate'}
+                    value={settingsForm.transport_retry_policy || 'hybrid'}
                     onValueChange={(value) => autoSaveStringField('transport_retry_policy', value)}
                     options={transportRetryPolicyOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.transportSameAccountRetries')} description={t('settings.transportSameAccountRetriesDesc')} suffix={t('settings.unit.times')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10}
+                    disabled={settingsForm.transport_retry_policy !== 'hybrid'}
+                    value={settingsForm.transport_same_account_retries}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, transport_same_account_retries: parseInt(e.target.value) || 0 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.compactSameAccountRetries')} description={t('settings.compactSameAccountRetriesDesc')} suffix={t('settings.unit.times')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10}
+                    value={settingsForm.compact_same_account_retries}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, compact_same_account_retries: parseInt(e.target.value) || 0 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.clientRequestReplayEnabled')} description={t('settings.clientRequestReplayEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.client_request_replay_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('client_request_replay_enabled', checked)}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.clientRequestReplayMaxRetries')} description={t('settings.clientRequestReplayMaxRetriesDesc')} suffix={t('settings.unit.times')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={10}
+                    disabled={!settingsForm.client_request_replay_enabled}
+                    value={settingsForm.client_request_replay_max_retries}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, client_request_replay_max_retries: Math.min(10, Math.max(1, parseInt(e.target.value) || 1)) }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.clientRequestReplayMaxDuration')} description={t('settings.clientRequestReplayMaxDurationDesc')} suffix={t('settings.unit.sec')}>
+                  <Input
+                    type="number"
+                    min={30}
+                    max={3600}
+                    disabled={!settingsForm.client_request_replay_enabled}
+                    value={settingsForm.client_request_replay_max_duration_seconds}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, client_request_replay_max_duration_seconds: Math.min(3600, Math.max(30, parseInt(e.target.value) || 30)) }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.clientRequestReplayBaseInterval')} description={t('settings.clientRequestReplayBaseIntervalDesc')} suffix={t('settings.unit.ms')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={60000}
+                    disabled={!settingsForm.client_request_replay_enabled}
+                    value={settingsForm.client_request_replay_retry_base_interval_ms}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, client_request_replay_retry_base_interval_ms: Math.min(f.client_request_replay_retry_max_interval_seconds * 1000, Math.max(0, parseInt(e.target.value) || 0)) }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.clientRequestReplayMaxInterval')} description={t('settings.clientRequestReplayMaxIntervalDesc')} suffix={t('settings.unit.sec')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={300}
+                    disabled={!settingsForm.client_request_replay_enabled}
+                    value={settingsForm.client_request_replay_retry_max_interval_seconds}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, client_request_replay_retry_max_interval_seconds: Math.min(300, Math.max(Math.ceil(f.client_request_replay_retry_base_interval_ms / 1000), parseInt(e.target.value) || 1)) }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.clientRequestReplayKeepalive')} description={t('settings.clientRequestReplayKeepaliveDesc')} suffix={t('settings.unit.sec')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={240}
+                    disabled={!settingsForm.client_request_replay_enabled}
+                    value={settingsForm.client_request_replay_keepalive_seconds}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, client_request_replay_keepalive_seconds: parseInt(e.target.value) || 0 }))}
                   />
                 </SettingField>
               </div>
@@ -2200,17 +2327,23 @@ export default function Settings() {
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, failure_score_threshold: parseInt(e.target.value) || 1 }))}
                   />
                 </SettingField>
-	                  <SettingField label={t('settings.failureCooldownThreshold')} description={t('settings.failureCooldownThresholdDesc')}>
+	                  <SettingField label={t('settings.failureToleranceWindow')} description={t('settings.failureToleranceWindowDesc')}>
                   <Input
-                    type="number"
-                    min={1}
-                    max={1000}
-                    value={settingsForm.failure_cooldown_threshold}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, failure_cooldown_threshold: parseInt(e.target.value) || 1 }))}
+                  type="number"
+                  min={1}
+                  max={3600}
+                  value={settingsForm.failure_tolerance_window_seconds}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, failure_tolerance_window_seconds: parseInt(e.target.value) || 1 }))}
+                />
+                </SettingField>
+		                </div>
+		                <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField label={t('settings.failureScoreRetroactive')} description={t('settings.failureScoreRetroactiveDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.failure_score_retroactive}
+                    onCheckedChange={(checked) => autoSaveBooleanField('failure_score_retroactive', checked)}
                   />
                 </SettingField>
-	                </div>
-	                <div className={SETTINGS_SWITCH_GRID}>
                   <SettingField label={t('settings.usageProbeResponsesFallback')} description={t('settings.usageProbeResponsesFallbackDesc')} layout="switch">
                     <Switch
                       checked={settingsForm.usage_probe_responses_fallback_enabled}
@@ -2234,9 +2367,53 @@ export default function Settings() {
                       }}
                     />
                   </SettingField>
+	                </div>
+		                <div className="border-t border-border pt-4">
+                <div className="mb-3 text-sm font-semibold">{t('settings.qualityEvalTitle')}</div>
+                {qualityEvalConfig.auto_enabled && !qualityEvalConfig.auto_runnable && (
+                  <div className="mb-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                    {t('settings.qualityEvalNotRunnable', {
+                      reason: qualityEvalConfig.auto_skip_reason || 'usage_log_mode != full',
+                    })}
+                  </div>
+                )}
+                <div className={SETTINGS_FIELD_GRID}>
+	                    <SettingField label={t('settings.qualityEvalEnabled')} description={t('settings.qualityEvalEnabledDesc')} layout="switch">
+	                      <Switch
+	                        checked={qualityEvalConfig.auto_enabled}
+	                        onCheckedChange={(checked) => setQualityEvalConfig((value) => ({ ...value, auto_enabled: checked }))}
+	                      />
+	                    </SettingField>
+	                    <SettingField label={t('settings.qualityEvalInterval')} suffix={t('settings.unit.min')}>
+	                      <Input type="number" min={60} max={1440} value={qualityEvalConfig.interval_minutes}
+	                        onChange={(event) => setQualityEvalConfig((value) => ({ ...value, interval_minutes: Math.min(1440, Math.max(60, Number(event.target.value) || 60)) }))} />
+	                    </SettingField>
+	                    <SettingField label={t('settings.qualityEvalLookback')} suffix={t('settings.unit.hour')}>
+	                      <Input type="number" min={1} max={168} value={qualityEvalConfig.lookback_hours}
+	                        onChange={(event) => setQualityEvalConfig((value) => ({ ...value, lookback_hours: Math.min(168, Math.max(1, Number(event.target.value) || 1)) }))} />
+	                    </SettingField>
+	                    <SettingField label={t('settings.qualityEvalTopAccounts')}>
+	                      <Input type="number" min={1} max={20} value={qualityEvalConfig.top_accounts}
+	                        onChange={(event) => setQualityEvalConfig((value) => ({ ...value, top_accounts: Math.min(20, Math.max(1, Number(event.target.value) || 1)) }))} />
+	                    </SettingField>
+	                    <SettingField label={t('settings.qualityEvalMinRequests')}>
+	                      <Input type="number" min={1} max={1000000} value={qualityEvalConfig.min_requests}
+	                        onChange={(event) => setQualityEvalConfig((value) => ({ ...value, min_requests: Math.min(1000000, Math.max(1, Number(event.target.value) || 1)) }))} />
+	                    </SettingField>
+	                    <SettingField label={t('settings.qualityEvalBatchConcurrency')} suffix={t('settings.unit.concurrency')}>
+	                      <Input type="number" min={1} max={5} value={qualityEvalConfig.batch_concurrency}
+	                        onChange={(event) => setQualityEvalConfig((value) => ({ ...value, batch_concurrency: Math.min(5, Math.max(1, Number(event.target.value) || 1)) }))} />
+                  </SettingField>
+                </div>
+                <div className="mt-3 flex justify-end">
+                  <Button type="button" size="sm" disabled={savingQualityEvalConfig} onClick={() => void handleSaveQualityEvalConfig()}>
+                    {savingQualityEvalConfig ? <Loader2 className="size-3.5 animate-spin" /> : <Save className="size-3.5" />}
+                    {t('settings.qualityEvalSave')}
+                  </Button>
                 </div>
               </div>
-            </SettingsCard>
+	              </div>
+	            </SettingsCard>
           </div>
 
           <SettingsCard
@@ -2836,7 +3013,26 @@ export default function Settings() {
 
           <SettingsCard title={t('settings.runtimeOptimization')} description={t('settings.runtimeOptimizationDesc')} icon={<Wrench className="size-4" />}>
             <div className="space-y-4">
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField
+                  label={t('settings.encryptedContentCompatibility')}
+                  description={t('settings.encryptedContentCompatibilityHint')}
+                  layout="switch"
+                >
+                  <Switch
+                    checked={settingsForm.encrypted_content_compatibility_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('encrypted_content_compatibility_enabled', checked)}
+                  />
+                </SettingField>
+              </div>
               <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField label={t('settings.fastTierPolicy')} description={t('settings.fastTierPolicyDesc')}>
+                  <Select
+                    value={settingsForm.fast_tier_policy}
+                    onValueChange={(value) => autoSaveStringField('fast_tier_policy', value)}
+                    options={fastTierPolicyOptions}
+                  />
+                </SettingField>
                 <SettingField label={t('settings.clientCompatMode')} description={t('settings.clientCompatModeDesc')}>
                   <Select
                     value={settingsForm.client_compat_mode}

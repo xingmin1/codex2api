@@ -49,6 +49,42 @@
 - **Streaming and authentication paths retain less memory, and the operations dashboard now reports real process RSS.** The SSE reader previously copied every single-line event through `bytes.Join`, repeatedly shortened its pooled line-buffer capacity and reallocated on the next chunk, and kept references to completed large events; it now avoids the common extra copy, compacts the existing buffer in place, and clears retained slices while preserving fragmented and multi-line SSE behavior. The authentication-specific uTLS HTTP/2 transport now has read-idle, Ping, and 90-second idle-connection timeouts, closes only connections with no active/reserved/pending streams, and uses compare-and-delete during TTL eviction so a refreshed pool entry cannot be removed by a stale cleanup pass. On Linux, `process_bytes` is now read from `/proc/self/status` `VmRSS` instead of Go’s high-water `MemStats.Sys`, so the dashboard displays current resident memory rather than virtual memory retained by the runtime.
 - **The default minimum emulated Codex CLI version is now `0.144.1`.** New installations, newly added database columns, and empty/fallback runtime configurations previously used the obsolete `0.118.0` floor even when the rest of the client fingerprint had moved forward. PostgreSQL, SQLite, bootstrap, frontend, and runtime defaults now agree on `0.144.1`; an existing explicitly stored minimum version remains under administrator control and is not overwritten.
 
+## v2.5.2-xmin.14 - 2026-07-28
+
+### Features
+
+- **增加账号临时调度分与双窗口首字统计。** 支持替换、到期和提前清除临时加分，
+  独立采集普通请求及手动、自动探测的首字样本，并在账号列表与详情中展示
+  10 分钟最近 5 个样本和 1 小时全量统计。
+- **增加 gpt-5.6-sol Max Juice/Candy 质量检测。** 支持官方账号及显式配置该模型的
+  Responses API 账号，提供手动批次、周期候选筛选、并发控制、历史样本、状态判定和
+  中英文管理界面；检测占用账号负载槽，但不污染健康、冷却和普通请求统计。
+
+### Fixes
+
+- **手动 Juice/Candy 检测改为服务端后台任务。** 管理接口创建批次后立即返回 `202`，
+  浏览器不再等待长 SSE 或锁住弹窗；请求断开不会取消任务，同账号重复提交仍返回
+  `409`，账号列表会持续刷新运行状态。
+- **后台质量检测纳入有界优雅关闭。** 手动与周期任务共享服务生命周期，收到停止信号后
+  与 HTTP 在途请求并行取消并在同一关闭期限内收尾；账号列表同时避免较旧请求覆盖
+  最新检测终态。
+- **完善质量检测候选与执行语义。** 自动候选只统计有效首轮请求，排除 499，修正跨实例
+  调度、API 账号模型判断、默认/自定义样本数量及并发、Juice 重试和 Candy 判分边界。
+- **完善流式请求安全重试。** 首轮输出、首字超时、客户端断开和协议转换路径统一约束
+  重试边界，避免已提交下游响应后继续创建不安全的新上游请求。
+- **禁止重放 `cyber_policy` 请求。** Responses HTTP、WebSocket、Anthropic Messages、
+  图片和提示过滤路径统一识别该策略，避免安全拒绝被整请求代重发放大。
+
+### Maintenance
+
+- **接入 Trellis、GitNexus 与 CodeGraph 项目工作流。** 增加代码导航、影响分析、任务规划
+  和检查上下文，统一后续代理开发与审阅流程。
+
+### Tests
+
+- **补充质量检测、临时加分、首字统计与重试回归。** 覆盖请求断开后后台继续、重复提交、
+  优雅停止、账号容量共享、跨实例调度、数据库持久化及前端生产构建。
+
 ## v2.6.6 - 2026-07-27
 
 ### Features
@@ -92,6 +128,27 @@
 ### Features
 
 - **Account groups become a first-class axis in account management and key usage analysis.** The Accounts page gains a **group clustering sort** — a toggleable asc/desc sort mode (in both the toolbar and the table header) that clusters accounts by their group's configured order, so a mixed pool reads as contiguous group blocks instead of an interleaved list. The group multi-select picker now supports **inline group creation**: typing a name that doesn't exist yet offers a create action right in the dropdown (available from the account editor, quick add, and batch import forms), auto-assigning a palette color — no round-trip to the group manager. The picker's dropdown is also portaled so it renders correctly inside dialogs and sheets instead of being clipped by the container. On the analysis side, the API key Token Usage panel's per-account breakdown rows now carry the account's **group chips** (name + color, batch-fetched server-side to avoid N+1 queries) plus usage/group sort controls, so a key's traffic can be read per group at a glance.
+
+## v2.5.2-xmin.13 - 2026-07-25
+
+### Features
+
+- **整请求代重发改为有界指数退避。** 原请求失败后默认额外重发 5 次，总轮数最多
+  6 次；默认等待序列为 1、2、4、8、16 秒，并支持配置额外重发次数、首业务输出前
+  600 秒总预算、基础间隔和最大间隔。旧版 `0` 无限值自动收敛为安全默认值。
+
+### Fixes
+
+- **客户端断开后不再继续创建上游请求。** 当前 attempt、账号等待、即时协议修复和整请求
+  退避均监听同一个取消控制器；首个业务输出前立即取消当前上游，首个业务输出后仅允许原
+  上游最多继续 5 秒以提取 usage，期间不会进入新一轮代重发。
+- **代重发耗尽时返回明确终态。** 非流式请求按最后一次上游错误返回；已发送 SSE 保活的
+  流式请求返回带 `stop_reason` 的 `response.failed`，便于区分次数、时长和客户端断开。
+
+### Tests
+
+- **补充代重发边界、指数退避、总预算、设置持久化和真实 HTTP 断连测试。** 覆盖当前
+  attempt、账号等待、退避阶段，以及首业务输出前立即取消和输出后 5 秒 usage 排空。
 
 ## v2.6.2 - 2026-07-24
 
@@ -211,6 +268,21 @@
 - **HTTP/2 upstream connections send keep-alive PINGs so dead connections are evicted.** Direct Codex/OpenAI HTTP connections negotiate HTTP/2 via ALPN, but `http2.Transport` defaults to `ReadIdleTimeout=0` (no keepalive PING), so a connection silently severed by an intermediate proxy/NAT looked alive on both ends — a request landing on it hung until the OS TCP retransmission timeout (minutes), surfacing as extreme first-token latency. Both HTTP/2 direct transports (the standard one via `http2.ConfigureTransports`, and the uTLS-fingerprint one's hand-built `http2.Transport`) now set `ReadIdleTimeout=15s` / `PingTimeout=15s`. WebSocket relays already have full Ping/Pong keepalive and are unaffected.
 - **Image-edit reference-image cap relaxed from 10 to 16 (#275).** The 10 was a defensive value from an earlier review pass, unrelated to upstream capability; the official Images API allows 16 reference images for gpt-image edits, and this proxy's responses image channel was verified to accept 16 `input_image` items end-to-end. Multipart, JSON, and Image Studio all reference the same constant, so the relaxation applies everywhere at once.
 
+## v2.5.2-xmin.11 - 2026-07-15
+
+### Features
+
+- **增加全局与账号级 Fast Tier 出站策略。** 支持保持客户端请求、强制附加
+  `service_tier: "priority"`、过滤所有 Fast Tier 字段三种互斥模式；账号可独立覆盖或
+  继承全局配置，覆盖 Responses HTTP/WebSocket、Chat Completions、Anthropic Messages、
+  compact、官方账号及 Responses 中转账号，用量日志记录实际出站等级。
+- **优雅关闭等待时间可配置。** `CODEX_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` 默认从 10 秒
+  延长到 360 秒，避免发布切换时中断耗时较长的流式响应或上下文压缩。
+
+### Tests
+
+- **补充 Fast Tier 策略、账号继承、管理接口、SQLite 持久化和关闭配置回归测试。**
+
 ## v2.5.4 - 2026-07-14
 
 ### Fixes
@@ -232,6 +304,33 @@
 
 - **Renewed accounts no longer show "subscription expired", and the authoritative expiry is synced from upstream (#360).** Subscription expiry was sourced solely from the JWT `chatgpt_subscription_active_until` claim, which stays stuck at the pre-renewal value long after a user renews; `wham/usage` was measured to carry no subscription-expiry field at all, so the refresh-time sync added in #300 never actually did anything. Two layers fix it. (1) **Stale-value cleanup:** an authoritative paid `plan_type` (a truly-expired plan degrades to `free` upstream) is mutually exclusive with "subscription expired", so a past expiry under a paid plan is treated as a stale leftover and cleared — uniformly across the wham probe, the `/responses` `x-codex-plan-type` header sync, the RT refresh path, and the import seed, all of which now also refuse to write such a stale value back; a genuinely expired `free` account keeps its expiry for display. (2) **Authoritative sync:** a new best-effort path fetches the real `active_until` from the ChatGPT web endpoint `/backend-api/subscriptions` using a uTLS Chrome fingerprint + browser headers (a plain TLS fingerprint is blocked by Cloudflare), triggered after a successful wham probe only when a paid account's expiry is missing / past / within 7 days, throttled to once per account per 6h; when `account_id` holds a polluted `user-...` value it falls back to the workspace UUID from the access-token JWT. Also completes the token-refresh fallback so a subscription field missing from the `id_token` is recovered from the `access_token`.
 - **Relay compaction triggers stay on the SSE path (#361).** `stream=true` `compaction_trigger` requests on relay-only pools are kept on the Responses SSE path (rather than being diverted to the non-stream compact endpoint), while compact-aware global and account model mappings are retained; the existing non-stream compact-endpoint fallback is preserved, with protocol regression coverage added.
+
+## v2.5.2-xmin.4 - 2026-07-12
+
+### Features
+
+- **新增“同号重试后换号”传输错误策略。** 新安装默认在连接级传输失败后使用原账号
+  额外重试 2 次，仍失败才记一次账号失败并重新调度；同号预算不消耗现有换号预算，
+  `rotate` 与 `sticky` 的既有配置和语义保持不变。
+- **支持全局与账号级同号次数配置。** 全局及账号覆盖均支持 `0~10`，账号留空继承
+  全局值，`0` 表示第一次传输失败后立即换号；账号管理界面同时展示当前有效值。
+
+### Fixes
+
+- **避免短暂网络抖动立即放大为跨账号失败。** 混合策略预算内不扣分、不写冷却、
+  不解绑会话亲和；只有同一账号连续传输失败达到阈值并真正换号时才记录一次失败。
+
+## v2.5.2-xmin.3 - 2026-07-12
+
+### Fixes
+
+- **修复 Responses v2 压缩断流后无法换号重试。** `compaction_trigger` 仍严格走普通
+  `/v1/responses`；在收到 `response.completed` 前暂存压缩 SSE，只有完整终态才向下游
+  提交，避免压缩项已写出后上游超时或断流导致后续账号只能返回不完整响应。重试耗尽且
+  尚未产生下游内容时现在返回明确的 502，而不是空的 200 SSE。
+- **修复部分 Responses 中转拒绝历史工具调用 `namespace`。** relay 请求中的
+  `input[].type=function_call` 只移除中转不接受的 `namespace`，保留 `name`、`call_id`
+  和 `arguments`；官方 Codex/OAuth 请求不受影响。
 
 ## v2.5.2-xmin.1 - 2026-07-12
 

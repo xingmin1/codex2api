@@ -8,6 +8,7 @@ export interface ToastState {
 
 export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | 'quota_paused' | string
 export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
+export type FastTierPolicy = 'preserve' | 'force_fast' | 'filter_fast'
 
 export interface StatsChannelCounts {
   total: number
@@ -79,6 +80,94 @@ export interface GrokPlanInfo {
   billing: boolean
 }
 
+export interface AccountFirstTokenWindowStats {
+  window_seconds: number
+  sample_limit?: number
+  average_ms: number
+  maximum_ms: number
+  sample_count: number
+  last_sample_at?: ISODateString
+}
+
+export interface AccountFirstTokenStats {
+  short: AccountFirstTokenWindowStats
+  long: AccountFirstTokenWindowStats
+}
+
+export type QualityEvalKind = 'juice' | 'candy' | 'full'
+export type QualityEvalStatus = 'running' | 'normal' | 'suspected' | 'degraded' | 'incomplete'
+
+export interface RunQualityEvalRequest {
+  kind: QualityEvalKind
+  juice_samples: number
+  juice_concurrency: number
+  candy_samples: number
+  candy_concurrency: number
+}
+
+export interface QualityEvalSample {
+  id?: number
+  batch_id: number
+  account_id: number
+  test_kind: Exclude<QualityEvalKind, 'full'>
+  sample_index: number
+  attempt_count: number
+  model: string
+  reasoning_effort: string
+  attempt_answers?: string[]
+  raw_answer: string
+  parsed_answer: string
+  graded: boolean
+  correct: boolean
+  input_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  first_token_ms: number
+  duration_ms: number
+  http_status: number
+  terminal_status?: string
+  error_message?: string
+  created_at: ISODateString
+}
+
+export interface QualityEvalBatch {
+  id: number
+  account_id: number
+  trigger_source: 'manual' | 'auto'
+  test_kind: QualityEvalKind
+  scheduled_hour?: ISODateString
+  model: string
+  reasoning_effort: string
+  status: QualityEvalStatus
+  error_message?: string
+  juice_requested: number
+  juice_concurrency: number
+  juice_graded: number
+  juice_correct: number
+  candy_requested: number
+  candy_concurrency: number
+  candy_graded: number
+  candy_correct: number
+  latest_juice_value?: string
+  reasoning_tokens_average: number
+  reasoning_tokens_maximum: number
+  started_at: ISODateString
+  finished_at?: ISODateString
+  created_at: ISODateString
+  samples?: QualityEvalSample[]
+}
+
+export interface QualityEvalConfig {
+  auto_enabled: boolean
+  interval_minutes: number
+  lookback_hours: number
+  top_accounts: number
+  min_requests: number
+  batch_concurrency: number
+  auto_runnable: boolean
+  auto_skip_reason?: string
+}
+
 export interface AccountRow {
   id: number
   name: string
@@ -111,6 +200,9 @@ export interface AccountRow {
   dispatch_score?: number
   score_bias_override?: number | null
   score_bias_effective?: number
+  manual_score_bonus?: number
+  manual_score_bonus_until?: ISODateString
+  manual_score_bonus_remaining_seconds?: number
   base_concurrency_override?: number | null
   base_concurrency_effective?: number
   skip_warm_tier?: boolean
@@ -131,6 +223,7 @@ export interface AccountRow {
     usage_urgency_bonus_5h?: number
     usage_urgency_bonus_7d?: number
     expiry_urgency_bonus?: number
+    manual_score_bonus?: number
     cheap_probe_bonus?: number
     latency_penalty: number
     success_rate_penalty?: number
@@ -164,10 +257,23 @@ export interface AccountRow {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
+  encrypted_content_compatibility_enabled?: boolean | null
+  encrypted_content_compatibility_effective?: boolean
+  fast_tier_policy?: FastTierPolicy | null
+  fast_tier_policy_effective?: FastTierPolicy
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
+  failure_tolerance_window_seconds?: number | null
+  failure_score_retroactive?: boolean | null
   failure_score_threshold_effective?: number
   failure_cooldown_threshold_effective?: number
+  failure_tolerance_window_seconds_effective?: number
+  failure_score_retroactive_effective?: boolean
+  transport_same_account_retries?: number | null
+  transport_same_account_retries_effective?: number
+  compact_same_account_retries?: number | null
+  compact_same_account_retries_effective?: number
+  failure_window_count?: number
   consecutive_failure_count?: number
   price_multiplier?: number | null
   cheap_probe_recovery_margin?: number | null
@@ -181,6 +287,9 @@ export interface AccountRow {
   ignore_usage_limit_status_effective?: boolean
   dispatch_count_limit?: number | null
   scheduler_priority?: number | null
+  first_token_stats?: AccountFirstTokenStats
+  latest_quality_eval?: QualityEvalBatch
+  quality_eval_supported?: boolean
   dispatch_count_used?: number
   dispatch_count_reset_at?: ISODateString
   dispatch_count_limited?: boolean
@@ -486,8 +595,14 @@ export interface UpdateAccountSchedulerRequest {
   auto_pause_7d_disabled?: boolean
   ignore_usage_limit_429_cooldown?: boolean
   ignore_unauthorized_cooldown?: boolean
+  encrypted_content_compatibility_enabled?: boolean | null
+  fast_tier_policy?: FastTierPolicy | null
   failure_score_threshold?: number | null
   failure_cooldown_threshold?: number | null
+  failure_tolerance_window_seconds?: number | null
+  failure_score_retroactive?: boolean | null
+  transport_same_account_retries?: number | null
+  compact_same_account_retries?: number | null
   price_multiplier?: number | null
   cheap_probe_recovery_margin?: number | null
   cheap_probe_bonus_duration_minutes?: number | null
@@ -908,6 +1023,8 @@ export interface SystemSettings {
   dispatch_max_multiplier: number
   failure_score_threshold: number
   failure_cooldown_threshold: number
+  failure_tolerance_window_seconds: number
+  failure_score_retroactive: boolean
   lazy_mode: boolean
   proxy_url?: string
   pg_max_conns: number
@@ -955,6 +1072,16 @@ export interface SystemSettings {
   max_rate_limit_retries: number
   retry_interval_ms: number
   transport_retry_policy: string
+  transport_same_account_retries: number
+  compact_same_account_retries: number
+  client_request_replay_enabled: boolean
+  client_request_replay_max_retries: number
+  client_request_replay_max_duration_seconds: number
+  client_request_replay_retry_base_interval_ms: number
+  client_request_replay_retry_max_interval_seconds: number
+  client_request_replay_keepalive_seconds: number
+  encrypted_content_compatibility_enabled: boolean
+  fast_tier_policy: FastTierPolicy
   allow_remote_migration: boolean
   database_driver: string
   database_label: string

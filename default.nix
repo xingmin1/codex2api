@@ -11,7 +11,7 @@
     inherit version;
 
     src = ./frontend;
-    npmDepsHash = "sha256-yF4LT2ZAZz/wt9OqEMchJxHkg4yNYt9QIB2rdFP3mbM=";
+    npmDepsHash = "sha256-l8qtfIGNvfaRYJqnLppEdbZjbxzowFfz0UzJoNrmHy0=";
 
     VITE_APP_VERSION = version;
 
@@ -30,7 +30,7 @@ in
     inherit version;
 
     src = ./.;
-    vendorHash = "sha256-y1pBdd3V8LVXoootXyWCvm78p+H00H+tEAlFqMYDfrI=";
+    vendorHash = "sha256-O8t4rPgcE+2e3jYPoFUZtVpEkchwcbWWMU/Aa9XGnTI=";
     subPackages = ["."];
 
     # nixpkgs 的 Go 补丁版本可能暂时落后于上游 go.mod；仅在 Nix 构建副本中

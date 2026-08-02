@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -88,16 +89,17 @@ func (c *CacheConfig) Label() string {
 // Config 全局核心环境配置（物理隔离的服务器参数）
 // 业务逻辑参数（如 ProxyURL，APIKeys，MaxConcurrency）已全部移至数据库 SystemSettings 进行化
 type Config struct {
-	Port                   int
-	BindAddress            string // 监听地址，默认 0.0.0.0（兼容 Docker / 反代 / 公网）；如需仅本机访问可设为 127.0.0.1
-	AdminSecret            string
-	AllowAnonymousV1       bool // 显式允许 /v1/* 在未配置 API Key 时无鉴权放行（默认禁止）
-	MaxRequestBodySize     int
-	Database               DatabaseConfig
-	Cache                  CacheConfig
-	UseWebsocket           bool     // 是否启用 WebSocket 传输
-	CodexUpstreamTransport string   // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
-	TrustedProxies         []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
+	Port                    int
+	BindAddress             string // 监听地址，默认 0.0.0.0（兼容 Docker / 反代 / 公网）；如需仅本机访问可设为 127.0.0.1
+	AdminSecret             string
+	AllowAnonymousV1        bool // 显式允许 /v1/* 在未配置 API Key 时无鉴权放行（默认禁止）
+	MaxRequestBodySize      int
+	GracefulShutdownTimeout time.Duration
+	Database                DatabaseConfig
+	Cache                   CacheConfig
+	UseWebsocket            bool     // 是否启用 WebSocket 传输
+	CodexUpstreamTransport  string   // http|auto|ws，默认 http；USE_WEBSOCKET 作为旧开关兼容
+	TrustedProxies          []string // Gin 可信反向代理 CIDR/IP；默认信任回环与私有网段以兼容 Docker 反代，none/off/false/0 表示禁用
 }
 
 // Load 从 .env 文件加载核心环境配置，支持环境变量覆盖
@@ -109,8 +111,9 @@ func Load(envPath string) (*Config, error) {
 	_ = godotenv.Load(envPath)
 
 	cfg := &Config{
-		Port:               8080,
-		MaxRequestBodySize: 48 * 1024 * 1024,
+		Port:                    8080,
+		MaxRequestBodySize:      48 * 1024 * 1024,
+		GracefulShutdownTimeout: 360 * time.Second,
 	}
 
 	// Web服务端口
@@ -131,6 +134,11 @@ func Load(envPath string) (*Config, error) {
 	if v := strings.TrimSpace(os.Getenv("CODEX_MAX_REQUEST_BODY_SIZE_MB")); v != "" {
 		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
 			cfg.MaxRequestBodySize = mb * 1024 * 1024
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("CODEX_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS")); v != "" {
+		if seconds, err := strconv.Atoi(v); err == nil && seconds > 0 {
+			cfg.GracefulShutdownTimeout = time.Duration(seconds) * time.Second
 		}
 	}
 	cfg.TrustedProxies = parseTrustedProxiesEnv(os.Getenv("CODEX_TRUSTED_PROXIES"))

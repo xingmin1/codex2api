@@ -32,6 +32,7 @@ import type {
   AddATAccountRequest,
   AddOpenAIResponsesAccountRequest,
   CodexClientMetadataMode,
+  FastTierPolicy,
   UpdateOpenAIResponsesAccountRequest,
   APIKeyRow,
   OpsOverviewResponse,
@@ -39,6 +40,10 @@ import type {
   SystemSettings,
   RecycleBinAccountRow,
   AgentIdentityImportItem,
+  QualityEvalBatch,
+  QualityEvalKind,
+  QualityEvalSample,
+  RunQualityEvalRequest,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
@@ -128,6 +133,9 @@ import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
 import AccountHealthBar from "../components/AccountHealthBar";
 import AccountDetailSheet from "../components/AccountDetailSheet";
+import AccountFirstTokenStatsView from "../components/AccountFirstTokenStatsView";
+import AccountManualScoreBonusBadge from "../components/AccountManualScoreBonusBadge";
+import AccountQualityEvalBadge from "../components/AccountQualityEvalBadge";
 import CodexInviteView from "../components/CodexInviteView";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
@@ -144,6 +152,22 @@ import AccountGroupFilterSelect, {
 import ChipInput from "../components/ChipInput";
 
 const OPERATION_PROGRESS_FLUSH_INTERVAL_MS = 200;
+const QUALITY_EVAL_MIN_VALUE = 1;
+const QUALITY_EVAL_MAX_VALUE = 10;
+const DEFAULT_QUALITY_EVAL_INPUTS = {
+  juiceSamples: "2",
+  juiceConcurrency: "2",
+  candySamples: "3",
+  candyConcurrency: "3",
+};
+
+function parseQualityEvalInput(value: string): number | null {
+  if (!/^\d+$/.test(value.trim())) return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed >= QUALITY_EVAL_MIN_VALUE && parsed <= QUALITY_EVAL_MAX_VALUE
+    ? parsed
+    : null;
+}
 const ACCOUNT_ANALYSIS_VISIBILITY_KEY = "codex2api:accounts:analysis-visible";
 const ACCOUNT_EMAIL_DOMAIN_VISIBILITY_KEY =
   "codex2api:accounts:email-domain-tags-visible";
@@ -158,6 +182,7 @@ const ACCOUNT_TABLE_COLUMNS = [
   "plan",
   "status",
   "requests",
+  "firstToken",
   "usage",
   "priceMultiplier",
   "billed",
@@ -231,6 +256,10 @@ function getDefaultAccountVisibleColumns(): Record<
   return Object.fromEntries(
     ACCOUNT_TABLE_COLUMNS.map((column) => [column, column !== "tags"]),
   ) as Record<AccountTableColumn, boolean>;
+}
+
+function accountSupportsQualityEval(account: AccountRow): boolean {
+  return account.quality_eval_supported ?? !account.openai_responses_api;
 }
 
 function getInitialAccountVisibleColumns(): Record<
@@ -347,6 +376,14 @@ function persistAccountViewMode(mode: AccountViewMode) {
 // （personal，主体列表改为每行 2 列卡片）。
 const ACCOUNT_PAGE_MODE_KEY = "codex2api:accounts:page-mode";
 type AccountPageMode = "pool" | "personal";
+
+type AccountsPageData = {
+  accounts: AccountRow[];
+  apiKeys: APIKeyRow[];
+  opsOverview: OpsOverviewResponse | null;
+  lazyMode: boolean;
+  healthBars: Record<string, AccountHealthBucket[]>;
+};
 
 // 自用模式自动判定阈值：用户从未手动设置过时，号池账号数 < 该值则默认自用模式。
 const ACCOUNT_PERSONAL_MODE_AUTO_THRESHOLD = 10;
@@ -718,6 +755,31 @@ function failureThresholdInputToValue(value: string): number | null {
   return parsed;
 }
 
+function formatTransportSameAccountRetriesInput(value?: number | null): string {
+  return typeof value === "number" ? String(Math.trunc(value)) : "";
+}
+
+function isTransportSameAccountRetriesInputInvalid(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (!/^\d+$/.test(trimmed)) return true;
+  const parsed = Number.parseInt(trimmed, 10);
+  return parsed < 0 || parsed > 10;
+}
+
+function transportSameAccountRetriesInputToValue(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return Number.parseInt(trimmed, 10);
+}
+
+function isFailureWindowInputInvalid(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (!/^\d+$/.test(trimmed)) return true;
+  const parsed = Number.parseInt(trimmed, 10);
+  return parsed < 1 || parsed > 3600;
+}
 
 function sortMissingNumber(direction: SortDirection): number {
   return direction === "asc" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
@@ -1043,6 +1105,25 @@ export default function Accounts() {
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null);
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null);
   const [detailAccountId, setDetailAccountId] = useState<number | null>(null);
+  const [manualBonusAccount, setManualBonusAccount] =
+    useState<AccountRow | null>(null);
+  const [manualBonusInput, setManualBonusInput] = useState("30");
+  const [manualBonusDurationInput, setManualBonusDurationInput] =
+    useState("30");
+  const [manualBonusSubmitting, setManualBonusSubmitting] = useState(false);
+  const [qualityEvalAccount, setQualityEvalAccount] = useState<AccountRow | null>(null);
+  const [qualityEvalHistory, setQualityEvalHistory] = useState<QualityEvalBatch[]>([]);
+  const [qualityEvalSubmitting, setQualityEvalSubmitting] = useState(false);
+  const [qualityEvalLoading, setQualityEvalLoading] = useState(false);
+  const [qualityEvalInputs, setQualityEvalInputs] = useState(DEFAULT_QUALITY_EVAL_INPUTS);
+  const qualityEvalHistoryRequestRef = useRef(0);
+  const qualityEvalInputsValid = Object.values(qualityEvalInputs).every(
+    (value) => parseQualityEvalInput(value) !== null,
+  );
+  const qualityEvalRunning = qualityEvalHistory.some(
+    (batch) => batch.status === "running",
+  );
+  const qualityEvalBusy = qualityEvalLoading || qualityEvalSubmitting || qualityEvalRunning;
   const [editingAccount, setEditingAccount] = useState<AccountRow | null>(null);
   const [editSubmitting, setEditSubmitting] = useState(false);
   const [editTab, setEditTab] = useState<"scheduler" | "account">("scheduler");
@@ -1068,12 +1149,19 @@ export default function Accounts() {
   const [editPriceMultiplierInput, setEditPriceMultiplierInput] = useState("");
   const [editFailureToleranceEnabled, setEditFailureToleranceEnabled] =
     useState(false);
+  const [
+    editEncryptedContentCompatibilityMode,
+    setEditEncryptedContentCompatibilityMode,
+  ] = useState<"inherit" | "enabled" | "disabled">("inherit");
+  const [editFastTierPolicyMode, setEditFastTierPolicyMode] =
+    useState<"inherit" | FastTierPolicy>("inherit");
   const [editFailureScoreThresholdInput, setEditFailureScoreThresholdInput] =
     useState("");
-  const [
-    editFailureCooldownThresholdInput,
-    setEditFailureCooldownThresholdInput,
-  ] = useState("");
+  const [editFailureWindowInput, setEditFailureWindowInput] = useState("");
+  const [editFailureScoreRetroactiveMode, setEditFailureScoreRetroactiveMode] =
+    useState<"inherit" | "enabled" | "disabled">("inherit");
+  const [editTransportSameAccountRetriesInput, setEditTransportSameAccountRetriesInput] = useState("");
+  const [editCompactSameAccountRetriesInput, setEditCompactSameAccountRetriesInput] = useState("");
   const [editSchedulerPriorityInput, setEditSchedulerPriorityInput] =
     useState("");
   const [allowedAPIKeySelection, setAllowedAPIKeySelection] = useState<
@@ -1308,6 +1396,8 @@ export default function Accounts() {
   const folderInputRef = useRef<HTMLInputElement>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
   const lazyModeRef = useRef<boolean | null>(null);
+  const accountsLoadSequenceRef = useRef(0);
+  const latestAccountsDataRef = useRef<AccountsPageData | null>(null);
   const { toast, showToast } = useToast();
   const { confirm, confirmDialog } = useConfirmDialog();
   const ipApiLang = i18n.language?.startsWith("zh") ? "zh-CN" : "en";
@@ -1784,6 +1874,7 @@ export default function Accounts() {
   );
 
   const loadAccounts = useCallback(async (options?: LoadOptions) => {
+    const requestSequence = ++accountsLoadSequenceRef.current;
     const shouldLoadSettings = !options?.silent || lazyModeRef.current === null;
     const [
       accountsResponse,
@@ -1807,26 +1898,25 @@ export default function Accounts() {
           .then((res) => res.buckets)
           .catch((): Record<string, AccountHealthBucket[]> | null => null),
       ]);
+    const nextData: AccountsPageData = {
+      accounts: accountsResponse.accounts ?? [],
+      apiKeys: apiKeysResponse.keys ?? [],
+      opsOverview,
+      lazyMode: settings?.lazy_mode ?? lazyModeRef.current ?? false,
+      healthBars: healthBars ?? {},
+    };
+    if (requestSequence !== accountsLoadSequenceRef.current) {
+      return latestAccountsDataRef.current ?? nextData;
+    }
     if (settings) {
       lazyModeRef.current = settings.lazy_mode;
     }
     setAllGroups(groupsResponse.groups ?? []);
-    return {
-      accounts: accountsResponse.accounts ?? [],
-      apiKeys: apiKeysResponse.keys ?? [],
-      opsOverview,
-      lazyMode: lazyModeRef.current ?? false,
-      healthBars: healthBars ?? {},
-    };
+    latestAccountsDataRef.current = nextData;
+    return nextData;
   }, []);
 
-  const { data, loading, error, reload, reloadSilently } = useDataLoader<{
-    accounts: AccountRow[];
-    apiKeys: APIKeyRow[];
-    opsOverview: OpsOverviewResponse | null;
-    lazyMode: boolean;
-    healthBars: Record<string, AccountHealthBucket[]>;
-  }>({
+  const { data, loading, error, reload, reloadSilently } = useDataLoader<AccountsPageData>({
     initialData: {
       accounts: [],
       apiKeys: [],
@@ -2178,6 +2268,147 @@ export default function Accounts() {
   const closeAccountDetail = useCallback(() => {
     setDetailAccountId(null);
   }, []);
+  const openManualScoreBonus = useCallback((account: AccountRow) => {
+    setManualBonusAccount(account);
+    setManualBonusInput(
+      (account.manual_score_bonus ?? 0) !== 0
+        ? String(account.manual_score_bonus)
+        : "30",
+    );
+    setManualBonusDurationInput("30");
+  }, []);
+  const closeManualScoreBonus = useCallback(() => {
+    if (manualBonusSubmitting) return;
+    setManualBonusAccount(null);
+  }, [manualBonusSubmitting]);
+  const saveManualScoreBonus = useCallback(async () => {
+    if (!manualBonusAccount || manualBonusSubmitting) return;
+    const bonus = Number(manualBonusInput);
+    const durationMinutes = Number(manualBonusDurationInput);
+    if (!Number.isInteger(bonus) || bonus < -400 || bonus > 400) {
+      showToast(t("accounts.manualScoreBonusRange"), "error");
+      return;
+    }
+    if (
+      !Number.isInteger(durationMinutes) ||
+      durationMinutes < 1 ||
+      durationMinutes > 1440
+    ) {
+      showToast(t("accounts.manualScoreBonusDurationRange"), "error");
+      return;
+    }
+
+    setManualBonusSubmitting(true);
+    try {
+      await api.setAccountManualScoreBonus(
+        manualBonusAccount.id,
+        bonus,
+        durationMinutes * 60,
+      );
+      await reloadSilently();
+      setManualBonusAccount(null);
+      showToast(bonus === 0 ? t("accounts.manualScoreBonusCleared") : t("accounts.manualScoreBonusSaved"));
+    } catch (error) {
+      showToast(
+        t("accounts.manualScoreBonusFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setManualBonusSubmitting(false);
+    }
+  }, [
+    manualBonusAccount,
+    manualBonusDurationInput,
+    manualBonusInput,
+    manualBonusSubmitting,
+    reloadSilently,
+    showToast,
+    t,
+  ]);
+  const clearManualScoreBonus = useCallback(async () => {
+    if (!manualBonusAccount || manualBonusSubmitting) return;
+    setManualBonusSubmitting(true);
+    try {
+      await api.clearAccountManualScoreBonus(manualBonusAccount.id);
+      await reloadSilently();
+      setManualBonusAccount(null);
+      showToast(t("accounts.manualScoreBonusCleared"));
+    } catch (error) {
+      showToast(
+        t("accounts.manualScoreBonusFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setManualBonusSubmitting(false);
+    }
+  }, [
+    manualBonusAccount,
+    manualBonusSubmitting,
+    reloadSilently,
+    showToast,
+    t,
+  ]);
+  const openQualityEval = useCallback(async (account: AccountRow) => {
+    const requestID = ++qualityEvalHistoryRequestRef.current;
+    setQualityEvalAccount(account);
+    setQualityEvalHistory([]);
+    setQualityEvalInputs(DEFAULT_QUALITY_EVAL_INPUTS);
+    setQualityEvalLoading(true);
+    try {
+      const response = await api.getAccountQualityEvals(account.id);
+      if (qualityEvalHistoryRequestRef.current === requestID) {
+        setQualityEvalHistory(response.batches ?? []);
+      }
+    } catch (error) {
+      if (qualityEvalHistoryRequestRef.current === requestID) {
+        showToast(t("accounts.qualityEvalHistoryFailed", { error: getErrorMessage(error) }), "error");
+      }
+    } finally {
+      if (qualityEvalHistoryRequestRef.current === requestID) {
+        setQualityEvalLoading(false);
+      }
+    }
+  }, [showToast, t]);
+  const runQualityEval = useCallback(async (kind: QualityEvalKind) => {
+    if (!qualityEvalAccount || qualityEvalBusy) return;
+    const account = qualityEvalAccount;
+    const dialogRequestID = qualityEvalHistoryRequestRef.current;
+    const parsedInputs = {
+      juiceSamples: parseQualityEvalInput(qualityEvalInputs.juiceSamples),
+      juiceConcurrency: parseQualityEvalInput(qualityEvalInputs.juiceConcurrency),
+      candySamples: parseQualityEvalInput(qualityEvalInputs.candySamples),
+      candyConcurrency: parseQualityEvalInput(qualityEvalInputs.candyConcurrency),
+    };
+    if (Object.values(parsedInputs).some((value) => value === null)) {
+      showToast(t("accounts.qualityEvalParameterError"), "error");
+      return;
+    }
+    const payload: RunQualityEvalRequest = {
+      kind,
+      juice_samples: parsedInputs.juiceSamples!,
+      juice_concurrency: parsedInputs.juiceConcurrency!,
+      candy_samples: parsedInputs.candySamples!,
+      candy_concurrency: parsedInputs.candyConcurrency!,
+    };
+    setQualityEvalSubmitting(true);
+    try {
+      await api.runAccountQualityEval(account.id, payload);
+      if (qualityEvalHistoryRequestRef.current === dialogRequestID) {
+        qualityEvalHistoryRequestRef.current += 1;
+        setQualityEvalAccount(null);
+      }
+      showToast(t("accounts.qualityEvalStarted"));
+      void reloadSilently();
+    } catch (error) {
+      showToast(t("accounts.qualityEvalFailed", { error: getErrorMessage(error) }), "error");
+    } finally {
+      setQualityEvalSubmitting(false);
+    }
+  }, [qualityEvalAccount, qualityEvalBusy, qualityEvalInputs, reloadSilently, showToast, t]);
   const goDetailPrev = useCallback(() => {
     if (detailNavIndex <= 0) return;
     setDetailAccountId(sortedAccounts[detailNavIndex - 1]?.id ?? null);
@@ -2219,7 +2450,7 @@ export default function Accounts() {
   }, [page, totalPages]);
 
   useEffect(() => {
-    if (!accounts.some((account) => account.status === "refreshing")) {
+    if (!accounts.some((account) => account.status === "refreshing" || account.latest_quality_eval?.status === "running")) {
       return;
     }
 
@@ -4172,11 +4403,32 @@ export default function Accounts() {
     setEditFailureToleranceEnabled(
       account.ignore_usage_limit_429_cooldown ?? false,
     );
+    setEditEncryptedContentCompatibilityMode(
+      account.encrypted_content_compatibility_enabled === true
+        ? "enabled"
+        : account.encrypted_content_compatibility_enabled === false
+          ? "disabled"
+          : "inherit",
+    );
+    setEditFastTierPolicyMode(account.fast_tier_policy ?? "inherit");
     setEditFailureScoreThresholdInput(
       formatFailureThresholdInput(account.failure_score_threshold),
     );
-    setEditFailureCooldownThresholdInput(
-      formatFailureThresholdInput(account.failure_cooldown_threshold),
+    setEditFailureWindowInput(
+      formatFailureThresholdInput(account.failure_tolerance_window_seconds),
+    );
+    setEditFailureScoreRetroactiveMode(
+      account.failure_score_retroactive === true
+        ? "enabled"
+        : account.failure_score_retroactive === false
+          ? "disabled"
+          : "inherit",
+    );
+    setEditTransportSameAccountRetriesInput(
+      formatTransportSameAccountRetriesInput(account.transport_same_account_retries),
+    );
+    setEditCompactSameAccountRetriesInput(
+      formatTransportSameAccountRetriesInput(account.compact_same_account_retries),
     );
     setEditSchedulerPriorityInput(
       formatSchedulerPriorityInput(account.scheduler_priority),
@@ -4231,8 +4483,13 @@ export default function Accounts() {
     setEditDispatchCountLimitInput("");
     setEditPriceMultiplierInput("");
     setEditFailureToleranceEnabled(false);
+    setEditEncryptedContentCompatibilityMode("inherit");
+    setEditFastTierPolicyMode("inherit");
     setEditFailureScoreThresholdInput("");
-    setEditFailureCooldownThresholdInput("");
+    setEditFailureWindowInput("");
+    setEditFailureScoreRetroactiveMode("inherit");
+    setEditTransportSameAccountRetriesInput("");
+    setEditCompactSameAccountRetriesInput("");
     setEditSchedulerPriorityInput("");
     setAllowedAPIKeySelection([]);
     setEditProxyUrl("");
@@ -4286,9 +4543,17 @@ export default function Accounts() {
   const editFailureScoreThresholdInvalid = isFailureThresholdInputInvalid(
     editFailureScoreThresholdInput,
   );
-  const editFailureCooldownThresholdInvalid = isFailureThresholdInputInvalid(
-    editFailureCooldownThresholdInput,
+  const editFailureWindowInvalid = isFailureWindowInputInvalid(
+    editFailureWindowInput,
   );
+  const editTransportSameAccountRetriesInvalid =
+    isTransportSameAccountRetriesInputInvalid(
+      editTransportSameAccountRetriesInput,
+    );
+  const editCompactSameAccountRetriesInvalid =
+    isTransportSameAccountRetriesInputInvalid(
+      editCompactSameAccountRetriesInput,
+    );
   const editSchedulerPriorityInvalid = isSchedulerPriorityInputInvalid(
     editSchedulerPriorityInput,
   );
@@ -4361,7 +4626,9 @@ export default function Accounts() {
       editDispatchCountLimitInvalid ||
       editPriceMultiplierInvalid ||
       editFailureScoreThresholdInvalid ||
-      editFailureCooldownThresholdInvalid ||
+      editFailureWindowInvalid ||
+      editTransportSameAccountRetriesInvalid ||
+      editCompactSameAccountRetriesInvalid ||
       editSchedulerPriorityInvalid
     ) {
       showToast(t("accounts.schedulerInvalidInput"), "error");
@@ -4400,12 +4667,30 @@ export default function Accounts() {
           editDispatchCountLimitInput,
         ),
         ignore_usage_limit_429_cooldown: editFailureToleranceEnabled,
+        encrypted_content_compatibility_enabled:
+          editEncryptedContentCompatibilityMode === "inherit"
+            ? null
+            : editEncryptedContentCompatibilityMode === "enabled",
+        fast_tier_policy:
+          editFastTierPolicyMode === "inherit" ? null : editFastTierPolicyMode,
         failure_score_threshold: failureThresholdInputToValue(
           editFailureScoreThresholdInput,
         ),
-        failure_cooldown_threshold: failureThresholdInputToValue(
-          editFailureCooldownThresholdInput,
+        failure_tolerance_window_seconds: failureThresholdInputToValue(
+          editFailureWindowInput,
         ),
+        failure_score_retroactive:
+          editFailureScoreRetroactiveMode === "inherit"
+            ? null
+            : editFailureScoreRetroactiveMode === "enabled",
+        transport_same_account_retries:
+          transportSameAccountRetriesInputToValue(
+            editTransportSameAccountRetriesInput,
+          ),
+        compact_same_account_retries:
+          transportSameAccountRetriesInputToValue(
+            editCompactSameAccountRetriesInput,
+          ),
         price_multiplier: priceMultiplierInputToNumber(editPriceMultiplierInput),
         scheduler_priority: schedulerPriorityInputToValue(
           editSchedulerPriorityInput,
@@ -5382,9 +5667,10 @@ export default function Accounts() {
                       plan: t("accounts.plan"),
                       tags: t("accounts.tagsLabel"),
                       groups: t("accounts.groupsLabel"),
-		                      status: t("accounts.status"),
-		                      requests: t("accounts.requests"),
-		                      usage: t("accounts.usage"),
+			                      status: t("accounts.status"),
+			                      requests: t("accounts.requests"),
+			                      firstToken: t("accounts.firstTokenColumn"),
+			                      usage: t("accounts.usage"),
 		                      priceMultiplier: t("accounts.priceMultiplierShort"),
 		                      billed: t("accounts.billed"),
                       priority: t("accounts.schedulerPriorityColumn"),
@@ -5681,6 +5967,7 @@ export default function Accounts() {
                           onEditGroups={() => openQuickGroupEditor(account)}
                           onUsage={() => setUsageAccount(account)}
                           onTest={() => setTestingAccount(account)}
+                          onQualityEval={() => void openQualityEval(account)}
                           onClone={() => void handleCloneAccount(account)}
                           onRefresh={() => void handleRefresh(account)}
                           onGenerateAuthJson={() =>
@@ -5813,6 +6100,11 @@ export default function Accounts() {
                                 ? "↓"
                                 : "↑"
                               : ""}
+                          </TableHead>
+                        )}
+                        {visibleColumns.firstToken && (
+                          <TableHead className="text-[13px] font-semibold">
+                            {t("accounts.firstTokenColumn")}
                           </TableHead>
                         )}
                         {visibleColumns.usage && (
@@ -6147,6 +6439,19 @@ export default function Accounts() {
                                       errorMessage={account.error_message}
                                     />
                                     <AccountStatusCountdown account={account} />
+                                    {(account.manual_score_bonus ?? 0) !== 0 && (
+                                      <AccountManualScoreBonusBadge
+                                        account={account}
+                                        className="h-6"
+                                        onClick={() => {
+                                          openManualScoreBonus(account);
+                                        }}
+                                      />
+                                    )}
+	                                    <AccountQualityEvalBadge
+	                                      account={account}
+                                        onClick={() => void openQualityEval(account)}
+	                                    />
                                     {(account.active_requests ?? 0) > 0 && (
                                       <span
                                         className="inline-flex items-center gap-1 rounded-md bg-blue-500/10 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 dark:text-blue-400"
@@ -6190,6 +6495,13 @@ export default function Accounts() {
                                     </div>
                                   )}
                                 </div>
+                              </TableCell>
+                            )}
+                            {visibleColumns.firstToken && (
+                              <TableCell>
+                                <AccountFirstTokenStatsView
+                                  stats={account.first_token_stats}
+                                />
                               </TableCell>
                             )}
                             {visibleColumns.usage && (
@@ -6247,7 +6559,7 @@ export default function Accounts() {
                               <TableCell className="text-right">
                                 <div className="flex items-center justify-end gap-0.5">
                                   <Button
-                                    variant="ghost"
+	                                    variant="ghost"
                                     size="icon-sm"
                                     className="size-8"
                                     onClick={() => openSchedulerEditor(account)}
@@ -6271,8 +6583,18 @@ export default function Accounts() {
                                     onClick={() => setTestingAccount(account)}
                                     title={t("accounts.testConnection")}
                                   >
-                                    <Zap className="size-3.5" />
-                                  </Button>
+	                                    <Zap className="size-3.5" />
+	                                  </Button>
+	                                  <Button
+	                                    variant="ghost"
+	                                    size="icon-sm"
+	                                    className="size-8"
+	                                    disabled={!accountSupportsQualityEval(account)}
+	                                    onClick={() => void openQualityEval(account)}
+	                                    title={t(accountSupportsQualityEval(account) ? "accounts.qualityEval" : "accounts.qualityEvalUnsupported")}
+	                                  >
+	                                    <FlaskConical className="size-3.5" />
+	                                  </Button>
                                   <Button
                                     variant="ghost"
                                     size="icon-sm"
@@ -7112,6 +7434,116 @@ export default function Accounts() {
           </Modal>
 
           <Modal
+            show={Boolean(qualityEvalAccount)}
+            title={t("accounts.qualityEvalTitle")}
+            contentClassName="sm:max-w-[760px]"
+            bodyClassName="space-y-4"
+            onClose={() => {
+              qualityEvalHistoryRequestRef.current += 1;
+              setQualityEvalAccount(null);
+            }}
+            footer={
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  qualityEvalHistoryRequestRef.current += 1;
+                  setQualityEvalAccount(null);
+                }}
+              >
+                {t("common.close")}
+              </Button>
+            }
+          >
+            <div className="rounded-lg border bg-muted/20 p-3 text-xs leading-relaxed text-muted-foreground">
+              <div className="font-semibold text-foreground">
+                {qualityEvalAccount?.email || qualityEvalAccount?.name || `#${qualityEvalAccount?.id}`}
+              </div>
+              {t("accounts.qualityEvalDescription")}
+            </div>
+            <div className="grid gap-3 rounded-lg border p-3 sm:grid-cols-2">
+              {([
+                ["juiceSamples", "accounts.qualityEvalJuiceSamples"],
+                ["juiceConcurrency", "accounts.qualityEvalJuiceConcurrency"],
+                ["candySamples", "accounts.qualityEvalCandySamples"],
+                ["candyConcurrency", "accounts.qualityEvalCandyConcurrency"],
+              ] as const).map(([field, label]) => (
+                <label key={field} className="space-y-1 text-xs">
+                  <span className="font-medium">{t(label)}</span>
+                  <Input
+                    type="number"
+                    min={QUALITY_EVAL_MIN_VALUE}
+                    max={QUALITY_EVAL_MAX_VALUE}
+                    step={1}
+                    disabled={qualityEvalBusy}
+                    value={qualityEvalInputs[field]}
+                    onChange={(event) => setQualityEvalInputs((current) => ({ ...current, [field]: event.target.value }))}
+                  />
+                </label>
+              ))}
+              {!qualityEvalInputsValid && (
+                <div className="text-xs text-destructive sm:col-span-2">{t("accounts.qualityEvalParameterError")}</div>
+              )}
+              <div className="text-[11px] text-muted-foreground sm:col-span-2">{t("accounts.qualityEvalConcurrencyHint")}</div>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-3">
+              <Button type="button" variant="outline" disabled={!qualityEvalInputsValid || qualityEvalBusy || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("juice")}>
+                {qualityEvalBusy ? <RefreshCw className="size-3.5 animate-spin" /> : <FlaskConical className="size-3.5" />}
+                {t("accounts.qualityEvalJuice", { count: qualityEvalInputs.juiceSamples })}
+              </Button>
+              <Button type="button" variant="outline" disabled={!qualityEvalInputsValid || qualityEvalBusy || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("candy")}>
+                {t("accounts.qualityEvalCandy", { count: qualityEvalInputs.candySamples })}
+              </Button>
+              <Button type="button" disabled={!qualityEvalInputsValid || qualityEvalBusy || !qualityEvalAccount || !accountSupportsQualityEval(qualityEvalAccount)} onClick={() => void runQualityEval("full")}>
+                {t("accounts.qualityEvalFull")}
+              </Button>
+            </div>
+            <div className="space-y-2">
+              <div className="text-xs font-semibold">{t("accounts.qualityEvalHistory")}</div>
+              {qualityEvalLoading ? (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground"><RefreshCw className="size-3.5 animate-spin" />{t("common.loading")}</div>
+              ) : qualityEvalHistory.length === 0 ? (
+                <div className="rounded-lg border border-dashed p-4 text-center text-xs text-muted-foreground">{t("accounts.qualityEvalEmpty")}</div>
+              ) : (
+                <div className="max-h-[420px] space-y-2 overflow-y-auto pr-1">
+                  {qualityEvalHistory.map((batch) => (
+                    <details key={batch.id} className="rounded-lg border bg-card p-3">
+                      <summary className="flex cursor-pointer list-none flex-wrap items-center gap-2 text-xs">
+                        <QualityEvalStatusBadge status={batch.status} />
+                        <span className="font-semibold">{batch.model} · {batch.reasoning_effort}</span>
+                        {batch.juice_requested > 0 && <span>Juice {batch.juice_correct}/{batch.juice_requested}</span>}
+                        {batch.candy_requested > 0 && <span>Candy {batch.candy_correct}/{batch.candy_requested}</span>}
+                        <span className="ml-auto text-muted-foreground">{formatRelativeTime(batch.created_at)}</span>
+                      </summary>
+                      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                        <span>{t(`accounts.qualityEvalSource${batch.trigger_source === "auto" ? "Auto" : "Manual"}`)}</span>
+                        <span>{t("accounts.qualityEvalRequestConfig", {
+                          juiceSamples: batch.juice_requested,
+                          juiceConcurrency: batch.juice_concurrency,
+                          candySamples: batch.candy_requested,
+                          candyConcurrency: batch.candy_concurrency,
+                        })}</span>
+                        <span>{t("accounts.qualityEvalReasoningSummary", {
+                          average: batch.reasoning_tokens_average.toFixed(1),
+                          maximum: batch.reasoning_tokens_maximum,
+                        })}</span>
+                      </div>
+                      {batch.error_message && (
+                        <div className="mt-2 rounded bg-amber-500/10 px-2 py-1.5 text-[11px] text-amber-700 dark:text-amber-300">{batch.error_message}</div>
+                      )}
+                      <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                        {(batch.samples ?? []).map((sample) => (
+                          <QualityEvalSampleCard key={sample.id ?? `${sample.test_kind}-${sample.sample_index}`} sample={sample} />
+                        ))}
+                      </div>
+                    </details>
+                  ))}
+                </div>
+              )}
+            </div>
+          </Modal>
+
+          <Modal
             show={showImportPicker}
             title={t("accounts.importTitle")}
             contentClassName="sm:max-w-[640px]"
@@ -7581,6 +8013,10 @@ export default function Accounts() {
               if (!detailAccount) return;
               openSchedulerEditor(detailAccount);
             }}
+            onManualScoreBonus={() => {
+              if (!detailAccount) return;
+              openManualScoreBonus(detailAccount);
+            }}
             onUsage={() => {
               if (!detailAccount) return;
               setUsageAccount(detailAccount);
@@ -7588,6 +8024,10 @@ export default function Accounts() {
             onTest={() => {
               if (!detailAccount) return;
               setTestingAccount(detailAccount);
+            }}
+            onQualityEval={() => {
+              if (!detailAccount) return;
+              void openQualityEval(detailAccount);
             }}
             onRefresh={() => {
               if (!detailAccount) return;
@@ -7618,6 +8058,101 @@ export default function Accounts() {
               void handleDelete(detailAccount);
             }}
           />
+
+          <Modal
+            show={Boolean(manualBonusAccount)}
+            title={t("accounts.manualScoreBonusTitle")}
+            contentClassName="sm:max-w-[420px]"
+            bodyClassName="space-y-4"
+            onClose={closeManualScoreBonus}
+            footer={
+              <>
+                {(manualBonusAccount?.manual_score_bonus ?? 0) !== 0 && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={manualBonusSubmitting}
+                    onClick={() => void clearManualScoreBonus()}
+                  >
+                    {t("accounts.manualScoreBonusClear")}
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={manualBonusSubmitting}
+                  onClick={closeManualScoreBonus}
+                >
+                  {t("common.cancel")}
+                </Button>
+                <Button
+                  type="button"
+                  disabled={manualBonusSubmitting}
+                  onClick={() => void saveManualScoreBonus()}
+                >
+                  {manualBonusSubmitting
+                    ? t("common.saving")
+                    : t("common.save")}
+                </Button>
+              </>
+            }
+          >
+            <p className="text-[13px] leading-relaxed text-muted-foreground">
+              {t("accounts.manualScoreBonusDescription")}
+            </p>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="space-y-1.5">
+                <span className="text-xs font-semibold text-muted-foreground">
+                  {t("accounts.manualScoreBonusValue")}
+                </span>
+                <Input
+                  type="number"
+                  min={-400}
+                  max={400}
+                  step={1}
+                  value={manualBonusInput}
+                  disabled={manualBonusSubmitting}
+                  onChange={(event) => setManualBonusInput(event.target.value)}
+                />
+              </label>
+              <label className="space-y-1.5">
+                <span className="text-xs font-semibold text-muted-foreground">
+                  {t("accounts.manualScoreBonusDuration")}
+                </span>
+                <Input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  step={1}
+                  value={manualBonusDurationInput}
+                  disabled={manualBonusSubmitting}
+                  onChange={(event) =>
+                    setManualBonusDurationInput(event.target.value)
+                  }
+                />
+              </label>
+            </div>
+            <div className="flex flex-wrap gap-1.5">
+              {[30, 60, 360, 1440].map((minutes) => (
+                <Button
+                  key={minutes}
+                  type="button"
+                  variant={
+                    manualBonusDurationInput === String(minutes)
+                      ? "secondary"
+                      : "outline"
+                  }
+                  size="xs"
+                  disabled={manualBonusSubmitting}
+                  onClick={() =>
+                    setManualBonusDurationInput(String(minutes))
+                  }
+                >
+                  {minutes < 60 ? `${minutes}m` : `${minutes / 60}h`}
+                </Button>
+              ))}
+            </div>
+          </Modal>
 
           <Modal
             show={Boolean(editingAccount)}
@@ -8051,6 +8586,147 @@ export default function Accounts() {
                         )}
                       </div>
 
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <label className="text-sm font-semibold text-foreground">
+                          {t("accounts.transportSameAccountRetriesLabel")}
+                        </label>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.transportSameAccountRetriesHint")}
+                        </div>
+                        <Input
+                          className="mt-3"
+                          inputMode="numeric"
+                          value={editTransportSameAccountRetriesInput}
+                          placeholder={String(
+                            editingAccount.transport_same_account_retries_effective ?? 2,
+                          )}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            setEditTransportSameAccountRetriesInput(event.target.value)
+                          }
+                        />
+                        <div
+                          className={`mt-1.5 text-xs ${editTransportSameAccountRetriesInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                        >
+                          {editTransportSameAccountRetriesInvalid
+                            ? t("accounts.transportSameAccountRetriesRange")
+                            : t("accounts.transportSameAccountRetriesInherit", {
+                                value:
+                                  editingAccount.transport_same_account_retries_effective ?? 2,
+                              })}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <label className="text-sm font-semibold text-foreground">
+                          {t("accounts.compactSameAccountRetriesLabel")}
+                        </label>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.compactSameAccountRetriesHint")}
+                        </div>
+                        <Input
+                          className="mt-3"
+                          inputMode="numeric"
+                          value={editCompactSameAccountRetriesInput}
+                          placeholder={String(
+                            editingAccount.compact_same_account_retries_effective ?? 2,
+                          )}
+                          onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                            setEditCompactSameAccountRetriesInput(event.target.value)
+                          }
+                        />
+                        <div
+                          className={`mt-1.5 text-xs ${editCompactSameAccountRetriesInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                        >
+                          {editCompactSameAccountRetriesInvalid
+                            ? t("accounts.compactSameAccountRetriesRange")
+                            : t("accounts.compactSameAccountRetriesInherit", {
+                                value:
+                                  editingAccount.compact_same_account_retries_effective ?? 2,
+                              })}
+                        </div>
+                      </div>
+
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
+                        <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="min-w-0">
+                            <div className="text-sm font-semibold text-foreground">
+                              {t("accounts.fastTierPolicyLabel")}
+                            </div>
+                            <div className="mt-1 text-xs text-muted-foreground">
+                              {t("accounts.fastTierPolicyHint")}
+                            </div>
+                          </div>
+                          <div className="flex shrink-0 flex-wrap gap-2">
+                            <TogglePill
+                              active={editFastTierPolicyMode === "inherit"}
+                              onClick={() => setEditFastTierPolicyMode("inherit")}
+                              label={t("accounts.fastTierPolicyInherit", {
+                                value: t(
+                                  editingAccount.fast_tier_policy_effective === "force_fast"
+                                    ? "accounts.fastTierPolicyForce"
+                                    : editingAccount.fast_tier_policy_effective === "filter_fast"
+                                      ? "accounts.fastTierPolicyFilter"
+                                      : "accounts.fastTierPolicyPreserve",
+                                ),
+                              })}
+                            />
+                            <TogglePill
+                              active={editFastTierPolicyMode === "preserve"}
+                              onClick={() => setEditFastTierPolicyMode("preserve")}
+                              label={t("accounts.fastTierPolicyPreserve")}
+                            />
+                            <TogglePill
+                              active={editFastTierPolicyMode === "force_fast"}
+                              onClick={() => setEditFastTierPolicyMode("force_fast")}
+                              label={t("accounts.fastTierPolicyForce")}
+                            />
+                            <TogglePill
+                              active={editFastTierPolicyMode === "filter_fast"}
+                              onClick={() => setEditFastTierPolicyMode("filter_fast")}
+                              label={t("accounts.fastTierPolicyFilter")}
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      {editingAccount.openai_responses_api && (
+                        <div className="rounded-xl border border-border p-4 md:col-span-2">
+                          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+                            <div className="min-w-0">
+                              <div className="text-sm font-semibold text-foreground">
+                                {t("accounts.encryptedContentCompatibilityLabel")}
+                              </div>
+                              <div className="mt-1 text-xs text-muted-foreground">
+                                {t("accounts.encryptedContentCompatibilityHint")}
+                              </div>
+                            </div>
+                            <div className="flex shrink-0 flex-wrap gap-2">
+                              <TogglePill
+                                active={editEncryptedContentCompatibilityMode === "inherit"}
+                                onClick={() => setEditEncryptedContentCompatibilityMode("inherit")}
+                                label={t("accounts.encryptedContentCompatibilityInherit", {
+                                  value: t(
+                                    editingAccount.encrypted_content_compatibility_effective ?? true
+                                      ? "common.enabled"
+                                      : "common.disabled",
+                                  ),
+                                })}
+                              />
+                              <TogglePill
+                                active={editEncryptedContentCompatibilityMode === "enabled"}
+                                onClick={() => setEditEncryptedContentCompatibilityMode("enabled")}
+                                label={t("common.enabled")}
+                              />
+                              <TogglePill
+                                active={editEncryptedContentCompatibilityMode === "disabled"}
+                                onClick={() => setEditEncryptedContentCompatibilityMode("disabled")}
+                                label={t("common.disabled")}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
                       <div className="rounded-xl border border-border p-4">
                         <div className="text-sm font-semibold text-foreground">
                           {t("accounts.schedulerConcurrencyLabel")}
@@ -8133,8 +8809,9 @@ export default function Accounts() {
                         </div>
                       </div>
 
-                      <div className="rounded-xl border border-border p-4 md:col-span-2">
-                        <div className="flex items-start justify-between gap-4">
+                      {editingAccount.openai_responses_api && (
+                        <div className="rounded-xl border border-border p-4 md:col-span-2">
+                          <div className="flex items-start justify-between gap-4">
                           <div>
                             <div className="text-sm font-semibold text-foreground">
                               {t("accounts.ignoreUsageLimit429Cooldown")}
@@ -8162,7 +8839,7 @@ export default function Accounts() {
                             />
                           </button>
                         </div>
-                        <div className="mt-4 grid gap-4 md:grid-cols-2">
+                          <div className="mt-4 grid gap-4 md:grid-cols-2">
                           <div>
                             <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
                               {t("accounts.failureScoreThresholdLabel")}
@@ -8192,45 +8869,75 @@ export default function Accounts() {
                           </div>
                           <div>
                             <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
-                              {t("accounts.failureCooldownThresholdLabel")}
+                              {t("accounts.failureToleranceWindowLabel")}
                             </label>
                             <Input
                               disabled={!editFailureToleranceEnabled}
                               inputMode="numeric"
-                              value={editFailureCooldownThresholdInput}
+                              value={editFailureWindowInput}
                               placeholder={t(
                                 "accounts.failureThresholdPlaceholder",
                               )}
                               onChange={(
                                 event: ChangeEvent<HTMLInputElement>,
                               ) =>
-                                setEditFailureCooldownThresholdInput(
-                                  event.target.value,
-                                )
+                                setEditFailureWindowInput(event.target.value)
                               }
                             />
                             <div
-                              className={`mt-1.5 text-xs ${editFailureCooldownThresholdInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                              className={`mt-1.5 text-xs ${editFailureWindowInvalid ? "text-red-500" : "text-muted-foreground"}`}
                             >
-                              {editFailureCooldownThresholdInvalid
-                                ? t("accounts.failureThresholdRange")
+                              {editFailureWindowInvalid
+                                ? t("accounts.failureWindowRange")
                                 : t("accounts.failureThresholdInheritHint")}
                             </div>
                           </div>
-                        </div>
+                            <div className="md:col-span-2">
+                              <label className="mb-1.5 block text-xs font-semibold text-muted-foreground">
+                                {t("accounts.failureScoreRetroactiveLabel")}
+                              </label>
+                              <div className="mb-2 text-xs text-muted-foreground">
+                                {t("accounts.failureScoreRetroactiveHint")}
+                              </div>
+                              <div className="flex flex-wrap gap-2">
+                                <TogglePill
+                                  active={editFailureScoreRetroactiveMode === "inherit"}
+                                  onClick={() => setEditFailureScoreRetroactiveMode("inherit")}
+                                  label={t("accounts.failureScoreRetroactiveInherit")}
+                                />
+                                <TogglePill
+                                  active={editFailureScoreRetroactiveMode === "enabled"}
+                                  onClick={() => setEditFailureScoreRetroactiveMode("enabled")}
+                                  label={t("common.enabled")}
+                                />
+                                <TogglePill
+                                  active={editFailureScoreRetroactiveMode === "disabled"}
+                                  onClick={() => setEditFailureScoreRetroactiveMode("disabled")}
+                                  label={t("common.disabled")}
+                                />
+                              </div>
+                            </div>
+                          </div>
                         <div className="mt-3 text-xs text-muted-foreground">
                           {t("accounts.failureToleranceStatus", {
                             count:
-                              editingAccount.consecutive_failure_count ?? 0,
+                              editingAccount.failure_window_count ??
+                              editingAccount.consecutive_failure_count ??
+                              0,
+                            window:
+                              editingAccount.failure_tolerance_window_seconds_effective ??
+                              60,
                             score:
                               editingAccount.failure_score_threshold_effective ??
                               1,
-                            cooldown:
-                              editingAccount.failure_cooldown_threshold_effective ??
-                              1,
+                            retroactive:
+                              editingAccount.failure_score_retroactive_effective
+                                ? t("common.enabled")
+                                : t("common.disabled"),
                           })}
                         </div>
                       </div>
+                      )}
 
                       <div className="rounded-xl border border-border p-4">
                         <label className="text-sm font-semibold text-foreground">
@@ -11764,6 +12471,54 @@ function SchedulerChip({
   );
 }
 
+function QualityEvalStatusBadge({ status }: { status: QualityEvalBatch["status"] }) {
+  const { t } = useTranslation();
+  const style = {
+    running: "bg-blue-500/10 text-blue-700 dark:text-blue-300",
+    normal: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+    suspected: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+    degraded: "bg-red-500/10 text-red-700 dark:text-red-300",
+    incomplete: "bg-slate-500/10 text-slate-700 dark:text-slate-300",
+  }[status];
+  return (
+    <span className={`rounded-md px-1.5 py-0.5 text-[10px] font-semibold ${style}`}>
+      {t(`accounts.qualityEvalStatus.${status}`)}
+    </span>
+  );
+}
+
+function QualityEvalSampleCard({ sample }: { sample: QualityEvalSample }) {
+  const answer = sample.raw_answer || sample.error_message || "-";
+  return (
+    <div className="min-w-0 rounded-lg border bg-muted/15 p-2.5 text-[11px]">
+      <div className="mb-1.5 flex items-center gap-2">
+        <span className="font-semibold uppercase">{sample.test_kind} #{sample.sample_index}</span>
+        <span className={sample.graded ? (sample.correct ? "text-emerald-600" : "text-red-600") : "text-slate-500"}>
+          {sample.graded ? (sample.correct ? "✓" : "✗") : "?"}
+        </span>
+        <span className="ml-auto tabular-nums text-muted-foreground">
+          {sample.first_token_ms || "-"}ms / {sample.duration_ms || "-"}ms
+        </span>
+      </div>
+      <pre className="max-h-24 overflow-auto whitespace-pre-wrap break-all rounded bg-background/70 p-2 font-mono text-[10px] leading-relaxed">
+        {answer}
+      </pre>
+      <div className="mt-1.5 flex flex-wrap gap-x-3 text-muted-foreground">
+        <span>in {sample.input_tokens}</span>
+        <span>out {sample.output_tokens}</span>
+        <span>reason {sample.reasoning_tokens}</span>
+        {sample.http_status > 0 && <span>HTTP {sample.http_status}</span>}
+        {sample.terminal_status && <span>{sample.terminal_status}</span>}
+        {sample.attempt_count > 1 && <span>attempts {sample.attempt_count}</span>}
+        {sample.parsed_answer && <span className="font-mono">parsed {sample.parsed_answer}</span>}
+      </div>
+      {sample.error_message && sample.raw_answer && (
+        <div className="mt-1.5 break-words text-red-600 dark:text-red-400">{sample.error_message}</div>
+      )}
+    </div>
+  );
+}
+
 function AccountRowActionsMenu({
   t,
   account,
@@ -12180,6 +12935,7 @@ function AccountMobileCard({
   onEditGroups,
   onUsage,
   onTest,
+  onQualityEval,
   onClone,
   onRefresh,
   onGenerateAuthJson,
@@ -12210,6 +12966,7 @@ function AccountMobileCard({
   onEditGroups: () => void;
   onUsage: () => void;
   onTest: () => void;
+  onQualityEval: () => void;
   onClone: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
@@ -12345,11 +13102,15 @@ function AccountMobileCard({
                   })}
                 </div>
               </div>
-              <div className="shrink-0">
+              <div className="flex shrink-0 flex-col items-end gap-1.5">
                 <StatusBadge
                   status={account.status}
                   detail={getAccountRateLimitWindow(account) ?? undefined}
                   errorMessage={account.error_message}
+                />
+                <AccountQualityEvalBadge
+                  account={account}
+                  onClick={onQualityEval}
                 />
               </div>
             </div>
@@ -12544,6 +13305,13 @@ function AccountMobileCard({
               onClick={onUsage}
               icon={<BarChart3 className="size-3.5" />}
             />
+            <AccountMobileActionButton
+              title={t(accountSupportsQualityEval(account) ? "accounts.qualityEval" : "accounts.qualityEvalUnsupported")}
+              label={t("accounts.qualityEvalBadge")}
+              disabled={!accountSupportsQualityEval(account)}
+              onClick={onQualityEval}
+              icon={<FlaskConical className="size-3.5" />}
+            />
             <AccountRowActionsMenu
               t={t}
 	              account={account}
@@ -12633,6 +13401,10 @@ function AccountMobileCard({
             </div>
 
           <div className="mt-2 flex min-h-6 min-w-0 flex-wrap items-center gap-1.5">
+            <AccountQualityEvalBadge
+              account={account}
+              onClick={onQualityEval}
+            />
             {account.at_only && (
               <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
                 {formatAccessTokenBadge(account)}
@@ -12779,6 +13551,13 @@ function AccountMobileCard({
           title={t("accounts.usageDetail")}
           onClick={onUsage}
           icon={<BarChart3 className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={t(accountSupportsQualityEval(account) ? "accounts.qualityEval" : "accounts.qualityEvalUnsupported")}
+          label={t("accounts.qualityEvalBadge")}
+          disabled={!accountSupportsQualityEval(account)}
+          onClick={onQualityEval}
+          icon={<FlaskConical className="size-3.5" />}
         />
         <AccountRowActionsMenu
           t={t}

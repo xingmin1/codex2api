@@ -1255,6 +1255,17 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 		IgnoreUsageLimitStatus:            true,
 		AutoResetCreditsEnabled:           true,
 		AutoResetCreditsBeforeExpiryMin:   75,
+		TransportRetryPolicy:             "hybrid",
+		TransportSameAccountRetries:      2,
+		CompactSameAccountRetries:        3,
+		ClientRequestReplayEnabled:       true,
+		ClientRequestReplayMaxRetries:     7,
+		ClientRequestReplayMaxDurationSec: 777,
+		ClientRequestReplayBaseIntervalMS: 1234,
+		ClientRequestReplayMaxIntervalSec: 45,
+		ClientRequestReplayKeepaliveSec:  30,
+		EncryptedContentCompat:           false,
+		FastTierPolicy:                   FastTierPolicyFilter,
 	}); err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
 	}
@@ -1289,6 +1300,32 @@ func TestSQLiteSystemSettingsPersistsFirstTokenTimeoutSeconds(t *testing.T) {
 	}
 	if settings.TestContent != "say pong" {
 		t.Fatalf("TestContent = %q, want say pong", settings.TestContent)
+	}
+	if settings.TransportRetryPolicy != "hybrid" || settings.TransportSameAccountRetries != 2 {
+		t.Fatalf("传输重试设置 = {%q %d}, want {hybrid 2}", settings.TransportRetryPolicy, settings.TransportSameAccountRetries)
+	}
+	if settings.CompactSameAccountRetries != 3 {
+		t.Fatalf("compact 同号重试次数 = %d, want 3", settings.CompactSameAccountRetries)
+	}
+	if !settings.ClientRequestReplayEnabled ||
+		settings.ClientRequestReplayMaxRetries != 7 ||
+		settings.ClientRequestReplayMaxDurationSec != 777 ||
+		settings.ClientRequestReplayBaseIntervalMS != 1234 ||
+		settings.ClientRequestReplayMaxIntervalSec != 45 ||
+		settings.ClientRequestReplayKeepaliveSec != 30 {
+		t.Fatalf("整请求代重发设置 = {%t %d %d %d %d %d}",
+			settings.ClientRequestReplayEnabled,
+			settings.ClientRequestReplayMaxRetries,
+			settings.ClientRequestReplayMaxDurationSec,
+			settings.ClientRequestReplayBaseIntervalMS,
+			settings.ClientRequestReplayMaxIntervalSec,
+			settings.ClientRequestReplayKeepaliveSec)
+	}
+	if settings.EncryptedContentCompat {
+		t.Fatal("EncryptedContentCompat = true, want false")
+	}
+	if settings.FastTierPolicy != FastTierPolicyFilter {
+		t.Fatalf("FastTierPolicy = %q, want %q", settings.FastTierPolicy, FastTierPolicyFilter)
 	}
 	if settings.FirstTokenMode != "loose" {
 		t.Fatalf("FirstTokenMode = %q, want loose", settings.FirstTokenMode)
@@ -1488,6 +1525,40 @@ func TestSQLitePartialBackgroundSettingsUpdatesPreserveAutoResetCredits(t *testi
 	}
 	if got.ModelPricingOverrides != `{"new":{"input":2}}` || got.ModelPricingSyncURL != "https://new.example/pricing.json" {
 		t.Fatalf("model pricing = %q / %q", got.ModelPricingOverrides, got.ModelPricingSyncURL)
+	}
+}
+
+func TestSystemSettingsNormalizeBlankFastTierPolicy(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if _, err := db.conn.ExecContext(ctx, `INSERT INTO system_settings (id, fast_tier_policy) VALUES (1, '')`); err != nil {
+		t.Fatalf("插入空 fast_tier_policy 失败: %v", err)
+	}
+
+	settings, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings 返回错误: %v", err)
+	}
+	if settings == nil || settings.FastTierPolicy != FastTierPolicyPreserve {
+		t.Fatalf("FastTierPolicy = %q, want %q", settings.FastTierPolicy, FastTierPolicyPreserve)
+	}
+
+	settings.FastTierPolicy = "invalid"
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
+	}
+	var stored string
+	if err := db.conn.QueryRowContext(ctx, `SELECT fast_tier_policy FROM system_settings WHERE id = 1`).Scan(&stored); err != nil {
+		t.Fatalf("读取 fast_tier_policy 返回错误: %v", err)
+	}
+	if stored != FastTierPolicyPreserve {
+		t.Fatalf("stored fast_tier_policy = %q, want %q", stored, FastTierPolicyPreserve)
 	}
 }
 
@@ -3503,5 +3574,41 @@ func TestSQLiteSystemSettingsWeakNetworkModeRoundtrip(t *testing.T) {
 	}
 	if after.CodexWSWeakNetworkMode {
 		t.Fatal("codex_ws_weak_network_mode = true after disabling, want false")
+	}
+}
+
+func TestSQLiteSystemSettingsFailureToleranceWindowRoundtrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite): %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	settings := &SystemSettings{
+		MaxConcurrency:                   2,
+		TestConcurrency:                  1,
+		TestModel:                        "gpt-5.4",
+		FailureScoreThreshold:            3,
+		FailureCooldownThreshold:         10,
+		FailureToleranceWindowSeconds:    90,
+		FailureScoreRetroactive:          true,
+		CodexContinueMaxRounds:           8,
+		CodexCLIVersionSyncIntervalHours: 12,
+	}
+	if err := db.UpdateSystemSettings(ctx, settings); err != nil {
+		t.Fatalf("UpdateSystemSettings: %v", err)
+	}
+
+	got, err := db.GetSystemSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSystemSettings: %v", err)
+	}
+	if got.FailureToleranceWindowSeconds != 90 {
+		t.Fatalf("failure tolerance window = %d, want 90", got.FailureToleranceWindowSeconds)
+	}
+	if !got.FailureScoreRetroactive {
+		t.Fatal("failure score retroactive = false, want true")
 	}
 }

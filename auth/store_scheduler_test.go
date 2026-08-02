@@ -23,6 +23,104 @@ func recomputeTestAccount(acc *Account, baseLimit int64) {
 	acc.mu.Unlock()
 }
 
+func TestApplyAccountManualScoreBonusOnlyChangesEligibleDispatchScore(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:  4,
+		TestConcurrency: 1,
+		TestModel:       "gpt-test",
+	})
+	account := &Account{
+		DBID:        9101,
+		AccessToken: "token",
+		Status:      StatusReady,
+		PlanType:    "free",
+	}
+	store.AddAccount(account)
+	baseline := account.GetSchedulerDebugSnapshot(4)
+
+	if !store.ApplyAccountManualScoreBonus(account.DBID, 40, time.Now().Add(time.Hour)) {
+		t.Fatal("ApplyAccountManualScoreBonus() = false, want true")
+	}
+	boosted := account.GetSchedulerDebugSnapshot(4)
+	if boosted.SchedulerScore != baseline.SchedulerScore {
+		t.Fatalf("SchedulerScore = %v, want unchanged %v", boosted.SchedulerScore, baseline.SchedulerScore)
+	}
+	if boosted.DispatchScore != baseline.DispatchScore+40 {
+		t.Fatalf("DispatchScore = %v, want %v", boosted.DispatchScore, baseline.DispatchScore+40)
+	}
+	if boosted.ManualScoreBonus != 40 || boosted.Breakdown.ManualScoreBonus != 40 {
+		t.Fatalf("临时加分快照 = %#v, want 40", boosted)
+	}
+	if !store.ApplyAccountManualScoreBonus(account.DBID, -400, time.Now().Add(time.Hour)) {
+		t.Fatal("ApplyAccountManualScoreBonus(-400) = false, want true")
+	}
+	penalized := account.GetSchedulerDebugSnapshot(4)
+	if penalized.SchedulerScore != baseline.SchedulerScore || penalized.HealthTier != baseline.HealthTier {
+		t.Fatalf("负向临时分改变了健康调度状态: baseline=%#v penalized=%#v", baseline, penalized)
+	}
+	if penalized.DispatchScore != baseline.DispatchScore-400 || penalized.Breakdown.ManualScoreBonus != -400 {
+		t.Fatalf("负向 DispatchScore = %#v, want baseline-400", penalized)
+	}
+
+	if !store.ApplyAccountManualScoreBonus(account.DBID, 60, time.Now().Add(-time.Second)) {
+		t.Fatal("设置已过期加分应视为成功清除")
+	}
+	cleared := account.GetSchedulerDebugSnapshot(4)
+	if cleared.ManualScoreBonus != 0 || !cleared.ManualScoreBonusUntil.IsZero() {
+		t.Fatalf("过期加分未清除: %#v", cleared)
+	}
+	if cleared.DispatchScore != baseline.DispatchScore {
+		t.Fatalf("清除后 DispatchScore = %v, want %v", cleared.DispatchScore, baseline.DispatchScore)
+	}
+	if store.ApplyAccountManualScoreBonus(999999, 1, time.Now().Add(time.Hour)) {
+		t.Fatal("未知账号不应应用临时加分")
+	}
+}
+
+func TestMaintenanceSlotsShareAccountLoadWithoutDispatchSideEffects(t *testing.T) {
+	store := NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-test"})
+	account := &Account{DBID: 9102, AccessToken: "token", Status: StatusReady, PlanType: "free"}
+	store.AddAccount(account)
+	baseline := account.GetSchedulerDebugSnapshot(2)
+	if !store.TryAcquireMaintenanceSlot(account) || !store.TryAcquireMaintenanceSlot(account) {
+		t.Fatal("前两个维护槽应成功")
+	}
+	if store.TryAcquireMaintenanceSlot(account) {
+		t.Fatal("维护槽不应超过账号并发上限")
+	}
+	if account.GetActiveRequests() != 2 || account.GetTotalRequests() != 0 {
+		t.Fatalf("负载/请求统计 = %d/%d, want 2/0", account.GetActiveRequests(), account.GetTotalRequests())
+	}
+	store.ReleaseMaintenanceSlot(account)
+	if !store.TryAcquireMaintenanceSlot(account) {
+		t.Fatal("释放后应能重新占用维护槽")
+	}
+	store.ReleaseMaintenanceSlot(account)
+	store.ReleaseMaintenanceSlot(account)
+	after := account.GetSchedulerDebugSnapshot(2)
+	if account.GetActiveRequests() != 0 || after.SchedulerScore != baseline.SchedulerScore || after.HealthTier != baseline.HealthTier {
+		t.Fatalf("维护请求改变了账号状态: active=%d baseline=%#v after=%#v", account.GetActiveRequests(), baseline, after)
+	}
+}
+
+func TestManualScoreBonusDoesNotMakeErrorAccountDispatchEligible(t *testing.T) {
+	account := &Account{
+		AccessToken:           "token",
+		Status:                StatusError,
+		PlanType:              "free",
+		ManualScoreBonus:      200,
+		ManualScoreBonusUntil: time.Now().Add(time.Hour),
+	}
+	recomputeTestAccount(account, 4)
+	snapshot := account.GetSchedulerDebugSnapshot(4)
+	if snapshot.Breakdown.ManualScoreBonus != 0 {
+		t.Fatalf("错误账号 Breakdown.ManualScoreBonus = %v, want 0", snapshot.Breakdown.ManualScoreBonus)
+	}
+	if snapshot.DispatchScore != snapshot.SchedulerScore {
+		t.Fatalf("错误账号 DispatchScore = %v, want SchedulerScore %v", snapshot.DispatchScore, snapshot.SchedulerScore)
+	}
+}
+
 func TestAccountPremiumPlanGetsDefaultScoreBias(t *testing.T) {
 	acc := &Account{
 		AccessToken: "token",

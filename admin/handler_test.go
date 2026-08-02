@@ -55,6 +55,40 @@ func TestRefreshAccountRejectsInvalidID(t *testing.T) {
 	}
 }
 
+func TestUpdateSettingsRejectsInvalidClientRequestReplayBounds(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := auth.NewStore(nil, nil, nil)
+	t.Cleanup(store.Stop)
+	handler := &Handler{store: store}
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "zero retries", body: `{"client_request_replay_max_retries":0}`},
+		{name: "too many retries", body: `{"client_request_replay_max_retries":11}`},
+		{name: "short duration", body: `{"client_request_replay_max_duration_seconds":29}`},
+		{name: "long duration", body: `{"client_request_replay_max_duration_seconds":3601}`},
+		{name: "negative base", body: `{"client_request_replay_retry_base_interval_ms":-1}`},
+		{name: "large base", body: `{"client_request_replay_retry_base_interval_ms":60001}`},
+		{name: "zero max interval", body: `{"client_request_replay_retry_max_interval_seconds":0}`},
+		{name: "large max interval", body: `{"client_request_replay_retry_max_interval_seconds":301}`},
+		{name: "max shorter than base", body: `{"client_request_replay_retry_base_interval_ms":5000,"client_request_replay_retry_max_interval_seconds":4}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = httptest.NewRequest(http.MethodPut, "/api/admin/settings", strings.NewReader(test.body))
+			ctx.Request.Header.Set("Content-Type", "application/json")
+			handler.UpdateSettings(ctx)
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
+			}
+		})
+	}
+}
+
 func TestAccountEmailDomain(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -1685,6 +1719,11 @@ func TestUpdateAccountSchedulerRejectsOutOfRangeValues(t *testing.T) {
 			body:    `{"auto_pause_7d_threshold":-0.01}`,
 			message: "auto_pause_7d_threshold 超出范围，必须在 0..1 之间",
 		},
+		{
+			name:    "compact same account retries out of range",
+			body:    `{"compact_same_account_retries":11}`,
+			message: "compact_same_account_retries 超出范围，必须在 0..10 之间",
+		},
 	}
 
 	for _, tc := range testCases {
@@ -1782,7 +1821,7 @@ func TestUpdateAccountSchedulerPersistsQuotaAutoPauseConfig(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(recorder)
 	ctx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"auto_pause_5h_threshold":0.95,"auto_pause_7d_threshold":null,"auto_pause_5h_disabled":true,"auto_pause_7d_disabled":false,"ignore_usage_limit_429_cooldown":true,"ignore_unauthorized_cooldown":true}`))
+	ctx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(`{"auto_pause_5h_threshold":0.95,"auto_pause_7d_threshold":null,"auto_pause_5h_disabled":true,"auto_pause_7d_disabled":false,"ignore_usage_limit_429_cooldown":true,"ignore_unauthorized_cooldown":true,"failure_score_retroactive":true}`))
 	ctx.Request.Header.Set("Content-Type", "application/json")
 
 	handler.UpdateAccountScheduler(ctx)
@@ -1811,6 +1850,9 @@ func TestUpdateAccountSchedulerPersistsQuotaAutoPauseConfig(t *testing.T) {
 	}
 	if !rows[0].GetCredentialBool("ignore_usage_limit_429_cooldown") {
 		t.Fatal("ignore_usage_limit_429_cooldown = false, want true")
+	}
+	if override := rows[0].GetCredentialOptionalBool("failure_score_retroactive"); override == nil || !*override {
+		t.Fatal("failure_score_retroactive = nil/false, want true")
 	}
 	if !rows[0].GetCredentialBool("ignore_unauthorized_cooldown") {
 		t.Fatal("ignore_unauthorized_cooldown = false, want true")
@@ -2065,7 +2107,7 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
 	ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
-	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"skip_warm_tier":true,"allowed_api_key_ids":[%d,%d],"auto_pause_5h_threshold":0.95,"auto_pause_7d_threshold":0.9,"auto_pause_5h_disabled":true,"auto_pause_7d_disabled":false,"ignore_usage_limit_429_cooldown":true,"ignore_unauthorized_cooldown":true}`, keyID2, keyID1)))
+	ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(fmt.Sprintf(`{"score_bias_override":33,"base_concurrency_override":5,"skip_warm_tier":true,"allowed_api_key_ids":[%d,%d],"auto_pause_5h_threshold":0.95,"auto_pause_7d_threshold":0.9,"auto_pause_5h_disabled":true,"auto_pause_7d_disabled":false,"ignore_usage_limit_429_cooldown":true,"ignore_unauthorized_cooldown":true,"failure_score_retroactive":true}`, keyID2, keyID1)))
 	ginCtx.Request.Header.Set("Content-Type", "application/json")
 
 	handler.UpdateAccountScheduler(ginCtx)
@@ -2107,6 +2149,9 @@ func TestUpdateAccountSchedulerUpdatesRuntimeOverrides(t *testing.T) {
 	}
 	if !runtimeAccount.IgnoreUnauthorizedCooldown {
 		t.Fatal("runtime ignore_unauthorized_cooldown = false, want true")
+	}
+	if override, _ := runtimeAccount.FailureScoreRetroactiveSnapshot(); override == nil || !*override {
+		t.Fatal("runtime failure_score_retroactive = nil/false, want true")
 	}
 }
 
@@ -2205,6 +2250,188 @@ func TestUpdateAccountSchedulerPersistsIgnoreUsageLimitOverrideAndInheritance(t 
 	}
 	if override := row.GetCredentialOptionalBool("ignore_usage_limit_status_override"); override != nil {
 		t.Fatalf("persisted override = %v, want nil", override)
+	}
+}
+
+func TestUpdateAccountSchedulerPersistsCompactRetriesOverrideAndInheritance(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:            2,
+		TestConcurrency:           1,
+		TestModel:                 "gpt-5.4",
+		CompactSameAccountRetries: 2,
+	})
+	t.Cleanup(store.Stop)
+	runtimeAccount := &auth.Account{DBID: accountID, AccessToken: "token", Status: auth.StatusReady}
+	store.AddAccount(runtimeAccount)
+	handler := &Handler{db: db, store: store}
+
+	patchOverride := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+		ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(body))
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateAccountScheduler(ginCtx)
+		return recorder
+	}
+
+	if recorder := patchOverride(`{"compact_same_account_retries":0}`); recorder.Code != http.StatusOK {
+		t.Fatalf("disable override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := store.CompactSameAccountRetriesForAccount(runtimeAccount); got != 0 {
+		t.Fatalf("runtime compact retries = %d, want 0", got)
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if value, ok := row.GetCredentialInt64("compact_same_account_retries"); !ok || value != 0 {
+		t.Fatalf("persisted compact retries = (%d, %t), want (0, true)", value, ok)
+	}
+
+	if recorder := patchOverride(`{"compact_same_account_retries":null}`); recorder.Code != http.StatusOK {
+		t.Fatalf("inherit override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if got := store.CompactSameAccountRetriesForAccount(runtimeAccount); got != 2 {
+		t.Fatalf("inherited compact retries = %d, want 2", got)
+	}
+	row, err = db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID after inherit: %v", err)
+	}
+	if _, ok := row.GetCredentialInt64("compact_same_account_retries"); ok {
+		t.Fatal("cleared compact retry override should not remain in credentials")
+	}
+}
+
+func TestUpdateAccountSchedulerPersistsEncryptedContentCompatibilityOverrideAndInheritance(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:         2,
+		EncryptedContentCompat: true,
+	})
+	t.Cleanup(store.Stop)
+	runtimeAccount := &auth.Account{
+		DBID:         accountID,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example.com",
+		APIKey:       "sk-test",
+		Status:       auth.StatusReady,
+	}
+	store.AddAccount(runtimeAccount)
+	handler := &Handler{db: db, store: store}
+
+	patch := func(value string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+		body := fmt.Sprintf(`{"encrypted_content_compatibility_enabled":%s}`, value)
+		ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(body))
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateAccountScheduler(ginCtx)
+		return recorder
+	}
+
+	if !runtimeAccount.ShouldUseEncryptedContentCompatibility() {
+		t.Fatal("account without override should inherit global true")
+	}
+
+	if recorder := patch("false"); recorder.Code != http.StatusOK {
+		t.Fatalf("disable override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if runtimeAccount.ShouldUseEncryptedContentCompatibility() {
+		t.Fatal("explicit account false should override global true")
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if override := row.GetCredentialOptionalBool("encrypted_content_compatibility_enabled"); override == nil || *override {
+		t.Fatalf("persisted compatibility override = %v, want false", override)
+	}
+
+	if recorder := patch("null"); recorder.Code != http.StatusOK {
+		t.Fatalf("inherit override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	if !runtimeAccount.ShouldUseEncryptedContentCompatibility() {
+		t.Fatal("cleared override should inherit global true")
+	}
+	override, effective := runtimeAccount.EncryptedContentCompatibilityConfig()
+	if override != nil || !effective {
+		t.Fatalf("runtime compatibility config = (%v, %t), want (nil, true)", override, effective)
+	}
+	row, err = db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID after inherit: %v", err)
+	}
+	if override := row.GetCredentialOptionalBool("encrypted_content_compatibility_enabled"); override != nil {
+		t.Fatalf("cleared compatibility override remains persisted: %v", override)
+	}
+}
+
+func TestUpdateAccountSchedulerPersistsFastTierPolicyOverrideAndInheritance(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	accountID := insertTestAccount(t, db)
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency: 2,
+		FastTierPolicy: database.FastTierPolicyForce,
+	})
+	t.Cleanup(store.Stop)
+	runtimeAccount := &auth.Account{DBID: accountID, AccessToken: "token", Status: auth.StatusReady}
+	store.AddAccount(runtimeAccount)
+	handler := &Handler{db: db, store: store}
+
+	patch := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", accountID)}}
+		ginCtx.Request = httptest.NewRequest(http.MethodPatch, fmt.Sprintf("/api/admin/accounts/%d/scheduler", accountID), strings.NewReader(body))
+		ginCtx.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateAccountScheduler(ginCtx)
+		return recorder
+	}
+
+	if recorder := patch(`{"fast_tier_policy":"filter_fast"}`); recorder.Code != http.StatusOK {
+		t.Fatalf("set override status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	override, effective := runtimeAccount.FastTierPolicyConfig()
+	if override == nil || *override != database.FastTierPolicyFilter || effective != database.FastTierPolicyFilter {
+		t.Fatalf("runtime fast tier policy = (%v, %q), want (filter_fast, filter_fast)", override, effective)
+	}
+	row, err := db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID: %v", err)
+	}
+	if got := row.GetCredential("fast_tier_policy"); got != database.FastTierPolicyFilter {
+		t.Fatalf("persisted fast_tier_policy = %q, want %q", got, database.FastTierPolicyFilter)
+	}
+
+	if recorder := patch(`{"fast_tier_policy":null}`); recorder.Code != http.StatusOK {
+		t.Fatalf("inherit policy status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	override, effective = runtimeAccount.FastTierPolicyConfig()
+	if override != nil || effective != database.FastTierPolicyForce {
+		t.Fatalf("inherited fast tier policy = (%v, %q), want (nil, force_fast)", override, effective)
+	}
+	row, err = db.GetAccountByID(context.Background(), accountID)
+	if err != nil {
+		t.Fatalf("GetAccountByID after inherit: %v", err)
+	}
+	if got := row.GetCredential("fast_tier_policy"); got != "" {
+		t.Fatalf("cleared fast_tier_policy remains persisted: %q", got)
+	}
+
+	if recorder := patch(`{"fast_tier_policy":"unknown"}`); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("invalid policy status = %d, want %d; body=%s", recorder.Code, http.StatusBadRequest, recorder.Body.String())
 	}
 }
 

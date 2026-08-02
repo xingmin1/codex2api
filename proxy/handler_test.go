@@ -1647,9 +1647,7 @@ func TestResponsesEndpointsAllowCompactionInputType(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body)).WithContext(ctx)
+			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
 			ginCtx, _ := gin.CreateTestContext(recorder)
@@ -1680,9 +1678,7 @@ func TestResponsesEndpointAllowsEncryptedContentInputType(t *testing.T) {
 		]
 	}`)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body)).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
@@ -1724,9 +1720,10 @@ func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	defer upstream.Close()
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency:      2,
-		MaxRetries:          0,
-		MaxRateLimitRetries: 0,
+		MaxConcurrency:         2,
+		MaxRetries:             0,
+		MaxRateLimitRetries:    0,
+		EncryptedContentCompat: true,
 	})
 	store.SetCodexModelMapping(`{"client-compact-alias":"gpt-4.1-direct","gpt-4.1-direct":"gpt-4.1-second"}`)
 	store.AddAccount(&auth.Account{
@@ -1773,6 +1770,141 @@ func TestResponsesCompactUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	}
 	if id := gjson.GetBytes(recorder.Body.Bytes(), "id").String(); id != "resp_compact_test" {
 		t.Fatalf("response id = %q, want resp_compact_test; body=%s", id, recorder.Body.String())
+	}
+}
+
+func TestResponsesCompactRetriesOnlyInitialAccountBeforeRotation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var sequence []string
+	counts := make(map[string]int)
+	firstKey := ""
+	secondKey := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		sequence = append(sequence, key)
+		counts[key]++
+		if firstKey == "" {
+			firstKey = key
+		}
+		if key == firstKey && counts[key] <= 3 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","message":"temporary"}}`)
+			return
+		}
+		if key != firstKey && secondKey == "" {
+			secondKey = key
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","message":"temporary"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"resp_compact","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`)
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:            3,
+		MaxRetries:                5,
+		MaxRateLimitRetries:       5,
+		TransportRetryPolicy:      "rotate",
+		CompactSameAccountRetries: 2,
+	})
+	t.Cleanup(store.Stop)
+	for id, key := range []string{"sk-first", "sk-second", "sk-third"} {
+		store.AddAccount(&auth.Account{
+			DBID:         int64(id + 1),
+			UpstreamType: auth.UpstreamOpenAIResponses,
+			BaseURL:      upstream.URL,
+			APIKey:       key,
+			Models:       []string{"gpt-5.6-sol"},
+			PlanType:     "api",
+		})
+	}
+	handler := NewHandler(store, nil, nil, nil)
+	body := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"compact"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ResponsesCompact(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(sequence) != 5 {
+		t.Fatalf("upstream sequence = %v, want 5 attempts", sequence)
+	}
+	if sequence[0] != sequence[1] || sequence[1] != sequence[2] {
+		t.Fatalf("首账号未获得完整同号预算: %v", sequence)
+	}
+	if sequence[3] == sequence[0] || sequence[4] == sequence[0] || sequence[4] == sequence[3] {
+		t.Fatalf("预算耗尽后应换号，且后续账号不重新获得预算: %v", sequence)
+	}
+}
+
+func TestResponsesCompactRetriesInitialAccountBeforeLongCompactFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var sequence []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		sequence = append(sequence, key)
+		w.Header().Set("Content-Type", "application/json")
+		if key == "sk-normal" {
+			w.WriteHeader(cloudflareOriginResponseTimeoutStatus)
+			_, _ = io.WriteString(w, `{"error_name":"origin_response_timeout","error_code":524}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_long_compact","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}`)
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:            2,
+		MaxRetries:                2,
+		TransportRetryPolicy:      "rotate",
+		CompactSameAccountRetries: 2,
+	})
+	t.Cleanup(store.Stop)
+	store.AddAccount(&auth.Account{
+		DBID:              1,
+		UpstreamType:      auth.UpstreamOpenAIResponses,
+		BaseURL:           upstream.URL,
+		APIKey:            "sk-normal",
+		Models:            []string{"gpt-5.6-sol"},
+		PlanType:          "api",
+		SchedulerPriority: 1,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         2,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-long",
+		Models:       []string{"gpt-5.6-sol"},
+		PlanType:     "api",
+		Tags:         []string{longCompactAccountTag},
+	})
+	handler := NewHandler(store, nil, nil, nil)
+	body := []byte(`{"model":"gpt-5.6-sol","input":[{"role":"user","content":"compact"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ResponsesCompact(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	want := []string{"sk-normal", "sk-normal", "sk-normal", "sk-long"}
+	if !slices.Equal(sequence, want) {
+		t.Fatalf("524 fallback sequence = %v, want %v", sequence, want)
 	}
 }
 
@@ -2036,11 +2168,415 @@ func TestResponsesAcceptsCustomOpenAIResponsesModelID(t *testing.T) {
 	}
 }
 
+func newEncryptedContentCompatibilityRelayStore(upstreamURL string, enabled bool) (*auth.Store, *auth.Account) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                2,
+		MaxRetries:                    0,
+		MaxRateLimitRetries:           0,
+		TransportRetryPolicy:          "rotate",
+		FailureScoreThreshold:         100,
+		FailureToleranceWindowSeconds: 60,
+		EncryptedContentCompat:        true,
+	})
+	enabledOverride := enabled
+	account := &auth.Account{
+		DBID:                           1,
+		UpstreamType:                   auth.UpstreamOpenAIResponses,
+		BaseURL:                        upstreamURL,
+		APIKey:                         "sk-compatibility",
+		Models:                         []string{"gpt-5.6-sol"},
+		PlanType:                       "api",
+		IgnoreUsageLimit429Cooldown:    true,
+		EncryptedContentCompatOverride: &enabledOverride,
+	}
+	store.AddAccount(account)
+	return store, account
+}
+
+func performEncryptedContentCompatibilityRequest(t *testing.T, handler *Handler, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+	handler.Responses(ctx)
+	return recorder
+}
+
+func TestResponsesEncryptedContentCompatibilityRetriesAfterStructuralFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	var seenBodies [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		body, _ := io.ReadAll(r.Body)
+		seenBodies = append(seenBodies, append([]byte(nil), body...))
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempts == 1 {
+			_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_discarded"}}`+"\n\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`+"\n\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.content_part.added","part":{"type":"summary_text","text":""}}`+"\n\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"status_code":400,"type":"invalid_request_error","code":"missing_required_parameter","param":"input[1].encrypted_content","message":"Missing required parameter: 'input[1].encrypted_content'."}}}`+"\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_repaired"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_item.added","item":{"type":"message"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"OK"}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_repaired","status":"completed","usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store, account := newEncryptedContentCompatibilityRelayStore(upstream.URL, true)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := performEncryptedContentCompatibilityRequest(t, handler, `{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"input":[
+			{"type":"message","role":"user","content":"continue"},
+			{"type":"reasoning","encrypted_content":"account-bound-state"},
+			{"type":"compaction","encrypted_content":"preserve-unrelated-compaction"}
+		]
+	}`)
+
+	if attempts != 2 {
+		t.Fatalf("upstream attempts = %d, want 2", attempts)
+	}
+	if len(seenBodies) != 2 || !strings.Contains(string(seenBodies[0]), "account-bound-state") {
+		t.Fatalf("first attempt did not contain original encrypted item: %q", seenBodies)
+	}
+	if strings.Contains(string(seenBodies[1]), "account-bound-state") ||
+		!strings.Contains(string(seenBodies[1]), "preserve-unrelated-compaction") {
+		t.Fatalf("second attempt should remove only the rejected item: %s", seenBodies[1])
+	}
+	responseBody := recorder.Body.String()
+	if recorder.Code != http.StatusOK || strings.Contains(responseBody, "resp_discarded") ||
+		strings.Contains(responseBody, "response.failed") || !strings.Contains(responseBody, "resp_repaired") ||
+		!strings.Contains(responseBody, `"delta":"OK"`) {
+		t.Fatalf("downstream should receive only the repaired success stream: status=%d body=%s", recorder.Code, responseBody)
+	}
+	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
+	if failures != 0 {
+		t.Fatalf("compatibility retry failure window count = %d, want 0", failures)
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityRetriesHTTPBadRequest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	var seenBodies [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		body, _ := io.ReadAll(r.Body)
+		seenBodies = append(seenBodies, append([]byte(nil), body...))
+		w.Header().Set("Content-Type", "application/json")
+		if attempts == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"missing_required_parameter","param":"input[1].encrypted_content","message":"Missing required parameter: input[1].encrypted_content"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_repaired","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`)
+	}))
+	defer upstream.Close()
+
+	store, account := newEncryptedContentCompatibilityRelayStore(upstream.URL, true)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := performEncryptedContentCompatibilityRequest(t, handler, `{"model":"gpt-5.6-sol","stream":false,"input":[{"role":"user","content":"continue"},{"type":"reasoning","encrypted_content":"rejected"},{"type":"compaction","encrypted_content":"preserved"}]}`)
+
+	if attempts != 2 {
+		t.Fatalf("HTTP compatibility attempts = %d, want 2", attempts)
+	}
+	if len(seenBodies) != 2 || strings.Contains(string(seenBodies[1]), "rejected") ||
+		!strings.Contains(string(seenBodies[1]), "preserved") {
+		t.Fatalf("HTTP compatibility retry should remove only the rejected item: %q", seenBodies)
+	}
+	if recorder.Code != http.StatusOK || gjson.GetBytes(recorder.Body.Bytes(), "id").String() != "resp_repaired" {
+		t.Fatalf("downstream should receive repaired HTTP success: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
+	if failures != 0 {
+		t.Fatalf("HTTP compatibility failure window count = %d, want 0", failures)
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityRetriesRelaySSEFunctionOutput(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	seenBodies := make([][]byte, 0, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		body, _ := io.ReadAll(r.Body)
+		seenBodies = append(seenBodies, append([]byte(nil), body...))
+		w.Header().Set("Content-Type", "text/event-stream")
+		if attempts == 1 {
+			_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_leaked"}}`+"\n\n")
+			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"status_code":400,"code":"invalid_encrypted_content","message":"Encrypted function output content could not be decrypted or decoded."}}}`+"\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"ok"}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store, account := newEncryptedContentCompatibilityRelayStore(upstream.URL, true)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	body := `{"model":"gpt-5.6-sol","stream":true,"input":[{"role":"user","content":"continue"},{"type":"function_call_output","call_id":"call-1","output":[{"type":"input_text","text":"keep"},{"type":"encrypted_content","encrypted_content":"drop"}]},{"type":"compaction","encrypted_content":"preserved"}]}`
+	recorder := performEncryptedContentCompatibilityRequest(t, handler, body)
+
+	if attempts != 2 {
+		t.Fatalf("relay SSE function output compatibility attempts = %d, want 2", attempts)
+	}
+	if strings.Contains(recorder.Body.String(), "resp_leaked") || strings.Contains(recorder.Body.String(), "invalid_encrypted_content") {
+		t.Fatalf("first response.failed leaked downstream: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(seenBodies) != 2 {
+		t.Fatalf("seen bodies = %d, want 2", len(seenBodies))
+	}
+	retryBody := string(seenBodies[1])
+	for _, want := range []string{"call-1", "keep", "preserved"} {
+		if !strings.Contains(retryBody, want) {
+			t.Fatalf("retry body missing %q: %s", want, retryBody)
+		}
+	}
+	if strings.Contains(retryBody, "drop") {
+		t.Fatalf("retry body still contains encrypted function output: %s", retryBody)
+	}
+	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
+	if failures != 0 {
+		t.Fatalf("relay SSE function output failure window count = %d, want 0", failures)
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityInheritsGlobalSetting(t *testing.T) {
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		if attempts == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"missing_required_parameter","param":"input[1].encrypted_content","message":"Missing required parameter: input[1].encrypted_content"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_ok","status":"completed","output":[]}`)
+	}))
+	defer upstream.Close()
+
+	store, account := newEncryptedContentCompatibilityRelayStore(upstream.URL, false)
+	t.Cleanup(store.Stop)
+	if !store.ApplyAccountEncryptedContentCompatibilityConfig(account.DBID, nil) {
+		t.Fatal("failed to clear account compatibility override")
+	}
+	override, effective := account.EncryptedContentCompatibilityConfig()
+	if override != nil || !effective {
+		t.Fatalf("inherited compatibility config = (%v, %t), want (nil, true)", override, effective)
+	}
+
+	recorder := performEncryptedContentCompatibilityRequest(t, NewHandler(store, nil, nil, nil), `{"model":"gpt-5.6-sol","stream":false,"input":[{"role":"user","content":"continue"},{"type":"reasoning","encrypted_content":"rejected"}]}`)
+	if recorder.Code != http.StatusOK || attempts != 2 {
+		t.Fatalf("global compatibility result = status:%d attempts:%d body=%s", recorder.Code, attempts, recorder.Body.String())
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityDoesNotDeleteCompactionState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	var seenBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		seenBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"missing_required_parameter","param":"input[1].encrypted_content","message":"Missing required parameter: input[1].encrypted_content"}}`)
+	}))
+	defer upstream.Close()
+
+	store, _ := newEncryptedContentCompatibilityRelayStore(upstream.URL, true)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := performEncryptedContentCompatibilityRequest(t, handler, `{"model":"gpt-5.6-sol","stream":false,"input":[{"role":"user","content":"continue"},{"type":"compaction","encrypted_content":"preserve-memory"}]}`)
+
+	if attempts != 1 {
+		t.Fatalf("protected compaction should not trigger destructive compatibility retry, attempts=%d", attempts)
+	}
+	if !strings.Contains(string(seenBody), "preserve-memory") {
+		t.Fatalf("compaction state was removed: %s", seenBody)
+	}
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("protected error status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityRetriesOnlyOnce(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"missing_required_parameter","param":"input[1].encrypted_content","message":"Missing required parameter: input[1].encrypted_content"}}`)
+	}))
+	defer upstream.Close()
+
+	store, account := newEncryptedContentCompatibilityRelayStore(upstream.URL, true)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := performEncryptedContentCompatibilityRequest(t, handler, `{"model":"gpt-5.6-sol","stream":false,"input":[{"role":"user","content":"continue"},{"type":"reasoning","encrypted_content":"rejected"},{"type":"compaction","encrypted_content":"still-present"}]}`)
+
+	if attempts != 2 {
+		t.Fatalf("compatibility retry attempts = %d, want exactly 2", attempts)
+	}
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("second compatibility failure status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+	}
+	_, _, _, _, _, _, _, failures := account.FailureToleranceSnapshot()
+	if failures != 1 {
+		t.Fatalf("compatibility failure window count = %d, want 1", failures)
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityDisabledKeepsImmediateStructuralFrames(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_visible"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_item.added","item":{"type":"reasoning","summary":[]}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"status_code":400,"code":"missing_required_parameter","param":"input[1].encrypted_content","message":"Missing required parameter: input[1].encrypted_content"}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store, _ := newEncryptedContentCompatibilityRelayStore(upstream.URL, false)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := performEncryptedContentCompatibilityRequest(t, handler, `{"model":"gpt-5.6-sol","stream":true,"input":[{"role":"user","content":"continue"},{"type":"reasoning","encrypted_content":"opaque"}]}`)
+
+	if attempts != 1 {
+		t.Fatalf("disabled compatibility attempts = %d, want 1", attempts)
+	}
+	if !strings.Contains(recorder.Body.String(), "resp_visible") || !strings.Contains(recorder.Body.String(), "response.failed") {
+		t.Fatalf("disabled account should keep existing immediate stream behavior: %s", recorder.Body.String())
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityDoesNotRetryAfterSemanticContent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_started"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"partial"}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"status_code":400,"code":"missing_required_parameter","param":"input[1].encrypted_content","message":"Missing required parameter: input[1].encrypted_content"}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store, _ := newEncryptedContentCompatibilityRelayStore(upstream.URL, true)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := performEncryptedContentCompatibilityRequest(t, handler, `{"model":"gpt-5.6-sol","stream":true,"input":[{"role":"user","content":"continue"},{"type":"reasoning","encrypted_content":"opaque"}]}`)
+
+	if attempts != 1 {
+		t.Fatalf("semantic output must disable compatibility replay, attempts=%d", attempts)
+	}
+	if !strings.Contains(recorder.Body.String(), `"delta":"partial"`) || !strings.Contains(recorder.Body.String(), "response.failed") {
+		t.Fatalf("already-visible stream should preserve the original terminal failure: %s", recorder.Body.String())
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityRequestControlsAreAccountScoped(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("enabled_%t", enabled), func(t *testing.T) {
+			var seenBody []byte
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				seenBody, _ = io.ReadAll(r.Body)
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, `data: {"type":"response.output_text.delta","delta":"OK"}`+"\n\n")
+				_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}`+"\n\n")
+			}))
+			defer upstream.Close()
+
+			store, _ := newEncryptedContentCompatibilityRelayStore(upstream.URL, enabled)
+			t.Cleanup(store.Stop)
+			handler := NewHandler(store, nil, nil, nil)
+			recorder := performEncryptedContentCompatibilityRequest(t, handler, `{
+				"model":"gpt-5.6-sol",
+				"stream":true,
+				"input":[
+					{"role":"user","content":"continue"},
+					{"type":"reasoning","summary":[]},
+					{"type":"agent_message","author":"a","recipient":"b","content":[{"type":"input_text","text":"header"},{"type":"encrypted_content"}]}
+				]
+			}`)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+			}
+			items := gjson.GetBytes(seenBody, "input").Array()
+			if len(items) != 2 || items[1].Get("type").String() != "agent_message" {
+				t.Fatalf("bare reasoning should always be removed without deleting agent state: %s", seenBody)
+			}
+			hasReasoning := gjson.GetBytes(seenBody, "reasoning").IsObject()
+			hasEncryptedInclude := false
+			for _, include := range gjson.GetBytes(seenBody, "include").Array() {
+				if include.String() == "reasoning.encrypted_content" {
+					hasEncryptedInclude = true
+					break
+				}
+			}
+			if hasReasoning != enabled || hasEncryptedInclude != enabled {
+				t.Fatalf("compatibility request controls enabled=%t, reasoning=%t, include=%t; body=%s", enabled, hasReasoning, hasEncryptedInclude, seenBody)
+			}
+		})
+	}
+}
+
+func TestResponsesEncryptedContentCompatibilityRetriesNonStreamingFailedResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "application/json")
+		if attempts == 1 {
+			_, _ = io.WriteString(w, `{"id":"resp_failed","status":"failed","error":{"status_code":400,"code":"missing_required_parameter","param":"input[1].encrypted_content","message":"Missing required parameter: input[1].encrypted_content"}}`)
+			return
+		}
+		_, _ = io.WriteString(w, `{"id":"resp_success","status":"completed","output":[],"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}`)
+	}))
+	defer upstream.Close()
+
+	store, _ := newEncryptedContentCompatibilityRelayStore(upstream.URL, true)
+	t.Cleanup(store.Stop)
+	handler := NewHandler(store, nil, nil, nil)
+	recorder := performEncryptedContentCompatibilityRequest(t, handler, `{"model":"gpt-5.6-sol","stream":false,"input":[{"role":"user","content":"continue"},{"type":"reasoning","encrypted_content":"opaque"}]}`)
+
+	if attempts != 2 {
+		t.Fatalf("non-stream compatibility attempts = %d, want 2", attempts)
+	}
+	if recorder.Code != http.StatusOK || gjson.GetBytes(recorder.Body.Bytes(), "id").String() != "resp_success" {
+		t.Fatalf("downstream should receive repaired non-stream success: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func newOpenAIResponsesRelayStoreWithModelMapping(upstreamURL string) *auth.Store {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
-		MaxConcurrency:      2,
-		MaxRetries:          0,
-		MaxRateLimitRetries: 0,
+		MaxConcurrency:         2,
+		MaxRetries:             0,
+		MaxRateLimitRetries:    0,
+		EncryptedContentCompat: true,
 	})
 	store.SetCodexModelMapping(`{"client-alias":"gpt-5.4"}`)
 	store.AddAccount(&auth.Account{
@@ -2602,9 +3138,7 @@ func TestResponsesEndpointsAllowGPT55MaxOutputTokens128K(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
-			cancel()
-			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body)).WithContext(ctx)
+			req := httptest.NewRequest(http.MethodPost, test.path, bytes.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			recorder := httptest.NewRecorder()
 			ginCtx, _ := gin.CreateTestContext(recorder)
@@ -4405,6 +4939,7 @@ func TestResponses_BodySignalCompactStaysStreamingOnRelayOnlyPool(t *testing.T) 
 		"client_metadata":{"x-codex-window-id":"w-1","x-codex-installation-id":"i-1"},
 		"input":[
 			{"role":"user","content":"my favorite color is blue"},
+			{"type":"reasoning","summary":[]},
 			{"type":"compaction_trigger"}
 		]
 	}`)
@@ -4426,7 +4961,10 @@ func TestResponses_BodySignalCompactStaysStreamingOnRelayOnlyPool(t *testing.T) 
 		t.Fatalf("upstream body must preserve stream=true, got %s", seenBody)
 	}
 	if gotType := gjson.GetBytes(seenBody, "input.1.type").String(); gotType != "compaction_trigger" {
-		t.Fatalf("input.1.type = %q, want compaction_trigger; body=%s", gotType, seenBody)
+		t.Fatalf("v2 compact must remove only unreplayable reasoning and preserve compaction_trigger, input.1.type = %q; body=%s", gotType, seenBody)
+	}
+	if inputCount := len(gjson.GetBytes(seenBody, "input").Array()); inputCount != 2 {
+		t.Fatalf("v2 compact input count = %d, want 2 after removing bare reasoning; body=%s", inputCount, seenBody)
 	}
 	if !gjson.GetBytes(seenBody, "client_metadata").Exists() {
 		t.Fatalf("v2 compact must preserve client_metadata on /responses, got %s", seenBody)
@@ -4559,6 +5097,279 @@ func TestResponses_NonStreamingBodySignalCompactStillUsesCompactEndpoint(t *test
 	}
 	if gjson.GetBytes(seenBody, "stream").Exists() {
 		t.Fatalf("compact upstream body should not carry stream, got %s", seenBody)
+	}
+}
+
+func TestResponses_V2CompactionRetriesAfterPartialUpstreamStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.created","response":{"id":"resp_attempt"}}`+"\n\n")
+		marker := "discarded-first-attempt"
+		if attempts > 1 {
+			marker = "accepted-second-attempt"
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"`+marker+`"}}`+"\n\n")
+		if attempts == 1 {
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_attempt","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.6-sol"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"role":"user","content":"compact"},{"type":"compaction_trigger"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if attempts != 2 {
+		t.Fatalf("upstream attempts = %d, want 2", attempts)
+	}
+	responseBody := recorder.Body.String()
+	if strings.Contains(responseBody, "discarded-first-attempt") {
+		t.Fatalf("下游不应看到断流尝试的部分压缩结果: %s", responseBody)
+	}
+	if !strings.Contains(responseBody, "accepted-second-attempt") ||
+		!strings.Contains(responseBody, `"type":"response.completed"`) {
+		t.Fatalf("下游必须收到完整的第二次压缩结果: %s", responseBody)
+	}
+}
+
+func TestResponses_V2CompactionRetriesOnlyInitialAccountBeforeRotation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var sequence []string
+	counts := make(map[string]int)
+	firstKey := ""
+	secondKey := ""
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		sequence = append(sequence, key)
+		counts[key]++
+		if firstKey == "" {
+			firstKey = key
+		}
+		if key == firstKey && counts[key] <= 3 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","message":"temporary"}}`)
+			return
+		}
+		if key != firstKey && secondKey == "" {
+			secondKey = key
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","message":"temporary"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"accepted"}}`+"\n\n")
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_compact","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:            3,
+		MaxRetries:                5,
+		MaxRateLimitRetries:       5,
+		TransportRetryPolicy:      "rotate",
+		CompactSameAccountRetries: 2,
+	})
+	t.Cleanup(store.Stop)
+	for id, key := range []string{"sk-first", "sk-second", "sk-third"} {
+		store.AddAccount(&auth.Account{
+			DBID:         int64(id + 1),
+			UpstreamType: auth.UpstreamOpenAIResponses,
+			BaseURL:      upstream.URL,
+			APIKey:       key,
+			Models:       []string{"gpt-5.6-sol"},
+			PlanType:     "api",
+		})
+	}
+	handler := NewHandler(store, nil, nil, nil)
+	body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"role":"user","content":"compact"},{"type":"compaction_trigger"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(sequence) != 5 {
+		t.Fatalf("upstream sequence = %v, want 5 attempts", sequence)
+	}
+	if sequence[0] != sequence[1] || sequence[1] != sequence[2] {
+		t.Fatalf("v2 compact 首账号未获得完整同号预算: %v", sequence)
+	}
+	if sequence[3] == sequence[0] || sequence[4] == sequence[0] || sequence[4] == sequence[3] {
+		t.Fatalf("v2 compact 预算耗尽后应换号，且后续账号不重新获得预算: %v", sequence)
+	}
+}
+
+func TestResponses_V2CompactionRetriesEveryUpstreamHTTPErrorOnInitialAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, status := range []int{
+		http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusTooManyRequests,
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		cloudflareOriginResponseTimeoutStatus,
+	} {
+		t.Run(fmt.Sprintf("status_%d", status), func(t *testing.T) {
+			attempts := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				if attempts == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(status)
+					_, _ = io.WriteString(w, `{"error":{"type":"upstream_error","message":"temporary"}}`)
+					return
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"accepted"}}`+"\n\n")
+				_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_compact","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+			}))
+			defer upstream.Close()
+
+			store := auth.NewStore(nil, nil, &database.SystemSettings{
+				MaxConcurrency:            1,
+				MaxRetries:                0,
+				MaxRateLimitRetries:       0,
+				TransportRetryPolicy:      "rotate",
+				CompactSameAccountRetries: 1,
+			})
+			t.Cleanup(store.Stop)
+			store.AddAccount(&auth.Account{
+				DBID:         1,
+				UpstreamType: auth.UpstreamOpenAIResponses,
+				BaseURL:      upstream.URL,
+				APIKey:       "sk-compact",
+				Models:       []string{"gpt-5.6-sol"},
+				PlanType:     "api",
+			})
+			handler := NewHandler(store, nil, nil, nil)
+			body := []byte(`{"model":"gpt-5.6-sol","stream":true,"input":[{"role":"user","content":"compact"},{"type":"compaction_trigger"}]}`)
+			req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = req
+
+			handler.Responses(ctx)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+			}
+			if attempts != 2 {
+				t.Fatalf("upstream attempts = %d, want 2", attempts)
+			}
+		})
+	}
+}
+
+func TestResponses_V2CompactionStripsEncryptedHistoryAfterRepeatedStreamBreaks(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var seenBodies [][]byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBodies = append(seenBodies, append([]byte(nil), body...))
+		attempt := len(seenBodies)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"attempt-`+fmt.Sprint(attempt)+`"}}`+"\n\n")
+		if attempt < 3 {
+			return
+		}
+		_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_stripped","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          2,
+		MaxRateLimitRetries: 0,
+	})
+	store.AddAccount(&auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-direct",
+		Models:       []string{"gpt-5.6-sol"},
+		PlanType:     "api",
+	})
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{
+		"model":"gpt-5.6-sol",
+		"stream":true,
+		"input":[
+			{"role":"user","content":"compact"},
+			{"type":"reasoning","id":"rs_stale","encrypted_content":"old-account-bound-state"},
+			{"type":"compaction_trigger"}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Responses(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if len(seenBodies) != 3 {
+		t.Fatalf("upstream attempts = %d, want 3", len(seenBodies))
+	}
+	for i := 0; i < 2; i++ {
+		if !strings.Contains(string(seenBodies[i]), "old-account-bound-state") {
+			t.Fatalf("第 %d 次请求应先保留 encrypted content 以容忍瞬时波动: %s", i+1, seenBodies[i])
+		}
+	}
+	if strings.Contains(string(seenBodies[2]), "encrypted_content") ||
+		strings.Contains(string(seenBodies[2]), "old-account-bound-state") {
+		t.Fatalf("第三次请求应移除不可跨上游复用的 encrypted content: %s", seenBodies[2])
+	}
+	if got := gjson.GetBytes(seenBodies[2], "input.#(type==\"compaction_trigger\").type").String(); got != "compaction_trigger" {
+		t.Fatalf("移除 encrypted content 后仍应保留 compaction_trigger: %s", seenBodies[2])
+	}
+	if strings.Contains(recorder.Body.String(), "attempt-1") || strings.Contains(recorder.Body.String(), "attempt-2") {
+		t.Fatalf("下游不应看到前两次断流结果: %s", recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "attempt-3") {
+		t.Fatalf("下游应收到第三次完整压缩结果: %s", recorder.Body.String())
 	}
 }
 

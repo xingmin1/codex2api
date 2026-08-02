@@ -14,9 +14,15 @@ type PoolStats struct {
 	StaleConns uint32
 }
 
+// SessionAffinityBinding 保存可跨进程恢复的会话亲和元数据。
+// 纳秒时间戳使用十进制字符串，避免 Redis Lua 将大整数转成双精度数后丢失身份精度。
+// ExpiresAtUnixNano 是不可滑动的绝对截止时间，重复读取或写回不得延长。
 type SessionAffinityBinding struct {
-	AccountID int64  `json:"account_id"`
-	ProxyURL  string `json:"proxy_url,omitempty"`
+	AccountID         int64  `json:"account_id"`
+	ProxyURL          string `json:"proxy_url,omitempty"`
+	BoundAtUnixNano   string `json:"bound_at_unix_nano,omitempty"`
+	ExpiresAtUnixNano string `json:"expires_at_unix_nano,omitempty"`
+	RequestCount      int64  `json:"request_count,omitempty"`
 }
 
 // ResponseContextReadStatus classifies a bounded shared-backend lookup without
@@ -65,6 +71,7 @@ type TokenCache interface {
 	SetSessionAffinity(ctx context.Context, key string, binding SessionAffinityBinding, ttl time.Duration) error
 	GetSessionAffinity(ctx context.Context, key string) (SessionAffinityBinding, bool, error)
 	DeleteSessionAffinity(ctx context.Context, key string, accountID int64) error
+	DeleteSessionAffinityIfMatches(ctx context.Context, key string, binding SessionAffinityBinding) error
 	SetResponseContext(ctx context.Context, responseID string, items []json.RawMessage, ttl time.Duration) error
 	GetResponseContext(ctx context.Context, responseID string) ([]json.RawMessage, error)
 	SetRuntime(ctx context.Context, namespace string, key string, value json.RawMessage, ttl time.Duration) error

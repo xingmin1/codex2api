@@ -45,6 +45,7 @@ Codex2API 采用三层配置架构：
 | `CODEX_PORT` | 否 | 8080 | HTTP 服务端口 |
 | `BIND_HOST` | 否 | `127.0.0.1`（SQLite）/ `0.0.0.0`（PostgreSQL） | Docker 端口发布绑定地址（非进程监听地址，由 `CODEX_BIND` 控制）。SQLite compose 默认 `127.0.0.1` 仅本机访问；标准 compose 默认 `0.0.0.0` 所有网络接口 |
 | `CODEX_MAX_REQUEST_BODY_SIZE_MB` | 否 | 48 | HTTP 请求体上限。后台 MP4 动态壁纸上传最大 40MB，默认值为 multipart 上传预留余量 |
+| `CODEX_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS` | 否 | 360 | 收到 `SIGINT`/`SIGTERM` 后等待在途 HTTP 请求完成的最长时间，必须为正整数秒；非法值回退默认值 |
 | `ADMIN_SECRET` | 否 | - | 管理后台登录密钥 |
 | `CODEX_ALLOW_ANONYMOUS` | 否 | `false` | 设为 `true` 时，未配置任何对外 API Key 也允许 `/v1/*` 直接调用（仅限内网测试场景） |
 | `FAST_SCHEDULER_ENABLED` | 否 | `false` | 通过环境变量启用快速调度器（也可在管理后台运行时开启） |
@@ -154,6 +155,18 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 
 这里的“字节”是保留 `json.RawMessage` 长度之和，不包含 map、切片、LRU、Go 堆或容器开销，因此不是 RSS 或进程内存硬上限。滚动升级时，新前端对旧后端缺失的设置使用 64/8/64 MiB 展示默认值、generation `0`；旧后端缺少 response-cache 运维对象时，前端显示兼容等待状态而不会崩溃。
 
+### Fast Tier 出站策略
+
+全局 `fast_tier_policy` 和账号级同名覆盖项控制业务请求发送给上游时的 `service_tier`：
+
+| 值 | 行为 |
+|----|------|
+| `preserve` | 保持客户端意图；`fast` 会转换为上游支持的 `priority`，不支持的值会被移除 |
+| `force_fast` | 无论客户端是否携带该字段，都向上游发送 `service_tier: "priority"` |
+| `filter_fast` | 移除 `service_tier` 与兼容字段 `serviceTier`，不向上游附加 Fast Tier |
+
+账号未配置覆盖值时继承全局策略。该策略覆盖 Responses HTTP/WebSocket、Chat Completions、Anthropic Messages、compact 以及中转账号请求；后台探测、模型列表和生图管理请求不受影响。用量日志中的 `requested_service_tier` 记录实际发送给本次所选账号上游的等级。
+
 ### 调度配置
 
 | 字段 | 类型 | 默认值 | 范围 | 说明 |
@@ -171,6 +184,12 @@ Redis 模式会把 response context 保存到共享后端。后端值在重建�
 | `CodexWSHideUpstreamErrors` | bool | true | - | WS 上游最终失败时向客户端隐藏原始错误，返回统一友好提示；原始错误仍记录在后台日志/用量记录 |
 | `CodexWSSilentRetryEnabled` | bool | true | - | WS 首包前遇到限流、额度耗尽、5xx、读取错误或超时时，静默换账号并重建上游 WS |
 | `CodexWSSilentMaxRetries` | int | 2 | 0-10 | WS 静默换号最大重试次数 |
+| `ClientRequestReplayEnabled` | bool | true | - | 响应提交前若完整请求最终失败，按原请求入口重新执行并复用现有调度规则 |
+| `ClientRequestReplayMaxRetries` | int | 5 | 1-10 | 原始请求失败后的额外重发次数；不再支持无限重发 |
+| `ClientRequestReplayMaxDurationSec` | int | 600 | 30-3600 | 首个业务输出前允许的整请求总时长；次数或时长任一耗尽即停止 |
+| `ClientRequestReplayBaseIntervalMS` | int | 1000 | 0-60000 | 第一次额外重发前的等待时间，后续按 2 倍递增；0 表示立即重发 |
+| `ClientRequestReplayMaxIntervalSec` | int | 30 | 1-300 | 指数退避的最大间隔，不得小于基础间隔 |
+| `ClientRequestReplayKeepaliveSec` | int | 15 | 0 或 5-240 | 等待首个业务响应和整请求重发期间的 SSE 保活间隔；0 表示关闭 |
 | `SchedulerMode` | string | `round_robin` | - | 调度模式：`round_robin`（轮询，按调度分权重排序）或 `remaining_quota`（优先使用用量少的账号） |
 | `AffinityMode` | string | `bounded` | - | 会话亲和：`bounded`（50 次、5 分钟或账号不健康时重新挑号）、`off`（每次重选）、`strict`（长期粘连） |
 

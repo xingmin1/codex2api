@@ -104,12 +104,19 @@ func main() {
 			FirstTokenMode:                    proxy.FirstTokenModeStrict,
 			FirstTokenTimeoutSeconds:          0,
 			BillingTierPolicy:                 proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
+			FastTierPolicy:                    database.FastTierPolicyPreserve,
 			ImageStorageConfig:                "{}",
 			PublicKeyUsagePageEnabled:         true,
 			PublicImageStudioPageEnabled:      true,
 			CodexWSHideUpstreamErrors:         true,
 			CodexWSSilentRetryEnabled:         true,
 			CodexWSSilentMaxRetries:           2,
+			ClientRequestReplayEnabled:        true,
+			ClientRequestReplayMaxRetries:     database.DefaultClientRequestReplayMaxRetries,
+			ClientRequestReplayMaxDurationSec: database.DefaultClientRequestReplayMaxDurationSeconds,
+			ClientRequestReplayBaseIntervalMS: database.DefaultClientRequestReplayBaseIntervalMS,
+			ClientRequestReplayMaxIntervalSec: database.DefaultClientRequestReplayMaxIntervalSeconds,
+			ClientRequestReplayKeepaliveSec:   15,
 			CodexContinueMaxRounds:            8,
 			AutoPause5hGuardBandPercent:       5,
 			AutoPause5hGuardConcurrency:       1,
@@ -155,12 +162,19 @@ func main() {
 			FirstTokenMode:                    proxy.FirstTokenModeStrict,
 			FirstTokenTimeoutSeconds:          0,
 			BillingTierPolicy:                 proxy.NormalizeBillingTierPolicy(os.Getenv("CODEX_BILLING_TIER_POLICY")),
+			FastTierPolicy:                    database.FastTierPolicyPreserve,
 			ImageStorageConfig:                "{}",
 			PublicKeyUsagePageEnabled:         true,
 			PublicImageStudioPageEnabled:      true,
 			CodexWSHideUpstreamErrors:         true,
 			CodexWSSilentRetryEnabled:         true,
 			CodexWSSilentMaxRetries:           2,
+			ClientRequestReplayEnabled:        true,
+			ClientRequestReplayMaxRetries:     database.DefaultClientRequestReplayMaxRetries,
+			ClientRequestReplayMaxDurationSec: database.DefaultClientRequestReplayMaxDurationSeconds,
+			ClientRequestReplayBaseIntervalMS: database.DefaultClientRequestReplayBaseIntervalMS,
+			ClientRequestReplayMaxIntervalSec: database.DefaultClientRequestReplayMaxIntervalSeconds,
+			ClientRequestReplayKeepaliveSec:   15,
 			CodexContinueMaxRounds:            8,
 			AutoPause5hGuardBandPercent:       5,
 			AutoPause5hGuardConcurrency:       1,
@@ -293,6 +307,7 @@ func main() {
 	store.TriggerRecoveryProbeAsync()
 	store.TriggerCheapProbeAsync()
 	store.TriggerAutoCleanupAsync()
+	adminHandler.StartQualityEvalScheduler()
 	defer store.Stop()
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
@@ -513,13 +528,23 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("正在关闭...")
+	log.Printf("正在关闭，最多等待在途请求完成 %s...", cfg.GracefulShutdownTimeout)
 	// 先停止会产生新副作用的后台任务，再等待现有 HTTP 请求排空。
 	cancelBackground()
-	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), cfg.GracefulShutdownTimeout)
 	defer cancelShutdown()
+	qualityEvalStopped := make(chan struct{})
+	go func() {
+		defer close(qualityEvalStopped)
+		adminHandler.StopQualityEvalScheduler()
+	}()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("HTTP 服务优雅关闭超时: %v", err)
+	}
+	select {
+	case <-qualityEvalStopped:
+	case <-shutdownCtx.Done():
+		log.Printf("质量检测后台任务优雅关闭超时: %v", shutdownCtx.Err())
 	}
 	adminHandler.WaitAutoResetCredits()
 	wsKeepalive.Stop()

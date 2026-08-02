@@ -397,5 +397,11 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		SmartPacingWindows:                "5h,7d",
 		AutoResetCreditsBeforeExpiryMin:   60,
 		UTLSShutdownTimeoutMinutes:        30,
+		ClientRequestReplayEnabled:       true,
+		ClientRequestReplayMaxRetries:     database.DefaultClientRequestReplayMaxRetries,
+		ClientRequestReplayMaxDurationSec: database.DefaultClientRequestReplayMaxDurationSeconds,
+		ClientRequestReplayBaseIntervalMS: database.DefaultClientRequestReplayBaseIntervalMS,
+		ClientRequestReplayMaxIntervalSec: database.DefaultClientRequestReplayMaxIntervalSeconds,
+		ClientRequestReplayKeepaliveSec:  15,
 	}
 }

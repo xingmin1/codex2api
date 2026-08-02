@@ -865,39 +865,6 @@ func normalizeResponsesCompactionItems(body map[string]any) bool {
 	return modified
 }
 
-// normalizeResponsesSystemRoleMessages 把 input[] 中 role=system 的消息项改写为
-// developer 角色。上游 Codex /responses 不接受 system 角色（报 "System messages
-// are not allowed"），而 chat 与 Anthropic 两条翻译链路均已把 system 落到
-// developer（buildInput / buildCodexInput）；原生 Responses 直通路径在此补齐
-// 同样的语义（issue #409）。内容保持原样，content part 类型交由后续
-// normalizeResponsesContentPartTypes 按角色归一。
-func normalizeResponsesSystemRoleMessages(body map[string]any) bool {
-	if len(body) == 0 {
-		return false
-	}
-	inputItems, ok := body["input"].([]any)
-	if !ok {
-		return false
-	}
-
-	modified := false
-	for _, raw := range inputItems {
-		itemMap, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if !isResponsesMessageInputItem(itemMap) {
-			continue
-		}
-		if strings.TrimSpace(firstNonEmptyAnyString(itemMap["role"])) != "system" {
-			continue
-		}
-		itemMap["role"] = "developer"
-		modified = true
-	}
-	return modified
-}
-
 // normalizeResponsesToolCallArgumentTypes 修正 input[] 中工具调用项 arguments 的
 // JSON 类型。上游对不同 item 类型的要求不对称：function_call.arguments 必须是
 // string（JSON 编码），tool_search_call.arguments 必须是 object。客户端与缓存
@@ -1093,6 +1060,31 @@ func codexToolCallOutputTypeForCall(callType string) string {
 	}
 }
 
+// stripRelayUnsupportedFunctionCallNamespaces 仅清理历史 function_call 项上的
+// namespace。部分 OpenAI Responses 中转会把它视为未知参数；历史调用仍通过
+// call_id 与 function_call_output 配对，移除 namespace 不会改变工具执行结果。
+// 顶层 namespace 工具声明不在清理范围内，官方 Codex/OAuth 请求体也不调用本函数。
+func stripRelayUnsupportedFunctionCallNamespaces(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	modified := false
+	for _, raw := range inputItems {
+		item, ok := raw.(map[string]any)
+		if !ok || firstNonEmptyAnyString(item["type"]) != "function_call" {
+			continue
+		}
+		if _, exists := item["namespace"]; !exists {
+			continue
+		}
+		delete(item, "namespace")
+		modified = true
+	}
+	return modified
+}
+
 func normalizeResponsesInputMessageContent(body map[string]any) bool {
 	inputItems, ok := body["input"].([]any)
 	if !ok {
@@ -1111,6 +1103,77 @@ func normalizeResponsesInputMessageContent(body map[string]any) bool {
 		}
 	}
 	return modified
+}
+
+func normalizeCodexResponsesSystemInstructions(body map[string]any) bool {
+	inputItems, ok := body["input"].([]any)
+	if !ok {
+		return false
+	}
+
+	kept := make([]any, 0, len(inputItems))
+	systemInstructions := make([]string, 0)
+	modified := false
+	for _, raw := range inputItems {
+		item, ok := raw.(map[string]any)
+		if !ok || !isResponsesMessageInputItem(item) || strings.TrimSpace(firstNonEmptyAnyString(item["role"])) != "system" {
+			kept = append(kept, raw)
+			continue
+		}
+
+		text, textOnly := codexResponsesSystemInstructionText(item["content"])
+		if !textOnly {
+			item["role"] = "developer"
+			kept = append(kept, item)
+			modified = true
+			continue
+		}
+		if text := strings.TrimSpace(text); text != "" {
+			systemInstructions = append(systemInstructions, text)
+		}
+		modified = true
+	}
+	if !modified {
+		return false
+	}
+
+	instructions := make([]string, 0, len(systemInstructions)+1)
+	if existing, ok := body["instructions"].(string); ok && strings.TrimSpace(existing) != "" {
+		instructions = append(instructions, existing)
+	}
+	instructions = append(instructions, systemInstructions...)
+	body["instructions"] = strings.Join(instructions, "\n\n")
+	body["input"] = kept
+	return true
+}
+
+func codexResponsesSystemInstructionText(content any) (string, bool) {
+	switch typed := content.(type) {
+	case nil:
+		return "", true
+	case string:
+		return typed, true
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, raw := range typed {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				return "", false
+			}
+			partType := strings.TrimSpace(firstNonEmptyAnyString(part["type"]))
+			if partType != "" && partType != "text" && partType != "input_text" {
+				return "", false
+			}
+			text, ok := part["text"].(string)
+			if !ok {
+				return "", false
+			}
+			parts = append(parts, text)
+		}
+		return strings.Join(parts, "\n"), true
+	default:
+		return "", false
+	}
 }
 
 func isResponsesMessageInputItem(item map[string]any) bool {
@@ -1272,6 +1335,10 @@ func isMissingEncryptedContentError(body []byte) bool {
 }
 
 func stripInvalidEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
+	return stripEncryptedContentFromResponsesBody(body)
+}
+
+func stripEncryptedContentFromResponsesBody(body []byte) ([]byte, bool) {
 	var root map[string]any
 	if err := json.Unmarshal(body, &root); err != nil || root == nil {
 		return body, false
@@ -1996,7 +2063,6 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 	moveTopLevelResponsesImageOptions(body)
 	normalizeResponsesImageGenerationTools(body, promptText)
-	applyResponsesImageGenerationBridgeInstructions(body)
 
 	// 6. 展开 previous_response_id（限定在请求归属的缓存命名空间，防跨用户注入）
 	prevID, _ := body["previous_response_id"].(string)
@@ -2019,8 +2085,10 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	}
 	// 6b. 把 input[] 中的 compaction 项翻译为 developer message（上游不识别 compaction）
 	normalizeResponsesCompactionItems(body)
-	// system 角色消息 → developer（上游不接受 system 角色，issue #409）
-	normalizeResponsesSystemRoleMessages(body)
+	// OpenAI Responses 允许 system 消息，但 Codex 上游要求同级指令放在顶层
+	// instructions。转换仅发生在 Codex 准备路径，中转账号仍保留原始协议语义。
+	normalizeCodexResponsesSystemInstructions(body)
+	applyResponsesImageGenerationBridgeInstructions(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
 	normalizeResponsesToolCallArgumentTypes(body)
@@ -2049,7 +2117,7 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 		"temperature", "top_p", "frequency_penalty", "presence_penalty",
 		"logprobs", "top_logprobs", "n", "seed", "stop", "user",
 		"logit_bias", "response_format", "serviceTier", "metadata",
-		"stream_options", "reasoning_effort", "truncation", "context_management",
+		"stream_options", "reasoning_effort", "truncation",
 		"disable_response_storage", "verbosity",
 		"prompt_cache_retention", "safety_identifier",
 	} {
@@ -2102,6 +2170,10 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 	normalizeResponsesToolChoice(body)
 	normalizeResponsesContentPartTypes(body)
 	normalizeResponsesInputMessageContent(body)
+	// reasoning 空壳无法被 Responses 重放，会让同一会话之后的每轮请求都返回
+	// missing_required_parameter。这里只删除不可重放的 reasoning；压缩和子代理密文保留。
+	dropBareReasoningInputItems(body)
+	stripRelayUnsupportedFunctionCallNamespaces(body)
 	if shouldInjectOpenAIResponsesImageGenerationTool(body) {
 		ensureResponsesImageGenerationTool(body)
 	}
@@ -2133,6 +2205,9 @@ func prepareCompactResponsesBodyForOwnerDetailed(rawBody []byte, owner string) r
 	prepared.Body, _ = sjson.DeleteBytes(prepared.Body, "include")
 	prepared.Body, _ = sjson.DeleteBytes(prepared.Body, "store")
 	prepared.Body, _ = sjson.DeleteBytes(prepared.Body, "stream")
+	// context_management 是 /responses 的服务端压缩控制字段；显式
+	// /responses/compact 端点执行一次独立压缩，不接受该字段。
+	prepared.Body, _ = sjson.DeleteBytes(prepared.Body, "context_management")
 	// 普通 /responses 请求携带的客户端指纹元数据,compact 端点不认识该参数
 	// (Unknown parameter: 'client_metadata')——body-signal 压缩提升会把普通
 	// 请求形状的 body 送进本函数,须在此剥除。
@@ -3233,10 +3308,16 @@ func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) 
 	switch eventType {
 	case "response.output_text.delta":
 		delta := parsed.Get("delta").String()
+		if delta == "" {
+			return nil, false
+		}
 		return newContentChunk(st.ChunkID, st.Model, st.Created, delta), false
 
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		delta := parsed.Get("delta").String()
+		if delta == "" {
+			return nil, false
+		}
 		return newReasoningChunk(st.ChunkID, st.Model, st.Created, delta), false
 
 	case "response.output_item.added":
@@ -3274,6 +3355,9 @@ func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) 
 			return nil, false
 		}
 		delta := parsed.Get("delta").String()
+		if delta == "" {
+			return nil, false
+		}
 		return newToolCallDeltaChunk(st.ChunkID, st.Model, st.Created, tcIdx, delta), false
 
 	case "response.function_call_arguments.done", "response.custom_tool_call_input.done":
@@ -3304,6 +3388,9 @@ func (st *StreamTranslator) TranslateParsed(parsed gjson.Result) ([]byte, bool) 
 
 	default:
 		if delta := parsed.Get("delta"); delta.Exists() && delta.Type == gjson.String {
+			if delta.String() == "" {
+				return nil, false
+			}
 			return newContentChunk(st.ChunkID, st.Model, st.Created, delta.String()), false
 		}
 		return nil, false

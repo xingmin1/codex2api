@@ -61,6 +61,11 @@ func isFirstTokenPayload(data []byte) bool {
 	return isFirstTokenResult(gjson.ParseBytes(data))
 }
 
+// IsFirstTokenPayload 判断 Responses 事件是否包含首个可观测模型产出。
+func IsFirstTokenPayload(data []byte) bool {
+	return isFirstTokenPayload(data)
+}
+
 func isFirstTokenResult(parsed gjson.Result) bool {
 	eventType := strings.TrimSpace(parsed.Get("type").String())
 	switch eventType {
@@ -116,6 +121,15 @@ func deltaEventHasContent(parsed gjson.Result) bool {
 	return stringFieldHasValue(parsed, "delta") ||
 		stringFieldHasValue(parsed, "partial_image_b64") ||
 		stringFieldHasValue(parsed, "partial_image")
+}
+
+func reasoningDeltaCharCount(parsed gjson.Result) int {
+	switch strings.TrimSpace(parsed.Get("type").String()) {
+	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+		return len(parsed.Get("delta").String())
+	default:
+		return 0
+	}
 }
 
 func outputItemHasFirstTokenContent(item gjson.Result) bool {

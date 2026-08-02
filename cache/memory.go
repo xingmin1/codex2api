@@ -343,6 +343,27 @@ func (tc *MemoryTokenCache) DeleteSessionAffinity(ctx context.Context, key strin
 	return nil
 }
 
+// DeleteSessionAffinityIfMatches 仅在缓存仍是指定版本时删除会话亲和。
+func (tc *MemoryTokenCache) DeleteSessionAffinityIfMatches(ctx context.Context, key string, binding SessionAffinityBinding) error {
+	key = strings.TrimSpace(key)
+	if key == "" || binding.AccountID == 0 {
+		return nil
+	}
+	tc.mu.Lock()
+	if entry, ok := tc.sessions[key]; ok && sameSessionAffinityIdentity(entry.binding, binding) {
+		delete(tc.sessions, key)
+	}
+	tc.mu.Unlock()
+	return nil
+}
+
+func sameSessionAffinityIdentity(left, right SessionAffinityBinding) bool {
+	return left.AccountID == right.AccountID &&
+		left.ProxyURL == right.ProxyURL &&
+		left.BoundAtUnixNano == right.BoundAtUnixNano &&
+		left.ExpiresAtUnixNano == right.ExpiresAtUnixNano
+}
+
 func (tc *MemoryTokenCache) SetResponseContext(ctx context.Context, responseID string, items []json.RawMessage, ttl time.Duration) error {
 	responseID = strings.TrimSpace(responseID)
 	if responseID == "" {

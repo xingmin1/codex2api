@@ -202,8 +202,8 @@ func TestRunSingleBatchTestTimesOutSlowStreamingBody(t *testing.T) {
 	if account.Status == auth.StatusError {
 		t.Fatal("timeout should not mark account as permanent error")
 	}
-	if account.LastTimeoutAt.IsZero() {
-		t.Fatal("timeout should be recorded in scheduler health")
+	if account.LastFailureAt.IsZero() {
+		t.Fatal("relay timeout should be recorded as a generic upstream failure")
 	}
 }
 
@@ -305,7 +305,7 @@ func TestRunSingleBatchTestResponseFailedDoesNotRecoverCooldown(t *testing.T) {
 	}
 }
 
-func TestRunSingleBatchTestResponseFailedMarksReadyAccountError(t *testing.T) {
+func TestRunSingleBatchTestResponseFailedKeepsRelayStateReady(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -330,18 +330,18 @@ func TestRunSingleBatchTestResponseFailedMarksReadyAccountError(t *testing.T) {
 	if status == "success" {
 		t.Fatalf("status = success, want failure for response.failed; message=%q", msg)
 	}
-	if got := account.RuntimeStatus(); got != "error" {
-		t.Fatalf("RuntimeStatus() = %q, want error", got)
+	if got := account.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active", got)
 	}
 	account.Mu().RLock()
 	errorMsg := account.ErrorMsg
 	account.Mu().RUnlock()
-	if !strings.Contains(errorMsg, "model unavailable") {
-		t.Fatalf("ErrorMsg = %q, want model unavailable", errorMsg)
+	if errorMsg != "" {
+		t.Fatalf("ErrorMsg = %q, want empty relay state", errorMsg)
 	}
 }
 
-func TestRunSingleBatchTestUsageLimitResponseFailedMarksRateLimited(t *testing.T) {
+func TestRunSingleBatchTestUsageLimitResponseFailedKeepsRelayStateReady(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
@@ -363,11 +363,11 @@ func TestRunSingleBatchTestUsageLimitResponseFailedMarksRateLimited(t *testing.T
 	handler := &Handler{store: store}
 
 	status, msg := handler.runSingleBatchTest(context.Background(), account)
-	if status != "rate_limited" {
-		t.Fatalf("status = %q, message = %q, want rate_limited", status, msg)
+	if status != "failed" {
+		t.Fatalf("status = %q, message = %q, want failed", status, msg)
 	}
-	if got := account.RuntimeStatus(); got != "rate_limited" {
-		t.Fatalf("RuntimeStatus() = %q, want rate_limited", got)
+	if got := account.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active", got)
 	}
 }
 
@@ -420,7 +420,7 @@ func TestApplyUsageLimitedTestStatePreservesBannedAccount(t *testing.T) {
 	}
 }
 
-func TestRunSingleBatchTestUnauthorizedRecordsErrorMessage(t *testing.T) {
+func TestRunSingleBatchTestUnauthorizedKeepsRelayStateReady(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
@@ -442,17 +442,17 @@ func TestRunSingleBatchTestUnauthorizedRecordsErrorMessage(t *testing.T) {
 	handler := &Handler{store: store}
 
 	status, msg := handler.runSingleBatchTest(context.Background(), account)
-	if status != "banned" {
-		t.Fatalf("status = %q, message = %q, want banned", status, msg)
+	if status != "failed" {
+		t.Fatalf("status = %q, message = %q, want failed", status, msg)
 	}
-	if got := account.RuntimeStatus(); got != "unauthorized" {
-		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	if got := account.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active", got)
 	}
 	account.Mu().RLock()
 	errorMsg := account.ErrorMsg
 	account.Mu().RUnlock()
-	if !strings.Contains(errorMsg, "token_invalidated") {
-		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
+	if errorMsg != "" {
+		t.Fatalf("ErrorMsg = %q, want empty relay state", errorMsg)
 	}
 }
 

@@ -73,3 +73,52 @@ func TestDrainableUpstreamContextPreservesRequestValues(t *testing.T) {
 		t.Fatalf("upstream context value = %v, want audit-value", got)
 	}
 }
+
+func TestDrainableUpstreamContextAlreadyCanceledDoesNotStayAlive(t *testing.T) {
+	clientCtx, cancelClient := context.WithCancel(context.Background())
+	cancelClient()
+
+	upstreamCtx, cancelUpstream := newDrainableUpstreamContext(clientCtx, time.Hour)
+	defer cancelUpstream()
+	select {
+	case <-upstreamCtx.Done():
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("already canceled client context left upstream alive")
+	}
+}
+
+func TestReplayUpstreamContextCancelsImmediatelyBeforeBusinessOutput(t *testing.T) {
+	clientCtx, cancelClient := context.WithCancel(context.Background())
+	controller := newClientRequestReplayController(clientCtx, time.Minute)
+	defer controller.close()
+	upstreamCtx, cancelUpstream := newDrainableUpstreamContext(controller.context(), time.Hour)
+	defer cancelUpstream()
+
+	cancelClient()
+	select {
+	case <-upstreamCtx.Done():
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("pre-business replay upstream did not cancel immediately")
+	}
+}
+
+func TestReplayUpstreamContextDrainsAfterBusinessOutput(t *testing.T) {
+	clientCtx, cancelClient := context.WithCancel(context.Background())
+	controller := newClientRequestReplayController(clientCtx, time.Minute)
+	defer controller.close()
+	controller.markBusinessStarted()
+	upstreamCtx, cancelUpstream := newDrainableUpstreamContext(controller.context(), 40*time.Millisecond)
+	defer cancelUpstream()
+
+	cancelClient()
+	select {
+	case <-upstreamCtx.Done():
+		t.Fatal("post-business replay upstream canceled before drain window")
+	case <-time.After(10 * time.Millisecond):
+	}
+	select {
+	case <-upstreamCtx.Done():
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("post-business replay upstream exceeded drain window")
+	}
+}

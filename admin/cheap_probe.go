@@ -6,8 +6,10 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/tidwall/gjson"
 )
@@ -26,6 +28,7 @@ func (h *Handler) ProbeCheapAccountReadiness(ctx context.Context, account *auth.
 		return err
 	}
 	payload := buildTestPayload(testModel)
+	startedAt := time.Now()
 
 	var resp *http.Response
 	if account.IsOpenAIResponsesAPI() {
@@ -43,13 +46,16 @@ func (h *Handler) ProbeCheapAccountReadiness(ctx context.Context, account *auth.
 		return fmt.Errorf("上游返回 %d: %s", resp.StatusCode, truncate(string(body), 500))
 	}
 
-	return readCheapProbeStream(resp.Body)
+	return readCheapProbeStream(resp.Body, h.newAccountFirstTokenObserver(account, database.FirstTokenSourceAutoProbe, testModel, startedAt))
 }
 
-func readCheapProbeStream(body io.Reader) error {
+func readCheapProbeStream(body io.Reader, observeFirstToken func([]byte)) error {
 	gotTerminal := false
 	var lastEvent []byte
 	readErr := proxy.ReadSSEStream(body, func(data []byte) bool {
+		if observeFirstToken != nil {
+			observeFirstToken(data)
+		}
 		if len(data) == 0 {
 			return true
 		}

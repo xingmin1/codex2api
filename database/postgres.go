@@ -68,6 +68,8 @@ type AccountRow struct {
 	SkipWarmTier            bool
 	ScoreBiasOverride       sql.NullInt64
 	BaseConcurrencyOverride sql.NullInt64
+	ManualScoreBonus        int64
+	ManualScoreBonusUntil   sql.NullTime
 	Tags                    []string
 	Note                    string
 	CreatedAt               time.Time
@@ -237,14 +239,16 @@ type DB struct {
 	backgroundTaskCancel  context.CancelFunc
 
 	// 使用日志批量写入缓冲
-	logBuf  []usageLogEntry
-	logMu   sync.Mutex
-	logStop chan struct{}
-	logWg   sync.WaitGroup
+	logBuf        []usageLogEntry
+	firstTokenBuf []AccountFirstTokenSample
+	logMu         sync.Mutex
+	logStop       chan struct{}
+	logWg         sync.WaitGroup
 
 	// 缓冲溢出/脏数据丢弃的累计条数，暴露在运行状态里供运维观察
-	usageLogDropped   int64
-	usageLogDropLogAt time.Time // 溢出日志的限流时间戳，由 logMu 保护
+	usageLogDropped     int64
+	usageLogDropLogAt   time.Time // 溢出日志的限流时间戳，由 logMu 保护
+	firstTokenCleanupAt int64
 
 	usageLogMode          atomic.Value // string: full|errors|off
 	usageLogBatchSize     int64
@@ -767,6 +771,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS score_bias_override INT NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS base_concurrency_override INT NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS manual_score_bonus INT NOT NULL DEFAULT 0;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS manual_score_bonus_until TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS image_quota_remaining INT NULL;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS image_quota_total INT NULL;
@@ -835,7 +841,102 @@ func (db *DB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_created_status ON usage_logs(created_at, status_code);
 	CREATE INDEX IF NOT EXISTS idx_usage_logs_account_status ON usage_logs(account_id, status_code);
 
+	CREATE TABLE IF NOT EXISTS account_first_token_samples (
+		id             BIGSERIAL PRIMARY KEY,
+		account_id     BIGINT NOT NULL,
+		source         VARCHAR(32) NOT NULL,
+		model          VARCHAR(100) DEFAULT '',
+		first_token_ms INT NOT NULL,
+		created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_account_first_token_account_created
+		ON account_first_token_samples(account_id, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_account_first_token_created
+		ON account_first_token_samples(created_at);
+
+	CREATE TABLE IF NOT EXISTS account_quality_eval_batches (
+		id               BIGSERIAL PRIMARY KEY,
+		account_id       BIGINT NOT NULL,
+		trigger_source   VARCHAR(16) NOT NULL,
+		test_kind        VARCHAR(16) NOT NULL DEFAULT 'full',
+		scheduled_hour   TIMESTAMPTZ NULL,
+		model            VARCHAR(100) NOT NULL,
+		reasoning_effort VARCHAR(20) NOT NULL,
+		status           VARCHAR(20) NOT NULL DEFAULT 'running',
+		error_message    TEXT NOT NULL DEFAULT '',
+		juice_requested  INT NOT NULL DEFAULT 0,
+		juice_concurrency INT NOT NULL DEFAULT 0,
+		juice_graded     INT NOT NULL DEFAULT 0,
+		juice_correct    INT NOT NULL DEFAULT 0,
+		candy_requested  INT NOT NULL DEFAULT 0,
+		candy_concurrency INT NOT NULL DEFAULT 0,
+		candy_graded     INT NOT NULL DEFAULT 0,
+		candy_correct    INT NOT NULL DEFAULT 0,
+		started_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		finished_at      TIMESTAMPTZ NULL,
+		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		UNIQUE(account_id, trigger_source, scheduled_hour)
+	);
+	CREATE TABLE IF NOT EXISTS account_quality_eval_samples (
+		id               BIGSERIAL PRIMARY KEY,
+		batch_id         BIGINT NOT NULL,
+		account_id       BIGINT NOT NULL,
+		test_kind        VARCHAR(16) NOT NULL,
+		sample_index     INT NOT NULL,
+		attempt_count    INT NOT NULL DEFAULT 1,
+		model            VARCHAR(100) NOT NULL,
+		reasoning_effort VARCHAR(20) NOT NULL,
+		attempt_answers  TEXT NOT NULL DEFAULT '[]',
+		raw_answer       TEXT NOT NULL DEFAULT '',
+		parsed_answer    TEXT NOT NULL DEFAULT '',
+		graded           BOOLEAN NOT NULL DEFAULT FALSE,
+		correct          BOOLEAN NOT NULL DEFAULT FALSE,
+		input_tokens     INT NOT NULL DEFAULT 0,
+		output_tokens    INT NOT NULL DEFAULT 0,
+		reasoning_tokens INT NOT NULL DEFAULT 0,
+		first_token_ms   INT NOT NULL DEFAULT 0,
+		duration_ms      INT NOT NULL DEFAULT 0,
+		http_status      INT NOT NULL DEFAULT 0,
+		terminal_status  VARCHAR(32) NOT NULL DEFAULT '',
+		error_message    TEXT NOT NULL DEFAULT '',
+		created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		UNIQUE(batch_id, test_kind, sample_index)
+	);
+	CREATE TABLE IF NOT EXISTS quality_eval_config (
+		id                INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+		auto_enabled      BOOLEAN NOT NULL DEFAULT FALSE,
+		interval_minutes  INT NOT NULL DEFAULT 60,
+		lookback_hours    INT NOT NULL DEFAULT 5,
+		top_accounts      INT NOT NULL DEFAULT 5,
+		min_requests      INT NOT NULL DEFAULT 50,
+		batch_concurrency INT NOT NULL DEFAULT 1,
+		updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE TABLE IF NOT EXISTS quality_eval_schedule_runs (
+		scheduled_hour TIMESTAMPTZ PRIMARY KEY,
+		status         VARCHAR(20) NOT NULL DEFAULT 'running',
+		started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		finished_at    TIMESTAMPTZ NULL
+	);
+	CREATE TABLE IF NOT EXISTS quality_eval_scheduler_lock (
+		id          INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+		owner       VARCHAR(100) NOT NULL DEFAULT '',
+		lease_until TIMESTAMPTZ NOT NULL,
+		updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_quality_eval_batches_account_created
+		ON account_quality_eval_batches(account_id, created_at DESC);
+	CREATE INDEX IF NOT EXISTS idx_quality_eval_batches_status
+		ON account_quality_eval_batches(status, created_at);
+	CREATE INDEX IF NOT EXISTS idx_quality_eval_samples_batch
+		ON account_quality_eval_samples(batch_id, test_kind, sample_index);
+
 	-- 增强字段（向后兼容 ALTER）
+	ALTER TABLE account_quality_eval_batches ADD COLUMN IF NOT EXISTS juice_concurrency INT NOT NULL DEFAULT 0;
+	ALTER TABLE account_quality_eval_batches ADD COLUMN IF NOT EXISTS candy_concurrency INT NOT NULL DEFAULT 0;
+	ALTER TABLE account_quality_eval_batches ADD COLUMN IF NOT EXISTS error_message TEXT NOT NULL DEFAULT '';
+	ALTER TABLE account_quality_eval_samples ADD COLUMN IF NOT EXISTS http_status INT NOT NULL DEFAULT 0;
+	ALTER TABLE account_quality_eval_samples ADD COLUMN IF NOT EXISTS terminal_status VARCHAR(32) NOT NULL DEFAULT '';
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS input_tokens INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS output_tokens INT DEFAULT 0;
 	ALTER TABLE usage_logs ADD COLUMN IF NOT EXISTS reasoning_tokens INT DEFAULT 0;
@@ -997,6 +1098,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS dispatch_max_multiplier DOUBLE PRECISION DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS failure_score_threshold INT DEFAULT 3;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS failure_cooldown_threshold INT DEFAULT 10;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS failure_tolerance_window_seconds INT DEFAULT 60;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS failure_score_retroactive BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS scheduler_mode VARCHAR(20) DEFAULT 'round_robin';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS affinity_mode VARCHAR(16) DEFAULT 'bounded';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
@@ -1064,7 +1167,18 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_min_concurrency INT DEFAULT 1;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS smart_pacing_windows TEXT DEFAULT '5h,7d';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS retry_interval_ms INT DEFAULT 0;
-	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'rotate';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_retry_policy VARCHAR(20) DEFAULT 'hybrid';
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS transport_same_account_retries INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS compact_same_account_retries INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_max_retries INT DEFAULT 5;
+	ALTER TABLE system_settings ALTER COLUMN client_request_replay_max_retries SET DEFAULT 5;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_max_duration_seconds INT DEFAULT 600;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_retry_base_interval_ms INT DEFAULT 1000;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_retry_max_interval_seconds INT DEFAULT 30;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS client_request_replay_keepalive_seconds INT DEFAULT 15;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS encrypted_content_compatibility_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS fast_tier_policy VARCHAR(20) DEFAULT 'preserve';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS ignore_usage_limit_status BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_enabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS auto_reset_credits_before_expiry_min INT DEFAULT 60;
@@ -1802,6 +1916,8 @@ type SystemSettings struct {
 	DispatchMaxMultiplier               float64
 	FailureScoreThreshold               int
 	FailureCooldownThreshold            int
+	FailureToleranceWindowSeconds       int
+	FailureScoreRetroactive             bool
 	SchedulerMode                       string
 	AffinityMode                        string // session 粘性模式: bounded / off / strict
 	ResinURL                            string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
@@ -1865,7 +1981,17 @@ type SystemSettings struct {
 	SmartPacingWindows                  string // "5h,7d" / "5h" / "7d"
 	IgnoreUsageLimitStatus              bool   // 用量窗口仅作参考，以 Responses 成功/usage_limit_reached 判定可用性
 	RetryIntervalMS                     int    // 重试间隔毫秒（0 = 立即重试，保持旧行为）
-	TransportRetryPolicy                string // 传输错误重试策略: rotate（换号，旧行为）/ sticky（同号延迟重试）
+	TransportRetryPolicy                string // 上游错误重试策略: rotate / sticky / hybrid
+	TransportSameAccountRetries         int    // hybrid 下每个账号额外同号重试次数
+	CompactSameAccountRetries           int    // compact 首账号额外同号重试次数
+	ClientRequestReplayEnabled          bool   // 响应提交前模拟客户端重发整个请求
+	ClientRequestReplayMaxRetries       int    // 原始请求失败后的额外重发次数
+	ClientRequestReplayMaxDurationSec   int    // 首个业务输出前的总预算秒数
+	ClientRequestReplayBaseIntervalMS   int    // 第一次额外重发前的等待毫秒数
+	ClientRequestReplayMaxIntervalSec   int    // 指数退避最大间隔秒数
+	ClientRequestReplayKeepaliveSec     int    // 等待整请求重发时的下游 SSE 保活间隔，0 表示关闭
+	EncryptedContentCompat              bool   // Responses API 中转账号默认启用加密上下文兼容修复
+	FastTierPolicy                      string // Fast Tier 出站策略: preserve / force_fast / filter_fast
 	// CodexSyncedCLIVersion 是从 openai/codex releases 同步到的最新 Codex CLI 版本缓存，
 	// 用于抬升出站 UA / manifest 的模拟版本（绝不低于内置常量），空表示尚未同步。
 	CodexSyncedCLIVersion string
@@ -2060,7 +2186,19 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 			       COALESCE(first_token_excludes_ws_acquire, false),
 			       COALESCE(codex_preflight_sse_passthrough_enabled, false),
 			       COALESCE(utls_shutdown_timeout_minutes, 30),
-			       COALESCE(codex_ws_weak_network_mode, false)
+			       COALESCE(codex_ws_weak_network_mode, false),
+			       COALESCE(failure_tolerance_window_seconds, 60),
+			       COALESCE(transport_same_account_retries, 2),
+			       COALESCE(compact_same_account_retries, 2),
+			       COALESCE(failure_score_retroactive, false),
+			       COALESCE(encrypted_content_compatibility_enabled, true),
+			       COALESCE(NULLIF(TRIM(fast_tier_policy), ''), 'preserve'),
+			       COALESCE(client_request_replay_enabled, true),
+			       COALESCE(client_request_replay_max_retries, 5),
+			       COALESCE(client_request_replay_max_duration_seconds, 600),
+			       COALESCE(client_request_replay_retry_base_interval_ms, 1000),
+			       COALESCE(client_request_replay_retry_max_interval_seconds, 30),
+			       COALESCE(client_request_replay_keepalive_seconds, 15)
 			FROM system_settings WHERE id = 1
 		`).Scan(
 		&s.SiteName, &s.SiteLogo,
@@ -2130,6 +2268,18 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.CodexPreflightSSEPassthroughEnabled,
 		&s.UTLSShutdownTimeoutMinutes,
 		&s.CodexWSWeakNetworkMode,
+		&s.FailureToleranceWindowSeconds,
+		&s.TransportSameAccountRetries,
+		&s.CompactSameAccountRetries,
+		&s.FailureScoreRetroactive,
+		&s.EncryptedContentCompat,
+		&s.FastTierPolicy,
+		&s.ClientRequestReplayEnabled,
+		&s.ClientRequestReplayMaxRetries,
+		&s.ClientRequestReplayMaxDurationSec,
+		&s.ClientRequestReplayBaseIntervalMS,
+		&s.ClientRequestReplayMaxIntervalSec,
+		&s.ClientRequestReplayKeepaliveSec,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2154,9 +2304,17 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 	}
 	s.FirstTokenMode = normalizeFirstTokenMode(s.FirstTokenMode)
 	s.BillingTierPolicy = normalizeBillingTierPolicy(s.BillingTierPolicy)
+	s.FastTierPolicy = NormalizeFastTierPolicy(s.FastTierPolicy)
 	s.FailureScoreThreshold = normalizeFailureToleranceThresholdDB(s.FailureScoreThreshold, 3)
 	s.FailureCooldownThreshold = normalizeFailureToleranceThresholdDB(s.FailureCooldownThreshold, 10)
 	s.AutoResetCreditsBeforeExpiryMin = NormalizeAutoResetCreditsBeforeExpiryMinutes(s.AutoResetCreditsBeforeExpiryMin)
+	s.FailureToleranceWindowSeconds = normalizeFailureToleranceWindowDB(s.FailureToleranceWindowSeconds)
+	s.TransportSameAccountRetries = NormalizeTransportSameAccountRetries(s.TransportSameAccountRetries)
+	s.CompactSameAccountRetries = NormalizeTransportSameAccountRetries(s.CompactSameAccountRetries)
+	s.ClientRequestReplayMaxRetries = NormalizeClientRequestReplayMaxRetries(s.ClientRequestReplayMaxRetries)
+	s.ClientRequestReplayMaxDurationSec = NormalizeClientRequestReplayMaxDurationSeconds(s.ClientRequestReplayMaxDurationSec)
+	s.ClientRequestReplayBaseIntervalMS = NormalizeClientRequestReplayBaseIntervalMS(s.ClientRequestReplayBaseIntervalMS)
+	s.ClientRequestReplayMaxIntervalSec = NormalizeClientRequestReplayMaxIntervalSeconds(s.ClientRequestReplayMaxIntervalSec)
 	return s, err
 }
 
@@ -2178,6 +2336,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 	}
 	firstTokenMode := normalizeFirstTokenMode(s.FirstTokenMode)
 	billingTierPolicy := normalizeBillingTierPolicy(s.BillingTierPolicy)
+	fastTierPolicy := NormalizeFastTierPolicy(s.FastTierPolicy)
 	testContent := strings.TrimSpace(s.TestContent)
 	if testContent == "" {
 		testContent = "hi"
@@ -2251,9 +2410,21 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					first_token_excludes_ws_acquire,
 					codex_preflight_sse_passthrough_enabled,
 					utls_shutdown_timeout_minutes,
-					codex_ws_weak_network_mode
+					codex_ws_weak_network_mode,
+					failure_tolerance_window_seconds,
+					transport_same_account_retries,
+					compact_same_account_retries,
+					failure_score_retroactive,
+					encrypted_content_compatibility_enabled,
+					fast_tier_policy,
+					client_request_replay_enabled,
+					client_request_replay_max_retries,
+					client_request_replay_max_duration_seconds,
+					client_request_replay_retry_base_interval_ms,
+					client_request_replay_retry_max_interval_seconds,
+					client_request_replay_keepalive_seconds
 				)
-				VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117)
+				VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63, $64, $65, $66, $67, $68, $69, $70, $71, $72, $73, $74, $75, $76, $77, $78, $79, $80, $81, $82, $83, $84, $85, $86, $87, $88, $89, $90, $91, $92, $93, $94, $95, $96, $97, $98, $99, $100, $101, $102, $103, $104, $105, $106, $107, $108, $109, $110, $111, $112, $113, $114, $115, $116, $117, $118, $119, $120, $121, $122, $123, $124, $125, $126, $127, $128, $129)
 				ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -2368,7 +2539,19 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 					first_token_excludes_ws_acquire = EXCLUDED.first_token_excludes_ws_acquire,
 					codex_preflight_sse_passthrough_enabled = EXCLUDED.codex_preflight_sse_passthrough_enabled,
 					utls_shutdown_timeout_minutes = EXCLUDED.utls_shutdown_timeout_minutes,
-					codex_ws_weak_network_mode = EXCLUDED.codex_ws_weak_network_mode
+					codex_ws_weak_network_mode = EXCLUDED.codex_ws_weak_network_mode,
+					failure_tolerance_window_seconds = EXCLUDED.failure_tolerance_window_seconds,
+					transport_same_account_retries = EXCLUDED.transport_same_account_retries,
+					compact_same_account_retries = EXCLUDED.compact_same_account_retries,
+					failure_score_retroactive = EXCLUDED.failure_score_retroactive,
+					encrypted_content_compatibility_enabled = EXCLUDED.encrypted_content_compatibility_enabled,
+					fast_tier_policy = EXCLUDED.fast_tier_policy,
+					client_request_replay_enabled = EXCLUDED.client_request_replay_enabled,
+					client_request_replay_max_retries = EXCLUDED.client_request_replay_max_retries,
+					client_request_replay_max_duration_seconds = EXCLUDED.client_request_replay_max_duration_seconds,
+					client_request_replay_retry_base_interval_ms = EXCLUDED.client_request_replay_retry_base_interval_ms,
+					client_request_replay_retry_max_interval_seconds = EXCLUDED.client_request_replay_retry_max_interval_seconds,
+					client_request_replay_keepalive_seconds = EXCLUDED.client_request_replay_keepalive_seconds
 			`, NormalizeSiteName(s.SiteName), strings.TrimSpace(s.SiteLogo),
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, testContent, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
@@ -2408,7 +2591,19 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.FirstTokenExcludesWsAcquire,
 		s.CodexPreflightSSEPassthroughEnabled,
 		NormalizeUTLSShutdownTimeoutMinutes(s.UTLSShutdownTimeoutMinutes),
-		s.CodexWSWeakNetworkMode)
+		s.CodexWSWeakNetworkMode,
+		normalizeFailureToleranceWindowDB(s.FailureToleranceWindowSeconds),
+		NormalizeTransportSameAccountRetries(s.TransportSameAccountRetries),
+		NormalizeTransportSameAccountRetries(s.CompactSameAccountRetries),
+		s.FailureScoreRetroactive,
+		s.EncryptedContentCompat,
+		fastTierPolicy,
+		s.ClientRequestReplayEnabled,
+		NormalizeClientRequestReplayMaxRetries(s.ClientRequestReplayMaxRetries),
+		NormalizeClientRequestReplayMaxDurationSeconds(s.ClientRequestReplayMaxDurationSec),
+		NormalizeClientRequestReplayBaseIntervalMS(s.ClientRequestReplayBaseIntervalMS),
+		NormalizeClientRequestReplayMaxIntervalSeconds(s.ClientRequestReplayMaxIntervalSec),
+		s.ClientRequestReplayKeepaliveSec)
 	return err
 }
 
@@ -2447,6 +2642,13 @@ func normalizeFailureToleranceThresholdDB(value, fallback int) int {
 		return 1000
 	}
 	return value
+}
+
+func normalizeFailureToleranceWindowDB(value int) int {
+	if value <= 0 {
+		value = 60
+	}
+	return min(max(value, 1), 3600)
 }
 
 // normalizeModelPricingOverridesJSON 空/非法 JSON 归一为 "{}"。
@@ -2491,14 +2693,25 @@ func normalizeRetryIntervalMSDB(ms int) int {
 	return ms
 }
 
-// NormalizeTransportRetryPolicy 归一化传输错误重试策略,空/未知值回落到 rotate(换号,旧行为)。
+// NormalizeTransportRetryPolicy 归一化上游错误重试策略，空或未知值回落到 rotate 以兼容旧配置。
 func NormalizeTransportRetryPolicy(policy string) string {
 	switch strings.ToLower(strings.TrimSpace(policy)) {
-	case "sticky":
-		return "sticky"
+	case "sticky", "hybrid":
+		return strings.ToLower(strings.TrimSpace(policy))
 	default:
 		return "rotate"
 	}
+}
+
+// NormalizeTransportSameAccountRetries 将同号重试次数限制在管理界面允许的范围内。
+func NormalizeTransportSameAccountRetries(retries int) int {
+	if retries < 0 {
+		return 0
+	}
+	if retries > 10 {
+		return 10
+	}
+	return retries
 }
 
 // NormalizeCodexWSBusyAcquireMaxWaitSec 把 busy 等待上限限制在 1-300 秒,非正值回落默认 30。
@@ -3460,52 +3673,73 @@ func (db *DB) flushLogBatch(drain bool) bool {
 	}
 
 	db.logMu.Lock()
-	if len(db.logBuf) == 0 {
+	if len(db.logBuf) == 0 && len(db.firstTokenBuf) == 0 {
 		db.logMu.Unlock()
 		return false
 	}
-	take := len(db.logBuf)
-	if take > batchSize {
-		take = batchSize
-	}
-	batch := make([]usageLogEntry, take)
-	copy(batch, db.logBuf[:take])
-	remaining := len(db.logBuf) - take
-	if remaining == 0 {
+	usageTake := min(len(db.logBuf), batchSize)
+	usageBatch := make([]usageLogEntry, usageTake)
+	copy(usageBatch, db.logBuf[:usageTake])
+	usageRemaining := len(db.logBuf) - usageTake
+	if usageRemaining == 0 {
 		db.logBuf = make([]usageLogEntry, 0, batchSize)
 	} else {
-		next := make([]usageLogEntry, remaining, remaining+batchSize)
-		copy(next, db.logBuf[take:])
+		next := make([]usageLogEntry, usageRemaining, usageRemaining+batchSize)
+		copy(next, db.logBuf[usageTake:])
 		db.logBuf = next
 	}
+	firstTokenTake := min(len(db.firstTokenBuf), batchSize)
+	firstTokenBatch := make([]AccountFirstTokenSample, firstTokenTake)
+	copy(firstTokenBatch, db.firstTokenBuf[:firstTokenTake])
+	firstTokenRemaining := len(db.firstTokenBuf) - firstTokenTake
+	if firstTokenRemaining == 0 {
+		db.firstTokenBuf = make([]AccountFirstTokenSample, 0, batchSize)
+	} else {
+		next := make([]AccountFirstTokenSample, firstTokenRemaining, firstTokenRemaining+batchSize)
+		copy(next, db.firstTokenBuf[firstTokenTake:])
+		db.firstTokenBuf = next
+	}
+	remaining := usageRemaining + firstTokenRemaining
 	db.logMu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second) // 增加超时时间
 	defer cancel()
 
-	if err := db.insertUsageLogBatch(ctx, batch); err != nil {
-		// 瞬时故障（连接断开、超时、死锁）原样放回缓冲区重试，一条都不能丢。
-		if !isUsageLogDataError(err) {
-			log.Printf("批量写入日志失败，已重新放回缓冲区等待重试: %v", err)
-			db.requeueUsageLogBatch(batch)
-			return false
-		}
-		// 脏数据重试多少次都写不进去，隔离出来丢掉，其余照常落库。
-		pending, dropped := db.salvageUsageLogBatch(ctx, batch, err)
-		if dropped > 0 {
-			total := atomic.AddInt64(&db.usageLogDropped, int64(dropped))
-			log.Printf("批量写入命中写不进去的日志：已丢弃 %d 条（累计 %d 条），其余继续落库。首个错误: %v",
-				dropped, total, err)
-		}
-		if len(pending) > 0 {
-			log.Printf("批量写入日志部分失败，%d 条已放回缓冲区等待重试", len(pending))
-			db.requeueUsageLogBatch(pending)
-			return false
+	if len(usageBatch) > 0 {
+		if err := db.insertUsageLogBatch(ctx, usageBatch); err != nil {
+			// 瞬时故障（连接断开、超时、死锁）原样放回缓冲区重试，一条都不能丢。
+			if !isUsageLogDataError(err) {
+				log.Printf("批量写入日志失败，已重新放回缓冲区等待重试: %v", err)
+				db.requeueUsageLogBatch(usageBatch)
+				db.requeueAccountFirstTokenBatch(firstTokenBatch)
+				return false
+			}
+			// 脏数据重试多少次都写不进去，隔离出来丢掉，其余照常落库。
+			pending, dropped := db.salvageUsageLogBatch(ctx, usageBatch, err)
+			if dropped > 0 {
+				total := atomic.AddInt64(&db.usageLogDropped, int64(dropped))
+				log.Printf("批量写入命中写不进去的日志：已丢弃 %d 条（累计 %d 条），其余继续落库。首个错误: %v",
+					dropped, total, err)
+			}
+			if len(pending) > 0 {
+				log.Printf("批量写入日志部分失败，%d 条已放回缓冲区等待重试", len(pending))
+				db.requeueUsageLogBatch(pending)
+				db.requeueAccountFirstTokenBatch(firstTokenBatch)
+				return false
+			}
 		}
 	}
 
-	if storedLogCount := countStoredUsageLogs(batch); storedLogCount > 10 {
+	if storedLogCount := countStoredUsageLogs(usageBatch); storedLogCount > 10 {
 		log.Printf("批量写入 %d 条使用日志", storedLogCount)
+	}
+	if len(firstTokenBatch) > 0 {
+		if err := db.insertAccountFirstTokenBatch(ctx, firstTokenBatch); err != nil {
+			log.Printf("批量写入首字样本失败，已重新放回缓冲区等待重试: %v", err)
+			db.requeueAccountFirstTokenBatch(firstTokenBatch)
+		} else if err := db.maybeCleanupAccountFirstTokenSamples(ctx, time.Now()); err != nil {
+			log.Printf("清理过期首字样本失败: %v", err)
+		}
 	}
 	if remaining > 0 {
 		if drain {
@@ -5540,7 +5774,7 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 	}
 
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(manual_score_bonus, 0), manual_score_bonus_until, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at
 		FROM accounts
 		WHERE ` + where + `
 		ORDER BY id
@@ -5556,6 +5790,7 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 		a := &AccountRow{}
 		var credRaw interface{}
 		var cooldownUntilRaw interface{}
+		var manualScoreBonusUntilRaw interface{}
 		var tagsRaw interface{}
 		var createdAtRaw interface{}
 		var updatedAtRaw interface{}
@@ -5577,6 +5812,8 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 			&a.SkipWarmTier,
 			&a.ScoreBiasOverride,
 			&a.BaseConcurrencyOverride,
+			&a.ManualScoreBonus,
+			&manualScoreBonusUntilRaw,
 			&tagsRaw,
 			&a.Note,
 			&createdAtRaw,
@@ -5589,6 +5826,10 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 		a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
 		if err != nil {
 			return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+		}
+		a.ManualScoreBonusUntil, err = parseDBNullTimeValue(manualScoreBonusUntilRaw)
+		if err != nil {
+			return nil, fmt.Errorf("解析 manual_score_bonus_until 失败: %w", err)
 		}
 		a.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 		if err != nil {
@@ -5699,7 +5940,7 @@ func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool)
 		deletedFilter = ""
 	}
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(manual_score_bonus, 0), manual_score_bonus_until, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at
 		FROM accounts
 		WHERE id = $1 ` + deletedFilter + `
 		LIMIT 1
@@ -5707,6 +5948,7 @@ func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool)
 	a := &AccountRow{}
 	var credRaw interface{}
 	var cooldownUntilRaw interface{}
+	var manualScoreBonusUntilRaw interface{}
 	var tagsRaw interface{}
 	var createdAtRaw interface{}
 	var updatedAtRaw interface{}
@@ -5728,6 +5970,8 @@ func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool)
 		&a.SkipWarmTier,
 		&a.ScoreBiasOverride,
 		&a.BaseConcurrencyOverride,
+		&a.ManualScoreBonus,
+		&manualScoreBonusUntilRaw,
 		&tagsRaw,
 		&a.Note,
 		&createdAtRaw,
@@ -5744,6 +5988,10 @@ func (db *DB) getAccountByID(ctx context.Context, id int64, includeDeleted bool)
 	a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
 	if err != nil {
 		return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)
+	}
+	a.ManualScoreBonusUntil, err = parseDBNullTimeValue(manualScoreBonusUntilRaw)
+	if err != nil {
+		return nil, fmt.Errorf("解析 manual_score_bonus_until 失败: %w", err)
 	}
 	a.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 	if err != nil {

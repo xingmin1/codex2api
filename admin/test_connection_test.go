@@ -96,7 +96,7 @@ func TestFormatUsageLimitedTestErrorAcceptsSuccessfulProbeWhenIgnored(t *testing
 	}
 }
 
-func TestConnectionUnauthorizedRecordsErrorMessage(t *testing.T) {
+func TestConnectionUnauthorizedKeepsRelayStateReady(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	upstreamBody := `{"error":{"message":"Your authentication token has been invalidated.","code":"token_invalidated"},"status":401}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -131,14 +131,14 @@ func TestConnectionUnauthorizedRecordsErrorMessage(t *testing.T) {
 	if !strings.Contains(recorder.Body.String(), "token_invalidated") {
 		t.Fatalf("SSE response %q does not contain token_invalidated", recorder.Body.String())
 	}
-	if got := account.RuntimeStatus(); got != "unauthorized" {
-		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	if got := account.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active", got)
 	}
 	account.Mu().RLock()
 	errorMsg := account.ErrorMsg
 	account.Mu().RUnlock()
-	if !strings.Contains(errorMsg, "token_invalidated") {
-		t.Fatalf("ErrorMsg = %q, want token_invalidated", errorMsg)
+	if errorMsg != "" {
+		t.Fatalf("ErrorMsg = %q, want empty relay state", errorMsg)
 	}
 }
 

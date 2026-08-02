@@ -188,24 +188,37 @@ type Account struct {
 	autoPause5hGuardConcurrency int     // 0 = disabled; otherwise guard-band concurrency cap
 	// 智能配速（issue #312）：按剩余配额/剩余时间把用量匀速摊到窗口重置，
 	// 燃烧过快时按可持续速率缩放并发。参数由 Store 全局设置快照而来。
-	smartPacingEnabled                bool
-	smartPacingMinConcurrency         int
-	smartPacingWindows5h              bool
-	smartPacingWindows7d              bool
-	DispatchCountLimit                int64 // 0 = disabled; per-reset-window dispatch cap
-	dispatchCountMu                   sync.Mutex
-	dispatchWindowUsed                int64
-	dispatchWindowResetAt             time.Time
-	IgnoreUsageLimit429Cooldown       bool
-	IgnoreUnauthorizedCooldown        bool
-	FailureScoreThresholdOverride     int // 0 表示继承全局
-	FailureCooldownThresholdOverride  int // 0 表示继承全局
-	FailureScoreThresholdEffective    int
-	FailureCooldownThresholdEffective int
-	ConsecutiveFailureCount           int
-	PriceMultiplier                   float64 // 价格倍率，0 表示未显式配置
-	CheapProbeRecoveryMargin          float64 // 便宜账号探测成功后高出当前最高分的账号级覆盖，0 表示继承全局
-	CheapProbeBonusDuration           time.Duration
+	smartPacingEnabled                     bool
+	smartPacingMinConcurrency              int
+	smartPacingWindows5h                   bool
+	smartPacingWindows7d                   bool
+	DispatchCountLimit                     int64 // 0 = disabled; per-reset-window dispatch cap
+	dispatchCountMu                        sync.Mutex
+	dispatchWindowUsed                     int64
+	dispatchWindowResetAt                  time.Time
+	IgnoreUsageLimit429Cooldown            bool
+	IgnoreUnauthorizedCooldown             bool
+	EncryptedContentCompatOverride         *bool
+	encryptedContentCompatEnabled          bool
+	FastTierPolicyOverride                 string
+	fastTierPolicyEffective                string
+	FailureScoreThresholdOverride          int // 0 表示继承全局
+	FailureCooldownThresholdOverride       int // 0 表示继承全局
+	FailureToleranceWindowOverride         int // 秒，0 表示继承全局
+	FailureScoreRetroactiveOverride        *bool
+	TransportSameAccountRetriesOverride    int
+	TransportSameAccountRetriesOverrideSet bool
+	CompactSameAccountRetriesOverride      int
+	CompactSameAccountRetriesOverrideSet   bool
+	FailureScoreThresholdEffective         int
+	FailureCooldownThresholdEffective      int
+	FailureToleranceWindowEffective        int
+	FailureScoreRetroactiveEffective       bool
+	failureTimestamps                      []time.Time
+	failureScoredCount                     int
+	PriceMultiplier                        float64 // 价格倍率，0 表示未显式配置
+	CheapProbeRecoveryMargin               float64 // 便宜账号探测成功后高出当前最高分的账号级覆盖，0 表示继承全局
+	CheapProbeBonusDuration                time.Duration
 	// SchedulerPriority 账号调度优先级（issue #358）：数值大者严格先调度，
 	// 同优先级内才按健康档位与调度分竞争。0 为默认；负值可把账号压为兜底渠道。
 	SchedulerPriority int64
@@ -233,6 +246,8 @@ type Account struct {
 	LastCheapProbeError      string
 	CheapProbeRecoveryBonus  float64
 	CheapProbeBonusUntil     time.Time
+	ManualScoreBonus         int64
+	ManualScoreBonusUntil    time.Time
 
 	// 滑动窗口成功率（最近 N 次请求）
 	RecentResults    [20]uint8 // 1=成功, 0=失败
@@ -285,32 +300,36 @@ const (
 	// probeBoundaryLag 是「到点即探」定时器相对边界时刻的滞后量：稍晚于重置/冷却
 	// 结束再探，确保 NeedsUsageProbe 里 `!ResetAt.After(now)` 已成立，并给上游与
 	// 本地之间的时钟偏差留出余量，避免探早了仍拿到重置前的旧数据。
-	probeBoundaryLag                 = 2 * time.Second
-	premium5hUrgencyWindow           = 4 * time.Hour
-	premium5hUrgencyMaxBonus         = 25.0
-	premium5hUrgencyMinRemainingPct  = 5.0
-	premium5hUrgencyFullRemainingPct = 50.0
-	premium7dUrgencyWindow           = 72 * time.Hour
-	premium7dUrgencyMaxBonus         = 80.0
-	premium7dUrgencyMinRemainingPct  = 5.0
-	premium7dUrgencyFullRemainingPct = 70.0
-	expiryUrgencyUrgentDays          = 3
-	expiryUrgencyWarnDays            = 7
-	expiryUrgencyUrgentBonus         = 60.0
-	expiryUrgencyWarnBonus           = 25.0
-	defaultCheapProbeScanInterval    = 10 * time.Second
-	defaultCheapProbeConcurrency     = 2
-	defaultCheapProbeRecoveryMargin  = 10.0
-	defaultCheapProbeBonusDuration   = 10 * time.Minute
-	defaultCheapProbeTimeout         = 30 * time.Second
-	defaultCheapProbeRankBase        = 180 * time.Second
-	defaultCheapProbeRankStep        = 30 * time.Second
-	defaultCheapProbeRankMin         = 30 * time.Second
-	defaultCheapProbeMaxMultiplier   = 0.0
-	defaultDispatchMaxMultiplier     = 0.0
-	defaultFailureScoreThreshold     = 3
-	defaultFailureCooldownThreshold  = 10
-	maxFailureToleranceThreshold     = 1000
+	probeBoundaryLag                   = 2 * time.Second
+	premium5hUrgencyWindow             = 4 * time.Hour
+	premium5hUrgencyMaxBonus           = 25.0
+	premium5hUrgencyMinRemainingPct    = 5.0
+	premium5hUrgencyFullRemainingPct   = 50.0
+	premium7dUrgencyWindow             = 72 * time.Hour
+	premium7dUrgencyMaxBonus           = 80.0
+	premium7dUrgencyMinRemainingPct    = 5.0
+	premium7dUrgencyFullRemainingPct   = 70.0
+	expiryUrgencyUrgentDays            = 3
+	expiryUrgencyWarnDays              = 7
+	expiryUrgencyUrgentBonus           = 60.0
+	expiryUrgencyWarnBonus             = 25.0
+	defaultCheapProbeScanInterval      = 10 * time.Second
+	defaultCheapProbeConcurrency       = 2
+	defaultCheapProbeRecoveryMargin    = 10.0
+	defaultCheapProbeBonusDuration     = 10 * time.Minute
+	defaultCheapProbeTimeout           = 30 * time.Second
+	defaultCheapProbeRankBase          = 180 * time.Second
+	defaultCheapProbeRankStep          = 30 * time.Second
+	defaultCheapProbeRankMin           = 30 * time.Second
+	defaultCheapProbeMaxMultiplier     = 0.0
+	defaultDispatchMaxMultiplier       = 0.0
+	defaultFailureScoreThreshold       = 3
+	defaultFailureCooldownThreshold    = 10
+	defaultFailureToleranceWindow      = 60
+	defaultTransportSameAccountRetries = 2
+	defaultCompactSameAccountRetries   = 2
+	maxFailureToleranceThreshold       = 1000
+	maxFailureToleranceWindow          = 3600
 )
 
 var (
@@ -331,6 +350,7 @@ type SchedulerBreakdown struct {
 	UsageUrgencyBonus7d float64
 	ExpiryUrgencyBonus  float64
 	CheapProbeBonus     float64
+	ManualScoreBonus    float64
 	LatencyPenalty      float64
 	SuccessRatePenalty  float64 // 滑动窗口成功率惩罚
 }
@@ -342,6 +362,8 @@ type SchedulerDebugSnapshot struct {
 	DispatchScore            float64
 	ScoreBiasOverride        *int64
 	ScoreBiasEffective       int64
+	ManualScoreBonus         int64
+	ManualScoreBonusUntil    time.Time
 	BaseConcurrencyOverride  *int64
 	BaseConcurrencyEffective int64
 	DynamicConcurrencyLimit  int64
@@ -996,6 +1018,20 @@ func normalizeFailureToleranceOverride(value int) int {
 	return normalizeFailureToleranceThreshold(value, 1)
 }
 
+func normalizeFailureToleranceWindow(value, fallback int) int {
+	if value <= 0 {
+		value = fallback
+	}
+	return min(max(value, 1), maxFailureToleranceWindow)
+}
+
+func normalizeFailureToleranceWindowOverride(value int) int {
+	if value <= 0 {
+		return 0
+	}
+	return normalizeFailureToleranceWindow(value, defaultFailureToleranceWindow)
+}
+
 func cheapProbeRecoveryMarginFromBits(bits uint64) float64 {
 	value := math.Float64frombits(bits)
 	return normalizeCheapProbeRecoveryMargin(value)
@@ -1209,6 +1245,21 @@ func (a *Account) effectiveScoreBiasLocked(now time.Time, tier AccountHealthTier
 	return defaultScoreBiasForPlan(a.PlanType)
 }
 
+func (a *Account) activeManualScoreBonusLocked(now time.Time) int64 {
+	if a.ManualScoreBonus == 0 || a.ManualScoreBonusUntil.IsZero() || !now.Before(a.ManualScoreBonusUntil) {
+		return 0
+	}
+	return a.ManualScoreBonus
+}
+
+func (a *Account) clearExpiredManualScoreBonusLocked(now time.Time) {
+	if a.ManualScoreBonusUntil.IsZero() || now.Before(a.ManualScoreBonusUntil) {
+		return
+	}
+	a.ManualScoreBonus = 0
+	a.ManualScoreBonusUntil = time.Time{}
+}
+
 // expiryUrgencyBonusLocked 在订阅快到期时给账号加分,促使调度器优先消耗它。
 // <= 3d 紧急(+60) / <= 7d 警告(+25) / 其它(0)。已过期/free/api 不加分。
 func (a *Account) expiryUrgencyBonusLocked(now time.Time) float64 {
@@ -1235,6 +1286,7 @@ func (a *Account) expiryUrgencyBonusLocked(now time.Time) float64 {
 
 func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	now := time.Now()
+	a.clearExpiredManualScoreBonusLocked(now)
 	breakdown := a.schedulerBreakdownLocked(now)
 	score := 100.0 -
 		breakdown.UnauthorizedPenalty -
@@ -1289,8 +1341,9 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 		breakdown.UsageUrgencyBonus5h = a.premium5hUsageUrgencyBonusLocked(now)
 		breakdown.UsageUrgencyBonus7d = a.premium7dUsageUrgencyBonusLocked(now)
 		breakdown.ExpiryUrgencyBonus = a.expiryUrgencyBonusLocked(now)
+		breakdown.ManualScoreBonus = float64(a.activeManualScoreBonusLocked(now))
 	}
-	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d + breakdown.ExpiryUrgencyBonus + breakdown.CheapProbeBonus - a.quotaAutoPause5hGuardDispatchPenaltyLocked(now)
+	dispatchScore := score + float64(scoreBiasEffective) + breakdown.UsageUrgencyBonus5h + breakdown.UsageUrgencyBonus7d + breakdown.ExpiryUrgencyBonus + breakdown.CheapProbeBonus + breakdown.ManualScoreBonus - a.quotaAutoPause5hGuardDispatchPenaltyLocked(now)
 
 	a.HealthTier = tier
 	a.SchedulerScore = score
@@ -1663,6 +1716,22 @@ func (a *Account) recomputeEffectiveIgnoreUsageLimitStatus(global bool) {
 	a.ignoreUsageLimitStatus = global
 }
 
+func (a *Account) recomputeEffectiveEncryptedContentCompatibility(global bool) {
+	if a.EncryptedContentCompatOverride != nil {
+		a.encryptedContentCompatEnabled = *a.EncryptedContentCompatOverride
+		return
+	}
+	a.encryptedContentCompatEnabled = global
+}
+
+func (a *Account) recomputeEffectiveFastTierPolicy(global string) {
+	if override, ok := database.ParseFastTierPolicy(a.FastTierPolicyOverride); ok {
+		a.fastTierPolicyEffective = override
+		return
+	}
+	a.fastTierPolicyEffective = database.NormalizeFastTierPolicy(global)
+}
+
 func (a *Account) skipsUsageWindowLimitsLocked() bool {
 	return a.creditSkipsUsageWindowLocked() || a.ignoreUsageLimitStatus
 }
@@ -1716,52 +1785,103 @@ func (a *Account) ShouldIgnoreUsageLimit429Cooldown() bool {
 func (a *Account) recomputeFailureToleranceThresholdsLocked(store *Store) {
 	scoreThreshold := 1
 	cooldownThreshold := 1
-	if a.IgnoreUsageLimit429Cooldown {
+	windowSeconds := defaultFailureToleranceWindow
+	retroactive := false
+	enabled := a.IgnoreUsageLimit429Cooldown && a.isOpenAIResponsesAPILocked()
+	if enabled {
 		scoreThreshold = store.GetFailureScoreThreshold()
-		cooldownThreshold = store.GetFailureCooldownThreshold()
+		windowSeconds = store.GetFailureToleranceWindowSeconds()
+		retroactive = store.GetFailureScoreRetroactive()
 		if a.FailureScoreThresholdOverride > 0 {
 			scoreThreshold = a.FailureScoreThresholdOverride
 		}
-		if a.FailureCooldownThresholdOverride > 0 {
-			cooldownThreshold = a.FailureCooldownThresholdOverride
+		if a.FailureToleranceWindowOverride > 0 {
+			windowSeconds = a.FailureToleranceWindowOverride
 		}
-	}
-	if cooldownThreshold < scoreThreshold {
-		cooldownThreshold = scoreThreshold
+		if a.FailureScoreRetroactiveOverride != nil {
+			retroactive = *a.FailureScoreRetroactiveOverride
+		}
+	} else {
+		a.failureTimestamps = nil
+		a.failureScoredCount = 0
 	}
 	a.FailureScoreThresholdEffective = normalizeFailureToleranceThreshold(scoreThreshold, 1)
-	a.FailureCooldownThresholdEffective = normalizeFailureToleranceThreshold(cooldownThreshold, a.FailureScoreThresholdEffective)
+	a.FailureCooldownThresholdEffective = normalizeFailureToleranceThreshold(cooldownThreshold, 1)
+	a.FailureToleranceWindowEffective = normalizeFailureToleranceWindow(windowSeconds, defaultFailureToleranceWindow)
+	a.FailureScoreRetroactiveEffective = retroactive
+	a.pruneFailureTimestampsLocked(time.Now())
 }
 
-// FailureToleranceSnapshot 返回账号连续失败容错配置与当前连续失败次数。
-func (a *Account) FailureToleranceSnapshot() (enabled bool, scoreOverride, cooldownOverride, scoreEffective, cooldownEffective, consecutiveFailures int) {
+func (a *Account) pruneFailureTimestampsLocked(now time.Time) {
+	window := time.Duration(normalizeFailureToleranceWindow(a.FailureToleranceWindowEffective, defaultFailureToleranceWindow)) * time.Second
+	cutoff := now.Add(-window)
+	firstValid := 0
+	for firstValid < len(a.failureTimestamps) && !a.failureTimestamps[firstValid].After(cutoff) {
+		firstValid++
+	}
+	if firstValid > 0 {
+		a.failureTimestamps = append(a.failureTimestamps[:0], a.failureTimestamps[firstValid:]...)
+		a.failureScoredCount = max(0, a.failureScoredCount-firstValid)
+	}
+	if a.failureScoredCount > len(a.failureTimestamps) {
+		a.failureScoredCount = len(a.failureTimestamps)
+	}
+}
+
+func (a *Account) recordFailureTimestampLocked(now time.Time) int {
+	a.pruneFailureTimestampsLocked(now)
+	a.failureTimestamps = append(a.failureTimestamps, now)
+	if len(a.failureTimestamps) > maxFailureToleranceThreshold {
+		removed := len(a.failureTimestamps) - maxFailureToleranceThreshold
+		a.failureTimestamps = a.failureTimestamps[removed:]
+		a.failureScoredCount = max(0, a.failureScoredCount-removed)
+	}
+	return len(a.failureTimestamps)
+}
+
+// FailureToleranceSnapshot 返回账号时间窗失败容错配置与当前窗口失败次数。
+func (a *Account) FailureToleranceSnapshot() (enabled bool, scoreOverride, cooldownOverride, windowOverride, scoreEffective, cooldownEffective, windowEffective, failures int) {
 	if a == nil {
-		return false, 0, 0, 1, 1, 0
+		return false, 0, 0, 0, 1, 1, defaultFailureToleranceWindow, 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruneFailureTimestampsLocked(time.Now())
+	return a.IgnoreUsageLimit429Cooldown && a.isOpenAIResponsesAPILocked(),
+		a.FailureScoreThresholdOverride,
+		a.FailureCooldownThresholdOverride,
+		a.FailureToleranceWindowOverride,
+		normalizeFailureToleranceThreshold(a.FailureScoreThresholdEffective, 1),
+		normalizeFailureToleranceThreshold(a.FailureCooldownThresholdEffective, 1),
+		normalizeFailureToleranceWindow(a.FailureToleranceWindowEffective, defaultFailureToleranceWindow),
+		len(a.failureTimestamps)
+}
+
+// FailureScoreRetroactiveSnapshot 返回账号追溯计分的覆盖值与最终生效值。
+func (a *Account) FailureScoreRetroactiveSnapshot() (override *bool, effective bool) {
+	if a == nil {
+		return nil, false
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.IgnoreUsageLimit429Cooldown,
-		a.FailureScoreThresholdOverride,
-		a.FailureCooldownThresholdOverride,
-		normalizeFailureToleranceThreshold(a.FailureScoreThresholdEffective, 1),
-		normalizeFailureToleranceThreshold(a.FailureCooldownThresholdEffective, 1),
-		a.ConsecutiveFailureCount
+	if a.FailureScoreRetroactiveOverride != nil {
+		value := *a.FailureScoreRetroactiveOverride
+		override = &value
+	}
+	return override, a.FailureScoreRetroactiveEffective
 }
 
-// ShouldDeferFailureCooldown 判断本次失败是否尚未达到持久冷却阈值。
+// ShouldDeferFailureCooldown 判断账号是否禁止根据中转响应写入 Codex 语义冷却。
 //
-// 该判断只控制跨请求冷却、用量耗尽和错误状态写入；当前请求仍会立即排除失败账号并换号。
+// API 中转返回的状态码不一定具有官方 Codex 语义，因此这类账号只通过失败窗口影响
+// 调度评分，不写入账号冷却、模型冷却、额度耗尽或封禁状态。
 func (a *Account) ShouldDeferFailureCooldown() bool {
 	if a == nil {
 		return false
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.IgnoreUsageLimit429Cooldown {
-		return false
-	}
-	threshold := normalizeFailureToleranceThreshold(a.FailureCooldownThresholdEffective, defaultFailureCooldownThreshold)
-	return a.ConsecutiveFailureCount < threshold
+	return a.isOpenAIResponsesAPILocked()
 }
 
 // ShouldIgnoreUnauthorizedCooldown 返回该账号是否把 401 当作普通上游错误。
@@ -1772,6 +1892,55 @@ func (a *Account) ShouldIgnoreUnauthorizedCooldown() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.IgnoreUnauthorizedCooldown
+}
+
+// ShouldUseEncryptedContentCompatibility 返回该 Responses API 中转账号是否启用加密上下文兼容修复。
+func (a *Account) ShouldUseEncryptedContentCompatibility() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.isOpenAIResponsesAPILocked() && a.encryptedContentCompatEnabled
+}
+
+// EncryptedContentCompatibilityConfig 返回账号覆盖值及当前有效值。
+func (a *Account) EncryptedContentCompatibilityConfig() (*bool, bool) {
+	if a == nil {
+		return nil, false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.EncryptedContentCompatOverride == nil {
+		return nil, a.encryptedContentCompatEnabled
+	}
+	override := *a.EncryptedContentCompatOverride
+	return &override, a.encryptedContentCompatEnabled
+}
+
+// FastTierPolicy 返回该账号当前生效的 Fast Tier 出站策略。
+func (a *Account) FastTierPolicy() string {
+	if a == nil {
+		return database.FastTierPolicyPreserve
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return database.NormalizeFastTierPolicy(a.fastTierPolicyEffective)
+}
+
+// FastTierPolicyConfig 返回账号覆盖值及当前有效值；nil 表示继承全局。
+func (a *Account) FastTierPolicyConfig() (*string, string) {
+	if a == nil {
+		return nil, database.FastTierPolicyPreserve
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	effective := database.NormalizeFastTierPolicy(a.fastTierPolicyEffective)
+	if a.FastTierPolicyOverride == "" {
+		return nil, effective
+	}
+	override := database.NormalizeFastTierPolicy(a.FastTierPolicyOverride)
+	return &override, effective
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -2477,6 +2646,7 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 		breakdown.UsageUrgencyBonus5h = a.premium5hUsageUrgencyBonusLocked(now)
 		breakdown.UsageUrgencyBonus7d = a.premium7dUsageUrgencyBonusLocked(now)
 		breakdown.ExpiryUrgencyBonus = a.expiryUrgencyBonusLocked(now)
+		breakdown.ManualScoreBonus = float64(a.activeManualScoreBonusLocked(now))
 	}
 	return SchedulerDebugSnapshot{
 		HealthTier:               string(a.HealthTier),
@@ -2484,6 +2654,8 @@ func (a *Account) GetSchedulerDebugSnapshot(baseLimit int64) SchedulerDebugSnaps
 		DispatchScore:            a.DispatchScore,
 		ScoreBiasOverride:        cloneInt64Ptr(a.ScoreBiasOverride),
 		ScoreBiasEffective:       a.ScoreBiasEffective,
+		ManualScoreBonus:         a.activeManualScoreBonusLocked(now),
+		ManualScoreBonusUntil:    a.ManualScoreBonusUntil,
 		BaseConcurrencyOverride:  cloneInt64Ptr(a.BaseConcurrencyOverride),
 		BaseConcurrencyEffective: a.BaseConcurrencyEffective,
 		DynamicConcurrencyLimit:  a.DynamicConcurrencyLimit,
@@ -2817,6 +2989,8 @@ type Store struct {
 	dispatchMaxMultiplierBits          atomic.Uint64
 	failureScoreThreshold              atomic.Int64
 	failureCooldownThreshold           atomic.Int64
+	failureToleranceWindowSeconds      atomic.Int64
+	failureScoreRetroactive            atomic.Bool
 	cheapProbeTopologyVersion          atomic.Uint64
 	cheapProbeRescanRequested          atomic.Bool
 	cheapProbeWakeCh                   chan struct{}
@@ -2866,15 +3040,25 @@ type Store struct {
 	codexPreflightSSEPassthroughEnabled atomic.Bool
 
 	// Codex 思考截断自动续想（默认关闭，不影响现有路径）
-	codexContinueThinkingEnabled atomic.Bool  // 检测到上游截断思考时自动续想并折叠成单响应
-	codexContinueMaxRounds       atomic.Int64 // 单次请求最大续想轮数（含首轮），默认 8
-	codexCLIVersionSyncEnabled   atomic.Bool  // 后台定时同步 Codex CLI 模拟版本，默认 true
-	codexCLIVersionSyncInterval  atomic.Int64 // 定时同步间隔（小时），默认 12
-	ignoreUsageLimitStatus       atomic.Bool  // 用量窗口只记录，不作为账号不可用证据
+	codexContinueThinkingEnabled  atomic.Bool  // 检测到上游截断思考时自动续想并折叠成单响应
+	codexContinueMaxRounds        atomic.Int64 // 单次请求最大续想轮数（含首轮），默认 8
+	codexCLIVersionSyncEnabled    atomic.Bool  // 后台定时同步 Codex CLI 模拟版本，默认 true
+	codexCLIVersionSyncInterval   atomic.Int64 // 定时同步间隔（小时），默认 12
+	ignoreUsageLimitStatus        atomic.Bool  // 用量窗口只记录，不作为账号不可用证据
+	encryptedContentCompatEnabled atomic.Bool  // Responses API 中转账号加密上下文兼容修复的全局默认
+	fastTierPolicy                atomic.Value // Fast Tier 出站策略: preserve / force_fast / filter_fast
 
-	// 重试间隔与传输错误重试策略（issue #331）
-	retryIntervalMS      atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
-	transportRetryPolicy atomic.Value // 传输错误重试策略: rotate / sticky
+	// 重试间隔与上游错误重试策略（issue #331）
+	retryIntervalMS                atomic.Int64 // 重试间隔毫秒，0 = 立即重试（旧行为）
+	transportRetryPolicy           atomic.Value // 上游错误重试策略: rotate / sticky / hybrid
+	transportSameAccountRetries    atomic.Int64 // hybrid 下每个账号额外同号重试次数
+	compactSameAccountRetries      atomic.Int64 // compact 首账号额外同号重试次数
+	clientRequestReplayEnabled     atomic.Bool  // 响应提交前模拟客户端重发整个请求
+	clientRequestReplayRetries     atomic.Int64 // 原始请求失败后的额外重发次数
+	clientRequestReplayMaxDuration atomic.Int64 // 首个业务输出前的总预算秒数
+	clientRequestReplayBaseDelay   atomic.Int64 // 指数退避基础间隔毫秒数
+	clientRequestReplayMaxDelay    atomic.Int64 // 指数退避最大间隔秒数
+	clientRequestReplayKeepalive   atomic.Int64 // 下游 SSE 保活间隔秒数，0 表示关闭
 
 	// 智能刷新调度器
 	refreshScheduler atomic.Pointer[RefreshSchedulerIntegration]
@@ -2920,6 +3104,59 @@ type sessionAffinity struct {
 	boundAt      time.Time
 	requestCount int64
 	expiresAt    time.Time
+}
+
+func sessionAffinityCacheBinding(binding sessionAffinity) cache.SessionAffinityBinding {
+	return cache.SessionAffinityBinding{
+		AccountID:         binding.accountID,
+		ProxyURL:          binding.proxyURL,
+		BoundAtUnixNano:   strconv.FormatInt(binding.boundAt.UnixNano(), 10),
+		ExpiresAtUnixNano: strconv.FormatInt(binding.expiresAt.UnixNano(), 10),
+		RequestCount:      binding.requestCount,
+	}
+}
+
+func sessionAffinityFromCacheBinding(binding cache.SessionAffinityBinding, now time.Time) (sessionAffinity, bool) {
+	if binding.AccountID == 0 {
+		return sessionAffinity{}, false
+	}
+	boundAtUnixNano, _ := strconv.ParseInt(strings.TrimSpace(binding.BoundAtUnixNano), 10, 64)
+	boundAt := time.Unix(0, boundAtUnixNano)
+	if boundAtUnixNano <= 0 {
+		// 兼容旧缓存：旧值没有原始绑定时间，只允许从本次恢复时开始计时，
+		// 不能继续沿用每次读取都重新延长的滑动 TTL。
+		boundAt = now
+	}
+	expiresAtUnixNano, _ := strconv.ParseInt(strings.TrimSpace(binding.ExpiresAtUnixNano), 10, 64)
+	expiresAt := time.Unix(0, expiresAtUnixNano)
+	if expiresAtUnixNano <= 0 {
+		expiresAt = boundAt.Add(sessionAffinityTTL())
+	}
+	return sessionAffinity{
+		accountID:    binding.AccountID,
+		proxyURL:     strings.TrimSpace(binding.ProxyURL),
+		boundAt:      boundAt,
+		requestCount: max(binding.RequestCount, int64(0)),
+		expiresAt:    expiresAt,
+	}, true
+}
+
+func sessionAffinityCacheTTL(binding sessionAffinity, now time.Time) time.Duration {
+	if binding.expiresAt.IsZero() {
+		return sessionAffinityTTL()
+	}
+	ttl := binding.expiresAt.Sub(now)
+	if ttl <= 0 {
+		return 0
+	}
+	return ttl
+}
+
+func sameSessionAffinityIdentity(left, right sessionAffinity) bool {
+	return left.accountID == right.accountID &&
+		left.proxyURL == right.proxyURL &&
+		left.boundAt.Equal(right.boundAt) &&
+		left.expiresAt.Equal(right.expiresAt)
 }
 
 const defaultSessionAffinityTTL = time.Hour
@@ -3302,6 +3539,18 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 			DispatchMaxMultiplier:              defaultDispatchMaxMultiplier,
 			FailureScoreThreshold:              defaultFailureScoreThreshold,
 			FailureCooldownThreshold:           defaultFailureCooldownThreshold,
+			FailureToleranceWindowSeconds:      defaultFailureToleranceWindow,
+			FailureScoreRetroactive:            false,
+			TransportRetryPolicy:               "hybrid",
+			TransportSameAccountRetries:        defaultTransportSameAccountRetries,
+			CompactSameAccountRetries:          defaultCompactSameAccountRetries,
+			ClientRequestReplayMaxRetries:      database.DefaultClientRequestReplayMaxRetries,
+			ClientRequestReplayMaxDurationSec:  database.DefaultClientRequestReplayMaxDurationSeconds,
+			ClientRequestReplayBaseIntervalMS:  database.DefaultClientRequestReplayBaseIntervalMS,
+			ClientRequestReplayMaxIntervalSec:  database.DefaultClientRequestReplayMaxIntervalSeconds,
+			ClientRequestReplayKeepaliveSec:    15,
+			EncryptedContentCompat:             true,
+			FastTierPolicy:                     database.FastTierPolicyPreserve,
 			LazyMode:                           false,
 			ProxyURL:                           "",
 			MaxRateLimitRetries:                1,
@@ -3381,6 +3630,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.setDispatchMaxMultiplier(settings.DispatchMaxMultiplier, false)
 	s.failureScoreThreshold.Store(int64(normalizeFailureToleranceThreshold(settings.FailureScoreThreshold, defaultFailureScoreThreshold)))
 	s.failureCooldownThreshold.Store(int64(normalizeFailureToleranceThreshold(settings.FailureCooldownThreshold, defaultFailureCooldownThreshold)))
+	s.failureToleranceWindowSeconds.Store(int64(normalizeFailureToleranceWindow(settings.FailureToleranceWindowSeconds, defaultFailureToleranceWindow)))
+	s.failureScoreRetroactive.Store(settings.FailureScoreRetroactive)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
@@ -3457,8 +3708,18 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.codexCLIVersionSyncEnabled.Store(settings.CodexCLIVersionSyncEnabled)
 	s.codexCLIVersionSyncInterval.Store(int64(database.NormalizeCodexCLIVersionSyncIntervalHours(settings.CodexCLIVersionSyncIntervalHours)))
 	s.ignoreUsageLimitStatus.Store(settings.IgnoreUsageLimitStatus)
+	s.encryptedContentCompatEnabled.Store(settings.EncryptedContentCompat)
+	s.fastTierPolicy.Store(database.NormalizeFastTierPolicy(settings.FastTierPolicy))
 	s.retryIntervalMS.Store(int64(normalizeRetryIntervalMS(settings.RetryIntervalMS)))
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(settings.TransportRetryPolicy))
+	s.transportSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.TransportSameAccountRetries)))
+	s.compactSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(settings.CompactSameAccountRetries)))
+	s.clientRequestReplayEnabled.Store(settings.ClientRequestReplayEnabled)
+	s.clientRequestReplayRetries.Store(int64(database.NormalizeClientRequestReplayMaxRetries(settings.ClientRequestReplayMaxRetries)))
+	s.clientRequestReplayMaxDuration.Store(int64(database.NormalizeClientRequestReplayMaxDurationSeconds(settings.ClientRequestReplayMaxDurationSec)))
+	s.clientRequestReplayBaseDelay.Store(int64(database.NormalizeClientRequestReplayBaseIntervalMS(settings.ClientRequestReplayBaseIntervalMS)))
+	s.clientRequestReplayMaxDelay.Store(int64(database.NormalizeClientRequestReplayMaxIntervalSeconds(settings.ClientRequestReplayMaxIntervalSec)))
+	s.clientRequestReplayKeepalive.Store(int64(normalizeClientRequestReplayKeepaliveSeconds(settings.ClientRequestReplayKeepaliveSec)))
 
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause5hThreshold)
 	s.globalAutoPause7dThreshold = normalizeQuotaAutoPauseThreshold(settings.AutoPause7dThreshold)
@@ -4509,6 +4770,9 @@ func (s *Store) Init(ctx context.Context) error {
 
 // loadFromDB 从数据库加载账号
 func (s *Store) loadFromDB(ctx context.Context) error {
+	if err := s.db.ClearExpiredAccountManualScoreBonuses(ctx, time.Now()); err != nil {
+		log.Printf("清理过期临时调度分调整失败: %v", err)
+	}
 	rows, err := s.db.ListActive(ctx)
 	if err != nil {
 		return fmt.Errorf("从数据库加载账号失败: %w", err)
@@ -4657,6 +4921,10 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
 	account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
+	if row.ManualScoreBonus != 0 && row.ManualScoreBonusUntil.Valid && time.Now().Before(row.ManualScoreBonusUntil.Time) {
+		account.ManualScoreBonus = row.ManualScoreBonus
+		account.ManualScoreBonusUntil = row.ManualScoreBonusUntil.Time
+	}
 	account.setAllowedAPIKeyIDsLocked(row.GetCredentialInt64Slice("allowed_api_key_ids"))
 	account.Tags = cloneStringSlice(row.Tags)
 	if row.Locked {
@@ -4780,11 +5048,29 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	}
 	account.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
 	account.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
+	account.EncryptedContentCompatOverride = row.GetCredentialOptionalBool("encrypted_content_compatibility_enabled")
+	account.recomputeEffectiveEncryptedContentCompatibility(s.EncryptedContentCompatibilityEnabled())
+	if policy, ok := database.ParseFastTierPolicy(row.GetCredential("fast_tier_policy")); ok {
+		account.FastTierPolicyOverride = policy
+	}
+	account.recomputeEffectiveFastTierPolicy(s.GetFastTierPolicy())
+	account.FailureScoreRetroactiveOverride = row.GetCredentialOptionalBool("failure_score_retroactive")
 	if threshold, ok := row.GetCredentialInt64("failure_score_threshold"); ok {
 		account.FailureScoreThresholdOverride = normalizeFailureToleranceOverride(int(threshold))
 	}
 	if threshold, ok := row.GetCredentialInt64("failure_cooldown_threshold"); ok {
 		account.FailureCooldownThresholdOverride = normalizeFailureToleranceOverride(int(threshold))
+	}
+	if seconds, ok := row.GetCredentialInt64("failure_tolerance_window_seconds"); ok {
+		account.FailureToleranceWindowOverride = normalizeFailureToleranceWindowOverride(int(seconds))
+	}
+	if retries, ok := row.GetCredentialInt64("transport_same_account_retries"); ok {
+		account.TransportSameAccountRetriesOverride = database.NormalizeTransportSameAccountRetries(int(retries))
+		account.TransportSameAccountRetriesOverrideSet = true
+	}
+	if retries, ok := row.GetCredentialInt64("compact_same_account_retries"); ok {
+		account.CompactSameAccountRetriesOverride = database.NormalizeTransportSameAccountRetries(int(retries))
+		account.CompactSameAccountRetriesOverrideSet = true
 	}
 	account.recomputeFailureToleranceThresholdsLocked(s)
 	account.PriceMultiplier = resolveAccountRowPriceMultiplier(row)
@@ -4925,6 +5211,13 @@ func (s *Store) StartBackgroundRefresh() {
 				resetCheapProbeTimer()
 			case <-autoCleanupTicker.C:
 				s.TriggerAutoCleanupAsync()
+				if s.db != nil {
+					go func() {
+						if err := s.db.ClearExpiredAccountManualScoreBonuses(context.Background(), time.Now()); err != nil {
+							log.Printf("清理过期临时调度分调整失败: %v", err)
+						}
+					}()
+				}
 			case <-fullUsageCleanupTicker.C:
 				if s.GetAutoCleanFullUsage() && !s.GetLazyMode() {
 					s.startDBBackgroundTask(func(ctx context.Context) {
@@ -5145,6 +5438,41 @@ func (s *Store) tryAcquireAccount(acc *Account, limit int64, updateSchedulerOnLi
 			return true
 		}
 	}
+}
+
+// TryAcquireMaintenanceSlot 为指定账号占用一个维护请求槽。
+//
+// 该槽与真实请求共享 ActiveRequests 并受账号并发上限约束，但不会增加调度次数、
+// 触发请求次数限制或改变健康状态。调用成功后必须配对 ReleaseMaintenanceSlot。
+func (s *Store) TryAcquireMaintenanceSlot(acc *Account) bool {
+	if s == nil || acc == nil || !acc.IsAvailable() {
+		return false
+	}
+	_, _, _, limit := acc.schedulerSnapshot(atomic.LoadInt64(&s.maxConcurrency))
+	if limit <= 0 {
+		return false
+	}
+	for {
+		current := atomic.LoadInt64(&acc.ActiveRequests)
+		if current >= limit {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(&acc.ActiveRequests, current, current+1) {
+			s.fastSchedulerUpdate(acc)
+			return true
+		}
+	}
+}
+
+// ReleaseMaintenanceSlot 释放 TryAcquireMaintenanceSlot 占用的账号槽。
+func (s *Store) ReleaseMaintenanceSlot(acc *Account) {
+	if s == nil || acc == nil {
+		return
+	}
+	if atomic.AddInt64(&acc.ActiveRequests, -1) < 0 {
+		atomic.StoreInt64(&acc.ActiveRequests, 0)
+	}
+	s.fastSchedulerUpdate(acc)
 }
 
 // NextExcludingWithFilter 获取下一个可用账号，并应用请求级账号过滤器。
@@ -5423,8 +5751,8 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 	if !s.affinityProxyStillValid(account.DBID, proxyURL) {
 		return
 	}
-	ttl := sessionAffinityTTL()
 	now := time.Now()
+	ttl := sessionAffinityTTL()
 	binding := sessionAffinity{
 		accountID:    account.DBID,
 		proxyURL:     proxyURL,
@@ -5449,26 +5777,28 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 	}
 	// 同账号的连续 Bind 视为复用,沿用 boundAt 与 requestCount 以保持 bounded 上限计数;
 	// 换账号时则按新绑定从 0 开始计。
-	if existing, ok := s.sessionBindings[key]; ok && existing.accountID == account.DBID {
+	if existing, ok := s.sessionBindings[key]; ok && existing.accountID == account.DBID && existing.expiresAt.After(now) {
 		binding.boundAt = existing.boundAt
 		binding.requestCount = existing.requestCount
+		binding.expiresAt = existing.expiresAt
 	}
 	s.sessionBindings[key] = binding
 	s.sessionMu.Unlock()
 
 	if s.tokenCache != nil {
+		ttl := sessionAffinityCacheTTL(binding, now)
+		if ttl <= 0 {
+			return
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer cancel()
-		if err := s.tokenCache.SetSessionAffinity(ctx, key, cache.SessionAffinityBinding{
-			AccountID: binding.accountID,
-			ProxyURL:  binding.proxyURL,
-		}, ttl); err != nil {
+		if err := s.tokenCache.SetSessionAffinity(ctx, key, sessionAffinityCacheBinding(binding), ttl); err != nil {
 			log.Printf("写入缓存会话粘性失败: account=%d err=%v", binding.accountID, err)
 		}
 	}
 }
 
-// UnbindSessionAffinity removes a session binding when it still points to the failed account.
+// UnbindSessionAffinity 仅在会话仍指向指定账号时删除亲和绑定。
 func (s *Store) UnbindSessionAffinity(key string, accountID int64) {
 	if s == nil || accountID == 0 {
 		return
@@ -5523,6 +5853,7 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 	s.sessionMu.RLock()
 	binding, ok := s.sessionBindings[key]
 	s.sessionMu.RUnlock()
+	skipCachedAffinity := false
 
 	// 绑定账号是 Grok 时，用 Grok 专属粘性模式覆盖全局（默认 strict，减少中途换号致缓存失效）。
 	mode := s.GetAffinityMode()
@@ -5556,7 +5887,17 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 		}
 
 		if expired || escape {
-			s.UnbindSessionAffinity(key, binding.accountID)
+			skipCachedAffinity = true
+			deleteCachedAffinity := false
+			s.sessionMu.Lock()
+			if current, exists := s.sessionBindings[key]; exists && sameSessionAffinityIdentity(current, binding) {
+				delete(s.sessionBindings, key)
+				deleteCachedAffinity = true
+			}
+			s.sessionMu.Unlock()
+			if deleteCachedAffinity {
+				s.deleteCachedSessionAffinityIfMatches(key, binding)
+			}
 		} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
 			// 命中粘性,记一次复用
 			s.sessionMu.Lock()
@@ -5568,26 +5909,33 @@ func (s *Store) NextForSessionWithFilter(key string, apiKeyID int64, exclude map
 			return acc, binding.proxyURL
 		}
 	}
-	if binding, ok := s.getCachedSessionAffinity(key); ok {
-		if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
-			s.UnbindSessionAffinity(key, binding.accountID)
-			return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
-		}
-		// 跨进程缓存的 binding 也按 bounded 逻辑校验账号健康；Grok 账号套用 Grok 专属模式。
-		cacheMode := mode
-		if override := s.resolveGrokAffinityOverride(binding.accountID); override != "" {
-			cacheMode = override
-		}
-		if cacheMode == AffinityModeBounded && !s.affinityAccountStillHealthy(binding.accountID) {
-			// 不复用,落到完整挑号
-		} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
-			s.sessionMu.Lock()
-			if s.sessionBindings == nil {
-				s.sessionBindings = make(map[string]sessionAffinity)
+	if !skipCachedAffinity {
+		if binding, ok := s.getCachedSessionAffinity(key); ok {
+			if !s.affinityProxyStillValid(binding.accountID, binding.proxyURL) {
+				s.UnbindSessionAffinity(key, binding.accountID)
+				return s.NextExcludingWithFilter(apiKeyID, exclude, filter), ""
 			}
-			s.sessionBindings[key] = binding
-			s.sessionMu.Unlock()
-			return acc, binding.proxyURL
+			// 跨进程缓存的 binding 也按 bounded 逻辑校验账号健康；Grok 账号套用 Grok 专属模式。
+			cacheMode := mode
+			if override := s.resolveGrokAffinityOverride(binding.accountID); override != "" {
+				cacheMode = override
+			}
+			expired := !binding.expiresAt.After(now)
+			escape := cacheMode == AffinityModeBounded && (binding.requestCount >= defaultMaxAffinityRequests ||
+				(!binding.boundAt.IsZero() && now.Sub(binding.boundAt) >= defaultMaxAffinityDuration) ||
+				!s.affinityAccountStillHealthy(binding.accountID))
+			if expired || escape {
+				s.deleteCachedSessionAffinityIfMatches(key, binding)
+			} else if acc := s.takeByIDExcluding(binding.accountID, apiKeyID, exclude, filter); acc != nil {
+				binding.requestCount++
+				s.sessionMu.Lock()
+				if s.sessionBindings == nil {
+					s.sessionBindings = make(map[string]sessionAffinity)
+				}
+				s.sessionBindings[key] = binding
+				s.sessionMu.Unlock()
+				return acc, binding.proxyURL
+			}
 		}
 	}
 
@@ -5685,11 +6033,18 @@ func (s *Store) getCachedSessionAffinity(key string) (sessionAffinity, bool) {
 	if !ok || binding.AccountID == 0 {
 		return sessionAffinity{}, false
 	}
-	return sessionAffinity{
-		accountID: binding.AccountID,
-		proxyURL:  strings.TrimSpace(binding.ProxyURL),
-		expiresAt: time.Now().Add(sessionAffinityTTL()),
-	}, true
+	return sessionAffinityFromCacheBinding(binding, time.Now())
+}
+
+func (s *Store) deleteCachedSessionAffinityIfMatches(key string, binding sessionAffinity) {
+	if s == nil || s.tokenCache == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if err := s.tokenCache.DeleteSessionAffinityIfMatches(ctx, key, sessionAffinityCacheBinding(binding)); err != nil {
+		log.Printf("按绑定条件删除缓存会话粘性失败: account=%d err=%v", binding.accountID, err)
+	}
 }
 
 func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bool, filter AccountFilter) *Account {
@@ -5741,6 +6096,12 @@ func (s *Store) takeByIDExcluding(id int64, apiKeyID int64, exclude map[int64]bo
 		return nil
 	}
 	return target
+}
+
+// TakeAccountForRetryWithFilter 在同号重试时重新占用指定账号。
+// 调用方必须保证该账号尚未被本次请求解绑或硬隔离。
+func (s *Store) TakeAccountForRetryWithFilter(id int64, apiKeyID int64, filter AccountFilter) *Account {
+	return s.takeByIDExcluding(id, apiKeyID, nil, filter)
 }
 
 // WaitForAvailable 等待可用账号（带超时的请求排队）
@@ -5927,7 +6288,113 @@ func (s *Store) GetRetryIntervalMS() int {
 	return int(s.retryIntervalMS.Load())
 }
 
-// SetFailureScoreThreshold 设置启用连续失败容错时的全局计分阈值。
+func normalizeClientRequestReplayKeepaliveSeconds(seconds int) int {
+	if seconds <= 0 {
+		return 0
+	}
+	if seconds < 5 {
+		return 5
+	}
+	if seconds > 240 {
+		return 240
+	}
+	return seconds
+}
+
+// SetClientRequestReplayEnabled 设置是否在响应提交前模拟客户端重发整个请求。
+func (s *Store) SetClientRequestReplayEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayEnabled.Store(enabled)
+}
+
+// ClientRequestReplayEnabled 返回整请求代重发是否启用。
+func (s *Store) ClientRequestReplayEnabled() bool {
+	return s != nil && s.clientRequestReplayEnabled.Load()
+}
+
+// SetClientRequestReplayMaxRetries 设置原始请求失败后的额外重发次数。
+func (s *Store) SetClientRequestReplayMaxRetries(retries int) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayRetries.Store(int64(database.NormalizeClientRequestReplayMaxRetries(retries)))
+}
+
+// ClientRequestReplayMaxRetries 返回原始请求失败后的额外重发次数。
+func (s *Store) ClientRequestReplayMaxRetries() int {
+	if s == nil {
+		return database.DefaultClientRequestReplayMaxRetries
+	}
+	return database.NormalizeClientRequestReplayMaxRetries(int(s.clientRequestReplayRetries.Load()))
+}
+
+// SetClientRequestReplayMaxDurationSeconds 设置首个业务输出前的总预算。
+func (s *Store) SetClientRequestReplayMaxDurationSeconds(seconds int) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayMaxDuration.Store(int64(database.NormalizeClientRequestReplayMaxDurationSeconds(seconds)))
+}
+
+// ClientRequestReplayMaxDurationSeconds 返回首个业务输出前的总预算。
+func (s *Store) ClientRequestReplayMaxDurationSeconds() int {
+	if s == nil {
+		return database.DefaultClientRequestReplayMaxDurationSeconds
+	}
+	return database.NormalizeClientRequestReplayMaxDurationSeconds(int(s.clientRequestReplayMaxDuration.Load()))
+}
+
+// SetClientRequestReplayBaseIntervalMS 设置整请求指数退避的基础间隔。
+func (s *Store) SetClientRequestReplayBaseIntervalMS(milliseconds int) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayBaseDelay.Store(int64(database.NormalizeClientRequestReplayBaseIntervalMS(milliseconds)))
+}
+
+// ClientRequestReplayBaseIntervalMS 返回整请求指数退避的基础间隔。
+func (s *Store) ClientRequestReplayBaseIntervalMS() int {
+	if s == nil {
+		return database.DefaultClientRequestReplayBaseIntervalMS
+	}
+	return database.NormalizeClientRequestReplayBaseIntervalMS(int(s.clientRequestReplayBaseDelay.Load()))
+}
+
+// SetClientRequestReplayMaxIntervalSeconds 设置整请求指数退避的最大间隔。
+func (s *Store) SetClientRequestReplayMaxIntervalSeconds(seconds int) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayMaxDelay.Store(int64(database.NormalizeClientRequestReplayMaxIntervalSeconds(seconds)))
+}
+
+// ClientRequestReplayMaxIntervalSeconds 返回整请求指数退避的最大间隔。
+func (s *Store) ClientRequestReplayMaxIntervalSeconds() int {
+	if s == nil {
+		return database.DefaultClientRequestReplayMaxIntervalSeconds
+	}
+	return database.NormalizeClientRequestReplayMaxIntervalSeconds(int(s.clientRequestReplayMaxDelay.Load()))
+}
+
+// SetClientRequestReplayKeepaliveSeconds 设置整请求重发期间的 SSE 保活间隔。
+func (s *Store) SetClientRequestReplayKeepaliveSeconds(seconds int) {
+	if s == nil {
+		return
+	}
+	s.clientRequestReplayKeepalive.Store(int64(normalizeClientRequestReplayKeepaliveSeconds(seconds)))
+}
+
+// ClientRequestReplayKeepaliveSeconds 返回整请求重发期间的 SSE 保活间隔。
+func (s *Store) ClientRequestReplayKeepaliveSeconds() int {
+	if s == nil {
+		return 0
+	}
+	return normalizeClientRequestReplayKeepaliveSeconds(int(s.clientRequestReplayKeepalive.Load()))
+}
+
+// SetFailureScoreThreshold 设置启用时间窗失败容错时的全局计分阈值。
 func (s *Store) SetFailureScoreThreshold(value int) {
 	if s == nil {
 		return
@@ -5936,7 +6403,7 @@ func (s *Store) SetFailureScoreThreshold(value int) {
 	s.refreshFailureToleranceThresholds()
 }
 
-// GetFailureScoreThreshold 返回全局连续失败计分阈值。
+// GetFailureScoreThreshold 返回全局时间窗失败计分阈值。
 func (s *Store) GetFailureScoreThreshold() int {
 	if s == nil {
 		return defaultFailureScoreThreshold
@@ -5944,7 +6411,7 @@ func (s *Store) GetFailureScoreThreshold() int {
 	return normalizeFailureToleranceThreshold(int(s.failureScoreThreshold.Load()), defaultFailureScoreThreshold)
 }
 
-// SetFailureCooldownThreshold 设置启用连续失败容错时的全局持久冷却阈值。
+// SetFailureCooldownThreshold 设置启用时间窗失败容错时的全局持久冷却阈值。
 func (s *Store) SetFailureCooldownThreshold(value int) {
 	if s == nil {
 		return
@@ -5953,12 +6420,43 @@ func (s *Store) SetFailureCooldownThreshold(value int) {
 	s.refreshFailureToleranceThresholds()
 }
 
-// GetFailureCooldownThreshold 返回全局连续失败持久冷却阈值。
+// GetFailureCooldownThreshold 返回全局时间窗失败持久冷却阈值。
 func (s *Store) GetFailureCooldownThreshold() int {
 	if s == nil {
 		return defaultFailureCooldownThreshold
 	}
 	return normalizeFailureToleranceThreshold(int(s.failureCooldownThreshold.Load()), defaultFailureCooldownThreshold)
+}
+
+// SetFailureToleranceWindowSeconds 设置全局失败统计滚动窗口。
+func (s *Store) SetFailureToleranceWindowSeconds(value int) {
+	if s == nil {
+		return
+	}
+	s.failureToleranceWindowSeconds.Store(int64(normalizeFailureToleranceWindow(value, defaultFailureToleranceWindow)))
+	s.refreshFailureToleranceThresholds()
+}
+
+// GetFailureToleranceWindowSeconds 返回全局失败统计滚动窗口秒数。
+func (s *Store) GetFailureToleranceWindowSeconds() int {
+	if s == nil {
+		return defaultFailureToleranceWindow
+	}
+	return normalizeFailureToleranceWindow(int(s.failureToleranceWindowSeconds.Load()), defaultFailureToleranceWindow)
+}
+
+// SetFailureScoreRetroactive 设置达到失败阈值时是否补记窗口内尚未计分的失败。
+func (s *Store) SetFailureScoreRetroactive(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.failureScoreRetroactive.Store(enabled)
+	s.refreshFailureToleranceThresholds()
+}
+
+// GetFailureScoreRetroactive 返回全局失败追溯计分设置。
+func (s *Store) GetFailureScoreRetroactive() bool {
+	return s != nil && s.failureScoreRetroactive.Load()
 }
 
 func (s *Store) refreshFailureToleranceThresholds() {
@@ -5978,7 +6476,7 @@ func (s *Store) refreshFailureToleranceThresholds() {
 	}
 }
 
-// SetTransportRetryPolicy 动态更新传输错误重试策略（rotate / sticky）。
+// SetTransportRetryPolicy 动态更新上游错误重试策略（rotate / sticky / hybrid）。
 func (s *Store) SetTransportRetryPolicy(policy string) {
 	if s == nil {
 		return
@@ -5986,7 +6484,110 @@ func (s *Store) SetTransportRetryPolicy(policy string) {
 	s.transportRetryPolicy.Store(database.NormalizeTransportRetryPolicy(policy))
 }
 
-// GetTransportRetryPolicy 获取传输错误重试策略，缺省 rotate（换号，旧行为）。
+// IsSameAccountRetryEnabled 返回是否启用了会保留当前账号的上游错误重试策略。
+func (s *Store) IsSameAccountRetryEnabled() bool {
+	if s == nil {
+		return false
+	}
+	switch s.GetTransportRetryPolicy() {
+	case "sticky", "hybrid":
+		return true
+	default:
+		return false
+	}
+}
+
+// SetTransportSameAccountRetries 更新 hybrid 策略的全局同号重试次数。
+func (s *Store) SetTransportSameAccountRetries(retries int) {
+	if s == nil {
+		return
+	}
+	s.transportSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(retries)))
+}
+
+// GetTransportSameAccountRetries 返回 hybrid 策略的全局同号重试次数。
+func (s *Store) GetTransportSameAccountRetries() int {
+	if s == nil {
+		return defaultTransportSameAccountRetries
+	}
+	return database.NormalizeTransportSameAccountRetries(int(s.transportSameAccountRetries.Load()))
+}
+
+// TransportSameAccountRetriesForAccount 返回账号覆盖优先的同号重试次数。
+func (s *Store) TransportSameAccountRetriesForAccount(account *Account) int {
+	global := s.GetTransportSameAccountRetries()
+	if account == nil {
+		return global
+	}
+	account.mu.RLock()
+	defer account.mu.RUnlock()
+	if !account.TransportSameAccountRetriesOverrideSet {
+		return global
+	}
+	return database.NormalizeTransportSameAccountRetries(account.TransportSameAccountRetriesOverride)
+}
+
+// TransportSameAccountRetriesConfig 返回账号覆盖值及其当前有效值。
+func (a *Account) TransportSameAccountRetriesConfig(global int) (*int, int) {
+	global = database.NormalizeTransportSameAccountRetries(global)
+	if a == nil {
+		return nil, global
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.TransportSameAccountRetriesOverrideSet {
+		return nil, global
+	}
+	override := database.NormalizeTransportSameAccountRetries(a.TransportSameAccountRetriesOverride)
+	return &override, override
+}
+
+// SetCompactSameAccountRetries 更新 compact 首账号的全局额外同号重试次数。
+func (s *Store) SetCompactSameAccountRetries(retries int) {
+	if s == nil {
+		return
+	}
+	s.compactSameAccountRetries.Store(int64(database.NormalizeTransportSameAccountRetries(retries)))
+}
+
+// GetCompactSameAccountRetries 返回 compact 首账号的全局额外同号重试次数。
+func (s *Store) GetCompactSameAccountRetries() int {
+	if s == nil {
+		return defaultCompactSameAccountRetries
+	}
+	return database.NormalizeTransportSameAccountRetries(int(s.compactSameAccountRetries.Load()))
+}
+
+// CompactSameAccountRetriesForAccount 返回 compact 首账号的账号覆盖优先重试次数。
+func (s *Store) CompactSameAccountRetriesForAccount(account *Account) int {
+	global := s.GetCompactSameAccountRetries()
+	if account == nil {
+		return global
+	}
+	account.mu.RLock()
+	defer account.mu.RUnlock()
+	if !account.CompactSameAccountRetriesOverrideSet {
+		return global
+	}
+	return database.NormalizeTransportSameAccountRetries(account.CompactSameAccountRetriesOverride)
+}
+
+// CompactSameAccountRetriesConfig 返回账号覆盖值及其当前有效值。
+func (a *Account) CompactSameAccountRetriesConfig(global int) (*int, int) {
+	global = database.NormalizeTransportSameAccountRetries(global)
+	if a == nil {
+		return nil, global
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if !a.CompactSameAccountRetriesOverrideSet {
+		return nil, global
+	}
+	override := database.NormalizeTransportSameAccountRetries(a.CompactSameAccountRetriesOverride)
+	return &override, override
+}
+
+// GetTransportRetryPolicy 获取上游错误重试策略，缺省 rotate（换号，旧行为）。
 func (s *Store) GetTransportRetryPolicy() string {
 	if s == nil {
 		return "rotate"
@@ -6460,6 +7061,49 @@ func (s *Store) IgnoreUsageLimitStatus() bool {
 	return s != nil && s.ignoreUsageLimitStatus.Load()
 }
 
+// SetEncryptedContentCompatibilityEnabled 更新 Responses API 中转账号的全局兼容修复默认值。
+func (s *Store) SetEncryptedContentCompatibilityEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.encryptedContentCompatEnabled.Store(enabled)
+	for _, acc := range s.Accounts() {
+		acc.mu.Lock()
+		acc.recomputeEffectiveEncryptedContentCompatibility(enabled)
+		acc.mu.Unlock()
+	}
+}
+
+// EncryptedContentCompatibilityEnabled 返回加密上下文兼容修复的全局默认值。
+func (s *Store) EncryptedContentCompatibilityEnabled() bool {
+	return s == nil || s.encryptedContentCompatEnabled.Load()
+}
+
+// SetFastTierPolicy 更新全局 Fast Tier 出站策略，并立即刷新继承全局的账号。
+func (s *Store) SetFastTierPolicy(policy string) {
+	if s == nil {
+		return
+	}
+	policy = database.NormalizeFastTierPolicy(policy)
+	s.fastTierPolicy.Store(policy)
+	for _, acc := range s.Accounts() {
+		acc.mu.Lock()
+		acc.recomputeEffectiveFastTierPolicy(policy)
+		acc.mu.Unlock()
+	}
+}
+
+// GetFastTierPolicy 返回全局 Fast Tier 出站策略。
+func (s *Store) GetFastTierPolicy() string {
+	if s == nil {
+		return database.FastTierPolicyPreserve
+	}
+	if policy, ok := s.fastTierPolicy.Load().(string); ok {
+		return database.NormalizeFastTierPolicy(policy)
+	}
+	return database.FastTierPolicyPreserve
+}
+
 func (s *Store) SetGlobalAutoPauseThresholds(t5h, t7d float64) {
 	s.mu.Lock()
 	s.globalAutoPause5hThreshold = normalizeQuotaAutoPauseThreshold(t5h)
@@ -6686,6 +7330,9 @@ func (s *Store) AddAccount(acc *Account) {
 	defer s.mu.Unlock()
 	acc.mu.Lock()
 	acc.recomputeEffectiveIgnoreUsageLimitStatus(s.IgnoreUsageLimitStatus())
+	acc.recomputeEffectiveEncryptedContentCompatibility(s.EncryptedContentCompatibilityEnabled())
+	acc.recomputeEffectiveFastTierPolicy(s.GetFastTierPolicy())
+	acc.recomputeFailureToleranceThresholdsLocked(s)
 	acc.recomputeEffectiveGroupBaseConcurrency(s)
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
@@ -6778,6 +7425,27 @@ func (s *Store) ApplyAccountSchedulerOverrides(dbID int64, scoreBiasOverride, ba
 	return true
 }
 
+// ApplyAccountManualScoreBonus 替换账号的临时调度分调整并立即重算；bonus 为零时清除。
+func (s *Store) ApplyAccountManualScoreBonus(dbID int64, bonus int64, until time.Time) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	if bonus == 0 || until.IsZero() || !time.Now().Before(until) {
+		bonus = 0
+		until = time.Time{}
+	}
+
+	acc.mu.Lock()
+	acc.ManualScoreBonus = bonus
+	acc.ManualScoreBonusUntil = until
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	s.markCheapProbeTopologyChanged()
+	return true
+}
+
 func (s *Store) ApplyAccountSchedulerOverridePatch(dbID int64, scoreBiasSet bool, scoreBiasOverride *int64, baseConcurrencySet bool, baseConcurrencyOverride *int64, skipWarmTier *bool) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
@@ -6801,21 +7469,46 @@ func (s *Store) ApplyAccountSchedulerOverridePatch(dbID int64, scoreBiasSet bool
 	return true
 }
 
-// ApplyAccountUsageLimit429CooldownConfig 更新账号连续失败容错开关。
+// ApplyAccountUsageLimit429CooldownConfig 更新账号时间窗失败容错开关。
 func (s *Store) ApplyAccountUsageLimit429CooldownConfig(dbID int64, ignore bool) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
 	}
 	acc.mu.Lock()
+	if acc.IgnoreUsageLimit429Cooldown != ignore {
+		acc.failureTimestamps = nil
+		acc.failureScoredCount = 0
+	}
 	acc.IgnoreUsageLimit429Cooldown = ignore
 	acc.recomputeFailureToleranceThresholdsLocked(s)
 	acc.mu.Unlock()
 	return true
 }
 
-// ApplyAccountFailureToleranceConfig 更新账号级连续失败阈值覆盖。
-func (s *Store) ApplyAccountFailureToleranceConfig(dbID int64, scoreSet bool, scoreThreshold int, cooldownSet bool, cooldownThreshold int) bool {
+// ApplyAccountFailureScoreRetroactive 更新账号级追溯计分覆盖，nil 表示继承全局设置。
+func (s *Store) ApplyAccountFailureScoreRetroactive(dbID int64, set bool, override *bool) bool {
+	if !set {
+		return true
+	}
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	if override == nil {
+		acc.FailureScoreRetroactiveOverride = nil
+	} else {
+		value := *override
+		acc.FailureScoreRetroactiveOverride = &value
+	}
+	acc.recomputeFailureToleranceThresholdsLocked(s)
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountFailureToleranceConfig 更新账号级时间窗失败容错覆盖。
+func (s *Store) ApplyAccountFailureToleranceConfig(dbID int64, scoreSet bool, scoreThreshold int, cooldownSet bool, cooldownThreshold int, windowSet bool, windowSeconds int) bool {
 	acc := s.FindByID(dbID)
 	if acc == nil {
 		return false
@@ -6828,7 +7521,54 @@ func (s *Store) ApplyAccountFailureToleranceConfig(dbID int64, scoreSet bool, sc
 	if cooldownSet {
 		acc.FailureCooldownThresholdOverride = normalizeFailureToleranceOverride(cooldownThreshold)
 	}
+	if windowSet {
+		acc.FailureToleranceWindowOverride = normalizeFailureToleranceWindowOverride(windowSeconds)
+	}
 	acc.recomputeFailureToleranceThresholdsLocked(s)
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountTransportSameAccountRetries 更新账号级同号重试次数覆盖，set=false 时不修改。
+func (s *Store) ApplyAccountTransportSameAccountRetries(dbID int64, set bool, retries *int) bool {
+	if !set {
+		return true
+	}
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	if retries == nil {
+		acc.TransportSameAccountRetriesOverride = 0
+		acc.TransportSameAccountRetriesOverrideSet = false
+	} else {
+		acc.TransportSameAccountRetriesOverride = database.NormalizeTransportSameAccountRetries(*retries)
+		acc.TransportSameAccountRetriesOverrideSet = true
+	}
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountCompactSameAccountRetries 更新账号级 compact 首账号同号重试次数覆盖。
+func (s *Store) ApplyAccountCompactSameAccountRetries(dbID int64, set bool, retries *int) bool {
+	if !set {
+		return true
+	}
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+
+	acc.mu.Lock()
+	if retries == nil {
+		acc.CompactSameAccountRetriesOverride = 0
+		acc.CompactSameAccountRetriesOverrideSet = false
+	} else {
+		acc.CompactSameAccountRetriesOverride = database.NormalizeTransportSameAccountRetries(*retries)
+		acc.CompactSameAccountRetriesOverrideSet = true
+	}
 	acc.mu.Unlock()
 	return true
 }
@@ -6841,6 +7581,41 @@ func (s *Store) ApplyAccountUnauthorizedCooldownConfig(dbID int64, ignore bool) 
 	}
 	acc.mu.Lock()
 	acc.IgnoreUnauthorizedCooldown = ignore
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountEncryptedContentCompatibilityConfig 更新账号级加密上下文兼容修复覆盖；nil 表示继承全局。
+func (s *Store) ApplyAccountEncryptedContentCompatibilityConfig(dbID int64, override *bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	if override == nil {
+		acc.EncryptedContentCompatOverride = nil
+	} else {
+		value := *override
+		acc.EncryptedContentCompatOverride = &value
+	}
+	acc.recomputeEffectiveEncryptedContentCompatibility(s.EncryptedContentCompatibilityEnabled())
+	acc.mu.Unlock()
+	return true
+}
+
+// ApplyAccountFastTierPolicy 更新账号级 Fast Tier 策略；nil 表示继承全局。
+func (s *Store) ApplyAccountFastTierPolicy(dbID int64, override *string) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	acc.mu.Lock()
+	if override == nil {
+		acc.FastTierPolicyOverride = ""
+	} else {
+		acc.FastTierPolicyOverride = database.NormalizeFastTierPolicy(*override)
+	}
+	acc.recomputeEffectiveFastTierPolicy(s.GetFastTierPolicy())
 	acc.mu.Unlock()
 	return true
 }
@@ -7903,8 +8678,9 @@ func (s *Store) ConfirmResponsesAvailableSince(acc *Account, requestStartedAt ti
 	return true
 }
 
-// RecordManualTestSuccess clears failure/cooldown state after an explicit admin
-// connection test succeeds.
+// RecordManualTestSuccess 在管理员连接测试成功后恢复账号状态。
+//
+// 滚动失败窗口按时间自然过期，不因测试成功而清空，避免反复测试绕过计分阈值。
 func (s *Store) RecordManualTestSuccess(acc *Account, latency time.Duration) {
 	if acc == nil {
 		return
@@ -7929,7 +8705,6 @@ func (s *Store) RecordManualTestSuccess(acc *Account, latency time.Duration) {
 	acc.LastSuccessAt = now
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
 	acc.FailureStreak = 0
-	acc.ConsecutiveFailureCount = 0
 	if wasUsageLimitCooldown {
 		acc.LastRateLimitedAt = time.Time{}
 	}
@@ -7970,7 +8745,6 @@ func (s *Store) ReportRequestSuccess(acc *Account, latency time.Duration) {
 	acc.LastSuccessAt = time.Now()
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
 	acc.FailureStreak = 0
-	acc.ConsecutiveFailureCount = 0
 	if acc.HealthTier == "" {
 		acc.HealthTier = HealthTierHealthy
 	}
@@ -7985,18 +8759,63 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 		return
 	}
 
-	now := time.Now()
+	s.reportRequestFailureAt(acc, kind, latency, time.Time{})
+}
+
+// ReportAPIUpstreamFailure 记录一次 API 中转上游失败，不解释上游错误码的业务语义。
+//
+// 每次真实上游尝试只应调用一次；同号重试和 compact 重试也各自计入失败窗口。
+func (s *Store) ReportAPIUpstreamFailure(acc *Account, latency time.Duration) {
+	if acc == nil || !acc.IsOpenAIResponsesAPI() {
+		return
+	}
+	s.reportRequestFailureAt(acc, "upstream", latency, time.Time{})
+}
+
+func (s *Store) reportRequestFailureAt(acc *Account, kind string, latency time.Duration, now time.Time) {
+	if acc == nil {
+		return
+	}
+
 	acc.mu.Lock()
-	acc.ConsecutiveFailureCount = clampInt(acc.ConsecutiveFailureCount+1, 0, maxFailureToleranceThreshold)
+	// 时间必须在账号锁内采样，保证并发失败写入的时间戳仍按顺序排列，窗口裁剪才能只扫描队首。
+	if now.IsZero() {
+		now = time.Now()
+	}
+	isRelay := acc.isOpenAIResponsesAPILocked()
+	if isRelay {
+		kind = "upstream"
+	}
+	failureCount := 1
+	windowEnabled := isRelay && acc.IgnoreUsageLimit429Cooldown
+	if windowEnabled {
+		failureCount = acc.recordFailureTimestampLocked(now)
+	} else {
+		acc.failureTimestamps = nil
+		acc.failureScoredCount = 0
+	}
 	scoreThreshold := normalizeFailureToleranceThreshold(acc.FailureScoreThresholdEffective, 1)
-	if acc.ConsecutiveFailureCount < scoreThreshold {
+	if failureCount < scoreThreshold {
+		acc.mu.Unlock()
+		return
+	}
+	penaltyCount := 1
+	if windowEnabled {
+		if acc.FailureScoreRetroactiveEffective {
+			penaltyCount = failureCount - acc.failureScoredCount
+		}
+		acc.failureScoredCount = failureCount
+	}
+	if penaltyCount <= 0 {
 		acc.mu.Unlock()
 		return
 	}
 	acc.recordLatencyLocked(latency)
-	acc.recordResultLocked(false)
+	for range penaltyCount {
+		acc.recordResultLocked(false)
+	}
 	acc.LastFailureAt = now
-	acc.FailureStreak = clampInt(acc.FailureStreak+1, 0, 20)
+	acc.FailureStreak = clampInt(acc.FailureStreak+penaltyCount, 0, 20)
 	acc.SuccessStreak = 0
 
 	switch kind {
@@ -8017,7 +8836,7 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 		} else {
 			acc.HealthTier = HealthTierRisky
 		}
-	case "transport":
+	case "transport", "upstream":
 		if acc.HealthTier == HealthTierHealthy {
 			acc.HealthTier = HealthTierWarm
 		} else {
@@ -8316,7 +9135,7 @@ const wsAuthVerifyMinInterval = 30 * time.Second
 // （wham 单方面 401 不定罪，避免误封 wham 恒 401 但流量可用的 codex_at 账号，issue #328）；
 // 若只是内容策略/网络抖动触发的 1008，探针返回正常，不会误封。带最小间隔节流。
 func (s *Store) VerifyAccountAuthAsync(account *Account) {
-	if s == nil || account == nil {
+	if s == nil || account == nil || account.IsOpenAIResponsesAPI() {
 		return
 	}
 	s.usageProbeMu.RLock()
@@ -9132,7 +9951,6 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 						account.HealthTier = HealthTierWarm
 						account.SchedulerScore = 80
 						account.FailureStreak = 0
-						account.ConsecutiveFailureCount = 0
 						account.SuccessStreak = 1
 						account.LastSuccessAt = time.Now()
 						if account.Status == StatusCooldown {

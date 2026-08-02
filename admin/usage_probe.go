@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
@@ -29,7 +30,7 @@ var errWhamUnauthorized = errors.New("wham usage probe unauthorized")
 // （会真实计入用量但保证向下兼容）。
 // 鉴权裁决：wham 401 不单方面封号，由 /responses 回退探针定夺（issue #328）。
 func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account) error {
-	if account == nil {
+	if account == nil || account.IsOpenAIResponsesAPI() {
 		return nil
 	}
 
@@ -190,30 +191,34 @@ func (h *Handler) probeUsageViaGrokBilling(ctx context.Context, account *auth.Ac
 // 通过响应头同步 Codex 用量状态。会真实消耗少量 token。
 func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Account) error {
 	probeStartedAt := time.Now()
-	payload := buildConnectionTestPayload(h.store, h.store.GetTestModel())
+	model := h.store.GetTestModel()
+	payload := buildConnectionTestPayload(h.store, model)
+	startedAt := time.Now()
 	resp, err := proxy.ExecuteRequest(ctx, account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	var usageState proxy.CodexUsageSyncResult
 	if resp.StatusCode == http.StatusOK {
-		usageState = proxy.SyncCodexUsageState(h.store, account, resp)
-	} else {
-		usageState = proxy.SyncCodexFailureUsageState(h.store, account, resp)
-	}
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-
-	switch resp.StatusCode {
-	case http.StatusOK:
+		usageState := proxy.SyncCodexUsageState(h.store, account, resp)
+		observeFirstToken := h.newAccountFirstTokenObserver(account, database.FirstTokenSourceAutoProbe, model, startedAt)
+		_ = proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
+			observeFirstToken(data)
+			return true
+		})
 		h.store.ReportRequestSuccess(account, 0)
 		// 只有用量未耗尽时才重置状态
 		if !applyUsageLimitedAccountState(h.store, account, usageState) {
 			h.store.ClearUsageLimitCooldownSince(account, probeStartedAt)
 		}
 		return nil
+	}
+
+	proxy.SyncCodexFailureUsageState(h.store, account, resp)
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+
+	switch resp.StatusCode {
 	case http.StatusUnauthorized:
 		h.store.ReportRequestFailure(account, "client", 0)
 		if !proxy.ShouldIgnoreFailureCooldown(account) {

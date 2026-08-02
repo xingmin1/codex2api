@@ -41,7 +41,11 @@ var responsesWSUpgrader = websocket.Upgrader{
 var errResponsesWSClientGone = errors.New("responses websocket client disconnected")
 
 type responsesWSRetryableStreamError struct {
-	outcome streamOutcome
+	outcome             streamOutcome
+	failurePayload      []byte
+	sameAccountRetry    bool
+	sameAccountFailures int
+	sameAccountLimit    int
 }
 
 func (e *responsesWSRetryableStreamError) Error() string {
@@ -233,6 +237,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		_ = writeResponsesWSError(conn, apiErr)
 		return newResponsesWSCloseError(websocket.ClosePolicyViolation, apiErr.Message, err)
 	}
+	isV2CompactionRequest := requestBodyHasCompactionTrigger(rawBody)
 
 	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, rawBody)
 	apiKeyID := requestAPIKeyID(c)
@@ -242,10 +247,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	// 上下文压缩轮豁免首字超时看门狗（issue #381）：压缩首帧天然慢，超时换号无益。
 	bodySignalCompact := compactionMeta.ProtocolTriggered
 	reasoningEffort := extractReasoningEffort(rawBody)
-	serviceTier := extractServiceTier(rawBody)
-	if serviceTier != "" {
-		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
-	}
+	requestedServiceTier := extractServiceTier(rawBody)
 
 	codexBody, expandedInputRaw := PrepareResponsesWebSocketBody(rawBody)
 	// strip 策略：剥离图片工具能力声明后作为普通文本请求继续（issue #411）。
@@ -300,6 +302,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	var lastBody []byte
 	var lastRetryableUpstreamErr *api.APIError
 	retryExclusions := newRetryAccountExclusions()
+	transportRetries := newTransportRetryTracker()
+	sameAccountTarget := sameAccountRetryTarget{}
 	invalidEncryptedContentRetried := false
 	var wsHTTPFallback websocketHTTPFallbackState
 	var lastUpstreamCancel context.CancelFunc
@@ -312,7 +316,10 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL, retainedHTTPFallback := wsHTTPFallback.Take()
 		if !retainedHTTPFallback {
-			account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+			account, stickyProxyURL = sameAccountTarget.take(h.store, apiKeyID, accountFilter)
+			if account == nil {
+				account, stickyProxyURL = h.nextRetryAccountForSession(c.Request.Context(), affinityKey, apiKeyID, retryExclusions, accountFilter)
+			}
 		}
 		if account == nil {
 			if lastRetryableUpstreamErr != nil {
@@ -328,6 +335,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			_ = writeResponsesWSError(conn, apiErr)
 			return newResponsesWSCloseError(websocket.CloseTryAgainLater, apiErr.Message, apiErr)
 		}
+		transportRetries.captureCompactInitialAccount(h, account, isV2CompactionRequest)
 
 		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
@@ -338,6 +346,7 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if wsHTTPFallback.ForceHTTP() {
 			log.Printf("Responses WebSocket upstream HTTP fallback attempt started (fallback_id=%s, source=%s, attempt=%d, account=%d, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
 		}
+		serviceTier := requestedServiceTier
 
 		apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
 		deviceCfg := h.deviceCfg
@@ -368,6 +377,8 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		}
 		// service_tier 记账按 payload 规则改写后的值归因（覆写 service_tier 的规则才生效）。
 		serviceTier = EffectiveRequestedServiceTier(upstreamBody, effectiveModel, downstreamHeaders, attemptIdentity)
+		upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
+		c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 		// 在 useWebsocket 最终确定后再派生上游身份键：与 handler.go 的
 		// Responses/ChatCompletions 路径一致——无显式会话默认每请求隔离上游身份，
 		// WS 路径交给 ExecuteRequest 的 stateless 槽位池处理。
@@ -381,6 +392,11 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			if timedOut {
 				reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
 			}
+			if downstreamRequestCanceled(c) {
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				return errResponsesWSClientGone
+			}
 			kind := classifyTransportFailure(reqErr)
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
@@ -392,29 +408,51 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				continue
 			}
 			retryable := IsRetryableError(reqErr) || kind != ""
-			shouldRetry := false
-			if silentRetryEnabled && retryable && attempt < maxRetries {
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := false, 0, 0
+			if silentRetryEnabled || isV2CompactionRequest {
+				sameAccountRetry, sameAccountFailures, sameAccountLimit = transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, isV2CompactionRequest || retryable, timedOut, kind)
+			}
+			shouldRetry := sameAccountRetry
+			if silentRetryEnabled && retryable && !sameAccountRetry {
 				shouldRetry = shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
 			}
-			// 传输类失败粘滞同号重试:不记账号失败、不解绑亲和、不硬排除(issue #331)
-			stickyRetry := shouldRetry && !timedOut && kind != "" && h.stickyTransportRetryEnabled()
-			if kind != "" && !(timedOut && shouldRetry) && !stickyRetry {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if sameAccountRetry {
+				usageTiers := resolveUsageServiceTiers("", serviceTier)
+				h.logSameAccountRetryRequestError(c, &database.UsageLogInput{
+					AccountID:            account.ID(),
+					Endpoint:             "/v1/responses",
+					Model:                logModel,
+					EffectiveModel:       logEffectiveModel,
+					DurationMs:           durationMs,
+					ReasoningEffort:      reasoningEffort,
+					InboundEndpoint:      "/v1/responses",
+					UpstreamEndpoint:     "/v1/responses",
+					Stream:               true,
+					ViaWebsocket:         useWebsocket,
+					ServiceTier:          usageTiers.ServiceTier,
+					RequestedServiceTier: usageTiers.RequestedServiceTier,
+					ActualServiceTier:    usageTiers.ActualServiceTier,
+					BillingServiceTier:   usageTiers.BillingServiceTier,
+				}, attempt, kind, reqErr)
+			}
+			// 同号重试只决定是否保留账号；relay/Grok 的每次真实上游失败都独立进入时间窗。
+			if shouldPenalizeTransportKind(kind) && ((!timedOut && account.IsRelayStyle()) || (!(timedOut && shouldRetry) && !sameAccountRetry)) {
+				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			if !stickyRetry {
+			if !sameAccountRetry {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			}
-			if timedOut && shouldRetry {
+			if timedOut && shouldRetry && !sameAccountRetry {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 				log.Printf("Responses WebSocket upstream first token timeout, retrying with another account (attempt %d/%d, account %d): %v", attempt+1, maxRetries+1, account.ID(), reqErr)
 				continue
 			}
-			if !timedOut && !stickyRetry {
+			if !timedOut && !sameAccountRetry {
 				retryExclusions.MarkHard(account.ID())
 			}
 
-			if !retryable {
+			if !retryable && !sameAccountRetry {
 				apiErr = api.NewAPIError(api.ErrCodeUpstreamError, reqErr.Error(), api.ErrorTypeUpstream)
 				clientErr := responsesWSClientUpstreamAPIError(apiErr, hideUpstreamErrors)
 				_ = writeResponsesWSError(conn, clientErr)
@@ -423,8 +461,13 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			log.Printf("Responses WebSocket upstream request failed (attempt %d): %v", attempt+1, reqErr)
 			lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, reqErr.Error(), api.ErrorTypeUpstream)
 			if shouldRetry {
-				if stickyRetry {
-					log.Printf("传输错误粘滞重试：保留账号 %d 与会话亲和 (attempt %d/%d, ws)", account.ID(), attempt+1, maxRetries+1)
+				if sameAccountRetry {
+					sameAccountTarget.remember(account, proxyURL)
+					if isV2CompactionRequest {
+						logCompactSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses-ws")
+					} else {
+						logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses-ws")
+					}
 				}
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return errResponsesWSClientGone
@@ -444,10 +487,14 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 
-			if !invalidEncryptedContentRetried && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
-				strippedRawBody, rawChanged := stripInvalidEncryptedContentFromResponsesBody(rawBody)
-				strippedCodexBody, codexChanged := stripInvalidEncryptedContentFromResponsesBody(codexBody)
+			if !cyberPolicy && !invalidEncryptedContentRetried {
+				strippedRawBody, rawReport := repairResponsesEncryptedContentForError(rawBody, resp.StatusCode, errBody)
+				strippedCodexBody, codexReport := repairResponsesEncryptedContentForError(codexBody, resp.StatusCode, errBody)
+				rawChanged := rawReport.Changed
+				codexChanged := codexReport.Changed
 				if rawChanged || codexChanged {
 					invalidEncryptedContentRetried = true
 					if rawChanged {
@@ -457,28 +504,58 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 						codexBody = strippedCodexBody
 						expandedInputRaw = responsesInputRaw(codexBody)
 					}
-					log.Printf("Responses WebSocket upstream rejected encrypted_content, stripped encrypted reasoning context and retried once (attempt %d)", attempt+1)
-					h.store.Release(account)
-					h.store.UnbindSessionAffinity(affinityKey, account.ID())
-					continue
+					log.Printf("Responses WebSocket upstream rejected encrypted_content, repaired request and retried once (attempt %d, raw_strategy=%s, codex_strategy=%s)", attempt+1, rawReport.Strategy, codexReport.Strategy)
+					if !isV2CompactionRequest {
+						h.store.Release(account)
+						sameAccountTarget.remember(account, proxyURL)
+						continue
+					}
+				}
+				if !rawReport.Handled && !codexReport.Handled && isInvalidEncryptedContentError(resp.StatusCode, errBody) {
+					strippedRawBody, rawChanged = stripInvalidEncryptedContentFromResponsesBody(rawBody)
+					strippedCodexBody, codexChanged = stripInvalidEncryptedContentFromResponsesBody(codexBody)
+					if rawChanged || codexChanged {
+						invalidEncryptedContentRetried = true
+						if rawChanged {
+							rawBody = strippedRawBody
+						}
+						if codexChanged {
+							codexBody = strippedCodexBody
+							expandedInputRaw = responsesInputRaw(codexBody)
+						}
+						log.Printf("Responses WebSocket upstream rejected encrypted_content, stripped encrypted reasoning context and retried once (attempt %d)", attempt+1)
+						if !isV2CompactionRequest {
+							h.store.Release(account)
+							h.store.UnbindSessionAffinity(affinityKey, account.ID())
+							continue
+						}
+					}
 				}
 			}
 
-			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetryForRequest(h, account, isV2CompactionRequest, !cyberPolicy, false, failureKind)
+			if failureKind != "" && (account.IsRelayStyle() || !sameAccountRetry) {
+				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexFailureUsageState(h.store, account, resp)
+			if !sameAccountRetry && !cyberPolicy {
+				SyncCodexFailureUsageState(h.store, account, resp)
+			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(affinityKey, account.ID())
-			retryExclusions.MarkHard(account.ID())
+			if !sameAccountRetry && !cyberPolicy {
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkHard(account.ID())
+			}
 
 			log.Printf("Responses WebSocket upstream returned error (attempt %d, status %d): %s", attempt+1, resp.StatusCode, upstreamErrorConsoleBody(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, logModel, account.ID(), errBody)
 			h.logUpstreamCyberPolicy(c, "/v1/responses", logModel, errBody)
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			shouldRetry := false
-			if silentRetryEnabled && attempt < maxRetries {
-				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			decision := codex429Decision{}
+			shouldRetry := sameAccountRetry
+			if !sameAccountRetry && !cyberPolicy {
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+				if silentRetryEnabled && transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest) < maxRetries {
+					shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, h.effectiveMaxRateLimitRetries(account, maxRateLimitRetries))
+				}
 			}
 			usageTiers := resolveUsageServiceTiers("", serviceTier)
 			h.logUsageForRequest(c, &database.UsageLogInput{
@@ -507,6 +584,14 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				lastRetryableUpstreamErr = responsesWSUpstreamAPIError(resp.StatusCode, errBody)
+				if sameAccountRetry {
+					sameAccountTarget.remember(account, proxyURL)
+					if isV2CompactionRequest {
+						logCompactSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses-ws")
+					} else {
+						logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, "/v1/responses-ws")
+					}
+				}
 				if !h.waitBeforeRetry(c.Request.Context()) {
 					return errResponsesWSClientGone
 				}
@@ -523,9 +608,36 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 		if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 			fallbackLog = &wsHTTPFallback
 		}
-		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options); err != nil {
+		if err := h.streamResponsesWSUpstream(c, conn, resp, account, proxyURL, affinityKey, logModel, effectiveModel, logEffectiveModel, reasoningEffort, serviceTier, respCacheOwner, expandedInputRaw, start, ttftGuard, silentRetryEnabled, hideUpstreamErrors, useWebsocket, fallbackLog, attempt+1, options, isV2CompactionRequest, attempt, transportRetries); err != nil {
 			var retryErr *responsesWSRetryableStreamError
 			if errors.As(err, &retryErr) {
+				if len(retryErr.failurePayload) > 0 {
+					if !invalidEncryptedContentRetried {
+						statusCode := responseFailedStatusCode(retryErr.failurePayload)
+						repairedRawBody, rawReport := repairResponsesEncryptedContentForError(rawBody, statusCode, retryErr.failurePayload)
+						repairedCodexBody, codexReport := repairResponsesEncryptedContentForError(codexBody, statusCode, retryErr.failurePayload)
+						if rawReport.Changed || codexReport.Changed {
+							invalidEncryptedContentRetried = true
+							if rawReport.Changed {
+								rawBody = repairedRawBody
+							}
+							if codexReport.Changed {
+								codexBody = repairedCodexBody
+								expandedInputRaw = responsesInputRaw(codexBody)
+							}
+							sameAccountTarget.remember(account, proxyURL)
+							log.Printf("Responses WebSocket response.failed 命中 encrypted_content 兼容修复后同号重试一次 (attempt %d, raw_strategy=%s, codex_strategy=%s)", attempt+1, rawReport.Strategy, codexReport.Strategy)
+							if !h.waitBeforeRetry(c.Request.Context()) {
+								return errResponsesWSClientGone
+							}
+							continue
+						}
+					}
+					apiErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
+					clientErr := responsesWSClientUpstreamAPIError(apiErr, hideUpstreamErrors)
+					_ = writeResponsesWSError(conn, clientErr)
+					return newResponsesWSCloseError(responsesWSCloseCodeForStatus(retryErr.outcome.logStatusCode), clientErr.Message, apiErr)
+				}
 				lastRetryableUpstreamErr = api.NewAPIError(api.ErrCodeUpstreamError, retryErr.outcome.failureMessage, api.ErrorTypeUpstream)
 				if useWebsocket && isWebsocketMessageTooBigOutcome(retryErr.outcome) {
 					wsElapsed := time.Since(start)
@@ -533,14 +645,25 @@ func (h *Handler) forwardResponsesWebSocketTurn(c *gin.Context, conn *websocket.
 					log.Printf("Responses WebSocket upstream close 1009 before first event; retaining account lease and falling back to HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, ws_elapsed_ms=%d): %s", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), retryErr.outcome.failureMessage)
 					continue
 				}
-				if silentRetryEnabled && attempt < maxRetries {
+				if retryErr.sameAccountRetry {
+					sameAccountTarget.remember(account, proxyURL)
+					if isV2CompactionRequest {
+						logCompactSameAccountRetry(account.ID(), attempt+1, retryErr.sameAccountFailures, retryErr.sameAccountLimit, "/v1/responses-ws-stream")
+					} else {
+						logTransportSameAccountRetry(account.ID(), attempt+1, retryErr.sameAccountFailures, retryErr.sameAccountLimit, "/v1/responses-ws-stream")
+					}
+					if !h.waitBeforeRetry(c.Request.Context()) {
+						return errResponsesWSClientGone
+					}
+					continue
+				}
+				if silentRetryEnabled && transportRetries.stateMachineAttempt(attempt, isV2CompactionRequest) < maxRetries {
 					if isFirstTokenTimeoutOutcome(retryErr.outcome) {
 						retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 					} else {
 						retryExclusions.MarkHard(account.ID())
 					}
 					log.Printf("Responses WebSocket upstream stream ended before first token, retrying (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), retryErr.outcome.failureMessage)
-					// 首字超时已白等一轮,不再叠加重试间隔;其余首包前断流按配置间隔等待
 					if !isFirstTokenTimeoutOutcome(retryErr.outcome) && !h.waitBeforeRetry(c.Request.Context()) {
 						return errResponsesWSClientGone
 					}
@@ -585,9 +708,10 @@ func (h *Handler) streamResponsesWSUpstream(
 	fallbackLog *websocketHTTPFallbackState,
 	fallbackAttempt int,
 	options *responsesWSForwardOptions,
+	isV2CompactionRequest bool,
+	attempt int,
+	transportRetries *transportRetryTracker,
 ) error {
-	SyncCodexUsageState(h.store, account, resp)
-
 	account.Mu().RLock()
 	c.Set("x-account-email", account.Email)
 	account.Mu().RUnlock()
@@ -690,7 +814,7 @@ func (h *Handler) streamResponsesWSUpstream(
 				// 不把失败帧下发给客户端：丢弃尚未发送的前导缓冲并提前结束读取，
 				// 让外层循环透明换到健康账号重试，避免客户端反复 Reconnecting。
 				// 已经向客户端写过内容（wroteAnyBody / 已记录首 token）则照常透传。
-				if (silentRetryEnabled || hideUpstreamErrors) && eventType == "response.failed" && !ttftRecorded && !wroteAnyBody && responseFailedRetryable(terminalFailurePayload) {
+				if (silentRetryEnabled || hideUpstreamErrors || isV2CompactionRequest) && eventType == "response.failed" && !ttftRecorded && !wroteAnyBody && responseFailedRetryable(terminalFailurePayload) {
 					pendingFirstTokenMessages = pendingFirstTokenMessages[:0]
 					pendingFirstTokenBytes = 0
 					return false
@@ -751,10 +875,6 @@ func (h *Handler) streamResponsesWSUpstream(
 	var responseFailedDecision codex429Decision
 	if len(terminalFailurePayload) > 0 {
 		outcome = classifyResponseFailedOutcomeForAccount(account, terminalFailurePayload)
-		responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
-		if responseFailedDecision.Reason != "" {
-			outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
-		}
 		// 流式 response.failed（HTTP 200）里的 cyber_policy 处罚也要记录，
 		// 否则只有非 2xx 错误体才会被记入提示词过滤日志。
 		h.logUpstreamCyberPolicy(c, "/v1/responses", model, responseFailedErrorBody(terminalFailurePayload))
@@ -762,14 +882,41 @@ func (h *Handler) streamResponsesWSUpstream(
 	if fallbackLog != nil {
 		fallbackLog.LogHTTPAttemptCompletion("/v1/responses", account.ID(), fallbackAttempt, totalDuration, firstTokenMs, outcome.logStatusCode)
 	}
+	if len(terminalFailurePayload) > 0 && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
+		if _, ok := recoverableEncryptedContentError(responseFailedStatusCode(terminalFailurePayload), terminalFailurePayload); ok {
+			resp.Body.Close()
+			h.store.Release(account)
+			return &responsesWSRetryableStreamError{
+				outcome:        outcome,
+				failurePayload: append([]byte(nil), terminalFailurePayload...),
+			}
+		}
+	}
+	if account.IsRelayStyle() && outcome.failureKind != "" && !isFirstTokenTimeoutOutcome(outcome) {
+		h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+	}
+	sameAccountStreamRetry, sameAccountStreamFailures, sameAccountStreamLimit := transportRetries.shouldRetryForRequest(
+		h,
+		account,
+		isV2CompactionRequest,
+		sameAccountStreamRetryEligible(isV2CompactionRequest, outcome, wroteAnyBody, c.Request.Context().Err(), writeErr),
+		isFirstTokenTimeoutOutcome(outcome),
+		outcome.failureKind,
+	)
+	if len(terminalFailurePayload) > 0 && !sameAccountStreamRetry {
+		responseFailedDecision = h.applyResponseFailedCooldown(account, terminalFailurePayload, resp, effectiveModel)
+		if responseFailedDecision.Reason != "" {
+			outcome.failureKind = upstreamErrorKindForAccount(account, outcome.logStatusCode, responseFailedErrorBody(terminalFailurePayload), responseFailedDecision)
+		}
+	}
 	if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, viaWebsocket, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 		resp.Body.Close()
 		return &responsesWSRetryableStreamError{outcome: outcome}
 	}
-	if silentRetryEnabled && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
+	if !sameAccountStreamRetry && silentRetryEnabled && outcome.penalize && !wroteAnyBody && c.Request.Context().Err() == nil && writeErr == nil {
 		resp.Body.Close()
-		if !isFirstTokenTimeoutOutcome(outcome) {
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		if !isFirstTokenTimeoutOutcome(outcome) && !account.IsRelayStyle() {
+			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
 		h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -824,17 +971,33 @@ func (h *Handler) streamResponsesWSUpstream(
 		logInput.CachedTokens = usage.CachedTokens
 	}
 	applyImageUsageLogInfo(logInput, imageLogInfo)
+	logInput.IsRetryAttempt = sameAccountStreamRetry
+	logInput.AttemptIndex = attempt + 1
 	h.logUsageForRequest(c, logInput)
+	if sameAccountStreamRetry {
+		resp.Body.Close()
+		h.store.Release(account)
+		return &responsesWSRetryableStreamError{
+			outcome:             outcome,
+			sameAccountRetry:    true,
+			sameAccountFailures: sameAccountStreamFailures,
+			sameAccountLimit:    sameAccountStreamLimit,
+		}
+	}
 
+	SyncCodexUsageState(h.store, account, resp)
 	resp.Body.Close()
 	if outcome.penalize {
 		recyclePooledClient(account, proxyURL)
-		h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		if !account.IsRelayStyle() {
+			h.reportUpstreamAttemptFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+		}
 		h.store.UnbindSessionAffinity(affinityKey, account.ID())
 	} else if outcome.logStatusCode == http.StatusOK {
 		h.store.ClearModelCooldown(account, effectiveModel)
 		h.store.ConfirmResponsesAvailableSince(account, start)
 		h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
+		h.clearAffinityAfterSuccessfulCompact(affinityKey, account.ID(), isV2CompactionRequest)
 	}
 	h.store.Release(account)
 
@@ -1024,6 +1187,9 @@ func responsesWSUpstreamAPIError(statusCode int, body []byte) *api.APIError {
 	}
 	errCode := api.ErrCodeUpstreamError
 	errType := api.ErrorTypeUpstream
+	if upstreamCyberPolicyCode(body) != "" {
+		return api.NewAPIError(api.ErrorCode(upstreamErrorKindCyberPolicy), message, api.ErrorTypePermission)
+	}
 	switch statusCode {
 	case http.StatusTooManyRequests:
 		errCode = api.ErrCodeRateLimitReached
