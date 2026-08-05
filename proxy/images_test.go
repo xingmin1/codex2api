@@ -451,7 +451,7 @@ func TestNextImageAccountSkipsRelayWithoutImageModel(t *testing.T) {
 	})
 	handler := &Handler{store: store}
 
-	account, _ := handler.nextImageAccount(0, nil, "gpt-image-2-2k")
+	account, _ := handler.nextImageAccount(nil, 0, nil, "gpt-image-2-2k", requestSessionIdentity{})
 	if account == nil {
 		t.Fatal("nextImageAccount returned nil")
 	}

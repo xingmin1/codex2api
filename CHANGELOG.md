@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.7.0-xmin.1 - 2026-08-05
+
+### Features
+
+- **同步官方 v2.7.0。** 合入 Prompt Policy、Grok 账号、Responses 缓存、积分调度、图片处理与管理界面等上游更新。
+- **保留 fork 的代理可靠性契约。** 适配新版状态机并保留同账号重试、compact 会话粘性、整请求代重发、Fast Tier、原生压缩输出校验与无效函数密文恢复。
+
+### Fixes
+
+- **修复设置保存的跨层字段丢失。** 失败容忍、同号重试、整请求重放、密文兼容和 Fast Tier 现在完整贯通管理 API、运行时 Store 与数据库，局部更新不再覆盖无关配置。
+- **禁止 CY 安全拒绝进入任何兼容重试。** Responses、Chat、compact 与 WebSocket 会在密文修复、自动压缩、处罚和账号切换前识别 `cyber_policy`；混合错误载荷同样只请求一次且不影响账号状态。
+
+### Tests
+
+- **补充跨协议与跨层回归。** 覆盖设置局部更新、CY 与密文混合错误、HTTP/WebSocket/compact 账号状态、上游合并冲突契约，并通过全量 Go、前端和 Nix 构建检查。
+
 ## v2.5.2-xmin.14 - 2026-07-28
 
 ### Features

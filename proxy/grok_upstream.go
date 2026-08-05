@@ -627,8 +627,8 @@ func parseRetryAfterHeader(value string) time.Duration {
 		return seconds
 	}
 	if at, err := http.ParseTime(value); err == nil {
-		if d := time.Until(at); d > 0 {
-			return d
+		if duration := time.Until(at); duration > 0 {
+			return duration
 		}
 	}
 	return 0

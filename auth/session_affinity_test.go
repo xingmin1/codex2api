@@ -235,7 +235,12 @@ func TestBindSessionAffinityDoesNotExtendCachedDeadline(t *testing.T) {
 	tokenCache := cache.NewMemory(1)
 	defer tokenCache.Close()
 	account := &Account{DBID: 1, AccessToken: "tok-1"}
-	store := &Store{tokenCache: tokenCache}
+	store := &Store{
+		accounts:     []*Account{account},
+		accountsByID: map[int64]*Account{account.DBID: account},
+		globalProxy:  "http://proxy-1",
+		tokenCache:   tokenCache,
+	}
 
 	store.bindSessionAffinity("session-cache-deadline", account, "http://proxy-1")
 	store.sessionMu.Lock()
@@ -311,6 +316,7 @@ func TestLegacyCachedAffinityIsUpgradedWithoutSlidingDeadline(t *testing.T) {
 			{DBID: 2, AccessToken: "tok-2"},
 		},
 		maxConcurrency: 2,
+		globalProxy:    "http://proxy-2",
 		tokenCache:     tokenCache,
 	}
 
