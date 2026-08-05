@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1128,38 +1129,91 @@ func requestBodyHasCompactionTrigger(body []byte) bool {
 	return requestBodyCompactionMeta(body).ProtocolTriggered
 }
 
-// storeHasAvailableCodexAccount 判断账号池中是否还有可调度的官方（非中转）账号。
-// 注意这是池级判断，不含 API Key 级的账号分组/套餐约束——极端情况下（Key 被限定
-// 只能用中转账号且池中有官方账号）body-signal 请求会等待官方账号而非提升，
-// 该组合目前视为配置矛盾，不做额外处理。
-func (h *Handler) storeHasAvailableCodexAccount() bool {
-	if h == nil || h.store == nil {
-		return false
+func logCompactV2RequestShape(traceID, stage string, attempt int, accountID int64, body []byte) {
+	if traceID == "" {
+		return
 	}
-	for _, account := range h.store.Accounts() {
-		if account.IsRelayStyle() {
-			continue
-		}
-		if account.IsAvailable() {
+	if stage == "inbound" {
+		captureCompactV2Request(body)
+	}
+	input := gjson.GetBytes(body, "input")
+	inputCount := 0
+	triggerIndexes := make([]string, 0, 1)
+	if input.IsArray() {
+		input.ForEach(func(index, item gjson.Result) bool {
+			inputCount++
+			if gjsonResultIsCompactionTrigger(item) {
+				triggerIndexes = append(triggerIndexes, index.String())
+			}
 			return true
+		})
+	} else if input.Exists() {
+		inputCount = 1
+		if gjsonResultIsCompactionTrigger(input) {
+			triggerIndexes = append(triggerIndexes, "0")
 		}
 	}
-	return false
+	log.Printf("Compact V2 结构诊断 (trace=%s stage=%s attempt=%d account=%d): model=%s input_count=%d trigger_count=%d trigger_indexes=%s stream=%t",
+		traceID, stage, attempt, accountID, strings.TrimSpace(gjson.GetBytes(body, "model").String()), inputCount,
+		len(triggerIndexes), strings.Join(triggerIndexes, ","), gjson.GetBytes(body, "stream").Bool())
 }
 
-// excludeRelayAccountsFilter 在既有过滤器上追加"排除中转/Grok 账号"约束。
-func excludeRelayAccountsFilter(inner auth.AccountFilter) auth.AccountFilter {
+func captureCompactV2Request(body []byte) {
+	path := strings.TrimSpace(os.Getenv("CODEX_COMPACT_V2_CAPTURE_PATH"))
+	if path == "" {
+		return
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		if !errors.Is(err, os.ErrExist) {
+			log.Printf("Compact V2 隔离快照创建失败: %v", err)
+		}
+		return
+	}
+	defer file.Close()
+	if _, err := file.Write(body); err != nil {
+		log.Printf("Compact V2 隔离快照写入失败: %v", err)
+	}
+}
+
+func logCompactV2OutputItemShape(traceID string, attempt int, accountID int64, event gjson.Result) {
+	if traceID == "" {
+		return
+	}
+	item := event.Get("item")
+	log.Printf("Compact V2 输出诊断 (trace=%s attempt=%d account=%d): event=%s item_type=%s item_id=%s output_index=%s",
+		traceID, attempt, accountID, strings.TrimSpace(event.Get("type").String()), strings.TrimSpace(item.Get("type").String()),
+		strings.TrimSpace(item.Get("id").String()), event.Get("output_index").Raw)
+}
+
+func logCompactV2CompletedShape(traceID string, attempt int, accountID int64, event gjson.Result) {
+	if traceID == "" {
+		return
+	}
+	output := event.Get("response.output")
+	itemTypes := make([]string, 0)
+	if output.IsArray() {
+		output.ForEach(func(_, item gjson.Result) bool {
+			itemTypes = append(itemTypes, strings.TrimSpace(item.Get("type").String()))
+			return true
+		})
+	}
+	log.Printf("Compact V2 完成诊断 (trace=%s attempt=%d account=%d): status=%s output_count=%d item_types=%s",
+		traceID, attempt, accountID, strings.TrimSpace(event.Get("response.status").String()), len(itemTypes), strings.Join(itemTypes, ","))
+}
+
+func relayOnlyAccountFilter(inner auth.AccountFilter) auth.AccountFilter {
 	return func(account *auth.Account) bool {
-		if account == nil || account.IsRelayStyle() {
+		if account == nil || !account.IsRelayStyle() {
 			return false
 		}
 		return inner == nil || inner(account)
 	}
 }
 
-func relayOnlyAccountFilter(inner auth.AccountFilter) auth.AccountFilter {
+func excludeGrokAccountsFilter(inner auth.AccountFilter) auth.AccountFilter {
 	return func(account *auth.Account) bool {
-		if account == nil || !account.IsRelayStyle() {
+		if account == nil || account.IsGrokAPI() {
 			return false
 		}
 		return inner == nil || inner(account)
@@ -2361,34 +2415,19 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 	bodyReadDone := time.Now()
 	compactionMeta := requestCompactionMetaForHTTP(c, rawBody)
 	cacheRequestCompactionMeta(c, compactionMeta)
-
-	// body-signal compact：较新的 Codex 客户端把会话压缩触发器作为 input item
-	// （type=compaction_trigger）嵌进普通 /responses 请求体，而不调用
-	// /responses/compact。官方 ChatGPT OAuth 账号的原生上游直接接受该形态，
-	// 透传即正确；中转（OpenAI Responses API）账号的普通 /v1/responses 通常
-	// 不接受，会 400 或返回非压缩响应导致客户端报
-	// "expected exactly one compaction output item"。
-	// 处理：池中还有可用官方账号时，把这类请求钉在官方账号上保持原生透传；
-	// 纯中转池的流式请求也必须继续走 /responses SSE，否则 ResponsesCompact 的
-	// 一次性 JSON 会让客户端在收到 response.completed 前遇到 EOF（issue #361）。
-	// 非流式请求仍可提升到 compact 专用链路，保留只实现 /responses/compact 的
-	// 中转兼容性。
-	bodySignalCompact := compactionMeta.ProtocolTriggered
-	pinBodySignalToCodexAccounts := bodySignalCompact && h.storeHasAvailableCodexAccount()
-	streamingRelayBodySignal := bodySignalCompact && !pinBodySignalToCodexAccounts && gjson.GetBytes(rawBody, "stream").Bool()
-	if bodySignalCompact && !pinBodySignalToCodexAccounts && !streamingRelayBodySignal {
-		h.ResponsesCompact(c)
-		return
+	compactTraceID := ""
+	if compactionMeta.ProtocolTriggered {
+		compactTraceID = uuid.NewString()[:8]
+		logCompactV2RequestShape(compactTraceID, "inbound", 0, 0, rawBody)
 	}
+
+	// Compact V2 以 compaction_trigger 作为普通 /responses 的协议项。
+	// 端点、stream 形态和账号类型都不得改变该请求的路由；只有客户端显式调用
+	// /responses/compact 时才进入旧 compact 专用链路。
+	bodySignalCompact := compactionMeta.ProtocolTriggered
 
 	supportedModels := h.supportedModelIDs(c.Request.Context())
-	var requestModel, mappedModel string
-	var mappingApplied bool
-	if streamingRelayBodySignal {
-		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
-	} else {
-		rawBody, requestModel, mappedModel, mappingApplied = h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
-	}
+	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredModelMappingToBody(rawBody, supportedModels)
 	setRawRequestBody(c, rawBody)
 
 	// Validate request
@@ -2434,7 +2473,9 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 		return
 	}
 
-	rawBody = normalizeServiceTierField(rawBody)
+	if !bodySignalCompact {
+		rawBody = normalizeServiceTierField(rawBody)
+	}
 	if err := ValidateResponsesFunctionNames(rawBody); err != nil {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
 		return
@@ -2467,7 +2508,11 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 	}
 	getOpenAIResponsesBody := func() []byte {
 		if openAIResponsesBody == nil {
-			openAIResponsesBody = applyImageGenerationStripPolicy(c, PrepareOpenAIResponsesBody(rawBody))
+			if bodySignalCompact {
+				openAIResponsesBody = append([]byte(nil), rawBody...)
+			} else {
+				openAIResponsesBody = applyImageGenerationStripPolicy(c, PrepareOpenAIResponsesBody(rawBody))
+			}
 		}
 		return openAIResponsesBody
 	}
@@ -2490,18 +2535,13 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 		defer releaseAPIKeyConcurrency()
 	}
 	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
-	var accountFilter auth.AccountFilter
-	if streamingRelayBodySignal {
-		accountFilter = accountFilterForCompactResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
-	} else {
-		accountFilter = accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
-	}
+	accountFilter := accountFilterForResponsesModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
 	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	if bodySignalCompact {
+		accountFilter = excludeGrokAccountsFilter(accountFilter)
+	}
 	if validateNativeCompactionOutput {
 		accountFilter = h.nativeCompactionAccountFilter(effectiveModel, accountFilter)
-	}
-	if pinBodySignalToCodexAccounts && !continuationUnavailable {
-		accountFilter = excludeRelayAccountsFilter(accountFilter)
 	}
 	if continuationUnavailable {
 		accountFilter = relayOnlyAccountFilter(accountFilter)
@@ -2629,21 +2669,23 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			}
 			upstreamEndpoint := relayUpstreamEndpointForAccount(account)
 			upstreamBody := getOpenAIResponsesBody()
-			var mappedBody []byte
-			var mappedModel string
-			var accountMappingApplied bool
-			if streamingRelayBodySignal {
-				mappedBody, mappedModel, accountMappingApplied = h.applyAccountCompactModelMappingToBody(upstreamBody, account, logModel, effectiveModel)
-			} else {
-				mappedBody, mappedModel, accountMappingApplied = h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel)
-			}
+			mappedBody, mappedModel, accountMappingApplied := h.applyAccountModelMappingToBodyForModels(upstreamBody, account, logModel, effectiveModel)
 			if accountMappingApplied {
 				upstreamBody = mappedBody
 				attemptEffectiveModel = mappedModel
 				attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, attemptEffectiveModel, true)
 			}
-			attemptValidatesNativeCompaction := validateNativeCompactionOutput && strings.HasPrefix(strings.ToLower(attemptEffectiveModel), "gpt-5")
-			upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
+			if bodySignalCompact {
+				logCompactV2RequestShape(compactTraceID, "relay-outbound", attempt+1, account.ID(), upstreamBody)
+			}
+			// Responses API 中转可能使用 compaction_summary + message 方言，Codex
+			// 客户端可直接消费；唯一 compaction 项是官方原生上游的契约。
+			attemptValidatesNativeCompaction := false
+			if bodySignalCompact && account.FastTierPolicy() == database.FastTierPolicyPreserve {
+				serviceTier = strings.TrimSpace(gjson.GetBytes(upstreamBody, "service_tier").String())
+			} else {
+				upstreamBody, serviceTier = applyAccountFastTierPolicy(upstreamBody, account)
+			}
 			c.Set("x-service-tier", resolveServiceTier("", serviceTier))
 			resp, reqErr := ExecuteRelayStyleRequest(upstreamCtx, account, upstreamBody, proxyURL, downstreamHeaders)
 			durationMs := int(time.Since(start).Milliseconds())
@@ -2838,6 +2880,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				completionBuffer = newCompletionBufferedSSEWriter(attemptValidatesNativeCompaction)
 				clientGone := false
 				var pendingFirstTokenEvents bytes.Buffer
+				preflightPassthrough := CurrentRuntimeSettings().CodexPreflightSSEPassthrough
 				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 					parsed := gjson.ParseBytes(data)
 					eventType := parsed.Get("type").String()
@@ -2849,6 +2892,12 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 					}
 					if eventType == "response.output_text.delta" {
 						deltaCharCount += len(parsed.Get("delta").String())
+					}
+					if bodySignalCompact && eventType == "response.output_item.done" {
+						logCompactV2OutputItemShape(compactTraceID, attempt+1, account.ID(), parsed)
+					}
+					if bodySignalCompact && eventType == "response.completed" {
+						logCompactV2CompletedShape(compactTraceID, attempt+1, account.ID(), parsed)
 					}
 					if attemptValidatesNativeCompaction && (eventType == "response.output_item.done" || eventType == "response.completed") {
 						if err := compactionOutput.observeSSEEvent(parsed); err != nil {
@@ -2884,7 +2933,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 						imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
 					}
 					if !clientGone {
-						shouldDefer := !ttftRecorded && !gotTerminal && isPreContentLifecycleEvent(eventType)
+						shouldDefer := shouldDeferPreContentSSEEvent(eventType, ttftRecorded, gotTerminal, preflightPassthrough)
 						wrote, err := completionBuffer.writeEvent(streamWriter, &pendingFirstTokenEvents, data, eventType, shouldDefer)
 						if err != nil {
 							writeErr = err
@@ -2968,6 +3017,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 			if len(terminalFailurePayload) > 0 && !wroteAnyBody && !invalidEncryptedContentRetried[account.ID()] {
 				repairedRawBody, rawReport := repairResponsesEncryptedContentForError(rawBody, responseFailedStatusCode(terminalFailurePayload), terminalFailurePayload)
 				repairedCodexBody, codexReport := repairResponsesEncryptedContentForError(codexBody, responseFailedStatusCode(terminalFailurePayload), terminalFailurePayload)
+				log.Printf("Responses encrypted_content 兼容检查 (account %d, attempt %d): raw={handled:%t changed:%t protected:%t removed:%d item:%s strategy:%s param:%s} codex={handled:%t changed:%t protected:%t removed:%d item:%s strategy:%s param:%s}", account.ID(), attempt+1, rawReport.Handled, rawReport.Changed, rawReport.Protected, rawReport.Removed, rawReport.ItemType, rawReport.Strategy, rawReport.Param, codexReport.Handled, codexReport.Changed, codexReport.Protected, codexReport.Removed, codexReport.ItemType, codexReport.Strategy, codexReport.Param)
 				if rawReport.Changed || codexReport.Changed {
 					invalidEncryptedContentRetried[account.ID()] = true
 					if rawReport.Changed {
@@ -3671,6 +3721,7 @@ func (h *Handler) responsesOnce(c *gin.Context) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 			} else {
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				retryExclusions.MarkHard(account.ID())
 			}
 			resp.Body.Close()
 			h.store.Release(account)
@@ -4497,6 +4548,8 @@ func (h *Handler) chatCompletionsOnce(c *gin.Context) {
 	var lastBody []byte
 	retryExclusions := newRetryAccountExclusions()
 	var wsHTTPFallback websocketHTTPFallbackState
+	overflowCompactRetried := false
+	overflowCompactEnabled := autoCompactOverflowEnabled(c)
 
 	// 上游 ctx 生命周期：每次 attempt 开始前用新的 drainable ctx 替换，
 	// defer 兜底确保函数退出时上游被释放。
@@ -4688,13 +4741,31 @@ func (h *Handler) chatCompletionsOnce(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
+			accountReleasedForOverflow := false
+
+			// Chat Completions 已翻译为 Responses 请求，沿用相同的超窗压缩恢复。
+			if !cyberPolicy && overflowCompactEnabled && !overflowCompactRetried &&
+				resp.StatusCode == http.StatusBadRequest && isContextLengthExceededBody(errBody) {
+				h.ReleaseAPIKeyScopeConcurrency(c)
+				h.store.Release(account)
+				accountReleasedForOverflow = true
+				if compacted, ok := h.compactOverflowResponsesBodyForRequest(c, codexBody); ok {
+					overflowCompactRetried = true
+					codexBody = compacted
+					log.Printf("Chat Completions 上游报上下文超窗，已压缩旧轮次并重试一次 (attempt %d)", attempt+1)
+					continue
+				}
+			}
+
 			if !cyberPolicy {
 				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 				}
 				SyncCodexUsageState(h.store, account, resp)
 			}
-			h.store.Release(account)
+			if !accountReleasedForOverflow {
+				h.store.Release(account)
+			}
 			if !cyberPolicy {
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 				retryExclusions.MarkHard(account.ID())
@@ -4980,6 +5051,7 @@ func (h *Handler) chatCompletionsOnce(c *gin.Context) {
 				retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
 			} else {
 				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				retryExclusions.MarkHard(account.ID())
 			}
 			resp.Body.Close()
 			h.store.Release(account)
@@ -5005,6 +5077,22 @@ func (h *Handler) chatCompletionsOnce(c *gin.Context) {
 					CompletionTokens: estOutputTokens,
 					TotalTokens:      estOutputTokens,
 				}
+			}
+		}
+		accountReleasedForOverflow := false
+		// 流内超窗发生在首包前时，Chat Completions 也执行一次既有的摘要压缩恢复。
+		if overflowCompactEnabled && !overflowCompactRetried && !wroteAnyBody &&
+			(!isStream || abortedForHTTPError) &&
+			isContextLengthExceededFailedPayload(terminalFailurePayload) {
+			resp.Body.Close()
+			h.ReleaseAPIKeyScopeConcurrency(c)
+			h.store.Release(account)
+			accountReleasedForOverflow = true
+			if compacted, ok := h.compactOverflowResponsesBodyForRequest(c, codexBody); ok {
+				overflowCompactRetried = true
+				codexBody = compacted
+				log.Printf("Chat Completions 上游流内报上下文超窗，已压缩旧轮次并重试一次 (attempt %d)", attempt+1)
+				continue
 			}
 		}
 		if isStream && abortedForHTTPError && !wroteAnyBody {
@@ -5067,7 +5155,9 @@ func (h *Handler) chatCompletionsOnce(c *gin.Context) {
 		}
 		h.logUsageForRequest(c, logInput)
 
-		resp.Body.Close()
+		if !accountReleasedForOverflow {
+			resp.Body.Close()
+		}
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
@@ -5076,7 +5166,9 @@ func (h *Handler) chatCompletionsOnce(c *gin.Context) {
 			h.store.ClearModelCooldown(account, attemptEffectiveModel)
 			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
-		h.store.Release(account)
+		if !accountReleasedForOverflow {
+			h.store.Release(account)
+		}
 		return
 	}
 }

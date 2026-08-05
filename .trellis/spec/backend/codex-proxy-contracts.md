@@ -37,8 +37,11 @@
 - Relay-style accounts, including Grok, are detected through `IsRelayStyle()` and executed through `ExecuteRelayStyleRequest`; Codex-specific cooldown and account-disable semantics must not be applied to them.
 - Retryable `response.failed` events before visible output may be suppressed only when another attempt is guaranteed. Once output is committed, the terminal event must be forwarded and the request must not be replayed transparently.
 - Invalid `encrypted_content` recovery is bounded to one sanitization/replay cycle for the request. It must keep the selected account when the same-account path is still valid.
-- Native compact responses must preserve the compaction request fields and produce exactly one valid compaction output item before reporting success.
+- A `compaction_trigger` item is part of the ordinary `/responses` Compact V2 protocol. Preserve the inbound `/responses` endpoint, the client's downstream `stream` semantics, and the trigger/history items for both official Codex and OpenAI Responses relay accounts; only an explicit inbound `/responses/compact` request may use the legacy compact endpoint. Without an explicit model mapping, Responses Lite transport, client-metadata compatibility retry, encrypted-content recovery, or non-preserve fast-tier policy, the OpenAI Responses relay request body must remain byte-for-byte unchanged. Official Codex requests may still receive the minimum fields and context preparation required by the Codex upstream contract.
+- Official Codex native compact responses must preserve the compaction request fields and produce exactly one valid `compaction` output item before reporting success. Responses API relays may return a client-compatible `compaction_summary` plus `message` dialect; relay responses must not be rejected or inserted into the native-capability negative cache solely for using that dialect.
 - Every `SystemSettings` field exposed by the admin API must round-trip through frontend types, admin request/response structs, database scan/select/update code, and runtime application. PostgreSQL column order, scan order, placeholders, and argument order must remain identical.
+- The full accounts response must preserve fork-owned runtime projections when upstream changes touch `admin/handler.go`: model capability, latest quality evaluation, first-token statistics, temporary dispatch score, and scheduler breakdown fields must survive from database/runtime state through `AccountRow`.
+- Quality-evaluation eligibility has one shared model-list rule across execution, admin serialization, and frontend rendering. A Responses API account supports evaluation only when its explicit model list contains `gpt-5.6-sol`; ordinary Codex OAuth accounts remain eligible.
 - Partial settings updates preserve unrelated persisted fields; a failed persistence operation must not apply the new runtime value.
 
 ### 4. Validation & Error Matrix
@@ -51,6 +54,8 @@
 | WebSocket `1009` after visible output | Forward terminal failure; do not transparently replay |
 | Retryable `response.failed` before visible output | Suppress only when a bounded retry will run |
 | Invalid `encrypted_content` before visible output | Strip invalid encrypted fields once, then replay according to the same-account policy |
+| Compact V2 `compaction_trigger` on `/responses` | Preserve `/responses`, downstream stream semantics, and the trigger/history items for official Codex and OpenAI Responses relay accounts; exclude incompatible Grok translation |
+| Relay body-signal compact returns `compaction_summary` + `message` | Pass the complete response through; do not apply official native-output validation or native-capability negative caching |
 | `ws_busy_acquire` | Do not enter ordinary same-account transport retry |
 | Relay/Grok 429 or transport failure | Use relay-style accounting and cooldown mapping, not Codex account punishment |
 | Invalid settings value | Return a client validation error and leave database/runtime state unchanged |

@@ -2163,6 +2163,189 @@ func TestChatCompletionsUsesOpenAIResponsesAPIAccount(t *testing.T) {
 	}
 }
 
+func writeOpenAIResponsesSSESuccess(w http.ResponseWriter, content string) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	events := []string{
+		`{"type":"response.created","response":{"id":"resp_relay_test"}}`,
+		`{"type":"response.output_item.added","item":{"type":"message"}}`,
+		fmt.Sprintf(`{"type":"response.output_text.delta","delta":%q}`, content),
+		`{"type":"response.output_text.done"}`,
+		`{"type":"response.completed","response":{"id":"resp_relay_test","status":"completed","usage":{"input_tokens":10,"output_tokens":2}}}`,
+	}
+	for _, event := range events {
+		_, _ = io.WriteString(w, "data: "+event+"\n\n")
+	}
+}
+
+func TestChatCompletionsRecoversContextOverflow(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	for _, failureMode := range []string{"http", "sse"} {
+		t.Run(failureMode, func(t *testing.T) {
+			var mu sync.Mutex
+			var businessBodies [][]byte
+			summaryCalls := 0
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestBody, _ := io.ReadAll(r.Body)
+				if strings.Contains(string(requestBody), "You are a conversation compaction assistant.") {
+					mu.Lock()
+					summaryCalls++
+					mu.Unlock()
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, `data: {"type":"response.completed","response":{"id":"resp_summary","status":"completed","output":[]}}`+"\n\n")
+					return
+				}
+
+				mu.Lock()
+				businessBodies = append(businessBodies, append([]byte(nil), requestBody...))
+				businessAttempt := len(businessBodies)
+				mu.Unlock()
+				if businessAttempt == 1 {
+					if failureMode == "http" {
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusBadRequest)
+						_, _ = io.WriteString(w, `{"error":{"code":"context_length_exceeded","message":"input exceeds the context window"}}`)
+						return
+					}
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"code":"context_length_exceeded","message":"input exceeds the context window"}}}`+"\n\n")
+					return
+				}
+				writeOpenAIResponsesSSESuccess(w, "OK")
+			}))
+			defer upstream.Close()
+
+			store := newOpenAIResponsesRelayStore(upstream.URL)
+			t.Cleanup(store.Stop)
+			handler := NewHandler(store, nil, nil, nil)
+
+			messages := make([]map[string]any, 0, 7)
+			messages = append(messages, map[string]any{"role": "system", "content": "keep system instructions"})
+			for i := 0; i < 6; i++ {
+				messages = append(messages, map[string]any{
+					"role":    map[bool]string{true: "user", false: "assistant"}[i%2 == 0],
+					"content": fmt.Sprintf("turn-%d:%s", i, strings.Repeat("x", 80*1024)),
+				})
+			}
+			body, err := json.Marshal(map[string]any{"model": "gpt-4.1-direct", "messages": messages})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(recorder)
+			ctx.Request = req
+			ctx.Set(contextAPIKeyID, int64(42))
+			ctx.Set(contextAPIKeyRow, &database.APIKeyRow{
+				ID: 42,
+				Limits: database.APIKeyLimits{
+					AutoCompactOnOverflow: true,
+				},
+			})
+
+			handler.ChatCompletions(ctx)
+
+			if recorder.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+			}
+			if content := gjson.GetBytes(recorder.Body.Bytes(), "choices.0.message.content").String(); content != "OK" {
+				t.Fatalf("message content = %q, want OK; body=%s", content, recorder.Body.String())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if summaryCalls != 1 {
+				t.Fatalf("summary calls = %d, want 1", summaryCalls)
+			}
+			if len(businessBodies) != 2 {
+				t.Fatalf("business attempts = %d, want 2", len(businessBodies))
+			}
+			firstInputCount := gjson.GetBytes(businessBodies[0], "input.#").Int()
+			secondInputCount := gjson.GetBytes(businessBodies[1], "input.#").Int()
+			if secondInputCount >= firstInputCount {
+				t.Fatalf("compacted input count = %d, want less than %d", secondInputCount, firstInputCount)
+			}
+			if !bytes.Contains(businessBodies[1], []byte(overflowCompactOmittedMarker)) {
+				t.Fatalf("compacted request missing overflow marker")
+			}
+		})
+	}
+}
+
+func TestChatCompletionsRetryableResponseFailedRotatesAccount(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	var mu sync.Mutex
+	attempts := make([]string, 0, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authHeader := r.Header.Get("Authorization")
+		mu.Lock()
+		attempts = append(attempts, authHeader)
+		mu.Unlock()
+		if authHeader == "Bearer sk-failing" {
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, `data: {"type":"response.failed","response":{"status":"failed","error":{"status_code":500,"code":"server_error","message":"temporary upstream failure"}}}`+"\n\n")
+			return
+		}
+		writeOpenAIResponsesSSESuccess(w, "recovered")
+	}))
+	defer upstream.Close()
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:      2,
+		MaxRetries:          1,
+		MaxRateLimitRetries: 0,
+	})
+	t.Cleanup(store.Stop)
+	store.SetRetryIntervalMS(0)
+	store.SetFailureScoreThreshold(100)
+	failing := &auth.Account{
+		DBID:              1,
+		UpstreamType:      auth.UpstreamOpenAIResponses,
+		BaseURL:           upstream.URL,
+		APIKey:            "sk-failing",
+		Models:            []string{"gpt-4.1-direct"},
+		PlanType:          "api",
+		SchedulerPriority: 100,
+	}
+	healthy := &auth.Account{
+		DBID:         2,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      upstream.URL,
+		APIKey:       "sk-healthy",
+		Models:       []string{"gpt-4.1-direct"},
+		PlanType:     "api",
+	}
+	store.AddAccount(failing)
+	store.AddAccount(healthy)
+	const sessionID = "chat-response-failed-rotation"
+	store.BindSessionAffinity(sessionAffinityKey(sessionID, 0), failing, "")
+	handler := NewHandler(store, nil, nil, nil)
+
+	body := []byte(`{"model":"gpt-4.1-direct","messages":[{"role":"user","content":"hi"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Session_id", sessionID)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.ChatCompletions(ctx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
+	}
+	if content := gjson.GetBytes(recorder.Body.Bytes(), "choices.0.message.content").String(); content != "recovered" {
+		t.Fatalf("message content = %q, want recovered; body=%s", content, recorder.Body.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	wantAttempts := []string{"Bearer sk-failing", "Bearer sk-healthy"}
+	if !slices.Equal(attempts, wantAttempts) {
+		t.Fatalf("attempt accounts = %v, want %v", attempts, wantAttempts)
+	}
+}
+
 func TestChatCompletionsUsesOpenAIResponsesAccountModelMapping(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -4405,7 +4588,7 @@ func TestResponses_BodySignalCompactStaysStreamingOnRelayOnlyPool(t *testing.T) 
 		MaxRetries:          0,
 		MaxRateLimitRetries: 0,
 	})
-	store.SetCodexModelMapping(`{"client-body-signal-alias-openai-compact":"gpt-4.1-direct","gpt-4.1-direct":"gpt-4.1-second"}`)
+	store.SetCodexModelMapping(`{"client-body-signal-alias":"gpt-4.1-direct","gpt-4.1-direct":"gpt-4.1-second"}`)
 	store.AddAccount(&auth.Account{
 		DBID:         1,
 		UpstreamType: auth.UpstreamOpenAIResponses,
@@ -4456,9 +4639,9 @@ func TestResponses_BodySignalCompactStaysStreamingOnRelayOnlyPool(t *testing.T) 
 	}
 }
 
-// 流式 body-signal 继续走 /responses 时，也必须保留账号级 compact 专用映射；
-// 否则 compact-only alias 无法选中中转账号，或会把错误模型发给上游（PR #350）。
-func TestResponses_BodySignalCompactStreamingUsesAccountCompactMapping(t *testing.T) {
+// body-signal 继续走 /responses 时，只应用普通账号模型映射；compact-only
+// 别名仅属于客户端显式调用的 /responses/compact 端点。
+func TestResponses_BodySignalCompactUsesResponsesAccountMapping(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	var seenPath string
@@ -4482,7 +4665,7 @@ func TestResponses_BodySignalCompactStreamingUsesAccountCompactMapping(t *testin
 		BaseURL:      upstream.URL,
 		APIKey:       "sk-direct",
 		Models:       []string{"gpt-4.1-direct"},
-		ModelMapping: `{"gpt-5.4-openai-compact":"gpt-4.1-direct"}`,
+		ModelMapping: `{"gpt-5.4":"gpt-4.1-direct"}`,
 		PlanType:     "api",
 	})
 	handler := NewHandler(store, nil, nil, nil)
@@ -4511,9 +4694,9 @@ func TestResponses_BodySignalCompactStreamingUsesAccountCompactMapping(t *testin
 	}
 }
 
-// 非流式 body-signal 没有 SSE 契约，继续使用 compact 专用端点以兼容只实现
-// /responses/compact 的中转账号。
-func TestResponses_NonStreamingBodySignalCompactStillUsesCompactEndpoint(t *testing.T) {
+// 非流式 Compact V2 同样属于普通 /responses 协议；不得因中转账号或
+// stream=false 改道到旧 /responses/compact 端点。
+func TestResponses_NonStreamingBodySignalCompactStaysOnResponsesEndpoint(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	var seenPath string
@@ -4524,7 +4707,7 @@ func TestResponses_NonStreamingBodySignalCompactStillUsesCompactEndpoint(t *test
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id":"resp_non_stream_compaction",
-			"object":"response.compaction",
+			"object":"response",
 			"output":[{"type":"compaction_summary","summary":"done"}],
 			"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
 		}`))
@@ -4546,11 +4729,7 @@ func TestResponses_NonStreamingBodySignalCompactStillUsesCompactEndpoint(t *test
 	})
 	handler := NewHandler(store, nil, nil, nil)
 
-	body := []byte(`{
-		"model":"gpt-4.1-direct",
-		"stream":false,
-		"input":[{"type":"compaction_trigger"}]
-	}`)
+	body := []byte(`{"model":"gpt-4.1-direct","stream":false,"service_tier":"relay-native-tier","x_compact_extension":{"keep":true},"input":[{"type":"compaction","encrypted_content":"opaque-history"},{"type":"compaction_trigger"}]}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
@@ -4562,11 +4741,11 @@ func TestResponses_NonStreamingBodySignalCompactStillUsesCompactEndpoint(t *test
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", recorder.Code, recorder.Body.String())
 	}
-	if seenPath != "/v1/responses/compact" {
-		t.Fatalf("upstream path = %q, want /v1/responses/compact", seenPath)
+	if seenPath != "/v1/responses" {
+		t.Fatalf("upstream path = %q, want /v1/responses", seenPath)
 	}
-	if gjson.GetBytes(seenBody, "stream").Exists() {
-		t.Fatalf("compact upstream body should not carry stream, got %s", seenBody)
+	if !bytes.Equal(seenBody, body) {
+		t.Fatalf("upstream body changed\n got: %s\nwant: %s", seenBody, body)
 	}
 }
 
@@ -4804,36 +4983,22 @@ func TestResponsesRelaySuccessPreservesNewerUsageLimitCooldown(t *testing.T) {
 	}
 }
 
-// 池中还有可用官方账号时,body-signal 请求被钉在官方账号上(不落中转)。
-func TestBodySignalCompactFilters(t *testing.T) {
+func TestCompactV2AccountFilterExcludesGrok(t *testing.T) {
+	filter := excludeGrokAccountsFilter(nil)
 	relay := &auth.Account{
 		DBID:         1,
 		UpstreamType: auth.UpstreamOpenAIResponses,
 		BaseURL:      "https://relay.example.com",
-		APIKey:       "sk-relay",
+		APIKey:       "relay-key",
 	}
 	codex := &auth.Account{DBID: 2, AccessToken: "at-codex"}
+	grok := &auth.Account{DBID: 3, UpstreamType: auth.UpstreamGrok, APIKey: "grok-key"}
 
-	filter := excludeRelayAccountsFilter(nil)
-	if filter(relay) {
-		t.Fatal("relay account must be excluded by pinned filter")
+	if !filter(relay) || !filter(codex) {
+		t.Fatal("Compact V2 filter must allow Responses relay and Codex accounts")
 	}
-	if !filter(codex) {
-		t.Fatal("codex account must pass pinned filter")
-	}
-
-	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
-	handler := NewHandler(store, nil, nil, nil)
-	if handler.storeHasAvailableCodexAccount() {
-		t.Fatal("empty pool should report no codex account")
-	}
-	store.AddAccount(relay)
-	if handler.storeHasAvailableCodexAccount() {
-		t.Fatal("relay-only pool should report no codex account")
-	}
-	store.AddAccount(codex)
-	if !handler.storeHasAvailableCodexAccount() {
-		t.Fatal("pool with codex account should report available")
+	if filter(grok) {
+		t.Fatal("Compact V2 filter must exclude Grok accounts")
 	}
 }
 

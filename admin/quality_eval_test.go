@@ -86,6 +86,27 @@ func TestQualityEvalSupportedByResponsesAPIAccountRequiresExactModel(t *testing.
 	}
 }
 
+func TestQualityEvalSupportedByModelsUsesExplicitResponsesModelList(t *testing.T) {
+	cases := []struct {
+		name      string
+		responses bool
+		models    []string
+		supported bool
+	}{
+		{name: "codex oauth", responses: false, supported: true},
+		{name: "responses exact", responses: true, models: []string{"gpt-5.6-sol"}, supported: true},
+		{name: "responses case insensitive", responses: true, models: []string{" GPT-5.6-SOL "}, supported: true},
+		{name: "responses missing", responses: true, models: []string{"gpt-5.5"}, supported: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := qualityEvalSupportedByModels(tc.responses, tc.models); got != tc.supported {
+				t.Fatalf("qualityEvalSupportedByModels(%v, %v) = %v, want %v", tc.responses, tc.models, got, tc.supported)
+			}
+		})
+	}
+}
+
 func TestExecuteQualityEvalRequestUsesResponsesAPIAccount(t *testing.T) {
 	requestPayload := make(chan []byte, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

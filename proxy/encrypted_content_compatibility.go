@@ -228,27 +228,19 @@ func removeEncryptedFunctionOutputContent(body []byte, info encryptedContentErro
 	removed := 0
 	for index, rawItem := range input {
 		item, ok := rawItem.(map[string]any)
-		if !ok || !isFunctionOutputItemType(strings.TrimSpace(firstNonEmptyAnyString(item["type"]))) {
-			continue
-		}
-		if hasTargetIndex && index != targetIndex {
-			continue
-		}
-		output, ok := item["output"].([]any)
 		if !ok {
 			continue
 		}
-		cleaned := make([]any, 0, len(output))
-		for _, rawContent := range output {
-			content, ok := rawContent.(map[string]any)
-			if ok && strings.TrimSpace(firstNonEmptyAnyString(content["type"])) == "encrypted_content" {
-				removed++
+		itemType := strings.TrimSpace(firstNonEmptyAnyString(item["type"]))
+		if isFunctionOutputItemType(itemType) {
+			if hasTargetIndex && index != targetIndex {
 				continue
 			}
-			cleaned = append(cleaned, rawContent)
+			removed += removeEncryptedContentFields(item)
+			continue
 		}
-		if len(cleaned) != len(output) {
-			item["output"] = cleaned
+		if !hasTargetIndex && itemType == "agent_message" {
+			removed += removeEncryptedAgentMessageContent(item)
 		}
 	}
 	if removed == 0 {
@@ -260,6 +252,75 @@ func removeEncryptedFunctionOutputContent(body []byte, info encryptedContentErro
 		return body, 0
 	}
 	return repaired, removed
+}
+
+func removeEncryptedAgentMessageContent(item map[string]any) int {
+	content, ok := item["content"].([]any)
+	if !ok {
+		return 0
+	}
+
+	plainContent := 0
+	for _, rawContent := range content {
+		contentItem, isObject := rawContent.(map[string]any)
+		if !isObject || strings.TrimSpace(firstNonEmptyAnyString(contentItem["type"])) != "encrypted_content" {
+			plainContent++
+		}
+	}
+	if plainContent == 0 {
+		return 0
+	}
+
+	cleaned := make([]any, 0, plainContent)
+	removed := 0
+	for _, rawContent := range content {
+		contentItem, isObject := rawContent.(map[string]any)
+		if isObject && strings.TrimSpace(firstNonEmptyAnyString(contentItem["type"])) == "encrypted_content" {
+			removed++
+			continue
+		}
+		cleaned = append(cleaned, rawContent)
+	}
+	if removed > 0 {
+		item["content"] = cleaned
+	}
+	return removed
+}
+
+func removeEncryptedContentFields(value any) int {
+	removed := 0
+	switch typed := value.(type) {
+	case []any:
+		for _, child := range typed {
+			removed += removeEncryptedContentFields(child)
+		}
+	case map[string]any:
+		if _, exists := typed["encrypted_content"]; exists {
+			delete(typed, "encrypted_content")
+			removed++
+		}
+		for key, child := range typed {
+			items, ok := child.([]any)
+			if !ok {
+				removed += removeEncryptedContentFields(child)
+				continue
+			}
+			cleaned := make([]any, 0, len(items))
+			for _, item := range items {
+				content, isObject := item.(map[string]any)
+				if isObject && strings.TrimSpace(firstNonEmptyAnyString(content["type"])) == "encrypted_content" {
+					removed++
+					continue
+				}
+				removed += removeEncryptedContentFields(item)
+				cleaned = append(cleaned, item)
+			}
+			if len(cleaned) != len(items) {
+				typed[key] = cleaned
+			}
+		}
+	}
+	return removed
 }
 
 func isInvalidEncryptedFunctionOutputError(info encryptedContentErrorInfo) bool {
@@ -298,12 +359,8 @@ func encryptedContentOutputInputIndex(info encryptedContentErrorInfo) (int, bool
 }
 
 func isFunctionOutputItemType(itemType string) bool {
-	switch itemType {
-	case "function_call_output", "custom_tool_call_output":
-		return true
-	default:
-		return false
-	}
+	_, _, isOutput := responseContextPairType(itemType)
+	return isOutput
 }
 
 func removeTargetedEncryptedReplayItem(body []byte, index int) ([]byte, string, bool) {

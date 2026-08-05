@@ -136,6 +136,7 @@ import AccountDetailSheet from "../components/AccountDetailSheet";
 import AccountFirstTokenStatsView from "../components/AccountFirstTokenStatsView";
 import AccountManualScoreBonusBadge from "../components/AccountManualScoreBonusBadge";
 import AccountQualityEvalBadge from "../components/AccountQualityEvalBadge";
+import { accountSupportsQualityEval } from "../lib/accountCapabilities";
 import CodexInviteView from "../components/CodexInviteView";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
@@ -256,10 +257,6 @@ function getDefaultAccountVisibleColumns(): Record<
   return Object.fromEntries(
     ACCOUNT_TABLE_COLUMNS.map((column) => [column, column !== "tags"]),
   ) as Record<AccountTableColumn, boolean>;
-}
-
-function accountSupportsQualityEval(account: AccountRow): boolean {
-  return account.quality_eval_supported ?? !account.openai_responses_api;
 }
 
 function getInitialAccountVisibleColumns(): Record<
@@ -5978,6 +5975,7 @@ export default function Accounts() {
                           onUsage={() => setUsageAccount(account)}
                           onTest={() => setTestingAccount(account)}
                           onQualityEval={() => void openQualityEval(account)}
+                          onManualScoreBonus={() => openManualScoreBonus(account)}
                           onClone={() => void handleCloneAccount(account)}
                           onRefresh={() => void handleRefresh(account)}
                           onGenerateAuthJson={() =>
@@ -6450,15 +6448,14 @@ export default function Accounts() {
                                     />
                                     <UsingCreditsBadge account={account} />
                                     <AccountStatusCountdown account={account} />
-                                    {(account.manual_score_bonus ?? 0) !== 0 && (
-                                      <AccountManualScoreBonusBadge
-                                        account={account}
-                                        className="h-6"
-                                        onClick={() => {
-                                          openManualScoreBonus(account);
-                                        }}
-                                      />
-                                    )}
+                                    <AccountManualScoreBonusBadge
+                                      account={account}
+                                      className="h-6"
+                                      onClick={() => {
+                                        openManualScoreBonus(account);
+                                      }}
+                                      showEmpty
+                                    />
 	                                    <AccountQualityEvalBadge
 	                                      account={account}
                                         onClick={() => void openQualityEval(account)}
@@ -12978,6 +12975,7 @@ function AccountMobileCard({
   onUsage,
   onTest,
   onQualityEval,
+  onManualScoreBonus,
   onClone,
   onRefresh,
   onGenerateAuthJson,
@@ -13009,6 +13007,7 @@ function AccountMobileCard({
   onUsage: () => void;
   onTest: () => void;
   onQualityEval: () => void;
+  onManualScoreBonus: () => void;
   onClone: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
@@ -13150,6 +13149,10 @@ function AccountMobileCard({
                   status={account.status}
                   detail={getAccountRateLimitWindow(account) ?? undefined}
                   errorMessage={account.error_message}
+                />
+                <AccountManualScoreBonusBadge
+                  account={account}
+                  onClick={onManualScoreBonus}
                 />
                 <AccountQualityEvalBadge
                   account={account}
@@ -13349,6 +13352,12 @@ function AccountMobileCard({
               icon={<BarChart3 className="size-3.5" />}
             />
             <AccountMobileActionButton
+              title={t("accounts.manualScoreBonusTitle")}
+              label={t("accounts.manualScoreBonus")}
+              onClick={onManualScoreBonus}
+              icon={<Coins className="size-3.5" />}
+            />
+            <AccountMobileActionButton
               title={t(accountSupportsQualityEval(account) ? "accounts.qualityEval" : "accounts.qualityEvalUnsupported")}
               label={t("accounts.qualityEvalBadge")}
               disabled={!accountSupportsQualityEval(account)}
@@ -13445,6 +13454,10 @@ function AccountMobileCard({
             </div>
 
           <div className="mt-2 flex min-h-6 min-w-0 flex-wrap items-center gap-1.5">
+            <AccountManualScoreBonusBadge
+              account={account}
+              onClick={onManualScoreBonus}
+            />
             <AccountQualityEvalBadge
               account={account}
               onClick={onQualityEval}
@@ -13595,6 +13608,12 @@ function AccountMobileCard({
           title={t("accounts.usageDetail")}
           onClick={onUsage}
           icon={<BarChart3 className="size-3.5" />}
+        />
+        <AccountMobileActionButton
+          title={t("accounts.manualScoreBonusTitle")}
+          label={t("accounts.manualScoreBonus")}
+          onClick={onManualScoreBonus}
+          icon={<Coins className="size-3.5" />}
         />
         <AccountMobileActionButton
           title={t(accountSupportsQualityEval(account) ? "accounts.qualityEval" : "accounts.qualityEvalUnsupported")}

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -115,28 +116,50 @@ func TestWriteDeferredSSEDataFlushesPendingWithCurrentEvent(t *testing.T) {
 	}
 }
 
-func TestWriteDeferredSSEDataFlushesLargeDeferredEventOnce(t *testing.T) {
+func TestWriteDeferredSSEDataKeepsLargePreContentEventRetryable(t *testing.T) {
 	var buf bytes.Buffer
 	writer := &streamFlushWriter{writer: &buf}
 	var pending bytes.Buffer
-	payload := []byte(strings.Repeat("x", pendingFirstTokenFlushBytes))
+	payload := []byte(strings.Repeat("x", 1024*1024))
 
 	wrote, err := writeDeferredSSEData(writer, &pending, payload, true)
 	if err != nil {
 		t.Fatalf("large deferred event returned error: %v", err)
 	}
-	if !wrote {
-		t.Fatal("large deferred event should force a flush")
+	if wrote || buf.Len() != 0 {
+		t.Fatalf("large pre-content event leaked before retry boundary: wrote=%t bytes=%d", wrote, buf.Len())
 	}
-	want := "data: " + string(payload) + "\n\n"
+
+	content := []byte(`{"type":"response.output_text.delta","delta":"hi"}`)
+	wrote, err = writeDeferredSSEData(writer, &pending, content, false)
+	if err != nil {
+		t.Fatalf("first content event returned error: %v", err)
+	}
+	if !wrote {
+		t.Fatal("first content event should flush the buffered pre-content event")
+	}
+	want := "data: " + string(payload) + "\n\ndata: " + string(content) + "\n\n"
 	if got := buf.String(); got != want {
 		t.Fatalf("unexpected large deferred output length/content: got len=%d want len=%d equal=%v", len(got), len(want), got == want)
 	}
-	if strings.Count(buf.String(), "data: ") != 1 {
-		t.Fatalf("large deferred event should be written once, got %d data frames", strings.Count(buf.String(), "data: "))
-	}
 	if pending.Len() != 0 {
 		t.Fatalf("pending buffer not reset: %d", pending.Len())
+	}
+}
+
+func TestWriteDeferredSSEDataRejectsUnboundedPreContentBuffer(t *testing.T) {
+	var buf bytes.Buffer
+	writer := &streamFlushWriter{writer: &buf}
+	var pending bytes.Buffer
+	pending.Grow(pendingFirstTokenMaxBytes + 1)
+	pending.Write(bytes.Repeat([]byte("x"), pendingFirstTokenMaxBytes))
+
+	wrote, err := writeDeferredSSEData(writer, &pending, []byte("x"), true)
+	if !errors.Is(err, errPendingFirstTokenBufferLimit) {
+		t.Fatalf("error = %v, want %v", err, errPendingFirstTokenBufferLimit)
+	}
+	if wrote || buf.Len() != 0 || pending.Len() != 0 {
+		t.Fatalf("overflow must fail closed without delivery: wrote=%t output=%d pending=%d", wrote, buf.Len(), pending.Len())
 	}
 }
 

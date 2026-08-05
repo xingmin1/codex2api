@@ -595,6 +595,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/grok/oauth/exchange-code", h.ExchangeGrokOAuthCode) // 兼容旧客户端
 	api.PATCH("/accounts/:id/grok", h.UpdateGrokAccount)
 	api.POST("/accounts/:id/oauth/exchange-code", h.UpdateOAuthAccountCode)
+	api.POST("/accounts/:id/clone", h.CloneAccount)
 	api.POST("/accounts/import", h.ImportAccounts)
 	api.POST("/accounts/sub2api/preview", h.PreviewSub2APIAccounts)
 	api.POST("/accounts/sub2api/import", h.ImportFromSub2API)
@@ -604,6 +605,10 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
 	api.PUT("/accounts/:id/manual-score-bonus", h.SetAccountManualScoreBonus)
 	api.DELETE("/accounts/:id/manual-score-bonus", h.ClearAccountManualScoreBonus)
+	api.POST("/accounts/:id/quality-eval", h.RunAccountQualityEval)
+	api.GET("/accounts/:id/quality-eval", h.ListAccountQualityEvals)
+	api.GET("/quality-eval/config", h.GetQualityEvalConfig)
+	api.PUT("/quality-eval/config", h.UpdateQualityEvalConfig)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
 	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
@@ -958,84 +963,118 @@ type accountResponse struct {
 	CreditSkipUsageWindow bool   `json:"credit_skip_usage_window"`
 	// UsingCredits 是与 Status 并列的独立信号：用量窗口已打满但积分顶着，
 	// 状态仍是 active（可调度），前端据此在状态徽章旁并列一个「使用积分」徽章。
-	UsingCredits               bool                        `json:"using_credits,omitempty"`
-	SkipWarmTier               bool                        `json:"skip_warm_tier"`
-	AccountType                string                      `json:"account_type,omitempty"`
-	AccessTokenType            string                      `json:"access_token_type,omitempty"`
-	OpenAIResponsesAPI         bool                        `json:"openai_responses_api,omitempty"`
-	GrokAPI                    bool                        `json:"grok_api,omitempty"`
-	AgentIdentity              bool                        `json:"agent_identity,omitempty"`
-	GrokAuthKind               string                      `json:"grok_auth_kind,omitempty"`
-	GrokPlan                   *auth.GrokPlan              `json:"grok_plan,omitempty"`
-	GrokBilling                json.RawMessage             `json:"grok_billing,omitempty"`
-	GrokRateLimit              *auth.GrokRateLimitSnapshot `json:"grok_rate_limit,omitempty"`
-	GrokFreeQuota              *auth.GrokFreeQuotaSnapshot `json:"grok_free_quota,omitempty"`
-	BaseURL                    string                      `json:"base_url,omitempty"`
-	Models                     []string                    `json:"models,omitempty"`
-	ModelMapping               string                      `json:"model_mapping,omitempty"`
-	CodexClientMetadataMode    string                      `json:"codex_client_metadata_mode,omitempty"`
-	CustomHeaders              map[string]string           `json:"custom_headers,omitempty"`
-	HealthTier                 string                      `json:"health_tier"`
-	SchedulerScore             float64                     `json:"scheduler_score"`
-	DispatchScore              float64                     `json:"dispatch_score"`
-	ScoreBiasOverride          *int64                      `json:"score_bias_override"`
-	ScoreBiasEffective         int64                       `json:"score_bias_effective"`
-	BaseConcurrencyOverride    *int64                      `json:"base_concurrency_override"`
-	BaseConcurrencyEffective   int64                       `json:"base_concurrency_effective"`
-	ConcurrencyCap             int64                       `json:"dynamic_concurrency_limit"`
-	ProxyURL                   string                      `json:"proxy_url"`
-	CreatedAt                  string                      `json:"created_at"`
-	UpdatedAt                  string                      `json:"updated_at"`
-	CodexUsageUpdatedAt        string                      `json:"codex_usage_updated_at,omitempty"`
-	Codex5HUsageUpdatedAt      string                      `json:"codex_5h_usage_updated_at,omitempty"`
-	ActiveRequests             int64                       `json:"active_requests"`
-	TotalRequests              int64                       `json:"total_requests"`
-	LastUsedAt                 string                      `json:"last_used_at"`
-	SuccessRequests            int64                       `json:"success_requests"`
-	ErrorRequests              int64                       `json:"error_requests"`
-	RetryErrorRequests         int64                       `json:"retry_error_requests"`
-	RateLimitAttempts          int64                       `json:"rate_limit_attempts"`
-	UsagePercent7d             *float64                    `json:"usage_percent_7d"`
-	UsagePercent5h             *float64                    `json:"usage_percent_5h"`
-	RateLimitResetCredits      *int                        `json:"rate_limit_reset_credits"`
-	ApplicableResetCredits     *int                        `json:"applicable_reset_credits"`
-	CreditsBalance             *string                     `json:"credits_balance"`
-	CreditsHasCredits          *bool                       `json:"credits_has_credits"`
-	CreditsUnlimited           *bool                       `json:"credits_unlimited"`
-	CreditsOverageLimitReached *bool                       `json:"credits_overage_limit_reached"`
-	AutoPause5hThreshold       *float64                    `json:"auto_pause_5h_threshold"`
-	AutoPause7dThreshold       *float64                    `json:"auto_pause_7d_threshold"`
-	AutoPause5hDisabled        bool                        `json:"auto_pause_5h_disabled"`
-	AutoPause7dDisabled        bool                        `json:"auto_pause_7d_disabled"`
-	UsageLimitOverride         *bool                       `json:"ignore_usage_limit_status_override"`
-	UsageLimitEffective        bool                        `json:"ignore_usage_limit_status_effective"`
-	DispatchCountLimit         *int64                      `json:"dispatch_count_limit"`
-	DispatchCountUsed          int64                       `json:"dispatch_count_used,omitempty"`
-	DispatchCountResetAt       string                      `json:"dispatch_count_reset_at,omitempty"`
-	DispatchCountLimited       bool                        `json:"dispatch_count_limited,omitempty"`
-	SchedulerPriority          *int64                      `json:"scheduler_priority"`
-	Usage5hDetail              *accountUsageWindow         `json:"usage_5h_detail,omitempty"`
-	Usage7dDetail              *accountUsageWindow         `json:"usage_7d_detail,omitempty"`
-	Reset5hAt                  string                      `json:"reset_5h_at,omitempty"`
-	Reset7dAt                  string                      `json:"reset_7d_at,omitempty"`
-	Window7dKind               string                      `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
-	Window7dSeconds            *int64                      `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
-	Billed5h                   *float64                    `json:"billed_5h"`
-	Billed7d                   *float64                    `json:"billed_7d"`
-	ScoreBreakdown             schedulerBreakdownResponse  `json:"scheduler_breakdown"`
-	LastUnauthorizedAt         string                      `json:"last_unauthorized_at,omitempty"`
-	LastRateLimitedAt          string                      `json:"last_rate_limited_at,omitempty"`
-	LastTimeoutAt              string                      `json:"last_timeout_at,omitempty"`
-	LastServerErrorAt          string                      `json:"last_server_error_at,omitempty"`
-	CooldownReason             string                      `json:"cooldown_reason,omitempty"`
-	CooldownUntil              string                      `json:"cooldown_until,omitempty"`
-	ModelCooldowns             []modelCooldownResponse     `json:"model_cooldowns,omitempty"`
-	Enabled                    bool                        `json:"enabled"`
-	Locked                     bool                        `json:"locked"`
-	AllowedAPIKeyIDs           []int64                     `json:"allowed_api_key_ids"`
-	Tags                       []string                    `json:"tags"`
-	GroupIDs                   []int64                     `json:"group_ids"`
-	Note                       string                      `json:"note"`
+	UsingCredits                         bool                             `json:"using_credits,omitempty"`
+	SkipWarmTier                         bool                             `json:"skip_warm_tier"`
+	AccountType                          string                           `json:"account_type,omitempty"`
+	AccessTokenType                      string                           `json:"access_token_type,omitempty"`
+	OpenAIResponsesAPI                   bool                             `json:"openai_responses_api,omitempty"`
+	GrokAPI                              bool                             `json:"grok_api,omitempty"`
+	AgentIdentity                        bool                             `json:"agent_identity,omitempty"`
+	GrokAuthKind                         string                           `json:"grok_auth_kind,omitempty"`
+	GrokPlan                             *auth.GrokPlan                   `json:"grok_plan,omitempty"`
+	GrokBilling                          json.RawMessage                  `json:"grok_billing,omitempty"`
+	GrokRateLimit                        *auth.GrokRateLimitSnapshot      `json:"grok_rate_limit,omitempty"`
+	GrokFreeQuota                        *auth.GrokFreeQuotaSnapshot      `json:"grok_free_quota,omitempty"`
+	BaseURL                              string                           `json:"base_url,omitempty"`
+	Models                               []string                         `json:"models,omitempty"`
+	ModelMapping                         string                           `json:"model_mapping,omitempty"`
+	CodexClientMetadataMode              string                           `json:"codex_client_metadata_mode,omitempty"`
+	CustomHeaders                        map[string]string                `json:"custom_headers,omitempty"`
+	HealthTier                           string                           `json:"health_tier"`
+	SchedulerScore                       float64                          `json:"scheduler_score"`
+	DispatchScore                        float64                          `json:"dispatch_score"`
+	ScoreBiasOverride                    *int64                           `json:"score_bias_override"`
+	ScoreBiasEffective                   int64                            `json:"score_bias_effective"`
+	ManualScoreBonus                     int64                            `json:"manual_score_bonus"`
+	ManualScoreBonusUntil                string                           `json:"manual_score_bonus_until,omitempty"`
+	ManualScoreBonusRemainingSeconds     int64                            `json:"manual_score_bonus_remaining_seconds"`
+	BaseConcurrencyOverride              *int64                           `json:"base_concurrency_override"`
+	BaseConcurrencyEffective             int64                            `json:"base_concurrency_effective"`
+	ConcurrencyCap                       int64                            `json:"dynamic_concurrency_limit"`
+	ProxyURL                             string                           `json:"proxy_url"`
+	CreatedAt                            string                           `json:"created_at"`
+	UpdatedAt                            string                           `json:"updated_at"`
+	CodexUsageUpdatedAt                  string                           `json:"codex_usage_updated_at,omitempty"`
+	Codex5HUsageUpdatedAt                string                           `json:"codex_5h_usage_updated_at,omitempty"`
+	ActiveRequests                       int64                            `json:"active_requests"`
+	TotalRequests                        int64                            `json:"total_requests"`
+	LastUsedAt                           string                           `json:"last_used_at"`
+	SuccessRequests                      int64                            `json:"success_requests"`
+	ErrorRequests                        int64                            `json:"error_requests"`
+	RetryErrorRequests                   int64                            `json:"retry_error_requests"`
+	RateLimitAttempts                    int64                            `json:"rate_limit_attempts"`
+	UsagePercent7d                       *float64                         `json:"usage_percent_7d"`
+	UsagePercent5h                       *float64                         `json:"usage_percent_5h"`
+	RateLimitResetCredits                *int                             `json:"rate_limit_reset_credits"`
+	IgnoreUsageLimit429Cooldown          bool                             `json:"ignore_usage_limit_429_cooldown"`
+	IgnoreUnauthorizedCooldown           bool                             `json:"ignore_unauthorized_cooldown"`
+	EncryptedContentCompat               *bool                            `json:"encrypted_content_compatibility_enabled"`
+	EncryptedContentCompatEffective      bool                             `json:"encrypted_content_compatibility_effective"`
+	FastTierPolicy                       *string                          `json:"fast_tier_policy"`
+	FastTierPolicyEffective              string                           `json:"fast_tier_policy_effective"`
+	FailureScoreThreshold                *int                             `json:"failure_score_threshold,omitempty"`
+	FailureCooldownThreshold             *int                             `json:"failure_cooldown_threshold,omitempty"`
+	FailureToleranceWindowSeconds        *int                             `json:"failure_tolerance_window_seconds,omitempty"`
+	FailureScoreRetroactive              *bool                            `json:"failure_score_retroactive"`
+	FailureScoreThresholdEffective       int                              `json:"failure_score_threshold_effective"`
+	FailureCooldownThresholdEffective    int                              `json:"failure_cooldown_threshold_effective"`
+	FailureToleranceWindowEffective      int                              `json:"failure_tolerance_window_seconds_effective"`
+	FailureScoreRetroactiveEffective     bool                             `json:"failure_score_retroactive_effective"`
+	TransportSameAccountRetries          *int                             `json:"transport_same_account_retries,omitempty"`
+	TransportSameAccountRetriesEffective int                              `json:"transport_same_account_retries_effective"`
+	CompactSameAccountRetries            *int                             `json:"compact_same_account_retries,omitempty"`
+	CompactSameAccountRetriesEffective   int                              `json:"compact_same_account_retries_effective"`
+	FailureWindowCount                   int                              `json:"failure_window_count"`
+	ConsecutiveFailureCount              int                              `json:"consecutive_failure_count"`
+	PriceMultiplier                      *float64                         `json:"price_multiplier,omitempty"`
+	CheapProbeRecoveryMargin             *float64                         `json:"cheap_probe_recovery_margin,omitempty"`
+	CheapProbeBonusDurationMinutes       *int                             `json:"cheap_probe_bonus_duration_minutes,omitempty"`
+	ApplicableResetCredits               *int                             `json:"applicable_reset_credits"`
+	CreditsBalance                       *string                          `json:"credits_balance"`
+	CreditsHasCredits                    *bool                            `json:"credits_has_credits"`
+	CreditsUnlimited                     *bool                            `json:"credits_unlimited"`
+	CreditsOverageLimitReached           *bool                            `json:"credits_overage_limit_reached"`
+	AutoPause5hThreshold                 *float64                         `json:"auto_pause_5h_threshold"`
+	AutoPause7dThreshold                 *float64                         `json:"auto_pause_7d_threshold"`
+	AutoPause5hDisabled                  bool                             `json:"auto_pause_5h_disabled"`
+	AutoPause7dDisabled                  bool                             `json:"auto_pause_7d_disabled"`
+	UsageLimitOverride                   *bool                            `json:"ignore_usage_limit_status_override"`
+	UsageLimitEffective                  bool                             `json:"ignore_usage_limit_status_effective"`
+	DispatchCountLimit                   *int64                           `json:"dispatch_count_limit"`
+	DispatchCountUsed                    int64                            `json:"dispatch_count_used,omitempty"`
+	DispatchCountResetAt                 string                           `json:"dispatch_count_reset_at,omitempty"`
+	DispatchCountLimited                 bool                             `json:"dispatch_count_limited,omitempty"`
+	SchedulerPriority                    *int64                           `json:"scheduler_priority"`
+	Usage5hDetail                        *accountUsageWindow              `json:"usage_5h_detail,omitempty"`
+	Usage7dDetail                        *accountUsageWindow              `json:"usage_7d_detail,omitempty"`
+	Reset5hAt                            string                           `json:"reset_5h_at,omitempty"`
+	Reset7dAt                            string                           `json:"reset_7d_at,omitempty"`
+	Window7dKind                         string                           `json:"usage_window_7d_kind,omitempty"`    // "monthly"(team 月窗)/"weekly"/""；供前端标「30天」而非误标「7天」
+	Window7dSeconds                      *int64                           `json:"usage_window_7d_seconds,omitempty"` // 长窗口真实周期秒数
+	Billed5h                             *float64                         `json:"billed_5h"`
+	Billed7d                             *float64                         `json:"billed_7d"`
+	ScoreBreakdown                       schedulerBreakdownResponse       `json:"scheduler_breakdown"`
+	FirstTokenStats                      *database.AccountFirstTokenStats `json:"first_token_stats,omitempty"`
+	LatestQualityEval                    *database.QualityEvalBatch       `json:"latest_quality_eval,omitempty"`
+	QualityEvalSupported                 bool                             `json:"quality_eval_supported"`
+	LastUnauthorizedAt                   string                           `json:"last_unauthorized_at,omitempty"`
+	LastRateLimitedAt                    string                           `json:"last_rate_limited_at,omitempty"`
+	LastTimeoutAt                        string                           `json:"last_timeout_at,omitempty"`
+	LastServerErrorAt                    string                           `json:"last_server_error_at,omitempty"`
+	LastCheapProbeAt                     string                           `json:"last_cheap_probe_at,omitempty"`
+	LastCheapProbeSuccessAt              string                           `json:"last_cheap_probe_success_at,omitempty"`
+	LastCheapProbeError                  string                           `json:"last_cheap_probe_error,omitempty"`
+	CheapProbeRecoveryBonus              float64                          `json:"cheap_probe_recovery_bonus,omitempty"`
+	CheapProbeBonusUntil                 string                           `json:"cheap_probe_bonus_until,omitempty"`
+	CooldownReason                       string                           `json:"cooldown_reason,omitempty"`
+	CooldownUntil                        string                           `json:"cooldown_until,omitempty"`
+	ModelCooldowns                       []modelCooldownResponse          `json:"model_cooldowns,omitempty"`
+	Enabled                              bool                             `json:"enabled"`
+	Locked                               bool                             `json:"locked"`
+	AllowedAPIKeyIDs                     []int64                          `json:"allowed_api_key_ids"`
+	Tags                                 []string                         `json:"tags"`
+	GroupIDs                             []int64                          `json:"group_ids"`
+	Note                                 string                           `json:"note"`
 	// 图片配额信息
 	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
@@ -1094,6 +1133,7 @@ type schedulerBreakdownResponse struct {
 	UsageUrgencyBonus5h float64 `json:"usage_urgency_bonus_5h"`
 	UsageUrgencyBonus7d float64 `json:"usage_urgency_bonus_7d"`
 	ExpiryUrgencyBonus  float64 `json:"expiry_urgency_bonus"`
+	ManualScoreBonus    float64 `json:"manual_score_bonus"`
 	LatencyPenalty      float64 `json:"latency_penalty"`
 	SuccessRatePenalty  float64 `json:"success_rate_penalty"`
 }
@@ -1132,6 +1172,16 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 	// 获取每账号近 7 天请求统计（带 30 秒内存缓存）
 	reqCounts := h.getCachedRequestCounts()
 	usage5h, usage7d := h.getAccountUsageWindows(ctx)
+	firstTokenStats, statsErr := h.db.GetAccountsFirstTokenStats(ctx, time.Now())
+	if statsErr != nil {
+		log.Printf("批量获取账号首字统计失败: %v", statsErr)
+		firstTokenStats = nil
+	}
+	latestQualityEvals, qualityEvalErr := h.db.GetLatestQualityEvalBatches(ctx)
+	if qualityEvalErr != nil {
+		log.Printf("批量获取账号质量检测摘要失败: %v", qualityEvalErr)
+		latestQualityEvals = nil
+	}
 
 	accounts := make([]accountResponse, 0, len(rows))
 	for _, row := range rows {
@@ -1227,14 +1277,71 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			Codex5HUsageUpdatedAt:    row.GetCredential("codex_5h_usage_updated_at"),
 			UsageLimitOverride:       ignoreUsageLimitStatusOverride,
 			UsageLimitEffective:      ignoreUsageLimitStatusEffective,
+			QualityEvalSupported:     qualityEvalSupportedByModels(isOpenAIResponsesAccount, row.GetCredentialStringSlice("models")),
+		}
+		if stats, ok := firstTokenStats[row.ID]; ok {
+			statsCopy := stats
+			resp.FirstTokenStats = &statsCopy
+		}
+		if latest, ok := latestQualityEvals[row.ID]; ok {
+			latestCopy := latest
+			resp.LatestQualityEval = &latestCopy
+		}
+		if row.ManualScoreBonus != 0 && row.ManualScoreBonusUntil.Valid && time.Now().Before(row.ManualScoreBonusUntil.Time) {
+			resp.ManualScoreBonus = row.ManualScoreBonus
+			resp.ManualScoreBonusUntil = row.ManualScoreBonusUntil.Time.Format(time.RFC3339)
+			resp.ManualScoreBonusRemainingSeconds = max(int64(time.Until(row.ManualScoreBonusUntil.Time).Seconds()), 0)
 		}
 		resp.AutoPause5hThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_5h_threshold")
 		resp.AutoPause7dThreshold = accountQuotaAutoPauseThreshold(row, "auto_pause_7d_threshold")
 		resp.AutoPause5hDisabled = row.GetCredentialBool("auto_pause_5h_disabled")
 		resp.AutoPause7dDisabled = row.GetCredentialBool("auto_pause_7d_disabled")
 		resp.DispatchCountLimit = accountDispatchCountLimit(row)
+		resp.IgnoreUsageLimit429Cooldown = row.GetCredentialBool("ignore_usage_limit_429_cooldown")
+		resp.IgnoreUnauthorizedCooldown = row.GetCredentialBool("ignore_unauthorized_cooldown")
+		resp.EncryptedContentCompat = row.GetCredentialOptionalBool("encrypted_content_compatibility_enabled")
+		resp.EncryptedContentCompatEffective = h.store.EncryptedContentCompatibilityEnabled()
+		if resp.EncryptedContentCompat != nil {
+			resp.EncryptedContentCompatEffective = *resp.EncryptedContentCompat
+		}
+		resp.FastTierPolicyEffective = h.store.GetFastTierPolicy()
+		if policy, ok := database.ParseFastTierPolicy(row.GetCredential("fast_tier_policy")); ok {
+			resp.FastTierPolicy = &policy
+			resp.FastTierPolicyEffective = policy
+		}
+		resp.FailureScoreThreshold = accountFailureThreshold(row, "failure_score_threshold")
+		resp.FailureCooldownThreshold = accountFailureThreshold(row, "failure_cooldown_threshold")
+		resp.FailureToleranceWindowSeconds = accountFailureThreshold(row, "failure_tolerance_window_seconds")
+		resp.FailureScoreRetroactive = row.GetCredentialOptionalBool("failure_score_retroactive")
+		resp.TransportSameAccountRetries = accountTransportSameAccountRetries(row)
+		resp.TransportSameAccountRetriesEffective = h.store.GetTransportSameAccountRetries()
+		if resp.TransportSameAccountRetries != nil {
+			resp.TransportSameAccountRetriesEffective = *resp.TransportSameAccountRetries
+		}
+		resp.CompactSameAccountRetries = accountCompactSameAccountRetries(row)
+		resp.CompactSameAccountRetriesEffective = h.store.GetCompactSameAccountRetries()
+		if resp.CompactSameAccountRetries != nil {
+			resp.CompactSameAccountRetriesEffective = *resp.CompactSameAccountRetries
+		}
+		if resp.OpenAIResponsesAPI && resp.IgnoreUsageLimit429Cooldown {
+			resp.FailureScoreThresholdEffective = h.store.GetFailureScoreThreshold()
+			resp.FailureCooldownThresholdEffective = 1
+			resp.FailureToleranceWindowEffective = h.store.GetFailureToleranceWindowSeconds()
+			resp.FailureScoreRetroactiveEffective = h.store.GetFailureScoreRetroactive()
+			if resp.FailureScoreRetroactive != nil {
+				resp.FailureScoreRetroactiveEffective = *resp.FailureScoreRetroactive
+			}
+		} else {
+			resp.FailureScoreThresholdEffective = 1
+			resp.FailureCooldownThresholdEffective = 1
+			resp.FailureToleranceWindowEffective = h.store.GetFailureToleranceWindowSeconds()
+		}
+		resp.PriceMultiplier = accountPriceMultiplier(row)
+		resp.CheapProbeRecoveryMargin = accountCheapProbeRecoveryMargin(row)
+		resp.CheapProbeBonusDurationMinutes = accountCheapProbeBonusDurationMinutes(row)
 		resp.SchedulerPriority = accountSchedulerPriority(row)
 		if acc, ok := accountMap[row.ID]; ok {
+			resp.QualityEvalSupported = qualityEvalSupportedByAccount(acc)
 			resp.UsageLimitOverride = acc.GetIgnoreUsageLimitStatusOverride()
 			resp.UsageLimitEffective = acc.IgnoresUsageLimitStatus()
 			if isGrokAccount {
@@ -1245,6 +1352,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 					resp.GrokFreeQuota = &snap
 				}
 			}
+			resp.EncryptedContentCompat, resp.EncryptedContentCompatEffective = acc.EncryptedContentCompatibilityConfig()
+			resp.FastTierPolicy, resp.FastTierPolicyEffective = acc.FastTierPolicyConfig()
 			acc.Mu().RLock()
 			resp.GroupIDs = append([]int64(nil), acc.GroupIDs...)
 			acc.Mu().RUnlock()
@@ -1274,8 +1383,17 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				UsageUrgencyBonus5h: debug.Breakdown.UsageUrgencyBonus5h,
 				UsageUrgencyBonus7d: debug.Breakdown.UsageUrgencyBonus7d,
 				ExpiryUrgencyBonus:  debug.Breakdown.ExpiryUrgencyBonus,
+				ManualScoreBonus:    debug.Breakdown.ManualScoreBonus,
 				LatencyPenalty:      debug.Breakdown.LatencyPenalty,
 				SuccessRatePenalty:  debug.Breakdown.SuccessRatePenalty,
+			}
+			resp.ManualScoreBonus = debug.ManualScoreBonus
+			if debug.ManualScoreBonus != 0 && !debug.ManualScoreBonusUntil.IsZero() {
+				resp.ManualScoreBonusUntil = debug.ManualScoreBonusUntil.Format(time.RFC3339)
+				resp.ManualScoreBonusRemainingSeconds = max(int64(time.Until(debug.ManualScoreBonusUntil).Seconds()), 0)
+			} else {
+				resp.ManualScoreBonusUntil = ""
+				resp.ManualScoreBonusRemainingSeconds = 0
 			}
 			if usagePct, ok := acc.GetUsagePercent7d(); ok {
 				resp.UsagePercent7d = &usagePct
@@ -1303,6 +1421,40 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 				if !snapshot.ResetAt.IsZero() {
 					resp.DispatchCountResetAt = snapshot.ResetAt.Format(time.RFC3339)
 				}
+			}
+			resp.PriceMultiplier = accountPriceMultiplier(row)
+			_, scoreOverride, cooldownOverride, windowOverride, scoreEffective, cooldownEffective, windowEffective, failures := acc.FailureToleranceSnapshot()
+			resp.FailureScoreThreshold = optionalPositiveIntPointer(scoreOverride)
+			resp.FailureCooldownThreshold = optionalPositiveIntPointer(cooldownOverride)
+			resp.FailureToleranceWindowSeconds = optionalPositiveIntPointer(windowOverride)
+			resp.FailureScoreRetroactive, resp.FailureScoreRetroactiveEffective = acc.FailureScoreRetroactiveSnapshot()
+			resp.FailureScoreThresholdEffective = scoreEffective
+			resp.FailureCooldownThresholdEffective = cooldownEffective
+			resp.FailureToleranceWindowEffective = windowEffective
+			resp.FailureWindowCount = failures
+			resp.ConsecutiveFailureCount = failures
+			resp.TransportSameAccountRetries, resp.TransportSameAccountRetriesEffective = acc.TransportSameAccountRetriesConfig(h.store.GetTransportSameAccountRetries())
+			resp.CompactSameAccountRetries, resp.CompactSameAccountRetriesEffective = acc.CompactSameAccountRetriesConfig(h.store.GetCompactSameAccountRetries())
+			if margin, duration := acc.CheapProbeConfigSnapshot(); margin > 0 || duration > 0 {
+				resp.CheapProbeRecoveryMargin = normalizePositiveFloatPointer(margin)
+				if duration > 0 {
+					minutes := int(duration / time.Minute)
+					resp.CheapProbeBonusDurationMinutes = &minutes
+				} else {
+					resp.CheapProbeBonusDurationMinutes = nil
+				}
+			}
+			_, lastCheapProbeAt, lastCheapProbeSuccessAt, lastCheapProbeError, cheapProbeRecoveryBonus, cheapProbeBonusUntil := acc.CheapProbeRuntimeSnapshot()
+			if !lastCheapProbeAt.IsZero() {
+				resp.LastCheapProbeAt = lastCheapProbeAt.Format(time.RFC3339)
+			}
+			if !lastCheapProbeSuccessAt.IsZero() {
+				resp.LastCheapProbeSuccessAt = lastCheapProbeSuccessAt.Format(time.RFC3339)
+			}
+			resp.LastCheapProbeError = lastCheapProbeError
+			resp.CheapProbeRecoveryBonus = cheapProbeRecoveryBonus
+			if !cheapProbeBonusUntil.IsZero() {
+				resp.CheapProbeBonusUntil = cheapProbeBonusUntil.Format(time.RFC3339)
 			}
 			if t := acc.GetReset5hAt(); !t.IsZero() {
 				resp.Reset5hAt = t.Format(time.RFC3339)
@@ -2598,6 +2750,99 @@ func optionalBoolPtr(value database.OptionalBool) *bool {
 	return &v
 }
 
+func accountPriceMultiplier(row *database.AccountRow) *float64 {
+	if row == nil {
+		return nil
+	}
+	value, ok := row.GetCredentialFloat64("price_multiplier")
+	if ok && value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0) {
+		return &value
+	}
+	if inferred, ok := auth.ParsePriceMultiplierFromName(row.Name); ok {
+		return &inferred
+	}
+	return nil
+}
+
+func accountCheapProbeRecoveryMargin(row *database.AccountRow) *float64 {
+	if row == nil {
+		return nil
+	}
+	value, ok := row.GetCredentialFloat64("cheap_probe_recovery_margin")
+	if !ok {
+		return nil
+	}
+	return normalizePositiveFloatPointer(value)
+}
+
+func accountFailureThreshold(row *database.AccountRow, key string) *int {
+	if row == nil {
+		return nil
+	}
+	value, ok := row.GetCredentialInt64(key)
+	if !ok || value <= 0 {
+		return nil
+	}
+	if value > 1000 {
+		value = 1000
+	}
+	threshold := int(value)
+	return &threshold
+}
+
+func accountTransportSameAccountRetries(row *database.AccountRow) *int {
+	if row == nil {
+		return nil
+	}
+	value, ok := row.GetCredentialInt64("transport_same_account_retries")
+	if !ok {
+		return nil
+	}
+	retries := database.NormalizeTransportSameAccountRetries(int(value))
+	return &retries
+}
+
+func accountCompactSameAccountRetries(row *database.AccountRow) *int {
+	if row == nil {
+		return nil
+	}
+	value, ok := row.GetCredentialInt64("compact_same_account_retries")
+	if !ok {
+		return nil
+	}
+	retries := database.NormalizeTransportSameAccountRetries(int(value))
+	return &retries
+}
+
+func optionalPositiveIntPointer(value int) *int {
+	if value <= 0 {
+		return nil
+	}
+	return &value
+}
+
+func accountCheapProbeBonusDurationMinutes(row *database.AccountRow) *int {
+	if row == nil {
+		return nil
+	}
+	value, ok := row.GetCredentialInt64("cheap_probe_bonus_duration_minutes")
+	if !ok || value <= 0 {
+		return nil
+	}
+	if value > 1440 {
+		value = 1440
+	}
+	minutes := int(value)
+	return &minutes
+}
+
+func normalizePositiveFloatPointer(value float64) *float64 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return nil
+	}
+	return &value
+}
+
 func effectiveScoreBias(planType string, override sql.NullInt64) int64 {
 	if override.Valid {
 		return override.Int64
@@ -3682,6 +3927,61 @@ func (h *Handler) UpdateOpenAIResponsesAccount(c *gin.Context) {
 	h.db.InsertAccountEventAsync(id, "updated", "manual_openai_responses")
 
 	writeMessage(c, http.StatusOK, "OpenAI Responses API 账号设置已更新")
+}
+
+type cloneAccountReq struct {
+	Name string `json:"name"`
+}
+
+// CloneAccount 复制一个账号的凭据与用户配置，生成新的 active 账号。
+func (h *Handler) CloneAccount(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	var req cloneAccountReq
+	decoder := json.NewDecoder(c.Request.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	req.Name = security.SanitizeInput(req.Name)
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	newID, err := h.db.CloneAccount(ctx, id, database.CloneAccountOptions{Name: req.Name})
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(c, http.StatusNotFound, "账号不存在")
+			return
+		}
+		writeError(c, http.StatusInternalServerError, "复制账号失败: "+err.Error())
+		return
+	}
+	h.db.InsertAccountEventAsync(newID, "added", "manual_clone")
+	if h.store != nil {
+		if err := h.store.LoadAccountByID(ctx, newID); err != nil {
+			log.Printf("复制账号 %d 后热加载失败: %v", newID, err)
+		}
+	}
+
+	security.SecurityAuditLog("ACCOUNT_CLONED", fmt.Sprintf("source_id=%d new_id=%d ip=%s", id, newID, c.ClientIP()))
+	c.JSON(http.StatusOK, gin.H{
+		"message": "账号已复制",
+		"id":      newID,
+	})
 }
 
 func fetchOpenAIResponsesModelIDs(ctx context.Context, baseURL, apiKey, proxyURL string) ([]string, error) {

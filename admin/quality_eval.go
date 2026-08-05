@@ -552,7 +552,19 @@ func qualityEvalSupportedByAccount(account *auth.Account) bool {
 	if account == nil {
 		return false
 	}
-	return !account.IsOpenAIResponsesAPI() || account.SupportsOpenAIResponsesModel(qualityEvalModel)
+	return qualityEvalSupportedByModels(account.IsOpenAIResponsesAPI(), account.OpenAIResponsesModels())
+}
+
+func qualityEvalSupportedByModels(isOpenAIResponsesAccount bool, models []string) bool {
+	if !isOpenAIResponsesAccount {
+		return true
+	}
+	for _, model := range models {
+		if strings.EqualFold(strings.TrimSpace(model), qualityEvalModel) {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) executeQualityEvalBatch(ctx context.Context, account *auth.Account, batch database.QualityEvalBatch, onSample func(database.QualityEvalSample), onTaskStart func(string, int)) database.QualityEvalBatch {

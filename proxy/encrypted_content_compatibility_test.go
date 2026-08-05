@@ -186,6 +186,98 @@ func TestOfficialSSEResponseFailedFunctionOutputRepairUsesDerivedBadRequestStatu
 	}
 }
 
+func TestOfficialSSEResponseFailedRemovesTopLevelFunctionOutputEncryptedContent(t *testing.T) {
+	body := []byte(`{"input":[
+		{"type":"function_call_output","call_id":"call-1","output":"keep output","encrypted_content":"drop"},
+		{"type":"compaction","encrypted_content":"keep-compaction"},
+		{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"keep-agent"}]}
+	]}`)
+	failure := []byte(`{"type":"response.failed","response":{"status":"failed","error":{
+		"status_code":400,
+		"code":"invalid_encrypted_content",
+		"message":"Encrypted function output content could not be decrypted or decoded."
+	}}}`)
+
+	got, report := repairResponsesEncryptedContentForError(body, responseFailedStatusCode(failure), failure)
+
+	if !report.Handled || !report.Changed || report.Strategy != "function-output" || report.Removed != 1 {
+		t.Fatalf("report = %+v, want top-level function output repair", report)
+	}
+	if gjson.GetBytes(got, "input.0.encrypted_content").Exists() {
+		t.Fatalf("top-level function output encrypted_content was not removed: %s", got)
+	}
+	if gjson.GetBytes(got, "input.0.output").String() != "keep output" || gjson.GetBytes(got, "input.0.call_id").String() != "call-1" {
+		t.Fatalf("function output payload changed during repair: %s", got)
+	}
+	if gjson.GetBytes(got, "input.1.encrypted_content").String() != "keep-compaction" || gjson.GetBytes(got, "input.2.content.0.encrypted_content").String() != "keep-agent" {
+		t.Fatalf("protected encrypted state was changed: %s", got)
+	}
+}
+
+func TestOfficialSSEResponseFailedRepairsAgentMessageFunctionOutputFallback(t *testing.T) {
+	body := []byte(`{"input":[
+		{"type":"reasoning","encrypted_content":"drop-reasoning"},
+		{"type":"agent_message","content":[
+			{"type":"input_text","text":"keep agent output"},
+			{"type":"encrypted_content","encrypted_content":"drop-agent"}
+		]},
+		{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"keep-protected"}]},
+		{"type":"compaction","encrypted_content":"keep-compaction"}
+	]}`)
+	failure := []byte(`{"type":"response.failed","response":{"status":"failed","error":{
+		"status_code":400,
+		"code":"invalid_encrypted_content",
+		"message":"Encrypted function output content could not be decrypted or decoded."
+	}}}`)
+
+	got, report := repairResponsesEncryptedContentForError(body, responseFailedStatusCode(failure), failure)
+
+	if !report.Changed || report.Strategy != "function-output" || report.Removed != 1 {
+		t.Fatalf("report = %+v, want one agent message encrypted attachment removed", report)
+	}
+	if gjson.GetBytes(got, "input.1.content.#").Int() != 1 || gjson.GetBytes(got, "input.1.content.0.text").String() != "keep agent output" {
+		t.Fatalf("agent message plaintext was not preserved: %s", got)
+	}
+	if gjson.GetBytes(got, "input.2.content.0.encrypted_content").String() != "keep-protected" {
+		t.Fatalf("pure encrypted agent message must remain protected: %s", got)
+	}
+	if gjson.GetBytes(got, "input.0.encrypted_content").String() != "drop-reasoning" || gjson.GetBytes(got, "input.3.encrypted_content").String() != "keep-compaction" {
+		t.Fatalf("function-output fallback changed unrelated encrypted state: %s", got)
+	}
+}
+
+func TestOfficialSSEResponseFailedRepairsAllCallOutputDialectsAndNestedContent(t *testing.T) {
+	body := []byte(`{"input":[
+		{"type":"tool_call_output","call_id":"call-1","output":{"content":[{"type":"input_text","text":"keep"},{"type":"encrypted_content","encrypted_content":"drop-item"}],"metadata":{"encrypted_content":"drop-field"}}},
+		{"type":"mcp_tool_call_output","call_id":"call-2","output":{"encrypted_content":"drop-mcp","text":"keep-mcp"}},
+		{"type":"compaction","encrypted_content":"keep-compaction"},
+		{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"keep-agent"}]}
+	]}`)
+	failure := []byte(`{"type":"response.failed","response":{"status":"failed","error":{
+		"status_code":400,
+		"code":"invalid_encrypted_content",
+		"message":"Encrypted function output content could not be decrypted or decoded."
+	}}}`)
+
+	got, report := repairResponsesEncryptedContentForError(body, responseFailedStatusCode(failure), failure)
+
+	if !report.Changed || report.Strategy != "function-output" || report.Removed != 3 {
+		t.Fatalf("report = %+v, want three encrypted function output values removed", report)
+	}
+	if gjson.GetBytes(got, "input.0.output.content.#").Int() != 1 || gjson.GetBytes(got, "input.0.output.content.0.text").String() != "keep" {
+		t.Fatalf("tool output content was not repaired safely: %s", got)
+	}
+	if gjson.GetBytes(got, "input.0.output.metadata.encrypted_content").Exists() || gjson.GetBytes(got, "input.1.output.encrypted_content").Exists() {
+		t.Fatalf("nested encrypted fields remain in call outputs: %s", got)
+	}
+	if gjson.GetBytes(got, "input.1.output.text").String() != "keep-mcp" {
+		t.Fatalf("ordinary MCP output changed during repair: %s", got)
+	}
+	if gjson.GetBytes(got, "input.2.encrypted_content").String() != "keep-compaction" || gjson.GetBytes(got, "input.3.content.0.encrypted_content").String() != "keep-agent" {
+		t.Fatalf("protected encrypted state was changed: %s", got)
+	}
+}
+
 func TestRepairResponsesEncryptedContentForErrorRecognizesFunctionOutputFromParamOnly(t *testing.T) {
 	body := []byte(`{"input":[
 		{"type":"message","role":"user","content":"keep"},

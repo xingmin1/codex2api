@@ -131,42 +131,52 @@ func TestValidateRemoteCompactionV2ResponseJSON(t *testing.T) {
 	}
 }
 
-func TestResponsesRelayRetriesInvalidNativeCompactionOnAnotherAccount(t *testing.T) {
+func TestNativeCompactionAccountFilterDoesNotApplyNegativeCacheToRelay(t *testing.T) {
+	handler := &Handler{}
+	model := "gpt-5.4"
+	relay := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://relay.example.com",
+		APIKey:       "relay-key",
+	}
+	codex := &auth.Account{DBID: 2, AccessToken: "at-codex"}
+	handler.rememberNativeCompactionUnsupported(relay.ID(), model)
+	handler.rememberNativeCompactionUnsupported(codex.ID(), model)
+
+	filter := handler.nativeCompactionAccountFilter(model, nil)
+	if !filter(relay) {
+		t.Fatal("relay account must ignore native compaction negative cache")
+	}
+	if filter(codex) {
+		t.Fatal("Codex account must honor native compaction negative cache")
+	}
+}
+
+func TestResponsesRelayPassesThroughCompactionSummaryDialect(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	badCalls := &atomic.Int32{}
-	badUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		badCalls.Add(1)
+	relayCalls := &atomic.Int32{}
+	relayUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		relayCalls.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = io.WriteString(w,
-			`data: {"type":"response.created","response":{"id":"resp_bad"}}`+"\n\n"+
-				`data: {"type":"response.completed","response":{"id":"resp_bad","status":"completed","output":[],"usage":{"input_tokens":30,"output_tokens":8,"total_tokens":38}}}`+"\n\n",
+			`data: {"type":"response.created","response":{"id":"resp_relay"}}`+"\n\n"+
+				`data: {"type":"response.output_item.done","item":{"type":"compaction_summary","encrypted_content":"accepted"}}`+"\n\n"+
+				`data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"input_text","text":"summary"}]}}`+"\n\n"+
+				`data: {"type":"response.completed","response":{"id":"resp_relay","status":"completed","output":[{"type":"compaction_summary","encrypted_content":"accepted"},{"type":"message","role":"assistant","content":[{"type":"input_text","text":"summary"}]}],"usage":{"input_tokens":30,"output_tokens":8,"total_tokens":38}}}`+"\n\n",
 		)
 	}))
-	defer badUpstream.Close()
-
-	goodCalls := &atomic.Int32{}
-	goodUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		goodCalls.Add(1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w,
-			`data: {"type":"response.created","response":{"id":"resp_good"}}`+"\n\n"+
-				`data: {"type":"response.output_item.done","item":{"type":"compaction","encrypted_content":"accepted"}}`+"\n\n"+
-				`data: {"type":"response.completed","response":{"id":"resp_good","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}`+"\n\n",
-		)
-	}))
-	defer goodUpstream.Close()
+	defer relayUpstream.Close()
 
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
 	t.Cleanup(store.Stop)
-	badAccount := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: badUpstream.URL, APIKey: "bad", Models: []string{"gpt-5.4"}}
-	goodAccount := &auth.Account{DBID: 2, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: goodUpstream.URL, APIKey: "good", Models: []string{"gpt-5.4"}}
-	store.AddAccount(badAccount)
-	store.AddAccount(goodAccount)
+	relayAccount := &auth.Account{DBID: 1, UpstreamType: auth.UpstreamOpenAIResponses, BaseURL: relayUpstream.URL, APIKey: "relay", Models: []string{"gpt-5.4"}}
+	store.AddAccount(relayAccount)
 
 	handler := NewHandler(store, nil, &config.Config{AllowAnonymousV1: true}, nil)
-	const sessionID = "native-compact-relay"
-	store.BindSessionAffinity(sessionAffinityKey(sessionID, 0), badAccount, "")
+	const sessionID = "relay-compact-summary"
+	store.BindSessionAffinity(sessionAffinityKey(sessionID, 0), relayAccount, "")
 
 	doRequest := func() *httptest.ResponseRecorder {
 		body := []byte(`{"model":"gpt-5.4","stream":true,"input":[{"role":"user","content":"compact"},{"type":"compaction_trigger"}]}`)
@@ -184,20 +194,20 @@ func TestResponsesRelayRetriesInvalidNativeCompactionOnAnotherAccount(t *testing
 	if first.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200; body=%s", first.Code, first.Body.String())
 	}
-	if strings.Contains(first.Body.String(), "resp_bad") || !strings.Contains(first.Body.String(), "accepted") {
-		t.Fatalf("invalid attempt leaked or valid compaction missing: %s", first.Body.String())
+	if !strings.Contains(first.Body.String(), `"type":"compaction_summary"`) || !strings.Contains(first.Body.String(), `"type":"message"`) {
+		t.Fatalf("relay compaction dialect missing from response: %s", first.Body.String())
 	}
-	if badCalls.Load() != 1 || goodCalls.Load() != 1 {
-		t.Fatalf("upstream calls bad=%d good=%d, want 1/1", badCalls.Load(), goodCalls.Load())
+	if relayCalls.Load() != 1 {
+		t.Fatalf("relay calls = %d, want 1", relayCalls.Load())
 	}
 
-	store.BindSessionAffinity(sessionAffinityKey(sessionID, 0), badAccount, "")
+	store.BindSessionAffinity(sessionAffinityKey(sessionID, 0), relayAccount, "")
 	second := doRequest()
-	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), "accepted") {
+	if second.Code != http.StatusOK || !strings.Contains(second.Body.String(), `"type":"compaction_summary"`) {
 		t.Fatalf("second response status=%d body=%s", second.Code, second.Body.String())
 	}
-	if badCalls.Load() != 1 {
-		t.Fatalf("temporarily unsupported relay was called again, calls=%d", badCalls.Load())
+	if relayCalls.Load() != 2 {
+		t.Fatalf("relay calls = %d, want 2; account may have been incorrectly filtered", relayCalls.Load())
 	}
 }
 

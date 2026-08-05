@@ -292,6 +292,6 @@ func (h *Handler) nativeCompactionAccountFilter(model string, base auth.AccountF
 		if base != nil && !base(account) {
 			return false
 		}
-		return account != nil && h.supportsNativeCompaction(account.ID(), model)
+		return account != nil && (account.IsRelayStyle() || h.supportsNativeCompaction(account.ID(), model))
 	}
 }

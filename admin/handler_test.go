@@ -539,6 +539,25 @@ func TestBatchRefreshAccountsStreamsProgress(t *testing.T) {
 	}
 }
 
+func TestCloneAccountRouteRemainsReachable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 1})
+	t.Cleanup(store.Stop)
+	tokenCache := cache.NewMemory(1)
+	t.Cleanup(func() { _ = tokenCache.Close() })
+	handler := NewHandler(store, db, tokenCache, nil, "")
+	router := gin.New()
+	handler.RegisterRoutes(router)
+
+	for _, route := range router.Routes() {
+		if route.Method == http.MethodPost && route.Path == "/api/admin/accounts/:id/clone" {
+			return
+		}
+	}
+	t.Fatal("账号克隆路由未注册")
+}
+
 func TestResetAccountStatusSyncsPlanMetadata(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -2865,6 +2884,67 @@ func TestExportAccountsSkipsAccountsWithoutCredentials(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Fatalf("got %d entries, want 0 (account has no credentials)", len(entries))
+	}
+}
+
+func TestListAccountsRestoresQualityEvalAndManualScoreFields(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	accountID, err := db.InsertOpenAIResponsesAccount(ctx, "relay-account", map[string]interface{}{
+		"upstream_type": auth.UpstreamOpenAIResponses,
+		"base_url":      "https://relay.example.com",
+		"api_key":       "relay-key",
+		"models":        []string{qualityEvalModel},
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount 返回错误: %v", err)
+	}
+	bonusUntil := time.Now().Add(30 * time.Minute)
+	if err := db.UpdateAccountManualScoreBonus(ctx, accountID, 40, bonusUntil); err != nil {
+		t.Fatalf("UpdateAccountManualScoreBonus 返回错误: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: qualityEvalModel})
+	t.Cleanup(store.Stop)
+	store.SetLazyMode(true)
+	store.AddAccount(&auth.Account{
+		DBID:                  accountID,
+		Status:                auth.StatusReady,
+		UpstreamType:          auth.UpstreamOpenAIResponses,
+		BaseURL:               "https://relay.example.com",
+		APIKey:                "relay-key",
+		Models:                []string{qualityEvalModel},
+		ManualScoreBonus:      40,
+		ManualScoreBonusUntil: bonusUntil,
+	})
+	handler := &Handler{db: db, store: store}
+
+	recorder := httptest.NewRecorder()
+	ginCtx, _ := gin.CreateTestContext(recorder)
+	ginCtx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts", nil)
+	handler.ListAccounts(ginCtx)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", recorder.Code, recorder.Body.String())
+	}
+	var payload accountsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("解析账号列表返回错误: %v", err)
+	}
+	if len(payload.Accounts) != 1 {
+		t.Fatalf("accounts len = %d, want 1", len(payload.Accounts))
+	}
+	account := payload.Accounts[0]
+	if !account.QualityEvalSupported || len(account.Models) != 1 || account.Models[0] != qualityEvalModel {
+		t.Fatalf("质量检测能力未完整序列化: %#v", account)
+	}
+	if account.ManualScoreBonus != 40 || account.ManualScoreBonusUntil == "" || account.ManualScoreBonusRemainingSeconds <= 0 {
+		t.Fatalf("临时调度分未完整序列化: %#v", account)
+	}
+	if account.ScoreBreakdown.ManualScoreBonus != 40 {
+		t.Fatalf("调度分解未包含临时调度分: %#v", account.ScoreBreakdown)
 	}
 }
 

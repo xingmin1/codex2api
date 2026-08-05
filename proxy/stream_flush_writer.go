@@ -13,13 +13,14 @@ import (
 )
 
 const (
-	pendingFirstTokenFlushBytes   = 1024 * 1024
+	pendingFirstTokenMaxBytes     = 64 * 1024 * 1024
 	completionBufferedSSEMaxBytes = 64 * 1024 * 1024
 )
 
 var (
 	sseDataPrefix                    = []byte("data: ")
 	sseDataSuffix                    = []byte("\n\n")
+	errPendingFirstTokenBufferLimit  = errors.New("pre-content SSE events exceeded the retry-safe buffer limit")
 	errRemoteCompactionV2BufferLimit = errors.New("remote compaction v2 response exceeded the completion buffer limit")
 )
 
@@ -81,9 +82,11 @@ func writeDeferredSSEData(streamWriter *streamFlushWriter, pending *bytes.Buffer
 	}
 	if shouldDefer {
 		appendSSEData(pending, data)
-		if pending != nil && pending.Len() <= pendingFirstTokenFlushBytes {
-			return false, nil
+		if pending != nil && pending.Len() > pendingFirstTokenMaxBytes {
+			pending.Reset()
+			return false, errPendingFirstTokenBufferLimit
 		}
+		return false, nil
 	}
 	if pending != nil && pending.Len() > 0 {
 		if !shouldDefer {

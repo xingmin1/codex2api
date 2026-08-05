@@ -1,5 +1,27 @@
 # Changelog
 
+## v2.7.0-xmin.2 - 2026-08-12
+
+### Features
+
+- **完善账号运维能力。** 账号列表与详情恢复 fork 自有的调度、失败容忍、首字统计、质量检测和手动加分投影，并支持复制账号；Responses API 账号仅在显式提供 `gpt-5.6-sol` 时开放质量检测。
+- **统一 Compact V2 中转协议。** `compaction_trigger` 继续留在普通 `/responses`，保留原始路径、流式语义和历史项；Responses API 中转可返回客户端兼容的 `compaction_summary` 与 `message`，Grok 账号仍被排除。
+
+### Fixes
+
+- **修复 Chat Completions 超窗恢复。** HTTP 400 与首包前 SSE `response.failed(context_length_exceeded)` 现在都会执行一次既有的旧轮次压缩并重试，不改变客户端的 372k 上下文配置。
+- **修复首包前失败重复命中同一账号。** 非首字超时的透明重试会硬排除当前失败账号，避免同一个中转账号连续消耗全部重试预算；首字超时仍保留软排除语义。
+- **增强中转 `encrypted_content` 兼容。** 精确清理函数输出和混合 `agent_message` 中不可接受的密文，同时保护纯密文历史，避免误删可继续使用的上下文。
+- **保持首包前 SSE 可恢复。** 生命周期、结构和元数据事件在可见输出前统一留在有界缓冲区，避免提前提交 200 后失去真实错误码、换号或超窗压缩能力。
+
+### Security
+
+- **升级前端传递依赖。** 更新 React Router、PostCSS 与 nanoid，修复当前 npm 高危公告；发布审计门禁恢复为零未处理漏洞。
+
+### Tests
+
+- **补充跨协议回归。** 覆盖 Chat HTTP/SSE 超窗压缩、失败账号轮换、Compact V2 中转输出、密文修复、质量检测能力与前端账号能力判断，并通过 Go、前端和 Nix 发布检查。
+
 ## v2.7.0-xmin.1 - 2026-08-05
 
 ### Features

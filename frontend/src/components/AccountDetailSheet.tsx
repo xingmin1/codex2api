@@ -25,6 +25,7 @@ import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
 import AccountFirstTokenStatsView from "./AccountFirstTokenStatsView";
 import AccountHealthBar from "./AccountHealthBar";
 import AccountManualScoreBonusBadge from "./AccountManualScoreBonusBadge";
+import { accountSupportsQualityEval } from "../lib/accountCapabilities";
 import ChannelLogo from "./ChannelLogo";
 import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
@@ -256,7 +257,7 @@ export default function AccountDetailSheet({
   );
   const resetCredits = account?.rate_limit_reset_credits ?? 0;
   const qualityEvalSupported = Boolean(
-    account && (account.quality_eval_supported ?? !account.openai_responses_api),
+    account && accountSupportsQualityEval(account),
   );
   const healthLabel = (() => {
     switch (account?.health_tier) {

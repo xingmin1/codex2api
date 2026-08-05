@@ -13,18 +13,7 @@ import { spawnSync } from "node:child_process";
  * 已评估的例外:GHSA id → 理由(含复查时间)。
  * 加入前先确认该漏洞的触发路径在本项目里不存在,而不是"暂时没人利用"。
  */
-const ALLOWLIST = new Map([
-  [
-    "GHSA-qwww-vcr4-c8h2",
-    // React Router: RSC Mode CSRF Bypass(react-router >=7.12.0 <8.3.0)。
-    // 仅 RSC(React Server Components)模式下的 server action 可被绕过前置校验;
-    // 本项目是 Vite 构建的纯客户端 SPA,用 BrowserRouter,没有 RSC/SSR 入口,
-    // 也没有 server action,触发路径不存在。修复版 8.3.0 属 major 迁移
-    // (react-router-dom 无 8.x,需改 12 处导入 + 升 React + 构建 node 20→22),
-    // 另行安排。复查:2026-10 或 react-router 发布 7.x 补丁版时。
-    "RSC-only;本项目为纯 SPA,无 RSC/SSR 入口。复查:2026-10",
-  ],
-]);
+const ALLOWLIST = new Map();
 
 const BLOCKING_SEVERITIES = new Set(["high", "critical"]);
 

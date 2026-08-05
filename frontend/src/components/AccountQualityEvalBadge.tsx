@@ -2,6 +2,7 @@ import { useTranslation } from 'react-i18next'
 import { FlaskConical } from 'lucide-react'
 import type { AccountRow, QualityEvalStatus } from '../types'
 import { cn } from '@/lib/utils'
+import { accountSupportsQualityEval } from '../lib/accountCapabilities'
 
 const statusClasses: Record<QualityEvalStatus, string> = {
   running: 'bg-blue-500/10 text-blue-700 ring-blue-500/20 dark:text-blue-300',
@@ -20,7 +21,7 @@ interface AccountQualityEvalBadgeProps {
 export default function AccountQualityEvalBadge({ account, className, onClick }: AccountQualityEvalBadgeProps) {
   const { t } = useTranslation()
   const batch = account.latest_quality_eval
-  const supported = account.quality_eval_supported ?? !account.openai_responses_api
+  const supported = accountSupportsQualityEval(account)
   const statusLabel = batch
     ? t(`accounts.qualityEvalStatus.${batch.status}`, { defaultValue: batch.status })
     : ''
