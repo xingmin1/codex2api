@@ -61,6 +61,62 @@ func TestShouldMarkBatchTestAccountError(t *testing.T) {
 	}
 }
 
+func TestBatchOperationHTTPStatus(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		status  string
+		message string
+		want    int
+	}{
+		{name: "success", status: "success", message: "测试通过", want: http.StatusOK},
+		{name: "upstream chinese", status: "failed", message: "上游返回 402: workspace deactivated", want: http.StatusPaymentRequired},
+		{name: "http prefix", status: "failed", message: "HTTP 500: upstream failed", want: http.StatusInternalServerError},
+		{name: "embedded status", status: "failed", message: "token endpoint returned status 401", want: http.StatusUnauthorized},
+		{name: "status code", status: "failed", message: "token endpoint returned status code 403", want: http.StatusForbidden},
+		{name: "status equals", status: "failed", message: "OAuth refresh failed (status=429)", want: http.StatusTooManyRequests},
+		{name: "application error", status: "failed", message: "response.failed: model unavailable", want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := batchOperationHTTPStatus(tt.status, tt.message); got != tt.want {
+				t.Fatalf("batchOperationHTTPStatus(%q, %q) = %d, want %d", tt.status, tt.message, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEmitBatchTestProgressIncludesStructuredResult(t *testing.T) {
+	var completed, success, failed, banned, rateLimited int64
+	atomic.StoreInt64(&failed, 1)
+	atomic.StoreInt64(&rateLimited, 1)
+
+	var got batchOperationEvent
+	handler := &Handler{}
+	handler.emitBatchTestProgress(
+		func(event batchOperationEvent) {
+			got = event
+		},
+		42,
+		3,
+		&completed,
+		&success,
+		&failed,
+		&banned,
+		&rateLimited,
+		"rate_limited",
+		"上游返回 429: 账号触发限流",
+	)
+
+	if got.Type != "progress" || got.Action != "batch_test" {
+		t.Fatalf("event type/action = %q/%q, want progress/batch_test", got.Type, got.Action)
+	}
+	if got.AccountID != 42 || got.Status != "rate_limited" || got.HTTPStatus != http.StatusTooManyRequests {
+		t.Fatalf("event account/status/http = %d/%q/%d, want 42/rate_limited/429", got.AccountID, got.Status, got.HTTPStatus)
+	}
+	if got.Current != 1 || got.Total != 3 || got.Failed != 1 || got.RateLimited != 1 {
+		t.Fatalf("event counters = current:%d total:%d failed:%d rate_limited:%d", got.Current, got.Total, got.Failed, got.RateLimited)
+	}
+}
+
 func TestResolveBatchTestAccountsDefaultsToAllAccounts(t *testing.T) {
 	store := auth.NewStore(nil, nil, nil)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "token-1", Status: auth.StatusReady})
@@ -397,5 +453,46 @@ func TestRunSingleBatchTestUnauthorizedKeepsRelayStateReady(t *testing.T) {
 	account.Mu().RUnlock()
 	if errorMsg != "" {
 		t.Fatalf("ErrorMsg = %q, want empty relay state", errorMsg)
+	}
+}
+
+// TestRunSingleBatchTestDeletedAgentRuntimeMarksBanned 验证批量测试会将 runtime 已删除的账号标记为封禁。
+func TestRunSingleBatchTestDeletedAgentRuntimeMarksBanned(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"Agent runtime has been deleted.","type":null,"code":"biscuit_baker_service_agent_error_status","param":null},"status":403}`))
+	}))
+	defer server.Close()
+
+	store := auth.NewStore(nil, nil, nil)
+	account := &auth.Account{
+		DBID:         1,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      server.URL,
+		APIKey:       "test-key",
+		Models:       []string{"gpt-4o-mini"},
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	status, msg := handler.runSingleBatchTest(context.Background(), account)
+	if status != "banned" {
+		t.Fatalf("status = %q, message = %q, want banned", status, msg)
+	}
+	if got := account.RuntimeStatus(); got != "unauthorized" {
+		t.Fatalf("RuntimeStatus() = %q, want unauthorized", got)
+	}
+	_, cooldownUntil := account.GetCooldownSnapshot()
+	if remaining := time.Until(cooldownUntil); remaining < 23*time.Hour+59*time.Minute || remaining > 24*time.Hour {
+		t.Fatalf("cooldown remaining = %s, want approximately 24h", remaining)
+	}
+	account.Mu().RLock()
+	errorMsg := account.ErrorMsg
+	account.Mu().RUnlock()
+	if !strings.Contains(errorMsg, "Agent runtime has been deleted") {
+		t.Fatalf("ErrorMsg = %q, want deleted runtime message", errorMsg)
 	}
 }

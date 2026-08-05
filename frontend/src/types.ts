@@ -10,12 +10,22 @@ export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refresh
 export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
 export type FastTierPolicy = 'preserve' | 'force_fast' | 'filter_fast'
 
+export interface StatsChannelCounts {
+  total: number
+  available: number
+  rate_limited: number
+  error: number
+  today_requests: number
+}
+
 export interface StatsResponse {
   total: number
   available: number
   rate_limited: number
   error: number
   today_requests: number
+  // 按上游渠道(codex/grok)拆分的账号与今日请求计数
+  channels?: Record<string, StatsChannelCounts>
 }
 
 export interface AccountUsageWindow {
@@ -113,6 +123,51 @@ export interface QualityEvalConfig {
   auto_skip_reason?: string
 }
 
+export interface GrokProductUsage {
+  product: string
+  usage_percent?: number | null
+}
+
+// Grok billing 完整额度视图（后端 grok_billing_detail 凭据透出）。
+export interface GrokBillingDetail {
+  plan?: string
+  weekly_percent?: number | null
+  weekly_period_start?: string
+  weekly_period_end?: string
+  product_usage?: GrokProductUsage[]
+  on_demand_cap_cents?: number | null
+  on_demand_used_cents?: number | null
+  monthly_limit_cents?: number | null
+  monthly_used_cents?: number | null
+  monthly_percent?: number | null
+  monthly_period_start?: string
+  monthly_period_end?: string
+  updated_at?: string
+}
+
+export interface GrokRateLimitSnapshot {
+  limit_tokens?: number
+  remaining_tokens?: number
+  limit_requests?: number
+  remaining_requests?: number
+  updated_at?: string
+}
+
+// 免费额度耗尽时从上游 429 错误体解析的权威用量(滚动 24h 窗口)。
+export interface GrokFreeQuotaSnapshot {
+  used_tokens: number
+  limit_tokens: number
+  model?: string
+  exhausted_at: string
+}
+
+export interface GrokPlanInfo {
+  key: string
+  display: string
+  paid: boolean
+  billing: boolean
+}
+
 export interface AccountRow {
   id: number
   name: string
@@ -127,6 +182,14 @@ export interface AccountRow {
   access_token_type?: string
   account_type?: string
   openai_responses_api?: boolean
+  grok_api?: boolean
+  agent_identity?: boolean
+  grok_auth_kind?: string
+  grok_plan?: GrokPlanInfo
+  grok_billing?: GrokBillingDetail
+  // 上游逐请求返回的配额余量(x-ratelimit-* 头),运行时快照
+  grok_rate_limit?: GrokRateLimitSnapshot
+  grok_free_quota?: GrokFreeQuotaSnapshot
   base_url?: string
   models?: string[]
   model_mapping?: string
@@ -146,6 +209,8 @@ export interface AccountRow {
   dynamic_concurrency_limit?: number
   allowed_api_key_ids?: number[]
   tags?: string[]
+  // 通用备注;自助提交的账号会带上「自助提交联系人: ...」这类说明。
+  note?: string
   group_ids?: number[]
   scheduler_breakdown?: {
     unauthorized_penalty: number
@@ -181,6 +246,11 @@ export interface AccountRow {
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
   rate_limit_reset_credits?: number | null
+  applicable_reset_credits?: number | null
+  credits_balance?: string | null
+  credits_has_credits?: boolean | null
+  credits_unlimited?: boolean | null
+  credits_overage_limit_reached?: boolean | null
   auto_pause_5h_threshold?: number | null
   auto_pause_7d_threshold?: number | null
   auto_pause_5h_disabled?: boolean
@@ -245,6 +315,9 @@ export interface AccountRow {
   locked?: boolean
   credit_enabled?: boolean
   credit_skip_usage_window?: boolean
+  // using_credits 与 status 并列：用量窗口已打满但积分顶着，status 仍是 active
+  // （确实可调度），这个标记只用于在状态徽章旁并列一个「使用积分」徽章。
+  using_credits?: boolean
   // 图片配额信息
   image_quota_remaining?: number
   image_quota_total?: number
@@ -290,9 +363,17 @@ export interface InviteResult {
   ok: boolean
   status_code: number
   request_id?: string
-  referral_key: string
+  program_id: string
+  entrypoint: string
   emails: string[]
   invites?: InviteItem[]
+  // upstream_message 是上游 detail 里的原因（如「此人已收到推荐邀请」），
+  // failed_emails 是被拒的收件人。收件人级被拒与账号资格无关，别报成「账号无资格」。
+  upstream_message?: string
+  failed_emails?: string[]
+  // challenged 为真表示被 Cloudflare 挑战拦下，不是上游的业务结论。
+  // 此时 status_code（通常 403）不能解读成「无资格」，应提示重试。
+  challenged?: boolean
   upstream?: unknown
   upstream_raw?: string
 }
@@ -300,6 +381,85 @@ export interface InviteResult {
 export interface InviteResponse {
   ok: boolean
   result: InviteResult
+}
+
+// InviteGrant 是一条奖励条目（邀请人 / 受邀人各一条）。
+export interface InviteGrant {
+  recipient?: string
+  grant_type?: string
+  amount?: number
+  reward_id?: string
+}
+
+// InviteTimeFrameRule 是一条配额规则。capacity_type 区分两种独立上限：
+// send 是发送次数、reward 是能拿到奖励的次数（后者通常远小于前者）。
+export interface InviteTimeFrameRule {
+  invites_sent: number
+  invites_total: number
+  time_frame?: string
+  type?: string
+  capacity_type?: string
+}
+
+// InviteEligibility 是 GET /api/accounts/:id/invite/eligibility 的 result。
+// remaining_* 缺失表示上游没给这个字段，与「明确为 0」不同，不要当成配额用尽。
+export interface InviteEligibility {
+  ok: boolean
+  status_code: number
+  request_id?: string
+  should_show: boolean
+  ineligible_reason?: string
+  ineligible_reason_code?: string
+  program_id?: string
+  entrypoint?: string
+  offer_id?: string
+  grants?: InviteGrant[]
+  remaining_send_capacity?: number
+  remaining_reward_capacity?: number
+  title?: string
+  description?: string
+  rules?: string[]
+  time_frame_rules?: InviteTimeFrameRule[]
+  requires_explicit_confirmation?: boolean
+  upstream_message?: string
+  challenged?: boolean
+  upstream?: unknown
+  upstream_raw?: string
+}
+
+export interface InviteEligibilityResponse {
+  ok: boolean
+  result: InviteEligibility
+}
+
+// InviteTrackingItem 是一条已发邀请记录。
+export interface InviteTrackingItem {
+  referral_id?: string
+  email?: string
+  status?: string
+  can_resend?: boolean
+  invite_url?: string
+  resend_available_at?: string
+  grants?: InviteGrant[]
+  created_at?: string
+  expires_at?: string
+}
+
+export interface InviteTracking {
+  ok: boolean
+  status_code: number
+  request_id?: string
+  items: InviteTrackingItem[]
+  cursor?: string
+  upstream_message?: string
+  challenged?: boolean
+  upstream?: unknown
+  upstream_raw?: string
+}
+
+export interface InviteTrackingResponse {
+  ok: boolean
+  result: InviteTracking
 }
 
 export interface RecycleBinAccountRow {
@@ -327,6 +487,8 @@ export interface AddAccountRequest {
   proxy_url: string
   allow_duplicate?: boolean
   custom_headers?: Record<string, string> | null
+  /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
+  group_ids?: number[]
 }
 
 export interface AddATAccountRequest {
@@ -335,6 +497,41 @@ export interface AddATAccountRequest {
   proxy_url: string
   allow_duplicate?: boolean
   custom_headers?: Record<string, string> | null
+  /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
+  group_ids?: number[]
+}
+
+// Codex Agent Identity auth.json 导入（auth_mode=agentIdentity，动态签名，不存 AT/RT）。
+export interface ImportAgentIdentityRequest {
+  name?: string
+  auth_json: string
+  proxy_url?: string
+}
+
+export interface ImportAgentIdentityResponse {
+  message: string
+  id: number
+  email?: string
+}
+
+// Agent Identity auth.json 文件批量导入(每项一个文件的原始 JSON 内容)。
+export interface AgentIdentityBatchImportRequest {
+  files: string[]
+  proxy_url?: string
+}
+
+export interface AgentIdentityImportItem {
+  email?: string
+  id?: number
+  ok: boolean
+  error?: string
+}
+
+export interface AgentIdentityBatchImportResponse {
+  total: number
+  imported: number
+  failed: number
+  items: AgentIdentityImportItem[]
 }
 
 export interface AddOpenAIResponsesAccountRequest {
@@ -373,6 +570,105 @@ export interface FetchOpenAIResponsesModelsResponse {
 
 export interface CloneAccountRequest {
   name?: string
+}
+
+export type GrokAuthKind = 'oauth' | 'api_key'
+
+export interface AddGrokAccountRequest {
+  name?: string
+  auth_kind: GrokAuthKind
+  auth_json?: string
+  api_key?: string
+  base_url?: string
+  models?: string[]
+  model_mapping?: string
+  proxy_url?: string
+  /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
+  group_ids?: number[]
+}
+
+export type UpdateGrokAccountRequest = AddGrokAccountRequest
+
+export interface FetchGrokModelsResponse {
+  models: string[]
+}
+
+// Grok Device Code OAuth（与 CLIProxyAPI / Grok CLI 一致）。
+export interface GrokDeviceStartRequest {
+  proxy_url?: string
+  name?: string
+  base_url?: string
+  models?: string[]
+}
+
+export interface GrokDeviceStartResponse {
+  session_id: string
+  user_code: string
+  verification_uri?: string
+  verification_uri_complete?: string
+  verification_url: string
+  expires_in: number
+  interval: number
+}
+
+export interface GrokDevicePollRequest {
+  session_id: string
+  proxy_url?: string
+  name?: string
+}
+
+export interface GrokDevicePollResponse {
+  status: 'pending' | 'authorized' | string
+  slow_down?: boolean
+  interval?: number
+  user_code?: string
+  expires_at?: string
+  message?: string
+  id?: number
+  email?: string
+}
+
+// Grok Web SSO 批量导入：用 sso token 自动换成 Build(OAuth) 账号。
+export interface GrokSSOImportRequest {
+  tokens: string
+  base_url?: string
+  models?: string[]
+  proxy_url?: string
+  /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
+  group_ids?: number[]
+}
+
+export interface GrokSSOImportItem {
+  name?: string
+  email?: string
+  id?: number
+  ok: boolean
+  error?: string
+}
+
+export interface GrokSSOImportResponse {
+  total: number
+  imported: number
+  failed: number
+  items: GrokSSOImportItem[]
+}
+
+// Grok 凭据文件批量导入（CPA.json / auth.json）：每项是一个文件的原始 JSON 内容。
+export interface GrokBatchImportRequest {
+  files: string[]
+  base_url?: string
+  models?: string[]
+  proxy_url?: string
+  /** 添加/导入时直接绑定的账号分组；命中已存在账号时不改其分组。 */
+  group_ids?: number[]
+}
+
+// 结果结构与 SSO 导入一致，复用 GrokSSOImportItem。
+export interface GrokBatchImportResponse {
+  total: number
+  imported: number
+  failed: number
+  items: GrokSSOImportItem[]
 }
 
 export interface UpdateAccountSchedulerRequest {
@@ -471,6 +767,16 @@ export interface AccountUsageDayStat {
   user_billed: number
 }
 
+export interface AccountKeyStat {
+  api_key_id: number
+  api_key_name: string
+  api_key_masked: string
+  requests: number
+  tokens: number
+  account_billed: number
+  user_billed: number
+}
+
 export interface AccountUsageDetail {
   period_days: number
   active_days: number
@@ -503,6 +809,7 @@ export interface AccountUsageDetail {
   highest_request_day?: AccountUsageDayStat
   history: AccountUsageDayStat[]
   models: AccountModelStat[]
+  by_api_key: AccountKeyStat[]
 }
 
 export interface MessageResponse {
@@ -586,6 +893,42 @@ export interface OpsOverviewResponse {
     used_bytes: number
     total_bytes: number
     process_bytes: number
+    heap_alloc_bytes?: number
+    heap_inuse_bytes?: number
+    heap_released_bytes?: number
+    num_gc?: number
+  }
+  response_cache?: {
+    effective_config: {
+      generation: number
+      local_max_bytes: number
+      local_max_entry_bytes: number
+      reconstruct_max_bytes: number
+    }
+    applied_config: {
+      generation: number
+      local_max_bytes: number
+      local_max_entry_bytes: number
+      reconstruct_max_bytes: number
+    }
+    entries: number
+    max_entries: number
+    current_bytes: number
+    max_bytes: number
+    high_water_bytes: number
+    largest_entry_bytes: number
+    local_hits: number
+    local_misses: number
+    remote_hits: number
+    remote_misses: number
+    expirations: number
+    count_evictions: number
+    byte_evictions: number
+    oversize_bypasses: number
+    oversize_rejections: number
+    known_unavailable_errors: number
+    last_config_sync_at: ISODateString | ''
+    last_config_sync_error: string
   }
   runtime: {
     goroutines: number
@@ -686,6 +1029,8 @@ export interface RuntimeStatusResponse {
     flush_interval_seconds: number
     buffer_length: number
     buffer_capacity: number
+    buffer_limit?: number
+    dropped_total?: number
   }
   probes: {
     status: RuntimeHealthStatus
@@ -728,6 +1073,13 @@ export interface RuntimeStatusResponse {
     configured: boolean
   }
   checks: RuntimeCheck[]
+}
+
+export interface PromptFilterPatternQuarantine {
+  index: number
+  name: string
+  code: string
+  message: string
 }
 
 export interface SystemSettings {
@@ -775,18 +1127,37 @@ export interface SystemSettings {
   auto_clean_full_usage: boolean
   auto_clean_error: boolean
   auto_clean_expired: boolean
+  auto_reset_credits_enabled: boolean
+  auto_reset_credits_before_expiry_min: number
   proxy_pool_enabled: boolean
   fast_scheduler_enabled: boolean
   codex_force_websocket: boolean
+  codex_ws_weak_network_mode: boolean
   codex_ws_keepalive_enabled: boolean
   codex_ws_keepalive_interval_sec: number
   codex_ws_hide_upstream_errors: boolean
   codex_ws_silent_retry_enabled: boolean
   codex_ws_silent_max_retries: number
+  codex_ws_size_router_enabled: boolean
+  codex_ws_busy_acquire_max_wait_sec: number
+  codex_ws_busy_overflow_enabled: boolean
+  codex_ws_busy_patience_sec: number
   codex_continue_thinking_enabled: boolean
+  overflow_auto_compact_enabled: boolean
+  codex_preflight_sse_passthrough_enabled: boolean
   codex_continue_max_rounds: number
+  utls_shutdown_timeout_minutes: number
   scheduler_mode: string
   affinity_mode?: string
+  grok_affinity_mode?: string
+  grok_probe_enabled?: boolean
+  grok_probe_interval_minutes?: number
+  grok_max_rate_limit_retries?: number
+  grok_oauth_client_id?: string
+  /** 环境变量 GROK_OAUTH_CLIENT_ID 是否正压着上面的设置（只读，后端下发）。 */
+  grok_oauth_client_id_env_override?: boolean
+  /** 实际生效的 client_id（只读，后端下发）。 */
+  grok_oauth_client_id_effective?: string
   max_retries: number
   max_rate_limit_retries: number
   retry_interval_ms: number
@@ -806,9 +1177,14 @@ export interface SystemSettings {
   database_label: string
   cache_driver: string
   cache_label: string
+  response_cache_local_max_bytes: number
+  response_cache_local_max_entry_bytes: number
+  response_cache_reconstruct_max_bytes: number
+  readonly response_cache_config_generation: number
   expired_cleaned?: number
   model_mapping: string
   codex_model_mapping: string
+  payload_rules: string
   reasoning_effort_models: string
   resin_url: string
   resin_platform_name: string
@@ -816,10 +1192,14 @@ export interface SystemSettings {
   prompt_filter_mode: 'monitor' | 'warn' | 'block' | string
   prompt_filter_threshold: number
   prompt_filter_strict_threshold: number
+  prompt_filter_strict_terminal_enabled: boolean
+  prompt_filter_advanced_config: string
   prompt_filter_log_matches: boolean
   prompt_filter_max_text_length: number
   prompt_filter_sensitive_words: string
   prompt_filter_custom_patterns: string
+  prompt_filter_custom_patterns_expected?: string
+  prompt_filter_pattern_quarantines?: PromptFilterPatternQuarantine[]
   prompt_filter_disabled_patterns: string
   prompt_filter_review_enabled: boolean
   prompt_filter_review_api_key?: string
@@ -842,9 +1222,12 @@ export interface SystemSettings {
   stream_flush_interval_ms: number
   first_token_mode: 'strict' | 'loose' | string
   first_token_timeout_seconds: number
+  first_token_excludes_ws_acquire: boolean
   billing_tier_policy: 'actual' | 'requested' | string
   show_full_usage_numbers: boolean
   public_key_usage_page_enabled: boolean
+  public_image_studio_page_enabled: boolean
+  public_account_portal_page_enabled: boolean
   image_storage_backend: 'local' | 's3' | string
   image_s3_endpoint: string
   image_s3_region: string
@@ -893,6 +1276,7 @@ export interface PromptFilterMatch {
   weight: number
   category?: string
   strict?: boolean
+  signal_only?: boolean
 }
 
 export interface PromptFilterVerdict {
@@ -918,12 +1302,20 @@ export interface PromptFilterLog {
   created_at: ISODateString
   source: string
   endpoint: string
+  protocol?: string
+  provider?: string
   model: string
   action: string
   mode: string
   score: number
+  audit_score?: number
   threshold: number
+  policy_profile?: string
+  reason_code?: string
+  primary_origin?: string
+  strike_eligible?: boolean
   matched_patterns: string
+  match_context?: string
   text_preview: string
   full_text: string
   api_key_id: number
@@ -933,7 +1325,22 @@ export interface PromptFilterLog {
   error_code: string
   review_model: string
   review_flagged: boolean
-  review_error: string
+	review_error: string
+	reviewed: boolean
+	review_confidence: number | null
+	review_threshold: number | null
+	review_reason: string
+	review_endpoint: string
+	review_request_mode: string
+	review_latency_ms: number | null
+	request_correlation_id?: string
+	newapi_policy_status?: string
+	newapi_platform?: string
+  newapi_user_id?: string
+  newapi_request_id?: string
+  newapi_decision_id?: string
+  session_hash?: string
+  client_ip_hash?: string
 }
 
 export interface PromptFilterLogsResponse {
@@ -943,13 +1350,528 @@ export interface PromptFilterLogsResponse {
   page_size: number
 }
 
+export type PromptPolicyEvaluationState = 'completed' | 'not_run' | 'unavailable' | 'legacy_unknown'
+export type PromptPolicyLocalOutcome = 'no_hit' | 'audit_hit' | 'warn' | 'block'
+export type PromptPolicyLocalComparison = 'confirmed_miss' | 'upstream_only' | 'evidence_unavailable' | 'local_detected' | 'not_comparable' | 'legacy_unknown'
+
+export interface PromptPolicyIncident {
+	id: number
+	incident_id: string
+	request_correlation_id?: string
+	created_at: ISODateString
+	attempt_index: number
+	transport: string
+	endpoint: string
+	protocol: string
+	provider: string
+	model: string
+	status_code: number
+	account_id: number
+	account_name: string
+	account_platform: string
+	account_group_ids: number[]
+	account_group_names: string[]
+	api_key_id: number
+	api_key_name: string
+	api_key_masked: string
+	api_key_allowed_group_ids: number[]
+	api_key_allowed_group_names: string[]
+	routing_snapshot_state: 'event_snapshot' | 'current_inferred' | 'unavailable'
+	platform: string
+	newapi_policy_status?: string
+	newapi_platform?: string
+	newapi_user_id?: string
+	newapi_request_id?: string
+	session_hash?: string
+	client_ip_hash?: string
+	source_ref?: string
+	upstream_error_code: string
+	upstream_error: string
+	local_evaluation_state: PromptPolicyEvaluationState
+	local_outcome: PromptPolicyLocalOutcome
+	local_action: string
+	local_score: number | null
+	local_raw_score: number | null
+	local_audit_score: number | null
+	local_audit_raw_score: number | null
+	local_threshold: number
+	local_mode: string
+	local_policy_profile: string
+	local_reason_code: string
+	local_reason: string
+	local_primary_origin: string
+	local_strike_eligible: boolean
+	local_review_model: string
+	local_review_flagged: boolean
+	local_review_error: string
+	local_matched_patterns: string
+	prompt_fingerprint: string
+	prompt_preview: string
+	prompt_text: string
+	prompt_available: boolean
+	local_comparison: PromptPolicyLocalComparison
+	candidate_id?: number
+	candidate_evidence_id?: number
+	local_miss: boolean
+}
+
+export interface PromptPolicyIncidentsResponse {
+	incidents: PromptPolicyIncident[]
+	total: number
+	page: number
+	page_size: number
+}
+
+export interface PromptPolicyIncidentDetailResponse {
+	incident: PromptPolicyIncident
+	matches: PromptFilterMatch[]
+	candidate?: {
+		id: number
+		status: string
+		kind: string
+		name: string
+		category: string
+		evidence_count: number
+		sample_preview?: string
+	}
+	evidence?: {
+		id: number
+		source_kind: string
+		source_ref?: string
+		prompt_policy_incident_id?: string
+		observed_at: ISODateString
+	}
+}
+
+export type PromptRiskSubjectType = 'newapi_user' | 'session' | 'api_key' | 'client_ip' | 'upstream_account'
+export type PromptRiskLevel = 'low' | 'observed' | 'elevated' | 'high' | 'critical'
+
+export interface PromptRiskScoreBreakdown {
+  local_signal: number
+  upstream_signal: number
+  recurrence: number
+  identity_confidence: number
+}
+
+export type PromptRiskTrustStatus = 'active' | 'suspended' | 'revoked' | 'expired'
+
+export interface PromptRiskTrustPolicy {
+  id: number
+  subject_type: PromptRiskSubjectType
+  subject_key: string
+  status: PromptRiskTrustStatus | string
+  source: 'manual' | 'automatic' | string
+  reason?: string
+  risk_threshold: number
+  valid_until: ISODateString
+  last_evaluated_at?: ISODateString
+  last_risk_score: number
+  last_risk_level?: PromptRiskLevel | string
+  bypass_count: number
+  last_bypass_at?: ISODateString
+  model_review_count: number
+  last_model_review_at?: ISODateString
+  created_at: ISODateString
+  updated_at: ISODateString
+}
+
+export interface PromptRiskTrustEvent {
+  id: number
+  policy_id: number
+  subject_type: PromptRiskSubjectType
+  subject_key: string
+  event_type: string
+  reason?: string
+  risk_score: number
+  risk_level?: PromptRiskLevel | string
+  request_id_hash?: string
+  created_at: ISODateString
+}
+
+export interface PromptRiskAdaptiveReviewBasis {
+  enabled: boolean
+  review_enabled: boolean
+  eligible: boolean
+  decision: 'disabled' | 'not_person' | 'adaptive_active' | 'suspended' | 'eligible' | 'building_history' | 'unavailable' | string
+  clean_review_count: number
+  positive_evidence_count: number
+  min_clean_reviews: number
+  min_observation_hours: number
+  observation_hours: number
+  sample_percent: number
+  force_review_interval_minutes: number
+  trust_duration_hours: number
+  risk_threshold: number
+  first_clean_at?: ISODateString
+  last_clean_at?: ISODateString
+  next_forced_review_at?: ISODateString
+  force_review_due: boolean
+}
+
+export interface PromptRiskProfile {
+  subject_type: PromptRiskSubjectType
+  subject_key: string
+  subject_display: string
+  platform?: string
+  newapi_user_id?: string
+  newapi_user_name?: string
+  newapi_user_email?: string
+  newapi_user_group?: string
+  is_person: boolean
+  identity_confidence: number
+  risk_score: number
+  risk_level: PromptRiskLevel
+  recommended_actions: string[]
+  score_breakdown: PromptRiskScoreBreakdown
+  has_activity: boolean
+  identity_source?: string
+  identity_updated_at?: ISODateString
+  latest_at: ISODateString
+  event_count: number
+  events_10m: number
+  events_24h: number
+  events_7d: number
+  events_30d: number
+  upstream_cy_count: number
+  confirmed_miss_count: number
+  local_block_count: number
+  local_warn_count: number
+  distinct_fingerprints: number
+  repeated_fingerprints: number
+  api_key_id?: number
+  api_key_name?: string
+  api_key_masked?: string
+  account_id?: number
+  account_name?: string
+  trust_policy?: PromptRiskTrustPolicy
+  conversation_lock?: PromptConversationLock
+}
+
+export interface PromptConversationLock {
+  id: number
+  lock_key: string
+  status: 'active' | 'unlocked'
+  platform: string
+  newapi_user_id: string
+  session_fingerprint: string
+  session_hash: string
+  incident_id?: string
+  decision_id: string
+  request_id?: string
+  reason_code: string
+  endpoint?: string
+  model?: string
+  trigger_count: number
+  unlock_count: number
+  locked_at: ISODateString
+  unlocked_at?: ISODateString
+  unlock_reason?: string
+  created_at: ISODateString
+  updated_at: ISODateString
+}
+
+export interface PromptRiskEvent {
+  id: number
+  created_at: ISODateString
+  source_type: string
+  source_id: string
+  incident_id?: string
+  prompt_filter_log_id?: number
+  request_correlation_id?: string
+  subject_type: PromptRiskSubjectType
+  subject_key: string
+  subject_display: string
+  platform?: string
+  newapi_user_id?: string
+  newapi_user_name?: string
+  newapi_user_email?: string
+  newapi_user_group?: string
+  is_person: boolean
+  identity_confidence: number
+  event_kind: string
+  request_risk_score: number
+  evidence_confidence: number
+  reason_code?: string
+  action?: string
+  local_outcome?: string
+  local_comparison?: string
+  endpoint?: string
+  model?: string
+  prompt_fingerprint?: string
+  prompt_preview?: string
+  api_key_id?: number
+  api_key_name?: string
+  api_key_masked?: string
+  account_id?: number
+  account_name?: string
+}
+
+export interface PromptRiskProfilesResponse {
+  profiles: PromptRiskProfile[]
+  total: number
+  page: number
+  page_size: number
+  scoring_version: string
+  guardrail: string
+}
+
+export interface PromptRiskProfileDetailResponse {
+  profile: PromptRiskProfile
+  events: PromptRiskEvent[]
+  trust_events: PromptRiskTrustEvent[]
+  adaptive_review_basis: PromptRiskAdaptiveReviewBasis
+  event_total: number
+  event_page: number
+  event_page_size: number
+  trust_event_total: number
+  trust_event_page: number
+  trust_event_page_size: number
+  scoring_version: string
+  guardrail: string
+}
+
 export interface PromptFilterTestResponse {
   verdict: PromptFilterVerdict
+  decision?: PromptGuardDecision
+  protocol?: string
+  provider?: string
+  endpoint?: string
+  model?: string
+}
+
+export interface PromptReviewTestRequest {
+  text: string
+  api_key?: string
+  base_url: string
+  model: string
+  request_mode: 'moderations' | 'chat_completions' | string
+  system_prompt: string
+  user_prompt_template: string
+  payload_template: string
+  confidence_threshold: number
+  moderation_thresholds: Record<string, number>
+  timeout_seconds: number
+  max_concurrent: number
+  max_text_length: number
+  test_all_keys?: boolean
+}
+
+export interface PromptReviewKeyTestResult {
+  key_index: number
+  ok: boolean
+  endpoint?: string
+  model?: string
+  flagged: boolean
+  confidence: number
+  reason?: string
+  highest_category?: string
+  decision_category?: string
+  decision_score?: number
+  decision_threshold?: number
+  category_scores?: Record<string, number>
+  moderation_thresholds?: Record<string, number>
+  latency_ms: number
+  error?: string
+}
+
+export interface PromptReviewTestResponse {
+  ok: boolean
+  endpoint: string
+  model: string
+  flagged: boolean
+  confidence: number
+  confidence_threshold: number
+  reason?: string
+  highest_category?: string
+  decision_category?: string
+  decision_score?: number
+  decision_threshold?: number
+  category_scores?: Record<string, number>
+  moderation_thresholds?: Record<string, number>
+  latency_ms: number
+  key_count?: number
+  results?: PromptReviewKeyTestResult[]
 }
 
 export interface PromptFilterRulePatternTestResponse {
   matched: boolean
   error?: string
+}
+
+export type PromptGuardMode = 'inherit' | 'off' | 'shadow' | 'warn' | 'enforce'
+
+export type PromptGuardProfile = 'balanced' | 'strict' | 'research'
+
+export type PromptGuardProvider = 'openai' | 'anthropic' | 'xai' | 'unknown'
+
+export interface PromptGuardDecision {
+  enabled: boolean
+  mode: string
+  profile: string
+  application_prompt_kind?: string
+  action: string
+  would_action: string
+  score: number
+  raw_score: number
+  audit_score?: number
+  audit_raw_score?: number
+  reason_code?: string
+  reason?: string
+  terminal?: boolean
+  strike_eligible?: boolean
+  truncated?: boolean
+  current_user_truncated?: boolean
+  auxiliary_truncated?: boolean
+  primary_origin?: string
+  primary_detector?: string
+  signals?: PromptGuardSignal[]
+  errors?: string[]
+}
+
+export interface PromptGuardSignal {
+  detector: string
+  family: string
+  category?: string
+  correlation_key?: string
+  origin: string
+  layer_mode: string
+  score: number
+  raw_score: number
+  confidence: number
+  suggested_action: string
+  terminal_candidate?: boolean
+  strike_eligible?: boolean
+  reason?: string
+  matches?: PromptFilterMatch[]
+}
+
+export interface PromptGuardPerformanceConfig {
+  async_shadow_auxiliary_enabled: boolean
+  exact_segment_cache_enabled: boolean
+  exact_segment_cache_entries: number
+  exact_segment_cache_ttl_seconds: number
+  max_segments: number
+  max_current_user_bytes: number
+  max_auxiliary_bytes: number
+  scan_chunk_bytes: number
+  scan_overlap_bytes: number
+  shadow_workers: number
+  shadow_queue_size: number
+  shadow_overflow_mode: 'drop'
+}
+
+export type PromptGuardLayer =
+  | 'current_user'
+  | 'history'
+  | 'system'
+  | 'developer'
+  | 'instructions'
+  | 'tool_output'
+  | 'tool_arguments'
+  | 'attachment_refs'
+  | 'session_context'
+  | 'attachment_content'
+
+export interface PromptGuardConfig {
+  mode: PromptGuardMode
+  default_profile: PromptGuardProfile
+  allow_trusted_overrides: boolean
+  provider_profiles: Partial<Record<PromptGuardProvider, PromptGuardProfile>>
+  layers: Record<PromptGuardLayer, { mode: PromptGuardMode }>
+  performance: PromptGuardPerformanceConfig
+}
+
+export type AdvancedConfigObject = Record<string, unknown>
+
+export interface AdvancedConfigDocument {
+  ok: boolean
+  value: AdvancedConfigObject | null
+  error: 'invalid_json' | 'root_not_object' | null
+}
+
+export interface AdvancedConfigPatch {
+  path: readonly string[]
+  value?: unknown
+  remove?: boolean
+}
+
+export interface AdvancedConfigPatchResult extends AdvancedConfigDocument {
+  serialized: string
+}
+
+function isAdvancedConfigObject(value: unknown): value is AdvancedConfigObject {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Parse the persisted advanced configuration without normalizing or rebuilding
+ * it. Callers can derive a typed view separately while retaining this original
+ * tree as the source of truth for compatible field-level updates.
+ */
+export function parseAdvancedConfigDocument(raw: string): AdvancedConfigDocument {
+  try {
+    const value = JSON.parse(raw || '{}') as unknown
+    if (!isAdvancedConfigObject(value)) {
+      return { ok: false, value: null, error: 'root_not_object' }
+    }
+    return { ok: true, value, error: null }
+  } catch {
+    return { ok: false, value: null, error: 'invalid_json' }
+  }
+}
+
+export function readAdvancedConfigPath(
+  value: AdvancedConfigObject | null,
+  path: readonly string[],
+): unknown {
+  let current: unknown = value
+  for (const key of path) {
+    if (!isAdvancedConfigObject(current)) return undefined
+    current = current[key]
+  }
+  return current
+}
+
+/**
+ * Apply only explicitly edited JSON paths to a freshly parsed document. This
+ * preserves unknown top-level and nested fields, including future enum values.
+ * Invalid JSON is returned untouched so the UI can block saving instead of
+ * silently replacing it with defaults.
+ */
+export function patchAdvancedConfigDocument(
+  raw: string,
+  patches: readonly AdvancedConfigPatch[],
+): AdvancedConfigPatchResult {
+  const parsed = parseAdvancedConfigDocument(raw)
+  if (!parsed.ok || !parsed.value) {
+    return { ...parsed, serialized: raw }
+  }
+
+  const root = parsed.value
+  for (const patch of patches) {
+    if (patch.path.length === 0) continue
+    let current = root
+    for (const key of patch.path.slice(0, -1)) {
+      const child = current[key]
+      if (isAdvancedConfigObject(child)) {
+        current = child
+      } else {
+        const next: AdvancedConfigObject = {}
+        current[key] = next
+        current = next
+      }
+    }
+    const leaf = patch.path[patch.path.length - 1]
+    if (patch.remove) delete current[leaf]
+    else current[leaf] = patch.value
+  }
+
+  return {
+    ok: true,
+    value: root,
+    error: null,
+    serialized: JSON.stringify(root),
+  }
 }
 
 export interface PromptFilterRule {
@@ -968,6 +1890,148 @@ export interface PromptFilterRulesResponse {
   disabled_patterns: string[]
 }
 
+export interface PromptIntelligenceRuleDraft {
+  name: string
+  pattern: string
+  weight: number
+  category: string
+  strict: boolean
+  rationale?: string
+  source_url?: string
+  change_type?: 'new' | 'update' | string
+}
+
+export interface PromptIntelligenceCandidate extends PromptIntelligenceRuleDraft {
+  id: number
+  fingerprint: string
+  kind: 'pattern' | 'evidence' | string
+  lifecycle_status: 'pending' | 'published' | 'dismissed' | 'superseded' | string
+  source?: string
+  evidence_count: number
+  sample_preview?: string
+  protocol?: string
+  provider?: string
+  model?: string
+  api_key_id?: number
+  api_key_name?: string
+  ai_analyzed?: boolean
+  ai_analysis_count?: number
+  ai_analyzed_at?: string
+  latest_ai_analysis?: PromptIntelligenceAIAnalysisResponse
+  created_at?: string
+  updated_at?: string
+  last_seen_at?: string
+}
+
+export interface PromptIntelligenceRunCandidate extends PromptIntelligenceRuleDraft {
+  id?: number
+  fingerprint?: string
+  kind?: 'pattern' | 'evidence' | string
+  lifecycle_status?: string
+  status?: 'new' | 'update' | string
+  source?: string
+  evidence_count?: number
+  sample_preview?: string
+}
+
+export interface PromptIntelligenceCandidatesResponse {
+  candidates: PromptIntelligenceCandidate[]
+  total: number
+}
+
+export interface PromptIntelligenceEvidence {
+  id: number
+  source_kind: string
+  source_ref?: string
+  sample_preview?: string
+  metadata: Record<string, unknown>
+  protocol?: string
+  provider?: string
+  model?: string
+  api_key_id?: number
+  api_key_name?: string
+  observed_at: string
+}
+
+export interface PromptIntelligenceEvidenceResponse {
+  candidate: PromptIntelligenceCandidate
+  evidence: PromptIntelligenceEvidence[]
+}
+
+export type PromptIntelligenceAIProvider = 'review' | 'account_pool'
+export type PromptIdentityUpdateMode = 'suggest' | 'guarded_auto'
+
+export interface PromptIntelligenceAIAnalysisRequest {
+  provider: PromptIntelligenceAIProvider
+  model?: string
+  api_key_id?: number
+  identity_update_mode: PromptIdentityUpdateMode
+}
+
+export interface PromptIntelligenceGatewayKey {
+  id: number
+  name: string
+  masked: string
+  status: 'active' | 'expired' | 'quota_exhausted' | string
+}
+
+export interface PromptIntelligenceAIProvidersResponse {
+  review: { configured: boolean; model: string; key_count: number }
+  gateway_keys: PromptIntelligenceGatewayKey[]
+}
+
+export interface PromptIntelligenceAIIdentityPatch {
+  clauses: string[]
+  rationale?: string
+}
+
+export interface PromptIntelligenceAIDecision {
+  decision: 'no_change' | 'rule' | 'identity' | 'both'
+  confidence: number
+  reason: string
+  rule?: PromptIntelligenceRuleDraft
+  identity_patch?: PromptIntelligenceAIIdentityPatch
+}
+
+export interface PromptIdentityUpdateResult {
+  mode: 'suggest' | 'guarded_auto' | 'manual' | 'rollback' | string
+  suggested: boolean
+  eligible: boolean
+  applied: boolean
+  rolled_back?: boolean
+  analysis_evidence_id: number
+  revision_evidence_id?: number
+  clauses?: string[]
+  block_reason?: string
+}
+
+export interface PromptIntelligenceAIAnalysisResponse {
+  analysis_evidence_id: number
+  provider: PromptIntelligenceAIProvider
+  model: string
+  decision: PromptIntelligenceAIDecision
+  rule_candidate?: PromptIntelligenceCandidate
+  rule_error?: string
+  identity_update: PromptIdentityUpdateResult
+}
+
+export interface PromptIntelligenceHistoryResponse {
+  runs: PromptIntelligenceRun[]
+  total: number
+}
+
+export interface PromptIntelligenceRun {
+  started_at: string
+  finished_at: string
+  queries: string[]
+  sources: Array<{ provider: string; title: string; url: string; description: string; updated_at: string }>
+  candidates: PromptIntelligenceRunCandidate[]
+  model_calls: number
+  staged?: number
+  added?: number
+  errors: string[]
+}
+
 export interface ModelInfo {
   id: string
   enabled: boolean
@@ -981,6 +2045,8 @@ export interface ModelInfo {
 
 export interface ModelsResponse {
   models: string[]
+  // Grok 渠道账号声明模型的并集;渠道选 grok 时模型下拉用这份
+  grok_models?: string[]
   items?: ModelInfo[]
   last_synced_at?: string
   source_url: string
@@ -1097,10 +2163,69 @@ export interface APIKeyTokenStat {
   user_billed: number
 }
 
+// APIKeyAccountGroup 是上游账号分组的精简展示项（Token 用量明细用）。
+export interface APIKeyAccountGroup {
+  id: number
+  name: string
+  color: string
+}
+
+// APIKeyAccountStat 是 /usage/api-keys/:id/accounts 端点返回项：
+// 某个下游 Key 在时间区间内按上游账号拆分的用量（账号"按 Key 分解"的转置）。
+export interface APIKeyAccountStat {
+  account_id: number
+  account_name: string
+  account_email: string
+  account_deleted?: boolean
+  groups?: APIKeyAccountGroup[]
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  total_tokens: number
+  error_count: number
+  account_billed: number
+  user_billed: number
+}
+
+export interface APIKeyAccountGroupUsage {
+  id: number
+  name: string
+  color: string
+  accounts: number
+  requests: number
+  total_tokens: number
+  account_billed: number
+  user_billed: number
+}
+
+export interface APIKeyAccountUsageSummary {
+  accounts: number
+  requests: number
+  total_tokens: number
+  account_billed: number
+  user_billed: number
+}
+
+export interface APIKeyAccountStatsResponse {
+  items: APIKeyAccountStat[]
+  groups: APIKeyAccountGroupUsage[]
+  summary: APIKeyAccountUsageSummary
+  /** Active accounts use current memberships; deleted accounts use their last retained membership. */
+  membership_basis: 'current_and_deleted_last_membership'
+}
+
 export interface UsageLog {
   id: number
   account_id: number
+  // 上游渠道(codex/grok),写入时固化;历史行回填,可能为空
+  channel?: string
   client_ip: string
+  client_user_agent: string
+  upstream_user_agent: string
+  user_agent_overridden: boolean
+  internal_reason: string
+  parent_request_id: string
   endpoint: string
   model: string
   effective_model: string
@@ -1113,11 +2238,13 @@ export interface UsageLog {
   output_tokens: number
   reasoning_tokens: number
   first_token_ms: number
+  ws_acquire_ms?: number
   reasoning_effort: string
   inbound_endpoint: string
   upstream_endpoint: string
   stream: boolean
   compact: boolean
+  has_compaction_history: boolean
   via_websocket?: boolean
   cached_tokens: number
   service_tier: string
@@ -1152,7 +2279,8 @@ export interface UsageLog {
   is_retry_attempt: boolean
   attempt_index: number
   upstream_error_kind: string
-  error_message: string
+	error_message: string
+	prompt_policy_incident_id?: string
 }
 
 export type UsageLogsResponse = ApiListResponse<'logs', UsageLog>
@@ -1209,20 +2337,111 @@ export interface ModelPricingOverride {
   output_long?: number
 }
 
+/**
+ * 单条「该 Key × 某账号分组 / 某账号」的用量上限（issue #439）。
+ * 0 或缺省表示该维度不限；超额后默认把该 scope 的账号从调度候选中剔除。
+ */
+export interface APIKeyScopeLimit {
+  scope_type: 'group' | 'account'
+  scope_id: number
+  /** skip: 剔除该 scope 后继续用其它账号（默认）；reject: 直接 429。 */
+  on_exhausted?: 'skip' | 'reject'
+  cost_5h?: number
+  cost_1d?: number
+  cost_7d?: number
+  cost_30d?: number
+  token_5h?: number
+  token_1d?: number
+  token_7d?: number
+  token_30d?: number
+  requests_1d?: number
+  /** 该 Key 在这条 scope 上的最大在途请求数（进程内软上限）。 */
+  max_concurrency?: number
+  /** 累计额度：不随时间回落，用完需手动重置。 */
+  quota_cost?: number
+  quota_tokens?: number
+  quota_requests?: number
+}
+
+/** 某条 scope 限额在某窗口的当前用量（GET /api/admin/keys/:id/scope-usage）。 */
+export interface APIKeyScopeUsageWindow {
+  window: string
+  requests: number
+  tokens: number
+  user_billed: number
+  cost_limit?: number
+  token_limit?: number
+  request_limit?: number
+  exhausted: boolean
+}
+
+export interface APIKeyScopeCumulativeUsage {
+  used_cost: number
+  used_tokens: number
+  used_requests: number
+  quota_cost?: number
+  quota_tokens?: number
+  quota_requests?: number
+  reset_count: number
+  last_reset_at?: string
+  exhausted: boolean
+}
+
+/** 一条 scope 预算被判定耗尽的运行态统计（网关进程内，重启清零）。 */
+export interface APIKeyScopeSkipStat {
+  requests: number
+  first_at: string
+  last_at: string
+  last_message: string
+}
+
+export interface APIKeyScopeUsageItem {
+  scope_type: 'group' | 'account'
+  scope_id: number
+  scope_name: string
+  scope_exists: boolean
+  on_exhausted: 'skip' | 'reject'
+  windows: APIKeyScopeUsageWindow[]
+  cumulative?: APIKeyScopeCumulativeUsage
+  skips?: APIKeyScopeSkipStat
+}
+
+/** 列表页用的 scope 预算概览（只给最紧的那个窗口）。 */
+export interface APIKeyScopeSummaryItem {
+  scope_type: 'group' | 'account'
+  scope_id: number
+  scope_name: string
+  on_exhausted: 'skip' | 'reject'
+  window: string
+  metric: string
+  ratio: number
+  exhausted: boolean
+  skip_requests?: number
+}
+
 export interface APIKeyLimits {
   model_allow?: string[]
   model_deny?: string[]
   plan_allow?: string[]
+  no_affinity_group_ids?: number[]
   rpm?: number
   rpd?: number
   max_concurrency?: number
   cost_limit_5h?: number
   cost_limit_7d?: number
   cost_limit_30d?: number
+  /** 自然日(服务器本地时区)金额上限,零点清零;与滑动窗口语义不同(issue #460)。 */
+  cost_limit_daily?: number
   token_limit_5h?: number
   token_limit_7d?: number
   token_limit_30d?: number
+  token_limit_daily?: number
   disable_image_generation?: boolean
+  /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
+  image_generation_policy?: "allow" | "strip" | "block"
+  upstream_channel?: "codex" | "grok"
+  /** 分组 / 账号维度的用量预算（issue #439）。 */
+  scope_limits?: APIKeyScopeLimit[]
 }
 
 export interface APIKeyWindowUsage {
@@ -1232,6 +2451,7 @@ export interface APIKeyWindowUsage {
   cost_5h: number
   cost_7d: number
   cost_30d: number
+  cost_today?: number
 }
 
 export interface APIKeyRow {
@@ -1254,6 +2474,37 @@ export interface APIKeyRow {
 }
 
 export type APIKeysResponse = ApiListResponse<'keys', APIKeyRow>
+
+export interface PromptFilterNewAPIBinding {
+  api_key_id: number
+  platform_code: string
+  platform_name: string
+  enabled: boolean
+  require_signed_identity: boolean
+  secret_configured: boolean
+  secret_masked: string
+  previous_secret_active: boolean
+  previous_secret_expires_at?: ISODateString | null
+  updated_at: ISODateString
+  /** 仅在创建或轮换成功的响应中出现，列表和详情接口不会回显明文。 */
+  secret?: string
+}
+
+export interface PromptFilterNewAPIBindingsResponse {
+  bindings: PromptFilterNewAPIBinding[]
+}
+
+export interface CreatePromptFilterNewAPIBindingRequest {
+  api_key_id: number
+  platform_code: string
+  platform_name: string
+  enabled?: boolean
+  require_signed_identity?: boolean
+}
+
+export type UpdatePromptFilterNewAPIBindingRequest = Partial<
+  Omit<CreatePromptFilterNewAPIBindingRequest, 'api_key_id'>
+>
 
 export interface CreateAPIKeyRequest {
   name: string
@@ -1301,9 +2552,16 @@ export interface PublicAPIKeyWindowUsage {
   requests: number
   tokens: number
   user_billed: number
+  /** 窗口内最早一笔用量时间(无用量时缺省)。 */
+  oldest_at?: ISODateString
+  /** fixed=自然日固定窗口(reset_at 清零);sliding=滑动窗口(decay_at 开始回落)。 */
+  window_kind: 'fixed' | 'sliding'
+  reset_at?: ISODateString
+  decay_at?: ISODateString
 }
 
 export interface PublicAPIKeyUsageWindows {
+  today: PublicAPIKeyWindowUsage
   last_5h: PublicAPIKeyWindowUsage
   last_7d: PublicAPIKeyWindowUsage
   last_30d: PublicAPIKeyWindowUsage
@@ -1359,6 +2617,7 @@ export interface PublicAPIKeyUsageLog {
   service_tier: string
   stream: boolean
   compact: boolean
+  has_compaction_history: boolean
   via_websocket: boolean
   upstream_error_kind: string
   created_at: ISODateString
@@ -1439,6 +2698,7 @@ export interface ImageGenerationJob {
   api_key_name: string
   api_key_masked: string
   error_message: string
+  warning?: string
   duration_ms: number
   created_at: ISODateString
   started_at?: ISODateString
@@ -1500,6 +2760,17 @@ export interface OAuthURLResponse {
   session_id: string
 }
 
+// 公开账号自助门户:生成授权链接的响应。
+export interface AccountPortalAuthURLResponse {
+  auth_url: string
+  session_id: string
+}
+
+// 公开账号自助门户:提交授权码的响应。
+export interface AccountPortalSubmitResponse {
+  message: string
+}
+
 export interface UpdateOAuthAccountRequest {
   session_id: string
   code: string
@@ -1512,4 +2783,17 @@ export interface OAuthExchangeResponse {
   id: number
   email: string
   plan_type: string
+}
+
+export interface ObservedInstructionsSample {
+  model: string
+  originator: string
+  instructions: string
+  length: number
+  truncated: boolean
+  observed_at: string
+}
+
+export interface ObservedInstructionsResponse {
+  samples: ObservedInstructionsSample[]
 }

@@ -142,6 +142,7 @@ func TestApplyRuntimeSettingsFromSystemCodexWebSocketRetrySettings(t *testing.T)
 		CodexWSHideUpstreamErrors: true,
 		CodexWSSilentRetryEnabled: true,
 		CodexWSSilentMaxRetries:   42,
+		CodexWSWeakNetworkMode:    true,
 	})
 
 	if !settings.CodexWSHideErrors {
@@ -152,6 +153,26 @@ func TestApplyRuntimeSettingsFromSystemCodexWebSocketRetrySettings(t *testing.T)
 	}
 	if settings.CodexWSSilentRetries != 10 {
 		t.Fatalf("CodexWSSilentRetries = %d, want 10", settings.CodexWSSilentRetries)
+	}
+	if !settings.CodexWSWeakNetworkMode {
+		t.Fatal("CodexWSWeakNetworkMode = false, want true")
+	}
+}
+
+func TestFirstTokenTimeoutForRequestExemptsCompaction(t *testing.T) {
+	base := 30 * time.Second
+
+	// 普通请求保持配置阈值不变。
+	if got := firstTokenTimeoutForRequest(base, false); got != base {
+		t.Fatalf("non-compaction timeout = %s, want %s", got, base)
+	}
+	// 压缩轮豁免看门狗（返回 0）。
+	if got := firstTokenTimeoutForRequest(base, true); got != 0 {
+		t.Fatalf("compaction timeout = %s, want 0", got)
+	}
+	// 看门狗本身遇到 0 阈值不启动，保证豁免生效。
+	if guard := newFirstTokenTimeoutGuard(firstTokenTimeoutForRequest(base, true), func() {}); guard != nil {
+		t.Fatal("compaction round should not create a first token timeout guard")
 	}
 }
 

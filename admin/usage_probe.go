@@ -7,10 +7,10 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/codex2api/auth"
-	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 )
@@ -31,6 +31,18 @@ var errWhamUnauthorized = errors.New("wham usage probe unauthorized")
 func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account) error {
 	if account == nil || account.IsOpenAIResponsesAPI() {
 		return nil
+	}
+
+	// Grok 账号绝不能走 ChatGPT wham / codex responses 探针——
+	// 否则会用错误的上游把有效 token 判成 unauthorized 并封禁。
+	if account.IsGrokAPI() {
+		return h.probeUsageViaGrokBilling(ctx, account)
+	}
+
+	// Agent Identity 无 AccessToken，wham（Bearer）用不了；直接用 /responses 最小探针
+	// （ExecuteRequest 会用 AgentAssertion 动态签名），从响应头同步用量快照。
+	if account.IsCodexAgentIdentity() {
+		return h.probeUsageViaResponses(ctx, account)
 	}
 
 	account.Mu().RLock()
@@ -76,6 +88,7 @@ func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account)
 // 「主动重置次数」与用量快照，不上报成功、也不清除冷却（冷却解除交给恢复探针/到期判断），
 // 避免把一次额度查询误判为账号已恢复。
 func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, limited bool) error {
+	probeStartedAt := time.Now()
 	usage, resp, err := proxy.QueryWhamUsage(ctx, account, h.store.ResolveProxyForAccount(account))
 	if resp != nil {
 		// QueryWhamUsage 在非 200 时不会读 body；这里读取一小段用于账号错误详情。
@@ -98,10 +111,19 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 	}
 
 	state := proxy.ApplyWhamUsage(h.store, account, usage)
+	// wham 不含订阅到期字段，按需从网页端 /subscriptions 补权威到期时间
+	// （带节流，best-effort，失败不影响探针结果）。(issue #360)
+	proxy.MaybeSyncSubscriptionExpiry(ctx, h.store, account, h.store.ResolveProxyForAccount(account))
 	if limited {
 		if state.UsageWindowLimitsIgnored {
 			// WHAM remains metadata-only in Responses-authoritative mode. It must
 			// not clear a cooldown established by a real Responses failure.
+			return nil
+		}
+		if !state.HasUsage5h && !state.HasUsage7d && !state.Cleared5h {
+			// An empty/malformed WHAM payload is not evidence that a cooldown
+			// ended. Preserve the existing source state and let the next probe
+			// retry with a complete response.
 			return nil
 		}
 		// 限流/冷却态下，用 wham 返回的权威用量窗口重新判定：
@@ -109,7 +131,7 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 		// 则主动解除限流冷却，无需等待冷却到期或用户手动测试连接。
 		// 仍不调用 ReportRequestSuccess，避免把一次零成本额度查询计入健康成功样本。
 		if !applyUsageLimitedAccountState(h.store, account, state) {
-			h.store.ClearCooldown(account)
+			h.store.ClearUsageLimitCooldownSince(account, probeStartedAt)
 			log.Printf("[账号 %d] wham 显示限流窗口已重置，自动解除限流冷却", account.DBID)
 		}
 		return nil
@@ -117,7 +139,49 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 	h.store.ReportRequestSuccess(account, 0)
 	// 用量未耗尽时重置冷却
 	if !applyUsageLimitedAccountState(h.store, account, state) {
-		h.store.ClearCooldown(account)
+		if state.HasUsage5h || state.HasUsage7d || state.Cleared5h {
+			h.store.ClearUsageLimitCooldownSince(account, probeStartedAt)
+		}
+	}
+	return nil
+}
+
+// probeUsageViaGrokBilling 通过 cli-chat-proxy /v1/billing 拉取套餐与周/月额度。
+// 不走 wham，401 才视作凭据失效。
+func (h *Handler) probeUsageViaGrokBilling(ctx context.Context, account *auth.Account) error {
+	if account == nil {
+		return nil
+	}
+	// API Key 账号可能没有 AT；用 bearer（api_key 或 AT）探测。
+	baseURL, bearer := account.GrokCredentials()
+	_ = baseURL
+	if strings.TrimSpace(bearer) == "" {
+		// OAuth 无 AT 时先刷一次
+		if account.GrokAuthKind() == auth.GrokAuthKindOAuth {
+			if err := h.store.RefreshSingle(ctx, account.DBID); err != nil {
+				log.Printf("[账号 %d] Grok billing 探针前刷新失败: %v", account.DBID, err)
+			}
+		}
+	}
+
+	summary, err := proxy.FetchGrokBilling(ctx, account, h.store.ResolveProxyForAccount(account))
+	if err != nil {
+		errText := err.Error()
+		if strings.Contains(strings.ToLower(errText), "unauthorized") {
+			h.store.ReportRequestFailure(account, "client", 0)
+			h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized",
+				fmt.Sprintf("Grok billing 探针 401: %s", truncate(errText, 300)))
+			return nil
+		}
+		log.Printf("[账号 %d] Grok billing 探针失败: %v", account.DBID, err)
+		return err
+	}
+
+	credentials := proxy.ApplyGrokBilling(h.store, account, summary)
+	if h.db != nil && len(credentials) > 0 {
+		if err := h.db.UpdateCredentials(ctx, account.DBID, credentials); err != nil {
+			log.Printf("[账号 %d] Grok billing 写库失败: %v", account.DBID, err)
+		}
 	}
 	return nil
 }
@@ -125,39 +189,29 @@ func (h *Handler) probeUsageViaWham(ctx context.Context, account *auth.Account, 
 // probeUsageViaResponses 原有探针：发送最小 /responses 请求，
 // 通过响应头同步 Codex 用量状态。会真实消耗少量 token。
 func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Account) error {
-	model := h.store.GetTestModel()
-	payload := buildConnectionTestPayload(h.store, model)
-	startedAt := time.Now()
+	probeStartedAt := time.Now()
+	payload := buildConnectionTestPayload(h.store, h.store.GetTestModel())
 	resp, err := proxy.ExecuteRequest(ctx, account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusOK {
-		usageState := proxy.SyncCodexUsageState(h.store, account, resp)
-		observeFirstToken := h.newAccountFirstTokenObserver(account, database.FirstTokenSourceAutoProbe, model, startedAt)
-		_ = proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
-			observeFirstToken(data)
-			return true
-		})
-		h.store.ReportRequestSuccess(account, 0)
-		// 只有用量未耗尽时才重置状态
-		if !applyUsageLimitedAccountState(h.store, account, usageState) {
-			h.store.ClearCooldown(account)
-		}
-		return nil
-	}
+	usageState := proxy.SyncCodexUsageState(h.store, account, resp)
 
-	proxy.SyncCodexFailureUsageState(h.store, account, resp)
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 
 	switch resp.StatusCode {
+	case http.StatusOK:
+		h.store.ReportRequestSuccess(account, 0)
+		// 只有用量未耗尽时才重置状态
+		if !applyUsageLimitedAccountState(h.store, account, usageState) {
+			h.store.ClearUsageLimitCooldownSince(account, probeStartedAt)
+		}
+		return nil
 	case http.StatusUnauthorized:
 		h.store.ReportRequestFailure(account, "client", 0)
-		if !proxy.ShouldIgnoreFailureCooldown(account) {
-			h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", fmt.Sprintf("用量探针上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
-		}
+		h.store.MarkCooldownWithError(account, 24*time.Hour, "unauthorized", fmt.Sprintf("用量探针上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
 		return nil
 	case http.StatusTooManyRequests:
 		h.store.ReportRequestFailure(account, "client", 0)
@@ -170,7 +224,12 @@ func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Acco
 			return nil
 		}
 		if shouldMarkUsageProbeAccountError(resp.StatusCode, body) {
-			h.store.MarkError(account, fmt.Sprintf("用量探针上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
+			errorMsg := fmt.Sprintf("用量探针上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300))
+			if resp.StatusCode == http.StatusForbidden && proxy.IsAgentRuntimeDeletedError(body) {
+				h.store.MarkCooldownWithErrorExactDuration(account, 24*time.Hour, "unauthorized", errorMsg)
+			} else {
+				h.store.MarkError(account, errorMsg)
+			}
 			return nil
 		}
 		if resp.StatusCode >= 500 {
@@ -185,7 +244,8 @@ func (h *Handler) probeUsageViaResponses(ctx context.Context, account *auth.Acco
 func shouldMarkUsageProbeAccountError(statusCode int, body []byte) bool {
 	switch statusCode {
 	case http.StatusPaymentRequired, http.StatusForbidden:
-		return proxy.IsDeactivatedWorkspaceError(body)
+		return proxy.IsDeactivatedWorkspaceError(body) ||
+			(statusCode == http.StatusForbidden && proxy.IsAgentRuntimeDeletedError(body))
 	default:
 		return false
 	}

@@ -8,12 +8,25 @@ import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
 import type { FastTierPolicy, HealthResponse, ModelInfo, QualityEvalConfig, SiteBranding, SystemSettings } from '../types'
+import { countPayloadRules } from './PayloadRules'
 import { getErrorMessage } from '../utils/error'
 import { DEFAULT_CLAUDE_MODEL_MAP } from '../lib/modelMapping'
+import { buildWritableSettingsPayload } from '../lib/settingsPayload'
+import {
+  MIB,
+  buildResponseCacheBudgetPatch,
+  bytesToMiB,
+  mergeResponseCacheGeneration,
+  mibToBytes,
+  validateResponseCacheBudget,
+  type ResponseCacheBudgetMiB,
+  type ResponseCacheBudgetValidationError,
+} from '../lib/responseCacheMetrics'
 import { DEFAULT_SITE_LOGO, isBrandingVideo, sanitizeBrandingImage, sanitizeBrandingLogo, useBranding } from '../branding'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { DraftNumberInput } from '@/components/ui/draft-number-input'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import {
@@ -64,7 +77,8 @@ import {
   Wrench,
   X,
 } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
+import ChannelLogo from '../components/ChannelLogo'
 
 type ModelPanelKey = 'registry' | 'anthropic' | 'codex' | 'reasoning'
 
@@ -92,6 +106,14 @@ const REASONING_EFFORT_OPTIONS = ['none', 'minimal', 'low', 'medium', 'high', 'x
 }))
 const AUTO_SAVE_STATUS_RESET_MS = 1800
 const AUTO_SAVE_TOAST_MS = 2000
+const DEFAULT_RESPONSE_CACHE_TOTAL_BYTES = 64 * MIB
+const DEFAULT_RESPONSE_CACHE_ENTRY_BYTES = 8 * MIB
+const DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES = 64 * MIB
+const RESPONSE_CACHE_BUDGET_KEYS = [
+  'response_cache_local_max_bytes',
+  'response_cache_local_max_entry_bytes',
+  'response_cache_reconstruct_max_bytes',
+] as const satisfies ReadonlyArray<keyof SystemSettings>
 const DEFAULT_CODEX_UA_CONFIG: Required<CodexUserAgentConfig> = {
   raw_user_agent: '',
   client_name: 'codex-tui',
@@ -157,6 +179,45 @@ const getSettingsPatchValues = (settings: SystemSettings, keys: Array<keyof Syst
     patch[key] = settings[key]
   }
   return patch as Partial<SystemSettings>
+}
+
+const normalizeResponseCacheSettings = (settings: SystemSettings): SystemSettings => ({
+  ...settings,
+  response_cache_local_max_bytes: Number.isFinite(settings.response_cache_local_max_bytes)
+    ? settings.response_cache_local_max_bytes
+    : DEFAULT_RESPONSE_CACHE_TOTAL_BYTES,
+  response_cache_local_max_entry_bytes: Number.isFinite(settings.response_cache_local_max_entry_bytes)
+    ? settings.response_cache_local_max_entry_bytes
+    : DEFAULT_RESPONSE_CACHE_ENTRY_BYTES,
+  response_cache_reconstruct_max_bytes: Number.isFinite(settings.response_cache_reconstruct_max_bytes)
+    ? settings.response_cache_reconstruct_max_bytes
+    : DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
+  response_cache_config_generation: Number.isFinite(settings.response_cache_config_generation)
+    ? settings.response_cache_config_generation
+    : 0,
+})
+
+const responseCacheBudgetFromSettings = (settings: SystemSettings): ResponseCacheBudgetMiB => ({
+  totalMiB: bytesToMiB(settings.response_cache_local_max_bytes),
+  entryMiB: bytesToMiB(settings.response_cache_local_max_entry_bytes),
+  reconstructMiB: bytesToMiB(settings.response_cache_reconstruct_max_bytes),
+})
+
+const isResponseCacheBudgetKey = (key: keyof SystemSettings) =>
+  RESPONSE_CACHE_BUDGET_KEYS.some((candidate) => candidate === key)
+
+const responseCacheBudgetFieldPatch = (
+  field: keyof ResponseCacheBudgetMiB,
+  value: number,
+): Partial<SystemSettings> => {
+  switch (field) {
+    case 'totalMiB':
+      return { response_cache_local_max_bytes: mibToBytes(value) }
+    case 'entryMiB':
+      return { response_cache_local_max_entry_bytes: mibToBytes(value) }
+    case 'reconstructMiB':
+      return { response_cache_reconstruct_max_bytes: mibToBytes(value) }
+  }
 }
 
 const parseReasoningEffortModelEntries = (value: string): ReasoningEffortModelEntry[] => {
@@ -1055,6 +1116,7 @@ async function compressSiteLogoFile(file: File, mimeType: string) {
 
 export default function Settings() {
   const { t } = useTranslation()
+  const navigate = useNavigate()
   const { applyBranding } = useBranding()
   const defaultClaudeModelMappingEntries = useMemo(() => getDefaultModelMappingEntries(), [])
   const schedulerModeOptions = [
@@ -1070,6 +1132,12 @@ export default function Settings() {
     { label: t('settings.affinityModeBounded'), value: 'bounded' },
     { label: t('settings.affinityModeOff'), value: 'off' },
     { label: t('settings.affinityModeStrict'), value: 'strict' },
+  ]
+  const grokAffinityModeOptions = [
+    { label: t('settings.grokAffinityModeStrict'), value: 'strict' },
+    { label: t('settings.grokAffinityModeFollow'), value: 'follow' },
+    { label: t('settings.affinityModeBounded'), value: 'bounded' },
+    { label: t('settings.affinityModeOff'), value: 'off' },
   ]
   const clientCompatOptions = [
     { label: t('settings.clientCompatPreserve'), value: 'preserve' },
@@ -1103,11 +1171,12 @@ export default function Settings() {
     { label: t('settings.imageStorageS3'), value: 's3' },
   ]
   const normalizeLazySettingsForm = useCallback((settings: SystemSettings): SystemSettings => {
+    const cacheNormalized = normalizeResponseCacheSettings(settings)
     const normalized = {
-      ...settings,
-      billing_tier_policy: normalizeBillingTierPolicyValue(settings.billing_tier_policy),
-      fast_tier_policy: normalizeFastTierPolicyValue(settings.fast_tier_policy),
-      first_token_mode: normalizeFirstTokenModeValue(settings.first_token_mode),
+      ...cacheNormalized,
+      billing_tier_policy: normalizeBillingTierPolicyValue(cacheNormalized.billing_tier_policy),
+      fast_tier_policy: normalizeFastTierPolicyValue(cacheNormalized.fast_tier_policy),
+      first_token_mode: normalizeFirstTokenModeValue(cacheNormalized.first_token_mode),
     }
     if (!normalized.lazy_mode) {
       return normalized
@@ -1162,16 +1231,31 @@ export default function Settings() {
     auto_clean_full_usage: false,
     proxy_pool_enabled: false,
     fast_scheduler_enabled: false,
+    auto_reset_credits_enabled: false,
+    auto_reset_credits_before_expiry_min: 60,
     codex_force_websocket: false,
+    codex_ws_weak_network_mode: false,
     codex_ws_keepalive_enabled: false,
     codex_ws_keepalive_interval_sec: 60,
     codex_ws_hide_upstream_errors: true,
     codex_ws_silent_retry_enabled: true,
     codex_ws_silent_max_retries: 2,
+    codex_ws_size_router_enabled: true,
+    codex_ws_busy_acquire_max_wait_sec: 30,
+    codex_ws_busy_overflow_enabled: false,
+    codex_ws_busy_patience_sec: 2,
     codex_continue_thinking_enabled: false,
+    overflow_auto_compact_enabled: false,
+    codex_preflight_sse_passthrough_enabled: false,
     codex_continue_max_rounds: 8,
+    utls_shutdown_timeout_minutes: 30,
     scheduler_mode: 'round_robin',
     affinity_mode: 'bounded',
+    grok_affinity_mode: 'strict',
+    grok_probe_enabled: false,
+    grok_probe_interval_minutes: 30,
+    grok_max_rate_limit_retries: 0,
+    grok_oauth_client_id: '',
     max_retries: 2,
     max_rate_limit_retries: 1,
     retry_interval_ms: 0,
@@ -1191,8 +1275,13 @@ export default function Settings() {
     database_label: 'PostgreSQL',
     cache_driver: 'redis',
     cache_label: 'Redis',
+    response_cache_local_max_bytes: DEFAULT_RESPONSE_CACHE_TOTAL_BYTES,
+    response_cache_local_max_entry_bytes: DEFAULT_RESPONSE_CACHE_ENTRY_BYTES,
+    response_cache_reconstruct_max_bytes: DEFAULT_RESPONSE_CACHE_RECONSTRUCT_BYTES,
+    response_cache_config_generation: 0,
     model_mapping: '{}',
     codex_model_mapping: '{}',
+    payload_rules: '{}',
     reasoning_effort_models: '[]',
     resin_url: '',
     resin_platform_name: '',
@@ -1200,6 +1289,8 @@ export default function Settings() {
     prompt_filter_mode: 'monitor',
     prompt_filter_threshold: 50,
     prompt_filter_strict_threshold: 90,
+    prompt_filter_strict_terminal_enabled: false,
+    prompt_filter_advanced_config: '{}',
     prompt_filter_log_matches: true,
     prompt_filter_max_text_length: 81920,
     prompt_filter_sensitive_words: '',
@@ -1213,7 +1304,7 @@ export default function Settings() {
     prompt_filter_review_timeout_seconds: 10,
     prompt_filter_review_fail_closed: true,
     client_compat_mode: 'preserve',
-    codex_min_cli_version: '0.118.0',
+    codex_min_cli_version: '0.144.1',
     codex_cli_version_sync_enabled: true,
     codex_cli_version_sync_interval_hours: 12,
     codex_user_agent_config: '{}',
@@ -1224,9 +1315,12 @@ export default function Settings() {
     stream_flush_interval_ms: 20,
     first_token_mode: 'strict',
     first_token_timeout_seconds: 0,
+    first_token_excludes_ws_acquire: false,
     billing_tier_policy: 'actual',
     show_full_usage_numbers: false,
     public_key_usage_page_enabled: true,
+    public_image_studio_page_enabled: true,
+    public_account_portal_page_enabled: false,
     image_storage_backend: 'local',
     image_s3_endpoint: '',
     image_s3_region: '',
@@ -1255,10 +1349,14 @@ export default function Settings() {
     auto_skip_reason: '',
   })
   const lazyModeActive = settingsForm.lazy_mode
+  const responseCacheBudget = responseCacheBudgetFromSettings(settingsForm)
   const [savingSettings, setSavingSettings] = useState(false)
   const [savingQualityEvalConfig, setSavingQualityEvalConfig] = useState(false)
   const [autoSaveStatus, setAutoSaveStatus] = useState<AutoSaveStatus>('idle')
-  const [autoSaveError, setAutoSaveError] = useState('')
+  const [responseCacheValidationError, setResponseCacheValidationError] = useState<ResponseCacheBudgetValidationError | null>(null)
+  const responseCacheValidationMessage = responseCacheValidationError
+    ? t(`settings.responseCache.validation.${responseCacheValidationError}`)
+    : ''
   const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
@@ -1274,7 +1372,7 @@ export default function Settings() {
   const settingsFormRef = useRef(settingsForm)
   const autoSavePendingCountRef = useRef(0)
   const autoSaveFieldVersionsRef = useRef<Record<string, number>>({})
-  const autoSaveStatusTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null)
+  const autoSaveStatusTimerRef = useRef<number | null>(null)
   const { toast, showToast } = useToast()
 
   useEffect(() => {
@@ -1345,7 +1443,6 @@ export default function Settings() {
       window.clearTimeout(autoSaveStatusTimerRef.current)
       autoSaveStatusTimerRef.current = null
     }
-    setAutoSaveError('')
     setAutoSaveStatus('saving')
 
     try {
@@ -1354,10 +1451,24 @@ export default function Settings() {
         const fieldKey = String(key)
         return autoSaveFieldVersionsRef.current[fieldKey] === requestedVersions[fieldKey]
       })
-      if (mergeKeys.length > 0) {
+      const currentSettings = settingsFormRef.current
+      const responseCacheRequest = patchKeys.some(isResponseCacheBudgetKey)
+      const mergedResponseCacheGeneration = responseCacheRequest
+        ? mergeResponseCacheGeneration(
+            currentSettings.response_cache_config_generation,
+            updated.response_cache_config_generation,
+          )
+        : currentSettings.response_cache_config_generation
+      if (
+        mergeKeys.length > 0
+        || mergedResponseCacheGeneration !== currentSettings.response_cache_config_generation
+      ) {
         commitSettingsForm({
-          ...settingsFormRef.current,
+          ...currentSettings,
           ...getSettingsPatchValues(updated, mergeKeys),
+          ...(responseCacheRequest
+            ? { response_cache_config_generation: mergedResponseCacheGeneration }
+            : {}),
         })
       }
       const autoSaveSuccessMessage = updated.expired_cleaned && updated.expired_cleaned > 0
@@ -1377,7 +1488,6 @@ export default function Settings() {
         })
       }
       const message = getErrorMessage(error)
-      setAutoSaveError(message)
       showToast(`${t('settings.autoSaveFailed')}: ${message}`, 'error')
       finishAutoSaveRequest('error')
     }
@@ -1396,6 +1506,38 @@ export default function Settings() {
       [field]: value,
     } as Partial<SystemSettings>)
   }, [autoSaveSettingsPatch])
+
+  const updateResponseCacheBudget = (
+    field: keyof ResponseCacheBudgetMiB,
+    value: number,
+  ) => {
+    const next = {
+      ...responseCacheBudgetFromSettings(settingsFormRef.current),
+      [field]: value,
+    }
+    setResponseCacheValidationError(validateResponseCacheBudget(next))
+    commitSettingsForm({
+      ...settingsFormRef.current,
+      ...responseCacheBudgetFieldPatch(field, value),
+    })
+  }
+
+  const commitResponseCacheBudget = (
+    field: keyof ResponseCacheBudgetMiB,
+    value: number,
+  ) => {
+    const next = {
+      ...responseCacheBudgetFromSettings(settingsFormRef.current),
+      [field]: value,
+    }
+    const validationError = validateResponseCacheBudget(next)
+    setResponseCacheValidationError(validationError)
+    if (validationError) {
+      showToast(t(`settings.responseCache.validation.${validationError}`), 'error')
+      return
+    }
+    void autoSaveSettingsPatch(buildResponseCacheBudgetPatch(next))
+  }
 
   const loadSettingsData = useCallback(async () => {
     const [health, settings, modelsResp, qualityConfig] = await Promise.all([
@@ -1435,11 +1577,21 @@ export default function Settings() {
   })
 
   const handleSaveSettings = async () => {
+    const normalized = normalizeLazySettingsForm(settingsForm)
+    const validationError = validateResponseCacheBudget(responseCacheBudgetFromSettings(normalized))
+    setResponseCacheValidationError(validationError)
+    if (validationError) {
+      showToast(t(`settings.responseCache.validation.${validationError}`), 'error')
+      return
+    }
     setSavingSettings(true)
     try {
       const adminSecretChanged = settingsForm.admin_auth_source !== 'env' && settingsForm.admin_secret !== loadedAdminSecret
-	      const updated = await api.updateSettings(normalizeLazySettingsForm(settingsForm))
-	      commitSettingsForm(updated)
+      const payload: Partial<SystemSettings> = buildWritableSettingsPayload(normalized)
+      // 自定义 Prompt 规则由规则页单独保存，避免普通设置提交覆盖并发发布结果。
+      delete payload.prompt_filter_custom_patterns
+      const updated = await api.updateSettings(payload)
+      commitSettingsForm(updated)
       const branding = {
         site_name: updated.site_name,
         site_logo: updated.site_logo,
@@ -1631,31 +1783,6 @@ export default function Settings() {
   const showConnectionPool = isExternalDatabase || isExternalCache
   const canConfigureRemoteMigration = settingsForm.admin_auth_source === 'env' || settingsForm.admin_secret.trim() !== ''
   const saveButtonLabel = savingSettings ? t('common.saving') : t('settings.saveSettings')
-  const autoSaveStatusMeta = autoSaveStatus === 'idle' ? null : (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1 font-medium',
-        autoSaveStatus === 'saving' && 'text-muted-foreground',
-        autoSaveStatus === 'saved' && 'text-emerald-600 dark:text-emerald-400',
-        autoSaveStatus === 'error' && 'text-destructive',
-      )}
-      title={autoSaveStatus === 'error' ? autoSaveError : undefined}
-    >
-      <span
-        className={cn(
-          'size-1.5 rounded-full',
-          autoSaveStatus === 'saving' && 'animate-pulse bg-muted-foreground',
-          autoSaveStatus === 'saved' && 'bg-emerald-500',
-          autoSaveStatus === 'error' && 'bg-destructive',
-        )}
-      />
-      {autoSaveStatus === 'saving'
-        ? t('settings.autoSaving')
-        : autoSaveStatus === 'saved'
-          ? t('settings.autoSaved')
-          : t('settings.autoSaveFailed')}
-    </span>
-  )
   const siteLogoPreview = sanitizeBrandingLogo(settingsForm.site_logo) || DEFAULT_SITE_LOGO
   const backgroundImagePreview = sanitizeBrandingImage(settingsForm.background_image)
   const backgroundIsVideo = isBrandingVideo(backgroundImagePreview)
@@ -1703,6 +1830,10 @@ export default function Settings() {
     () => parseReasoningEffortModelEntries(settingsForm.reasoning_effort_models).length,
     [settingsForm.reasoning_effort_models],
   )
+  const payloadRuleCount = useMemo(
+    () => countPayloadRules(settingsForm.payload_rules),
+    [settingsForm.payload_rules],
+  )
   const showInitialSkeleton = loading && !health
   const codexUserAgentConfig = useMemo(
     () => parseCodexUserAgentConfig(settingsForm.codex_user_agent_config),
@@ -1736,6 +1867,7 @@ export default function Settings() {
       [
         { id: 'settings-overview', label: t('settings.nav.overview'), icon: <Activity className="size-4" /> },
         { id: 'settings-traffic', label: t('settings.nav.traffic'), icon: <Gauge className="size-4" /> },
+        { id: 'settings-grok', label: t('settings.nav.grok'), icon: <ChannelLogo channel="grok" size={16} /> },
         { id: 'settings-runtime', label: t('settings.nav.runtime'), icon: <Wrench className="size-4" /> },
         { id: 'settings-storage', label: t('settings.nav.storage'), icon: <ImageIcon className="size-4" /> },
         { id: 'settings-appearance', label: t('settings.nav.appearance'), icon: <Palette className="size-4" /> },
@@ -1881,20 +2013,11 @@ export default function Settings() {
               )
             })}
           </nav>
-          {autoSaveStatusMeta ? (
-            <div className="hidden shrink-0 items-center gap-1.5 rounded-full border border-border/80 bg-card/95 px-3 py-2 text-xs shadow-sm backdrop-blur-xl sm:inline-flex">
-              {autoSaveStatus === 'saving' ? (
-                <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
-              ) : null}
-              {autoSaveStatusMeta}
-            </div>
-          ) : null}
         </div>
 
         <PageHeader
           title={t('settings.title')}
           description={t('settings.description')}
-          actionMeta={autoSaveStatusMeta}
           actions={renderSaveButton('shrink-0')}
         />
 
@@ -1940,48 +2063,46 @@ export default function Settings() {
             <SettingsCard title={t('settings.trafficProtection')} icon={<Gauge className="size-4" />}>
               <div className={SETTINGS_FIELD_GRID}>
                 <SettingField label={t('settings.maxConcurrency')} description={t('settings.maxConcurrencyRange')} suffix={t('settings.unit.concurrency')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={1}
-                    max={50}
                     value={settingsForm.max_concurrency}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_concurrency: parseInt(e.target.value) || 1 }))}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, max_concurrency: value }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.globalRpm')} description={t('settings.globalRpmRange')} suffix={t('settings.unit.rpm')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={0}
                     value={settingsForm.global_rpm}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, global_rpm: parseInt(e.target.value) || 0 }))}
+                    emptyValue={0}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, global_rpm: value }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.maxRetries')} description={t('settings.maxRetriesRange')} suffix={t('settings.unit.times')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={0}
                     max={10}
                     value={settingsForm.max_retries}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_retries: parseInt(e.target.value) || 0 }))}
+                    emptyValue={0}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, max_retries: value }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.maxRateLimitRetries')} description={t('settings.maxRateLimitRetriesRange')} suffix={t('settings.unit.times')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={0}
                     max={10}
                     value={settingsForm.max_rate_limit_retries}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_rate_limit_retries: parseInt(e.target.value) || 0 }))}
+                    emptyValue={0}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, max_rate_limit_retries: value }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.retryIntervalMs')} description={t('settings.retryIntervalMsDesc')} suffix="ms">
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={0}
                     max={30000}
                     step={100}
                     value={settingsForm.retry_interval_ms}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, retry_interval_ms: parseInt(e.target.value) || 0 }))}
+                    emptyValue={0}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, retry_interval_ms: value }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.transportRetryPolicy')} description={t('settings.transportRetryPolicyDesc')}>
@@ -2073,30 +2194,27 @@ export default function Settings() {
               <div className="space-y-4">
                 <div className={SETTINGS_FIELD_GRID}>
                   <SettingField label={t('settings.backgroundRefreshInterval')} description={t('settings.backgroundRefreshIntervalDesc')} suffix={t('settings.unit.min')}>
-                    <Input
-                      type="number"
+                    <DraftNumberInput
                       min={1}
                       max={1440}
                       value={settingsForm.background_refresh_interval_minutes}
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, background_refresh_interval_minutes: parseInt(e.target.value) || 1 }))}
+                      onValueChange={(value) => setSettingsForm(f => ({ ...f, background_refresh_interval_minutes: value }))}
                     />
                   </SettingField>
                   <SettingField label={t('settings.usageProbeMaxAge')} description={t('settings.usageProbeMaxAgeDesc')} suffix={t('settings.unit.min')}>
-                    <Input
-                      type="number"
+                    <DraftNumberInput
                       min={1}
                       max={10080}
                       value={settingsForm.usage_probe_max_age_minutes}
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: parseInt(e.target.value) || 1 }))}
+                      onValueChange={(value) => setSettingsForm(f => ({ ...f, usage_probe_max_age_minutes: value }))}
                     />
                   </SettingField>
                   <SettingField label={t('settings.usageProbeConcurrency')} description={t('settings.usageProbeConcurrencyDesc')} suffix={t('settings.unit.concurrency')}>
-                    <Input
-                      type="number"
+                    <DraftNumberInput
                       min={1}
                       max={128}
                       value={settingsForm.usage_probe_concurrency}
-                      onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_probe_concurrency: parseInt(e.target.value) || 1 }))}
+                      onValueChange={(value) => setSettingsForm(f => ({ ...f, usage_probe_concurrency: value }))}
                     />
                   </SettingField>
 	                  <SettingField label={t('settings.recoveryProbeInterval')} description={t('settings.recoveryProbeIntervalDesc')}>
@@ -2225,6 +2343,7 @@ export default function Settings() {
 		                      onCheckedChange={(checked) => autoSaveBooleanField('failure_score_retroactive', checked)}
 		                    />
 		                  </SettingField>
+
                   <SettingField label={t('settings.usageProbeResponsesFallback')} description={t('settings.usageProbeResponsesFallbackDesc')} layout="switch">
                     <Switch
                       checked={settingsForm.usage_probe_responses_fallback_enabled}
@@ -2297,6 +2416,65 @@ export default function Settings() {
 	            </SettingsCard>
           </div>
 
+          <SettingsCard
+            title={t('settings.autoResetCreditsTitle')}
+            description={t('settings.autoResetCreditsDesc')}
+            icon={<RefreshCw className="size-4" />}
+          >
+            <div className={cn(SETTINGS_SWITCH_GRID, 'items-stretch')}>
+              <SettingField
+                label={t('settings.autoResetCreditsEnabled')}
+                description={t('settings.autoResetCreditsEnabledDesc')}
+                layout="switch"
+                className="h-full"
+              >
+                <Switch
+                  checked={settingsForm.auto_reset_credits_enabled}
+                  onCheckedChange={(checked) => autoSaveBooleanField(
+                    'auto_reset_credits_enabled',
+                    checked,
+                    checked
+                      ? { auto_reset_credits_before_expiry_min: settingsFormRef.current.auto_reset_credits_before_expiry_min }
+                      : {},
+                  )}
+                />
+              </SettingField>
+              <div className="flex min-h-[48px] min-w-0 items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5">
+                <div className="min-w-0 flex-1 space-y-0.5">
+                  <div className="flex items-center gap-1.5">
+                    <label className="block text-[13px] font-medium leading-snug text-foreground sm:text-sm">
+                      {t('settings.autoResetCreditsBeforeExpiry')}
+                    </label>
+                    <SettingHelp text={t('settings.autoResetCreditsBeforeExpiryDesc')} />
+                  </div>
+                </div>
+                <div className="relative w-[7.5rem] shrink-0 sm:w-[8.5rem]">
+                  <DraftNumberInput
+                    min={10}
+                    max={10080}
+                    step={10}
+                    className="pr-11"
+                    value={settingsForm.auto_reset_credits_before_expiry_min}
+                    onValueChange={(value) => {
+                      commitSettingsForm({
+                        ...settingsFormRef.current,
+                        auto_reset_credits_before_expiry_min: value,
+                      })
+                    }}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({
+                        auto_reset_credits_before_expiry_min: value,
+                      })
+                    }}
+                  />
+                  <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-medium tabular-nums text-muted-foreground">
+                    {t('settings.unit.min')}
+                  </span>
+                </div>
+              </div>
+            </div>
+          </SettingsCard>
+
           <SettingsCard title={t('settings.schedulingStrategy')} icon={<Layers className="size-4" />}>
             <div className="space-y-4">
               <div className={SETTINGS_FIELD_GRID_3}>
@@ -2308,12 +2486,11 @@ export default function Settings() {
                   />
                 </SettingField>
                 <SettingField label={t('settings.testConcurrency')} description={t('settings.testConcurrencyRange')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={1}
                     max={200}
                     value={settingsForm.test_concurrency}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, test_concurrency: parseInt(e.target.value) || 1 }))}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, test_concurrency: value }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.schedulerMode')} description={t('settings.schedulerModeDesc')}>
@@ -2358,89 +2535,75 @@ export default function Settings() {
             <div className="space-y-4">
               <div className={SETTINGS_FIELD_GRID_3}>
                 <SettingField label={t('settings.globalAutoPause5h')} description={t('settings.globalAutoPauseHint')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={0}
                     max={100}
                     step={0.1}
                     inputMode="decimal"
                     placeholder={t('settings.globalAutoPausePlaceholder')}
-                    value={settingsForm.auto_pause_5h_threshold > 0 ? (settingsForm.auto_pause_5h_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => {
-                      const raw = e.target.value
-                      const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
-                      setSettingsForm(f => ({ ...f, auto_pause_5h_threshold: isNaN(ratio) ? 0 : ratio }))
+                    integer={false}
+                    emptyValue={0}
+                    value={settingsForm.auto_pause_5h_threshold * 100}
+                    formatValue={(value) => value > 0 ? value.toFixed(1).replace(/\.0$/, '') : ''}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, auto_pause_5h_threshold: value / 100 }))
                     }}
-                    onBlur={() => {
-                      void autoSaveSettingsPatch({ auto_pause_5h_threshold: settingsForm.auto_pause_5h_threshold })
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ auto_pause_5h_threshold: value / 100 })
                     }}
                   />
                 </SettingField>
                 <SettingField label={t('settings.globalAutoPause7d')} description={t('settings.globalAutoPauseHint')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={0}
                     max={100}
                     step={0.1}
                     inputMode="decimal"
                     placeholder={t('settings.globalAutoPausePlaceholder')}
-                    value={settingsForm.auto_pause_7d_threshold > 0 ? (settingsForm.auto_pause_7d_threshold * 100).toFixed(1).replace(/\.0$/, '') : ''}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => {
-                      const raw = e.target.value
-                      const ratio = raw === '' ? 0 : Math.max(0, Math.min(1, parseFloat(raw) / 100))
-                      setSettingsForm(f => ({ ...f, auto_pause_7d_threshold: isNaN(ratio) ? 0 : ratio }))
+                    integer={false}
+                    emptyValue={0}
+                    value={settingsForm.auto_pause_7d_threshold * 100}
+                    formatValue={(value) => value > 0 ? value.toFixed(1).replace(/\.0$/, '') : ''}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, auto_pause_7d_threshold: value / 100 }))
                     }}
-                    onBlur={() => {
-                      void autoSaveSettingsPatch({ auto_pause_7d_threshold: settingsForm.auto_pause_7d_threshold })
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ auto_pause_7d_threshold: value / 100 })
                     }}
                   />
                 </SettingField>
                 <SettingField label={t('settings.autoPause5hGuardBand')} description={t('settings.autoPause5hGuardBandHint')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={0}
                     max={100}
                     step={0.1}
                     inputMode="decimal"
                     placeholder={t('settings.autoPause5hGuardBandPlaceholder')}
-                    value={settingsForm.auto_pause_5h_guard_band_percent > 0 ? settingsForm.auto_pause_5h_guard_band_percent : ''}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => {
-                      const raw = e.target.value
-                      if (raw === '') {
-                        setSettingsForm(f => ({ ...f, auto_pause_5h_guard_band_percent: 0 }))
-                        return
-                      }
-                      const parsed = parseFloat(raw)
-                      if (Number.isNaN(parsed)) return
-                      const value = Math.max(0, Math.min(100, parsed))
+                    integer={false}
+                    emptyValue={0}
+                    value={settingsForm.auto_pause_5h_guard_band_percent}
+                    formatValue={(value) => value > 0 ? String(value) : ''}
+                    onValueChange={(value) => {
                       setSettingsForm(f => ({ ...f, auto_pause_5h_guard_band_percent: value }))
                     }}
-                    onBlur={() => {
-                      void autoSaveSettingsPatch({ auto_pause_5h_guard_band_percent: settingsForm.auto_pause_5h_guard_band_percent })
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ auto_pause_5h_guard_band_percent: value })
                     }}
                   />
                 </SettingField>
                 <SettingField label={t('settings.autoPause5hGuardConcurrency')} description={t('settings.autoPause5hGuardConcurrencyHint')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={0}
                     max={1000}
                     step={1}
                     inputMode="numeric"
                     value={settingsForm.auto_pause_5h_guard_concurrency ?? 1}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => {
-                      const raw = e.target.value
-                      if (raw === '') {
-                        setSettingsForm(f => ({ ...f, auto_pause_5h_guard_concurrency: 0 }))
-                        return
-                      }
-                      const parsed = Number.parseInt(raw, 10)
-                      if (Number.isNaN(parsed)) return
-                      const value = Math.max(0, Math.min(1000, parsed))
+                    emptyValue={0}
+                    onValueChange={(value) => {
                       setSettingsForm(f => ({ ...f, auto_pause_5h_guard_concurrency: value }))
                     }}
-                    onBlur={() => {
-                      void autoSaveSettingsPatch({ auto_pause_5h_guard_concurrency: settingsForm.auto_pause_5h_guard_concurrency })
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ auto_pause_5h_guard_concurrency: value })
                     }}
                   />
                 </SettingField>
@@ -2459,26 +2622,17 @@ export default function Settings() {
                   />
                 </SettingField>
                 <SettingField label={t('settings.smartPacingMinConcurrency')} description={t('settings.smartPacingMinConcurrencyHint')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={1}
                     max={1000}
                     step={1}
                     inputMode="numeric"
                     value={settingsForm.smart_pacing_min_concurrency ?? 1}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => {
-                      const raw = e.target.value
-                      if (raw === '') {
-                        setSettingsForm(f => ({ ...f, smart_pacing_min_concurrency: 1 }))
-                        return
-                      }
-                      const parsed = Number.parseInt(raw, 10)
-                      if (Number.isNaN(parsed)) return
-                      const value = Math.max(1, Math.min(1000, parsed))
+                    onValueChange={(value) => {
                       setSettingsForm(f => ({ ...f, smart_pacing_min_concurrency: value }))
                     }}
-                    onBlur={() => {
-                      void autoSaveSettingsPatch({ smart_pacing_min_concurrency: settingsForm.smart_pacing_min_concurrency })
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({ smart_pacing_min_concurrency: value })
                     }}
                   />
                 </SettingField>
@@ -2506,7 +2660,169 @@ export default function Settings() {
 
           </SettingsSection>
 
+          <SettingsSection id="settings-grok" title={t('settings.nav.grok')} description={t('settings.nav.grokDesc')}>
+          <SettingsCard title={t('settings.grokSettingsTitle')} description={t('settings.grokSettingsDesc')} icon={<ChannelLogo channel="grok" size={16} />}>
+            {/* 与「探测调度」一致：表单控件同宽网格，开关单独一行，避免 switch 卡片与 input 混排导致高低宽不一致。 */}
+            <div className="space-y-4">
+              <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField label={t('settings.grokAffinityMode')} description={t('settings.grokAffinityModeDesc')}>
+                  <Select
+                    value={settingsForm.grok_affinity_mode || 'strict'}
+                    onValueChange={(value) => autoSaveStringField('grok_affinity_mode', value)}
+                    options={grokAffinityModeOptions}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.grokProbeInterval')}
+                  description={t('settings.grokProbeIntervalDesc')}
+                  suffix={t('settings.unit.min')}
+                >
+                  <DraftNumberInput
+                    min={5}
+                    max={1440}
+                    step={5}
+                    integer
+                    emptyValue={30}
+                    disabled={!settingsForm.grok_probe_enabled}
+                    value={settingsForm.grok_probe_interval_minutes ?? 30}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, grok_probe_interval_minutes: value }))
+                    }}
+                    onValueCommit={(value) => {
+                      const v = value < 5 ? 5 : value
+                      void autoSaveSettingsPatch({ grok_probe_interval_minutes: v })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.grokMaxRateLimitRetries')}
+                  description={t('settings.grokMaxRateLimitRetriesDesc')}
+                  suffix={t('settings.unit.times')}
+                >
+                  <DraftNumberInput
+                    min={0}
+                    max={20}
+                    step={1}
+                    integer
+                    emptyValue={0}
+                    value={settingsForm.grok_max_rate_limit_retries ?? 0}
+                    onValueChange={(value) => {
+                      setSettingsForm(f => ({ ...f, grok_max_rate_limit_retries: value }))
+                    }}
+                    onValueCommit={(value) => {
+                      const v = value < 0 ? 0 : value
+                      void autoSaveSettingsPatch({ grok_max_rate_limit_retries: v })
+                    }}
+                  />
+                </SettingField>
+              </div>
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField label={t('settings.grokProbeEnabled')} description={t('settings.grokProbeEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.grok_probe_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('grok_probe_enabled', checked)}
+                  />
+                </SettingField>
+              </div>
+              <div className={SETTINGS_FIELD_GRID_3}>
+                {/* client_id 同时可由环境变量 GROK_OAUTH_CLIENT_ID 指定，且环境变量优先级更高；
+                    被覆盖时这里禁用输入并说明当前生效值，避免用户以为改了却不起作用。 */}
+                <SettingField
+                  className="sm:col-span-2 xl:col-span-3"
+                  label={t('settings.grokOAuthClientId')}
+                  description={
+                    settingsForm.grok_oauth_client_id_env_override
+                      ? t('settings.grokOAuthClientIdEnvOverride', {
+                          value: settingsForm.grok_oauth_client_id_effective || '',
+                        })
+                      : t('settings.grokOAuthClientIdDesc')
+                  }
+                >
+                  <Input
+                    value={settingsForm.grok_oauth_client_id ?? ''}
+                    disabled={settingsForm.grok_oauth_client_id_env_override}
+                    placeholder={t('settings.grokOAuthClientIdPlaceholder')}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                      setSettingsForm(f => ({ ...f, grok_oauth_client_id: e.target.value }))
+                    }
+                    onBlur={(e) => autoSaveStringField('grok_oauth_client_id', e.currentTarget.value.trim())}
+                  />
+                </SettingField>
+              </div>
+            </div>
+          </SettingsCard>
+          </SettingsSection>
+
           <SettingsSection id="settings-runtime" title={t('settings.nav.runtime')} description={t('settings.nav.runtimeDesc')}>
+          <SettingsCard
+            title={t('settings.responseCache.title')}
+            description={t('settings.responseCache.description')}
+            icon={<Database className="size-4" />}
+            badge={
+              <Badge variant="outline" className="text-[11px] tabular-nums">
+                {settingsForm.response_cache_config_generation > 0
+                  ? t('settings.responseCache.generation', { value: settingsForm.response_cache_config_generation })
+                  : t('settings.responseCache.generationPending')}
+              </Badge>
+            }
+          >
+            <div className="space-y-4">
+              <div className={SETTINGS_FIELD_GRID_3}>
+                <SettingField
+                  label={t('settings.responseCache.total')}
+                  description={t('settings.responseCache.totalDesc')}
+                  suffix="MiB"
+                >
+                  <DraftNumberInput
+                    step={1}
+                    integer={true}
+                    value={responseCacheBudget.totalMiB}
+                    aria-invalid={Boolean(responseCacheValidationError)}
+                    onValueChange={(value) => updateResponseCacheBudget('totalMiB', value)}
+                    onValueCommit={(value) => commitResponseCacheBudget('totalMiB', value)}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.responseCache.entry')}
+                  description={t('settings.responseCache.entryDesc')}
+                  suffix="MiB"
+                >
+                  <DraftNumberInput
+                    step={1}
+                    integer={true}
+                    value={responseCacheBudget.entryMiB}
+                    aria-invalid={Boolean(responseCacheValidationError)}
+                    onValueChange={(value) => updateResponseCacheBudget('entryMiB', value)}
+                    onValueCommit={(value) => commitResponseCacheBudget('entryMiB', value)}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.responseCache.reconstruct')}
+                  description={t('settings.responseCache.reconstructDesc')}
+                  suffix="MiB"
+                >
+                  <DraftNumberInput
+                    step={1}
+                    integer={true}
+                    value={responseCacheBudget.reconstructMiB}
+                    aria-invalid={Boolean(responseCacheValidationError)}
+                    onValueChange={(value) => updateResponseCacheBudget('reconstructMiB', value)}
+                    onValueCommit={(value) => commitResponseCacheBudget('reconstructMiB', value)}
+                  />
+                </SettingField>
+              </div>
+              {responseCacheValidationMessage ? (
+                <p role="alert" className="text-xs font-medium text-destructive">
+                  {responseCacheValidationMessage}
+                </p>
+              ) : null}
+              <div className="rounded-lg border border-primary/15 bg-primary/5 px-3.5 py-3 text-xs leading-relaxed text-muted-foreground">
+                <p>{t('settings.responseCache.l1Note')}</p>
+                <p className="mt-1.5">{t('settings.responseCache.memoryNote')}</p>
+              </div>
+            </div>
+          </SettingsCard>
+
           <SettingsCard title={t('settings.codexWebsocket')} description={t('settings.codexWebsocketDesc')} icon={<Wifi className="size-4" />}>
             <div className="space-y-4">
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
@@ -2516,9 +2832,16 @@ export default function Settings() {
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_force_websocket', checked)}
                   />
                 </SettingField>
+                <SettingField label={t('settings.codexWSWeakNetworkMode')} description={t('settings.codexWSWeakNetworkModeDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_ws_weak_network_mode}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_weak_network_mode', checked)}
+                  />
+                </SettingField>
                 <SettingField label={t('settings.codexWSKeepaliveEnabled')} description={t('settings.codexWSKeepaliveEnabledDesc')} layout="switch">
                   <Switch
                     checked={settingsForm.codex_ws_keepalive_enabled}
+                    disabled={settingsForm.codex_ws_weak_network_mode}
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_keepalive_enabled', checked)}
                   />
                 </SettingField>
@@ -2534,6 +2857,18 @@ export default function Settings() {
                     onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_silent_retry_enabled', checked)}
                   />
                 </SettingField>
+                <SettingField label={t('settings.codexWSSizeRouterEnabled')} description={t('settings.codexWSSizeRouterEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_ws_size_router_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_size_router_enabled', checked)}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.codexWSBusyOverflowEnabled')} description={t('settings.codexWSBusyOverflowEnabledDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.codex_ws_busy_overflow_enabled}
+                    onCheckedChange={(checked) => autoSaveBooleanField('codex_ws_busy_overflow_enabled', checked)}
+                  />
+                </SettingField>
               </div>
 
               <div className={cn(SETTINGS_FIELD_GRID, 'border-t border-border/80 pt-4')}>
@@ -2541,19 +2876,18 @@ export default function Settings() {
                   label={t('settings.codexWSKeepaliveInterval')}
                   description={t('settings.codexWSKeepaliveIntervalDesc')}
                   suffix={t('settings.unit.sec')}
-                  className={cn(!settingsForm.codex_ws_keepalive_enabled && 'opacity-60')}
+                  className={cn((!settingsForm.codex_ws_keepalive_enabled || settingsForm.codex_ws_weak_network_mode) && 'opacity-60')}
                 >
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={10}
                     max={600}
-                    disabled={!settingsForm.codex_ws_keepalive_enabled}
+                    disabled={!settingsForm.codex_ws_keepalive_enabled || settingsForm.codex_ws_weak_network_mode}
                     value={settingsForm.codex_ws_keepalive_interval_sec}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_ws_keepalive_interval_sec: parseInt(e.target.value) || 60 }))}
-                    onBlur={() => {
-                      if (!settingsForm.codex_ws_keepalive_enabled) return
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_keepalive_interval_sec: value }))}
+                    onValueCommit={(value) => {
+                      if (!settingsForm.codex_ws_keepalive_enabled || settingsForm.codex_ws_weak_network_mode) return
                       void autoSaveSettingsPatch({
-                        codex_ws_keepalive_interval_sec: settingsForm.codex_ws_keepalive_interval_sec,
+                        codex_ws_keepalive_interval_sec: value,
                       })
                     }}
                   />
@@ -2564,17 +2898,55 @@ export default function Settings() {
                   suffix={t('settings.unit.times')}
                   className={cn(!settingsForm.codex_ws_silent_retry_enabled && 'opacity-60')}
                 >
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={0}
                     max={10}
                     disabled={!settingsForm.codex_ws_silent_retry_enabled}
                     value={settingsForm.codex_ws_silent_max_retries}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_ws_silent_max_retries: parseInt(e.target.value) || 0 }))}
-                    onBlur={() => {
+                    emptyValue={0}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_silent_max_retries: value }))}
+                    onValueCommit={(value) => {
                       if (!settingsForm.codex_ws_silent_retry_enabled) return
                       void autoSaveSettingsPatch({
-                        codex_ws_silent_max_retries: settingsForm.codex_ws_silent_max_retries,
+                        codex_ws_silent_max_retries: value,
+                      })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexWSBusyAcquireMaxWait')}
+                  description={t('settings.codexWSBusyAcquireMaxWaitDesc')}
+                  suffix={t('settings.unit.sec')}
+                >
+                  <DraftNumberInput
+                    min={1}
+                    max={300}
+                    value={settingsForm.codex_ws_busy_acquire_max_wait_sec}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_busy_acquire_max_wait_sec: value }))}
+                    onValueCommit={(value) => {
+                      void autoSaveSettingsPatch({
+                        codex_ws_busy_acquire_max_wait_sec: value,
+                      })
+                    }}
+                  />
+                </SettingField>
+                <SettingField
+                  label={t('settings.codexWSBusyPatience')}
+                  description={t('settings.codexWSBusyPatienceDesc')}
+                  suffix={t('settings.unit.sec')}
+                  className={cn(!settingsForm.codex_ws_busy_overflow_enabled && 'opacity-60')}
+                >
+                  <DraftNumberInput
+                    min={0}
+                    max={300}
+                    disabled={!settingsForm.codex_ws_busy_overflow_enabled}
+                    value={settingsForm.codex_ws_busy_patience_sec}
+                    emptyValue={0}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_ws_busy_patience_sec: value }))}
+                    onValueCommit={(value) => {
+                      if (!settingsForm.codex_ws_busy_overflow_enabled) return
+                      void autoSaveSettingsPatch({
+                        codex_ws_busy_patience_sec: value,
                       })
                     }}
                   />
@@ -2599,22 +2971,43 @@ export default function Settings() {
                   description={t('settings.codexContinueMaxRoundsDesc')}
                   className={cn(!settingsForm.codex_continue_thinking_enabled && 'opacity-60')}
                 >
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={1}
                     max={32}
                     disabled={!settingsForm.codex_continue_thinking_enabled}
                     value={settingsForm.codex_continue_max_rounds}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, codex_continue_max_rounds: parseInt(e.target.value) || 8 }))}
-                    onBlur={() => {
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, codex_continue_max_rounds: value }))}
+                    onValueCommit={(value) => {
                       if (!settingsForm.codex_continue_thinking_enabled) return
                       void autoSaveSettingsPatch({
-                        codex_continue_max_rounds: settingsForm.codex_continue_max_rounds,
+                        codex_continue_max_rounds: value,
                       })
                     }}
                   />
                 </SettingField>
               </div>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.overflowAutoCompact')} description={t('settings.overflowAutoCompactDesc')} icon={<Layers className="size-4" />}>
+            <div className={SETTINGS_SWITCH_GRID}>
+              <SettingField label={t('settings.overflowAutoCompactEnabled')} description={t('settings.overflowAutoCompactEnabledDesc')} layout="switch">
+                <Switch
+                  checked={settingsForm.overflow_auto_compact_enabled}
+                  onCheckedChange={(checked) => autoSaveBooleanField('overflow_auto_compact_enabled', checked)}
+                />
+              </SettingField>
+            </div>
+          </SettingsCard>
+
+          <SettingsCard title={t('settings.codexPreflightSSEPassthrough')} description={t('settings.codexPreflightSSEPassthroughDesc')} icon={<Layers className="size-4" />}>
+            <div className={SETTINGS_SWITCH_GRID}>
+              <SettingField label={t('settings.codexPreflightSSEPassthroughEnabled')} description={t('settings.codexPreflightSSEPassthroughEnabledDesc')} layout="switch">
+                <Switch
+                  checked={settingsForm.codex_preflight_sse_passthrough_enabled}
+                  onCheckedChange={(checked) => autoSaveBooleanField('codex_preflight_sse_passthrough_enabled', checked)}
+                />
+              </SettingField>
             </div>
           </SettingsCard>
 
@@ -2691,23 +3084,22 @@ export default function Settings() {
                       <SettingHelp text={t('settings.codexCliVersionSyncIntervalDesc')} />
                     </div>
                     <div className="relative w-[7.25rem] shrink-0">
-                      <Input
-                        type="number"
+                      <DraftNumberInput
                         min={1}
                         max={720}
                         className="h-9 pr-10 tabular-nums"
                         disabled={!settingsForm.codex_cli_version_sync_enabled}
                         value={settingsForm.codex_cli_version_sync_interval_hours}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) =>
+                        onValueChange={(value) =>
                           setSettingsForm((f) => ({
                             ...f,
-                            codex_cli_version_sync_interval_hours: parseInt(e.target.value) || 12,
+                            codex_cli_version_sync_interval_hours: value,
                           }))
                         }
-                        onBlur={() => {
+                        onValueCommit={(value) => {
                           if (!settingsForm.codex_cli_version_sync_enabled) return
                           void autoSaveSettingsPatch({
-                            codex_cli_version_sync_interval_hours: settingsForm.codex_cli_version_sync_interval_hours,
+                            codex_cli_version_sync_interval_hours: value,
                           })
                         }}
                       />
@@ -2717,6 +3109,25 @@ export default function Settings() {
                     </div>
                   </div>
                 </div>
+                <SettingField label={t('settings.utlsShutdownTimeout')} description={t('settings.utlsShutdownTimeoutDesc')}>
+                  <div className="relative">
+                    <DraftNumberInput
+                      min={1}
+                      max={240}
+                      className="pr-12 tabular-nums"
+                      value={settingsForm.utls_shutdown_timeout_minutes}
+                      onValueChange={(value) => setSettingsForm(f => ({ ...f, utls_shutdown_timeout_minutes: value }))}
+                      onValueCommit={(value) => {
+                        void autoSaveSettingsPatch({
+                          utls_shutdown_timeout_minutes: value,
+                        })
+                      }}
+                    />
+                    <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-[11px] font-medium text-muted-foreground">
+                      {t('settings.unit.min')}
+                    </span>
+                  </div>
+                </SettingField>
                 <SettingField className="sm:col-span-2 xl:col-span-3" label={t('settings.codexUserAgentRaw')} description={t('settings.codexUserAgentRawDesc')}>
                   <Input
                     className="font-mono text-xs"
@@ -2789,21 +3200,19 @@ export default function Settings() {
                   />
                 </SettingField>
                 <SettingField label={t('settings.usageLogBatchSize')} description={t('settings.usageLogBatchSizeDesc')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={1}
-                    max={10000}
+                    max={1000}
                     value={settingsForm.usage_log_batch_size}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_log_batch_size: parseInt(e.target.value) || 200 }))}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, usage_log_batch_size: value }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.usageLogFlushInterval')} description={t('settings.usageLogFlushIntervalDesc')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={1}
                     max={300}
                     value={settingsForm.usage_log_flush_interval_seconds}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, usage_log_flush_interval_seconds: parseInt(e.target.value) || 5 }))}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, usage_log_flush_interval_seconds: value }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.billingTierPolicy')} description={t('settings.billingTierPolicyDesc')}>
@@ -2821,12 +3230,11 @@ export default function Settings() {
                   />
                 </SettingField>
                 <SettingField label={t('settings.streamFlushInterval')} description={t('settings.streamFlushIntervalDesc')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={1}
                     max={1000}
                     value={settingsForm.stream_flush_interval_ms}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, stream_flush_interval_ms: parseInt(e.target.value) || 20 }))}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, stream_flush_interval_ms: value }))}
                   />
                 </SettingField>
                 <SettingField label={t('settings.firstTokenMode')} description={t('settings.firstTokenModeDesc')}>
@@ -2837,12 +3245,20 @@ export default function Settings() {
                   />
                 </SettingField>
                 <SettingField label={t('settings.firstTokenTimeout')} description={t('settings.firstTokenTimeoutDesc')}>
-                  <Input
-                    type="number"
+                  <DraftNumberInput
                     min={0}
                     max={600}
                     value={settingsForm.first_token_timeout_seconds}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, first_token_timeout_seconds: parseInt(e.target.value) || 0 }))}
+                    emptyValue={0}
+                    onValueChange={(value) => setSettingsForm(f => ({ ...f, first_token_timeout_seconds: value }))}
+                  />
+                </SettingField>
+              </div>
+              <div className={SETTINGS_SWITCH_GRID}>
+                <SettingField label={t('settings.firstTokenExcludesWsAcquire')} description={t('settings.firstTokenExcludesWsAcquireDesc')} layout="switch">
+                  <Switch
+                    checked={settingsForm.first_token_excludes_ws_acquire}
+                    onCheckedChange={(checked) => autoSaveBooleanField('first_token_excludes_ws_acquire', checked)}
                   />
                 </SettingField>
               </div>
@@ -2866,23 +3282,21 @@ export default function Settings() {
                 <div className={SETTINGS_FIELD_GRID}>
                   {isExternalDatabase ? (
                     <SettingField label={t('settings.pgMaxConns')} description={t('settings.pgMaxConnsRange')}>
-                      <Input
-                        type="number"
+                      <DraftNumberInput
                         min={5}
                         max={500}
                         value={settingsForm.pg_max_conns}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, pg_max_conns: parseInt(e.target.value) || 50 }))}
+                        onValueChange={(value) => setSettingsForm(f => ({ ...f, pg_max_conns: value }))}
                       />
                     </SettingField>
                   ) : null}
                   {isExternalCache ? (
                     <SettingField label={t('settings.redisPoolSize')} description={t('settings.redisPoolSizeRange')}>
-                      <Input
-                        type="number"
+                      <DraftNumberInput
                         min={5}
                         max={500}
                         value={settingsForm.redis_pool_size}
-                        onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, redis_pool_size: parseInt(e.target.value) || 30 }))}
+                        onValueChange={(value) => setSettingsForm(f => ({ ...f, redis_pool_size: value }))}
                       />
                     </SettingField>
                   ) : null}
@@ -3364,6 +3778,13 @@ export default function Settings() {
                 meta={t('settings.nav.mappingCount', { count: reasoningEffortCount })}
                 openLabel={t('settings.nav.manage')}
                 onOpen={() => setModelPanel('reasoning')}
+              />
+              <ModelSummaryCard
+                title={t('settings2.payloadRules')}
+                description={t('settings2.payloadRulesDesc')}
+                meta={t('settings.nav.mappingCount', { count: payloadRuleCount })}
+                openLabel={t('settings.nav.manage')}
+                onOpen={() => navigate('/payload-rules')}
               />
             </div>
 

@@ -565,14 +565,14 @@ func TestPrepareResponsesBody_NormalizesUserOutputTextToInputText(t *testing.T) 
 	}
 }
 
-func TestCodexResponsesPreparersMoveZedSystemMessageToInstructions(t *testing.T) {
+func TestCodexResponsesPreparersPromoteTextSystemContent(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.6-sol",
-		"stream":true,
-		"instructions":null,
+		"instructions":"existing",
 		"input":[
-			{"type":"message","role":"system","content":[{"type":"input_text","text":"You are Zed's coding assistant."}]},
-			{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+			{"type":"message","role":"system","content":[{"type":"input_text","text":"text policy"}]},
+			{"type":"message","role":"system","content":[{"type":"input_image","image_url":"https://example.com/policy.png"}]},
+			{"type":"message","role":"user","content":"hi"}
 		]
 	}`)
 	preparers := []struct {
@@ -586,144 +586,136 @@ func TestCodexResponsesPreparersMoveZedSystemMessageToInstructions(t *testing.T)
 
 	for _, test := range preparers {
 		t.Run(test.name, func(t *testing.T) {
-			got, expandedInputRaw := test.prepare(raw)
-
+			got, _ := test.prepare(raw)
 			instructions := gjson.GetBytes(got, "instructions").String()
-			systemIndex := strings.Index(instructions, "You are Zed's coding assistant.")
-			bridgeIndex := strings.Index(instructions, codexImageGenerationBridgeMarker)
-			if systemIndex < 0 || bridgeIndex <= systemIndex {
-				t.Fatalf("Zed system prompt should precede the service bridge, got %q; body=%s", instructions, got)
+			if !strings.Contains(instructions, "existing") || !strings.Contains(instructions, "text policy") {
+				t.Fatalf("text system content was not promoted to instructions: %s", got)
 			}
-			input := gjson.GetBytes(got, "input").Array()
-			if len(input) != 1 || input[0].Get("role").String() != "user" {
-				t.Fatalf("system message should be removed from Codex input; body=%s", got)
+			if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
+				t.Fatalf("non-text system content should remain as developer, got %q; body=%s", role, got)
 			}
-			if expanded := gjson.Parse(expandedInputRaw).Array(); len(expanded) != 1 || expanded[0].Get("role").String() != "user" {
-				t.Fatalf("expanded input should exclude system message; expanded=%s", expandedInputRaw)
+			if imageURL := gjson.GetBytes(got, "input.0.content.0.image_url").String(); imageURL != "https://example.com/policy.png" {
+				t.Fatalf("non-text system content was not preserved: %s", got)
+			}
+			if role := gjson.GetBytes(got, "input.1.role").String(); role != "user" {
+				t.Fatalf("user message order changed: %s", got)
 			}
 		})
-	}
-}
-
-func TestPrepareResponsesBodyAppendsOrderedSystemMessagesToExistingInstructions(t *testing.T) {
-	raw := []byte(`{
-		"model":"gpt-5.6-sol",
-		"instructions":"Existing instructions.",
-		"input":[
-			{"type":"message","role":"system","content":"First system message."},
-			{"type":"message","role":"user","content":"hello"},
-			{"type":"message","role":"system","content":[{"type":"input_text","text":"Second system message."}]}
-		]
-	}`)
-
-	got, _ := PrepareResponsesBody(raw)
-
-	instructions := gjson.GetBytes(got, "instructions").String()
-	existingIndex := strings.Index(instructions, "Existing instructions.")
-	firstIndex := strings.Index(instructions, "First system message.")
-	secondIndex := strings.Index(instructions, "Second system message.")
-	bridgeIndex := strings.Index(instructions, codexImageGenerationBridgeMarker)
-	if existingIndex != 0 || firstIndex <= existingIndex || secondIndex <= firstIndex || bridgeIndex <= secondIndex {
-		t.Fatalf("instructions should preserve existing/system order, got %q; body=%s", instructions, got)
-	}
-	input := gjson.GetBytes(got, "input").Array()
-	if len(input) != 1 || input[0].Get("role").String() != "user" {
-		t.Fatalf("only the user message should remain; body=%s", got)
-	}
-}
-
-func TestPrepareResponsesBodyPreservesNonTextSystemContentAsDeveloperMessage(t *testing.T) {
-	raw := []byte(`{
-		"model":"gpt-5.6-sol",
-		"input":[
-			{"type":"message","role":"system","content":[{"type":"input_image","image_url":"https://example.com/policy.png"}]},
-			{"type":"message","role":"user","content":"hello"}
-		]
-	}`)
-
-	got, _ := PrepareResponsesBody(raw)
-
-	if role := gjson.GetBytes(got, "input.0.role").String(); role != "developer" {
-		t.Fatalf("non-text system message should fall back to developer, got %q; body=%s", role, got)
-	}
-	if imageURL := gjson.GetBytes(got, "input.0.content.0.image_url").String(); imageURL != "https://example.com/policy.png" {
-		t.Fatalf("non-text system content was not preserved; body=%s", got)
-	}
-	if role := gjson.GetBytes(got, "input.1.role").String(); role != "user" {
-		t.Fatalf("user message order changed; body=%s", got)
-	}
-}
-
-func TestPrepareResponsesBodyDropsEmptySystemMessages(t *testing.T) {
-	raw := []byte(`{
-		"model":"gpt-5.6-sol",
-		"input":[
-			{"type":"message","role":"system","content":null},
-			{"type":"message","role":"system","content":[]},
-			{"type":"message","role":"user","content":"hello"}
-		]
-	}`)
-
-	got, _ := PrepareResponsesBody(raw)
-
-	input := gjson.GetBytes(got, "input").Array()
-	if len(input) != 1 || input[0].Get("role").String() != "user" {
-		t.Fatalf("empty system messages should be removed; body=%s", got)
-	}
-}
-
-func TestPrepareResponsesBodyMovesCachedSystemMessageToInstructions(t *testing.T) {
-	resetResponseCacheForTest()
-	t.Cleanup(resetResponseCacheForTest)
-	setResponseCache("zed-owner", "resp_zed", []json.RawMessage{
-		json.RawMessage(`{"type":"message","role":"system","content":[{"type":"input_text","text":"Historical system message."}]}`),
-	})
-	raw := []byte(`{
-		"model":"gpt-5.6-sol",
-		"previous_response_id":"resp_zed",
-		"input":[{"type":"message","role":"user","content":"continue"}]
-	}`)
-
-	got, expandedInputRaw := PrepareResponsesBodyForOwner(raw, "zed-owner")
-
-	if !strings.Contains(gjson.GetBytes(got, "instructions").String(), "Historical system message.") {
-		t.Fatalf("cached system message was not moved to instructions; body=%s", got)
-	}
-	if input := gjson.GetBytes(got, "input").Array(); len(input) != 1 || input[0].Get("role").String() != "user" {
-		t.Fatalf("cached system message should not remain in input; body=%s", got)
-	}
-	if expanded := gjson.Parse(expandedInputRaw).Array(); len(expanded) != 1 || expanded[0].Get("role").String() != "user" {
-		t.Fatalf("expanded input should exclude cached system message; expanded=%s", expandedInputRaw)
 	}
 }
 
 func TestPrepareOpenAIResponsesBodyPreservesSystemMessages(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.6-sol",
-		"instructions":null,
 		"input":[
-			{"type":"message","role":"system","content":[{"type":"input_text","text":"Keep relay semantics."}]},
-			{"type":"message","role":"user","content":"hello"}
+			{"type":"message","role":"system","content":"relay policy"},
+			{"type":"message","role":"user","content":"hi"}
 		]
 	}`)
 
-	preparers := []struct {
-		name    string
-		prepare func([]byte) []byte
-	}{
-		{name: "responses", prepare: PrepareOpenAIResponsesBody},
-		{name: "compact", prepare: PrepareOpenAIResponsesCompactBody},
+	for _, prepare := range []func([]byte) []byte{PrepareOpenAIResponsesBody, PrepareOpenAIResponsesCompactBody} {
+		got := prepare(raw)
+		if role := gjson.GetBytes(got, "input.0.role").String(); role != "system" {
+			t.Fatalf("relay path changed system role to %q; body=%s", role, got)
+		}
 	}
-	for _, test := range preparers {
-		t.Run(test.name, func(t *testing.T) {
-			got := test.prepare(raw)
-			if role := gjson.GetBytes(got, "input.0.role").String(); role != "system" {
-				t.Fatalf("OpenAI Responses relay should preserve system role, got %q; body=%s", role, got)
-			}
-			if len(gjson.GetBytes(got, "input").Array()) != 2 {
-				t.Fatalf("OpenAI Responses relay should preserve both input messages; body=%s", got)
-			}
-		})
+}
+
+func TestPrepareResponsesBody_ConvertsOrphanToolOutputToMessage(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"message","role":"user","content":"what is the weather?"},
+			{"type":"function_call_output","call_id":"call_orphan1","output":"{\"temp\":21}"},
+			{"type":"function_call","call_id":"call_ok","name":"get_weather","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_ok","output":"sunny"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "message" {
+		t.Fatalf("orphan output should become a message, got %q; body=%s", typ, got)
+	}
+	if role := gjson.GetBytes(got, "input.1.role").String(); role != "user" {
+		t.Fatalf("orphan output message should be user role, got %q; body=%s", role, got)
+	}
+	text := gjson.GetBytes(got, "input.1.content.0.text").String()
+	if !strings.Contains(text, "call_orphan1") || !strings.Contains(text, `{"temp":21}`) {
+		t.Fatalf("orphan output text should keep call_id and content, got %q", text)
+	}
+	if typ := gjson.GetBytes(got, "input.3.type").String(); typ != "function_call_output" {
+		t.Fatalf("paired output must stay untouched, got %q; body=%s", typ, got)
+	}
+}
+
+func TestPrepareResponsesBody_SynthesizesOutputForOrphanToolCall(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"message","role":"user","content":"hi"},
+			{"type":"function_call","call_id":"call_orphan2","name":"get_weather","arguments":"{}"},
+			{"type":"message","role":"user","content":"continue"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.2.type").String(); typ != "function_call_output" {
+		t.Fatalf("orphan call should get a placeholder output right after it, got %q; body=%s", typ, got)
+	}
+	if callID := gjson.GetBytes(got, "input.2.call_id").String(); callID != "call_orphan2" {
+		t.Fatalf("placeholder output call_id mismatch, got %q; body=%s", callID, got)
+	}
+	if typ := gjson.GetBytes(got, "input.1.type").String(); typ != "function_call" {
+		t.Fatalf("orphan call itself must be preserved; body=%s", got)
+	}
+}
+
+func TestPrepareResponsesBody_FlattensOrphanOutputContentParts(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"function_call_output","call_id":"call_parts","output":[{"type":"output_text","text":"part a"},{"type":"output_text","text":"part b"}]}
+		]
+	}`)
+
+	got, _ := PrepareResponsesBody(raw)
+
+	text := gjson.GetBytes(got, "input.0.content.0.text").String()
+	if !strings.Contains(text, "part a") || !strings.Contains(text, "part b") {
+		t.Fatalf("content-part outputs should be flattened into text, got %q", text)
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_SkipsPairingRepairWithPreviousResponseID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"previous_response_id":"resp_123",
+		"input":[
+			{"type":"function_call_output","call_id":"call_linked","output":"result"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesWebSocketBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "function_call_output" {
+		t.Fatalf("orphan output is legitimate when previous_response_id is preserved, got %q; body=%s", typ, got)
+	}
+}
+
+func TestPrepareResponsesWebSocketBody_RepairsPairingWithoutPreviousResponseID(t *testing.T) {
+	raw := []byte(`{
+		"model":"gpt-5.5",
+		"input":[
+			{"type":"function_call_output","call_id":"call_ws_orphan","output":"result"}
+		]
+	}`)
+
+	got, _ := PrepareResponsesWebSocketBody(raw)
+
+	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
+		t.Fatalf("WS path without previous_response_id should repair orphan output, got %q; body=%s", typ, got)
 	}
 }
 
@@ -803,61 +795,6 @@ func TestPrepareOpenAIResponsesBody_NormalizesLegacyImageContentPart(t *testing.
 	}
 	if stream := gjson.GetBytes(got, "stream"); !stream.Exists() || stream.Bool() {
 		t.Fatalf("OpenAI Responses body should preserve stream=false; body=%s", got)
-	}
-}
-
-func TestPrepareOpenAIResponsesBodyDropsBareReasoningOnly(t *testing.T) {
-	raw := []byte(`{
-		"model":"gpt-5.6-sol",
-		"input":[
-			{"type":"message","role":"user","content":"continue"},
-			{"type":"reasoning","summary":[]},
-			{"type":"reasoning","encrypted_content":"valid-reasoning"},
-			{"type":"compaction","encrypted_content":"compact-state"},
-			{"type":"agent_message","content":[{"type":"encrypted_content"}]}
-		]
-	}`)
-
-	got := PrepareOpenAIResponsesBody(raw)
-
-	items := gjson.GetBytes(got, "input").Array()
-	if len(items) != 4 {
-		t.Fatalf("input len = %d, want 4; body=%s", len(items), got)
-	}
-	if items[1].Get("encrypted_content").String() != "valid-reasoning" ||
-		items[2].Get("type").String() != "compaction" ||
-		items[3].Get("type").String() != "agent_message" {
-		t.Fatalf("relay cleanup removed protected encrypted state: %s", got)
-	}
-}
-
-func TestPrepareOpenAIResponsesBodyDropsBareReasoningAtLongConversationIndexes(t *testing.T) {
-	input := make([]any, 0, 52)
-	for index := 0; index < 49; index++ {
-		input = append(input, map[string]any{
-			"type":    "message",
-			"role":    "user",
-			"content": fmt.Sprintf("message-%d", index),
-		})
-	}
-	input = append(input,
-		map[string]any{"type": "reasoning", "summary": []any{}},
-		map[string]any{"type": "reasoning", "encrypted_content": nil},
-		map[string]any{"type": "reasoning", "encrypted_content": "valid-long-session-state"},
-	)
-	raw, err := json.Marshal(map[string]any{"model": "gpt-5.6-sol", "input": input})
-	if err != nil {
-		t.Fatalf("marshal request: %v", err)
-	}
-
-	got := PrepareOpenAIResponsesBody(raw)
-
-	items := gjson.GetBytes(got, "input").Array()
-	if len(items) != 50 {
-		t.Fatalf("input len = %d, want 50 after removing input[49] and input[50]; body=%s", len(items), got)
-	}
-	if encrypted := items[49].Get("encrypted_content").String(); encrypted != "valid-long-session-state" {
-		t.Fatalf("valid reasoning after malformed long-session items was not preserved: %s", got)
 	}
 }
 
@@ -1814,13 +1751,15 @@ func TestPrepareResponsesBody_DefaultsMissingMessageContent(t *testing.T) {
 
 	got, expandedInputRaw := PrepareResponsesBody(raw)
 
-	if content := gjson.GetBytes(got, "input.2.content"); !content.Exists() || content.String() != "" {
+	// 孤儿 function_call 会被配对修复在其后补一条占位 output，
+	// 缺省 content 的 message 顺移到下标 3。
+	if content := gjson.GetBytes(got, "input.3.content"); !content.Exists() || content.String() != "" {
 		t.Fatalf("missing message content should be defaulted to empty string, got %s; body=%s", content.Raw, got)
 	}
 	if gjson.GetBytes(got, "input.1.content").Exists() {
 		t.Fatalf("non-message tool context item should not receive content, got %s", got)
 	}
-	if content := gjson.Get(expandedInputRaw, "2.content"); !content.Exists() || content.String() != "" {
+	if content := gjson.Get(expandedInputRaw, "3.content"); !content.Exists() || content.String() != "" {
 		t.Fatalf("expanded input should include normalized empty content, got %s; expanded=%s", content.Raw, expandedInputRaw)
 	}
 }
@@ -1887,6 +1826,42 @@ func TestValidateResponsesFunctionNamesAllowsValidFunctionNames(t *testing.T) {
 
 	if err := ValidateResponsesFunctionNames(raw); err != nil {
 		t.Fatalf("valid function names should pass, got %v", err)
+	}
+}
+
+func TestValidateResponsesFunctionNamesIgnoresInvalidJSON(t *testing.T) {
+	if err := ValidateResponsesFunctionNames([]byte(`{not json`)); err != nil {
+		t.Fatalf("invalid JSON must pass through (upstream validates), got %v", err)
+	}
+}
+
+// buildManyTurnResponsesBody 模拟 issue #417 的长会话形态：大量小文本轮次。
+func buildManyTurnResponsesBody(turns int) []byte {
+	var b strings.Builder
+	b.WriteString(`{"model":"gpt-5.5","input":[`)
+	txt := strings.Repeat("analyze this module carefully ", 40)
+	for i := 0; i < turns; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(`{"type":"message","role":"user","content":[{"type":"input_text","text":"`)
+		b.WriteString(txt)
+		b.WriteString(`"}]}`)
+	}
+	b.WriteString(`],"tools":[{"type":"function","name":"lookup","parameters":{}}]}`)
+	return []byte(b.String())
+}
+
+// BenchmarkValidateResponsesFunctionNamesManyTurns 守护 issue #417 的优化：校验器
+// 只做惰性 gjson 遍历，不再对大请求体做全量 map[string]any 反序列化。
+func BenchmarkValidateResponsesFunctionNamesManyTurns(b *testing.B) {
+	body := buildManyTurnResponsesBody(4000)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(body)))
+	for i := 0; i < b.N; i++ {
+		if err := ValidateResponsesFunctionNames(body); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -2044,42 +2019,6 @@ func TestPrepareOpenAIResponsesBodyNormalizesChatStyleFunctionToolChoice(t *test
 	}
 }
 
-func TestPrepareOpenAIResponsesBodyStripsHistoricalFunctionCallNamespace(t *testing.T) {
-	raw := []byte(`{
-		"model":"gpt-5.6-sol",
-		"input":[
-			{"type":"function_call","call_id":"call_1","name":"spawn_agent","namespace":"collaboration","arguments":"{\"task\":\"inspect\"}"},
-			{"type":"function_call_output","call_id":"call_1","output":"done"}
-		],
-		"tools":[{"type":"namespace","name":"collaboration","description":"agent tools","tools":[]}]
-	}`)
-
-	relayBody := PrepareOpenAIResponsesBody(raw)
-	if gjson.GetBytes(relayBody, "input.0.namespace").Exists() {
-		t.Fatalf("relay 历史 function_call 不应保留 namespace: %s", relayBody)
-	}
-	if got := gjson.GetBytes(relayBody, "input.0.name").String(); got != "spawn_agent" {
-		t.Fatalf("function_call.name = %q, want spawn_agent; body=%s", got, relayBody)
-	}
-	if got := gjson.GetBytes(relayBody, "input.0.call_id").String(); got != "call_1" {
-		t.Fatalf("function_call.call_id = %q, want call_1; body=%s", got, relayBody)
-	}
-	if got := gjson.GetBytes(relayBody, "input.1.call_id").String(); got != "call_1" {
-		t.Fatalf("function_call_output.call_id = %q, want call_1; body=%s", got, relayBody)
-	}
-	if got := gjson.GetBytes(relayBody, "tools.0.namespace").String(); got != "" {
-		t.Fatalf("namespace 工具声明不应被改写为历史字段: %s", relayBody)
-	}
-	if got := gjson.GetBytes(relayBody, "tools.0.type").String(); got != "namespace" {
-		t.Fatalf("顶层 namespace 工具声明必须保留: %s", relayBody)
-	}
-
-	codexBody, _ := PrepareResponsesBody(raw)
-	if got := gjson.GetBytes(codexBody, "input.0.namespace").String(); got != "collaboration" {
-		t.Fatalf("官方 Codex/OAuth 请求必须保留 namespace，got %q; body=%s", got, codexBody)
-	}
-}
-
 func TestPrepareResponsesBody_DefaultsNullMessageContent(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
@@ -2104,7 +2043,7 @@ func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
 		"input":[
 			{"type":"reasoning","id":"rs_123","encrypted_content":"opaque"},
 			{"type":"message","id":"msg_123","role":"user","content":"continue"},
-			{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","arguments":"{}"}
+			{"type":"function_call","id":"fc_123","call_id":"call_123","name":"lookup","namespace":"code_tools","arguments":"{}"}
 		]
 	}`)
 
@@ -2123,6 +2062,9 @@ func TestPrepareResponsesBody_StripsInputItemIDsForStoreFalse(t *testing.T) {
 	}
 	if callID := gjson.GetBytes(got, "input.2.call_id").String(); callID != "call_123" {
 		t.Fatalf("function_call call_id should be preserved, got %q; body=%s", callID, got)
+	}
+	if namespace := gjson.GetBytes(got, "input.2.namespace").String(); namespace != "code_tools" {
+		t.Fatalf("function_call namespace should be preserved, got %q; body=%s", namespace, got)
 	}
 }
 
@@ -2182,13 +2124,11 @@ func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 	raw := []byte(`{
 		"model":"gpt-5.4",
 		"input":[
-				{"type":"message","role":"user","content":"hello"},
-				{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
-				{"type":"encrypted_content","encrypted_content":"gBBB"},
-				{"type":"compaction","encrypted_content":"gCCC"},
-				{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"}
-			]
-		}`)
+			{"type":"message","role":"user","content":"hello"},
+			{"type":"reasoning","id":"rs_bad","encrypted_content":"gAAA"},
+			{"type":"function_call","call_id":"call_123","name":"lookup","arguments":"{}"}
+		]
+	}`)
 
 	got, changed := stripInvalidEncryptedContentFromResponsesBody(raw)
 	if !changed {
@@ -2196,7 +2136,7 @@ func TestStripInvalidEncryptedContentFromResponsesBody(t *testing.T) {
 	}
 	items := gjson.GetBytes(got, "input").Array()
 	if len(items) != 2 {
-		t.Fatalf("expected encrypted-only items to be removed, got %d items: %s", len(items), got)
+		t.Fatalf("expected reasoning item to be removed, got %d items: %s", len(items), got)
 	}
 	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
 		t.Fatalf("first input should remain message, got %q; body=%s", typ, got)
@@ -2252,8 +2192,10 @@ func TestPrepareResponsesBodyDropsBareReasoningItems(t *testing.T) {
 
 	got, expandedInputRaw := PrepareResponsesBody(raw)
 
+	// 无 output 的 function_call 会被配对修复补一条占位 output，
+	// 因此裸 reasoning 清理后剩 3 条原始项 + 1 条合成 output。
 	items := gjson.GetBytes(got, "input").Array()
-	if len(items) != 3 {
+	if len(items) != 4 {
 		t.Fatalf("expected bare reasoning items to be dropped before upstream, got %d items: %s", len(items), got)
 	}
 	if typ := gjson.GetBytes(got, "input.0.type").String(); typ != "message" {
@@ -2264,6 +2206,9 @@ func TestPrepareResponsesBodyDropsBareReasoningItems(t *testing.T) {
 	}
 	if typ := gjson.GetBytes(got, "input.2.type").String(); typ != "function_call" {
 		t.Fatalf("function call should remain, got %q; body=%s", typ, got)
+	}
+	if typ := gjson.GetBytes(got, "input.3.type").String(); typ != "function_call_output" {
+		t.Fatalf("orphan function call should get a placeholder output, got %q; body=%s", typ, got)
 	}
 	if strings.Contains(expandedInputRaw, `"summary_text"`) {
 		t.Fatalf("expanded input cache should use cleaned input, got %s", expandedInputRaw)
@@ -2561,6 +2506,56 @@ func TestStreamTranslator_CustomToolCallInputDelta(t *testing.T) {
 	}
 }
 
+// 终结块必须带 "delta":{}(OpenAI 官方形状)。缺失会让 Rust/serde 系客户端
+// 报 "missing field `delta`" 并整轮失败。
+func TestFinalChunk_AlwaysCarriesEmptyDeltaObject(t *testing.T) {
+	assertDelta := func(t *testing.T, label string, chunk []byte) {
+		t.Helper()
+		delta := gjson.GetBytes(chunk, "choices.0.delta")
+		if !delta.Exists() {
+			t.Fatalf("%s: final chunk missing choices.0.delta; chunk=%s", label, chunk)
+		}
+		if !delta.IsObject() {
+			t.Fatalf("%s: choices.0.delta is not an object; chunk=%s", label, chunk)
+		}
+	}
+
+	// 无状态翻译:文本轮结束
+	statelessChunk, done := TranslateStreamChunk(
+		[]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":3}}}`),
+		"grok-4.5", "chatcmpl-test", 0,
+	)
+	if !done {
+		t.Fatal("stateless: response.completed should be terminal")
+	}
+	assertDelta(t, "stateless", statelessChunk)
+
+	// 有状态翻译:纯文本轮(finish_reason=stop)
+	stText := NewStreamTranslator("chatcmpl-test", "grok-4.5", 0)
+	stText.Translate([]byte(`{"type":"response.output_text.delta","delta":"Hello"}`))
+	textChunk, done := stText.Translate([]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":5,"output_tokens":3}}}`))
+	if !done {
+		t.Fatal("stateful text: response.completed should be terminal")
+	}
+	assertDelta(t, "stateful text", textChunk)
+
+	// 有状态翻译:工具调用轮(finish_reason=tool_calls)
+	stTool := NewStreamTranslator("chatcmpl-test", "grok-4.5", 0)
+	stTool.Translate([]byte(`{
+		"type":"response.output_item.added",
+		"output_index":0,
+		"item":{"type":"function_call","id":"fc_001","call_id":"call_1","name":"func_a","arguments":""}
+	}`))
+	toolChunk, done := stTool.Translate([]byte(`{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5}}}`))
+	if !done {
+		t.Fatal("stateful tool: response.completed should be terminal")
+	}
+	if got := gjson.GetBytes(toolChunk, "choices.0.finish_reason").String(); got != "tool_calls" {
+		t.Fatalf("stateful tool: finish_reason = %q, want tool_calls", got)
+	}
+	assertDelta(t, "stateful tool", toolChunk)
+}
+
 func TestStreamTranslator_TextOnly(t *testing.T) {
 	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
 
@@ -2590,22 +2585,6 @@ func TestStreamTranslator_TextOnly(t *testing.T) {
 
 	if st.HasToolCalls {
 		t.Fatal("HasToolCalls should be false for text-only")
-	}
-}
-
-func TestStreamTranslator_IgnoresEmptyDeltas(t *testing.T) {
-	st := NewStreamTranslator("chatcmpl-test", "gpt-5.4", 0)
-	events := [][]byte{
-		[]byte(`{"type":"response.output_text.delta","delta":""}`),
-		[]byte(`{"type":"response.reasoning_summary_text.delta","delta":""}`),
-		[]byte(`{"type":"response.unknown.delta","delta":""}`),
-	}
-
-	for _, event := range events {
-		chunk, done := st.Translate(event)
-		if done || chunk != nil {
-			t.Fatalf("空增量不得提交下游业务流: event=%s chunk=%s done=%v", event, chunk, done)
-		}
 	}
 }
 

@@ -1,10 +1,12 @@
 import type { ReactNode } from "react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   AlertTriangle,
   BarChart3,
+  Check,
   ChevronLeft,
   ChevronRight,
+  Copy,
   ExternalLink,
   FileJson,
   FlaskConical,
@@ -23,6 +25,8 @@ import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
 import AccountFirstTokenStatsView from "./AccountFirstTokenStatsView";
 import AccountHealthBar from "./AccountHealthBar";
 import AccountManualScoreBonusBadge from "./AccountManualScoreBonusBadge";
+import ChannelLogo from "./ChannelLogo";
+import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
 import { Button } from "@/components/ui/button";
 import {
@@ -45,6 +49,11 @@ function isFutureTime(value?: string): boolean {
 
 function getRateLimitWindow(account: AccountRow): "5h" | "7d" | null {
   const status = (account.status || "").toLowerCase();
+  const reason = (account.cooldown_reason || "").toLowerCase();
+  if (status === "rate_limited_5h") return "5h";
+  if (status === "rate_limited_7d") return "7d";
+  if (reason === "rate_limited_5h") return "5h";
+  if (reason === "rate_limited_7d") return "7d";
   if (status === "rate_limited" || status === "quota_paused" || status === "usage_exhausted") {
     if (account.reset_5h_at && isFutureTime(account.reset_5h_at)) return "5h";
     if (account.reset_7d_at && isFutureTime(account.reset_7d_at)) return "7d";
@@ -54,6 +63,59 @@ function getRateLimitWindow(account: AccountRow): "5h" | "7d" | null {
       return "7d";
   }
   return null;
+}
+
+// 复制邮箱按钮。navigator.clipboard 在非安全上下文（局域网 http 访问）下不存在，
+// 回退到隐藏 textarea + execCommand，否则内网部署里这个按钮会静默失效。
+async function copyTextToClipboard(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand("copy");
+  document.body.removeChild(ta);
+}
+
+function CopyValueButton({ value, label }: { value: string; label: string }) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = window.setTimeout(() => setCopied(false), 1500);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const handleCopy = async () => {
+    try {
+      await copyTextToClipboard(value);
+      setCopied(true);
+    } catch {
+      // 剪贴板权限被拒时不打断查看详情，保持静默。
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={() => void handleCopy()}
+      title={copied ? t("common.copied") : label}
+      aria-label={label}
+      className="inline-flex size-6 shrink-0 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:border-border hover:bg-muted hover:text-foreground"
+    >
+      {copied ? (
+        <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
+      ) : (
+        <Copy className="size-3.5" />
+      )}
+    </button>
+  );
 }
 
 function Section({
@@ -109,10 +171,10 @@ export interface AccountDetailSheetProps {
   onPrev?: () => void;
   onNext?: () => void;
   onEdit: () => void;
-  onManualScoreBonus: () => void;
+  onManualScoreBonus?: () => void;
   onUsage: () => void;
   onTest: () => void;
-  onQualityEval: () => void;
+  onQualityEval?: () => void;
   onRefresh: () => void;
   onGenerateAuthJson: () => void;
   onToggleEnabled: () => void;
@@ -171,11 +233,23 @@ export default function AccountDetailSheet({
       ? account.name || account.email || `#${account.id}`
       : account.email || account.name || `#${account.id}`
     : "";
+  // 标题退化成 "#12" 这种 id 兜底时没有复制价值（旁边就有 ID 徽章），不显示按钮。
+  const copyableName = Boolean(
+    account && displayName && displayName !== `#${account.id}`,
+  );
   const rateWindow = account ? getRateLimitWindow(account) : null;
+  const isGrok = Boolean(account?.grok_api);
+  // Grok API Key 无 refresh_token；Codex AT-only / Responses 也不走 AT 刷新。
   const refreshDisabled = Boolean(
     account &&
-      (refreshing || account.at_only || account.openai_responses_api),
+      (refreshing ||
+        account.at_only ||
+        account.openai_responses_api ||
+        (isGrok && account.grok_auth_kind !== "oauth")),
   );
+  // auth.json / 额度券是 Codex 订阅路径专属，Grok 不展示。
+  const showAuthJson = Boolean(account && !isGrok);
+  const showResetCredits = Boolean(account && !isGrok);
   const authJsonDisabled = Boolean(
     account &&
       (authJsonExporting || account.at_only || account.openai_responses_api),
@@ -224,7 +298,17 @@ export default function AccountDetailSheet({
         >
           <SheetHeader>
             <div className="flex items-start justify-between gap-3 pr-2">
-              <div className="min-w-0 flex-1">
+              <div className="flex min-w-0 flex-1 items-start gap-3">
+                <span className="mt-0.5 flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-card ring-1 ring-border shadow-sm">
+                  {account.grok_api ? (
+                    <ChannelLogo channel="grok" size={22} />
+                  ) : account.openai_responses_api ? (
+                    <ModelLogo model="openai" variant="plain" size={22} />
+                  ) : (
+                    <ChannelLogo channel="codex" size={40} className="rounded-xl" />
+                  )}
+                </span>
+                <div className="min-w-0 flex-1">
                 <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
                   {sequence != null && (
                     <span className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[11px] font-semibold text-muted-foreground">
@@ -240,18 +324,37 @@ export default function AccountDetailSheet({
                     </span>
                   )}
                 </div>
-                <SheetTitle className="break-all text-[17px] leading-snug">
-                  {displayName}
-                </SheetTitle>
+                <div className="flex items-start gap-1.5">
+                  <SheetTitle className="break-all text-[17px] leading-snug">
+                    {displayName}
+                  </SheetTitle>
+                  {copyableName && (
+                    <span className="mt-0.5">
+                      <CopyValueButton
+                        value={displayName}
+                        label={
+                          displayName.includes("@")
+                            ? t("accounts.detailCopyEmail")
+                            : t("common.copy")
+                        }
+                      />
+                    </span>
+                  )}
+                </div>
                 {account.chatgpt_account_id ? (
                   <SheetDescription className="mt-1 break-all font-mono text-[11px]">
                     {account.chatgpt_account_id}
+                  </SheetDescription>
+                ) : isGrok && account.email && account.name && account.email !== account.name ? (
+                  <SheetDescription className="mt-1 break-all text-[12px]">
+                    {account.email}
                   </SheetDescription>
                 ) : (
                   <SheetDescription className="mt-1">
                     {t("accounts.detailSubtitle")}
                   </SheetDescription>
                 )}
+                </div>
               </div>
               <div className="flex shrink-0 items-center gap-0.5">
                 <Button
@@ -321,11 +424,13 @@ export default function AccountDetailSheet({
                       concurrency: account.dynamic_concurrency_limit ?? "-",
                     })}
                   </span>
-                  <AccountManualScoreBonusBadge
-                    account={account}
-                    onClick={onManualScoreBonus}
-                    showEmpty
-                  />
+                  {onManualScoreBonus ? (
+                    <AccountManualScoreBonusBadge
+                      account={account}
+                      onClick={onManualScoreBonus}
+                      showEmpty
+                    />
+                  ) : null}
                 </div>
 
                 <div className="space-y-1">
@@ -369,7 +474,7 @@ export default function AccountDetailSheet({
                   type="button"
                   variant="ghost"
                   size="xs"
-                  disabled={!qualityEvalSupported}
+                  disabled={!qualityEvalSupported || !onQualityEval}
                   onClick={onQualityEval}
                   className="h-7 text-[11px]"
                 >
@@ -561,7 +666,10 @@ export default function AccountDetailSheet({
             {(account.proxy_url ||
               account.at_only ||
               account.openai_responses_api ||
-              account.base_url) && (
+              account.grok_api ||
+              account.base_url ||
+              (!account.openai_responses_api &&
+                (account.models?.length ?? 0) > 0)) && (
               <Section title={t("accounts.detailTechnical")}>
                 <div className="space-y-2 rounded-xl border border-border bg-card p-3 text-[12px]">
                   {account.at_only && (
@@ -581,6 +689,18 @@ export default function AccountDetailSheet({
                       </span>
                       <span className="font-medium text-foreground">
                         {t("accounts.detailApiResponses")}
+                      </span>
+                    </div>
+                  )}
+                  {isGrok && (
+                    <div className="flex justify-between gap-3">
+                      <span className="text-muted-foreground">
+                        {t("accounts.detailAuthType")}
+                      </span>
+                      <span className="font-medium text-foreground">
+                        {account.grok_auth_kind === "oauth"
+                          ? t("grok.authKindOAuthShort")
+                          : t("grok.authKindApiKey")}
                       </span>
                     </div>
                   )}
@@ -604,7 +724,7 @@ export default function AccountDetailSheet({
                       </span>
                     </div>
                   )}
-                  {resetCredits > 0 && (
+                  {showResetCredits && resetCredits > 0 && (
                     <div className="flex justify-between gap-3">
                       <span className="text-muted-foreground">
                         {t("accounts.resetCreditsButton")}
@@ -614,6 +734,18 @@ export default function AccountDetailSheet({
                       </span>
                     </div>
                   )}
+                  {(account.models?.length ?? 0) > 0 && (
+                      <div className="flex justify-between gap-3">
+                        <span className="shrink-0 text-muted-foreground">
+                          {t("accounts.supportedModelsAction")}
+                        </span>
+                        <span className="font-medium tabular-nums text-foreground">
+                          {t("accounts.supportedModelsCount", {
+                            count: account.models?.length ?? 0,
+                          })}
+                        </span>
+                      </div>
+                    )}
                 </div>
               </Section>
             )}
@@ -654,18 +786,22 @@ export default function AccountDetailSheet({
                 <RefreshCw
                   className={`size-3.5 ${refreshing ? "animate-spin" : ""}`}
                 />
-                {t("accounts.actionRefreshAT")}
+                {isGrok
+                  ? t("grok.actionRefresh")
+                  : t("accounts.actionRefreshAT")}
               </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={authJsonDisabled}
-                onClick={onGenerateAuthJson}
-              >
-                <FileJson className="size-3.5" />
-                {t("accounts.actionAuthJson")}
-              </Button>
+              {showAuthJson && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={authJsonDisabled}
+                  onClick={onGenerateAuthJson}
+                >
+                  <FileJson className="size-3.5" />
+                  {t("accounts.actionAuthJson")}
+                </Button>
+              )}
               <Button
                 type="button"
                 variant="outline"
@@ -705,16 +841,18 @@ export default function AccountDetailSheet({
                 <RotateCcw className="size-3.5" />
                 {t("accounts.resetStatus")}
               </Button>
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                disabled={resetCredits <= 0}
-                onClick={onResetCredits}
-              >
-                <Timer className="size-3.5" />
-                {t("accounts.resetCreditsButton")}
-              </Button>
+              {showResetCredits && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={resetCredits <= 0}
+                  onClick={onResetCredits}
+                >
+                  <Timer className="size-3.5" />
+                  {t("accounts.resetCreditsButton")}
+                </Button>
+              )}
               <Button
                 type="button"
                 variant="destructive"

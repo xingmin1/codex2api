@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,6 +51,9 @@ type readPumpItem struct {
 type capturedReadLease struct {
 	leaseID string
 	write   *readLeaseWriteResult
+	// idleSniff 空闲期（无活跃租约）收到业务帧：先读完 payload 看帧类型再定去向——
+	// 元数据帧丢弃续命，内容帧维持销毁语义。见 runReadPump 与 isIdleDroppableMetadataFrame。
+	idleSniff bool
 }
 
 type readLeaseWriteResult struct {
@@ -62,6 +68,7 @@ type wsReadState struct {
 
 	queue               []readPumpItem
 	queuedPayload       int
+	queueSequence       uint64
 	activeLease         string
 	leasePhase          readLeasePhase
 	leaseWrite          *readLeaseWriteResult
@@ -69,6 +76,9 @@ type wsReadState struct {
 	pumpStarted         bool
 	readerErr           error
 	readerStopped       bool
+	// idleSniffing 空闲期业务帧正在读取/裁决中：期间拒绝新租约，保证该帧
+	// 永远不会被归属给后来的请求（无论最终判定丢弃还是销毁连接）。
+	idleSniffing bool
 
 	notify     chan struct{}
 	readerDone chan struct{}
@@ -83,6 +93,15 @@ func (wc *WsConnection) ensureReadState() *wsReadState {
 		}
 	})
 	return wc.readState
+}
+
+// appendQueueItemLocked 是队列 append 的唯一入口:queuedPayload 与 queueSequence
+// 必须与 append 原子同步推进——探针快路径靠 queueSequence 识别并发队列活动,
+// 任何绕过本方法的 append 都会让探针漏看新帧、在检查点边界误杀活流。
+func (state *wsReadState) appendQueueItemLocked(item readPumpItem) {
+	state.queue = append(state.queue, item)
+	state.queuedPayload += len(item.payload)
+	state.queueSequence++
 }
 
 func (state *wsReadState) notifyReaderLocked() {
@@ -182,6 +201,19 @@ func (wc *WsConnection) runReadPump() {
 			wc.finishReadPumpForLease(err, captured.leaseID)
 			return
 		}
+		if captured.idleSniff {
+			// 空闲期帧从不投递给任何后续租约（帧在无租约时刻开始，归属已定），
+			// 只在"丢弃续命"与"销毁连接"之间裁决。
+			eventType := strings.TrimSpace(gjson.GetBytes(payload, "type").String())
+			if isIdleDroppableMetadataFrame(eventType) {
+				wc.endIdleSniff()
+				wc.Touch()
+				wc.touchInbound()
+				continue
+			}
+			wc.finishReadPump(fmt.Errorf("%w: type=%q", errReadPumpIdleFrame, eventType), true)
+			return
+		}
 		// Never wait for the request writer in the sole raw reader. A response can
 		// arrive just before WriteMessage returns; queue it with the captured
 		// commit result so Ping/Pong/Close frames behind it are still processed.
@@ -194,15 +226,45 @@ func (wc *WsConnection) runReadPump() {
 	}
 }
 
+// isIdleDroppableMetadataFrame 判断空闲期（无活跃租约）收到的业务帧是否可以
+// 安全丢弃：codex.* / responsesapi.* 是上游 WS 通道的元数据/遥测事件
+// （rate_limits、response.metadata、websocket_timing 等），不属于任何请求的
+// 响应内容；实测上游在 response.completed 后 1~2s 仍会补发
+// responsesapi.websocket_timing，若据此销毁连接，每条连接每轮响应后必死。
+// response.* 内容帧不在此列：空闲期出现意味着上一响应被截断后上游仍在推送，
+// 投喂给下一个请求会串会话，必须维持销毁连接的语义 (issue #308)。
+func isIdleDroppableMetadataFrame(eventType string) bool {
+	if eventType == "" {
+		return false
+	}
+	if strings.HasPrefix(eventType, "codex.") || strings.HasPrefix(eventType, "responsesapi.") {
+		return true
+	}
+	return eventType == "response.metadata"
+}
+
+// endIdleSniff 结束空闲帧裁决（丢弃路径）：恢复接受新租约。
+// 销毁路径无需调用：finishReadPump 置 readerStopped 后租约本就无法建立。
+func (wc *WsConnection) endIdleSniff() {
+	state := wc.ensureReadState()
+	state.mu.Lock()
+	state.idleSniffing = false
+	state.mu.Unlock()
+}
+
 func (wc *WsConnection) captureReadLease() (capturedReadLease, error) {
 	state := wc.ensureReadState()
 	state.mu.Lock()
 	leaseID := state.activeLease
 	if state.activeLease == "" {
-		wc.recordReadPumpFailureLocked(state, errReadPumpIdleFrame, "")
+		// 空闲期业务帧不再立即判死：上游在 response.completed 后 ~1-2s 会在同一
+		// 连接上补发元数据帧（codex.rate_limits 等），若在此处直接销毁，每条连接
+		// 每轮响应后必死，零散流量的下一请求永远付整段 TLS+WS 冷握手。
+		// 先放行给调用方读出帧类型再裁决（元数据丢弃 / 内容帧销毁，防 issue #308 串会话）；
+		// 裁决期间挂起嗅探标记，拒绝新租约介入。
+		state.idleSniffing = true
 		state.mu.Unlock()
-		wc.finalizeReadPumpFailure(state)
-		return capturedReadLease{}, errReadPumpIdleFrame
+		return capturedReadLease{idleSniff: true}, nil
 	}
 	if state.leaseTerminalQueued {
 		err := fmt.Errorf("websocket read pump received a business frame after the terminal frame for request %q", leaseID)
@@ -280,13 +342,12 @@ func (wc *WsConnection) enqueueBusinessFrameForCapturedLease(messageType int, pa
 		return errReadPumpQueueOverflow
 	}
 
-	state.queue = append(state.queue, readPumpItem{
+	state.appendQueueItemLocked(readPumpItem{
 		messageType: messageType,
 		payload:     payload,
 		leaseID:     leaseID,
 		captured:    captured,
 	})
-	state.queuedPayload += len(payload)
 	if isReadLeaseTerminal(payload) {
 		if captured.write != nil && !captured.write.resolved {
 			state.leaseTerminalQueued = true
@@ -348,7 +409,7 @@ func (wc *WsConnection) recordReadPumpFailureLocked(state *wsReadState, readErr 
 		state.leaseWrite != nil &&
 		isNormalPeerClose(readErr)
 	if leaseID != "" && state.activeLease == leaseID && len(state.queue) < readPumpMaxQueuedItems {
-		state.queue = append(state.queue, readPumpItem{err: readErr, leaseID: leaseID})
+		state.appendQueueItemLocked(readPumpItem{err: readErr, leaseID: leaseID})
 	}
 	if !deferTerminalCommit {
 		state.resolveLeaseWriteLocked(false, readErr)
@@ -381,6 +442,27 @@ func isNormalPeerClose(readErr error) bool {
 
 func (wc *WsConnection) finalizeReadPumpFailure(state *wsReadState) {
 	wc.readFailureOnce.Do(func() {
+		// 连接死亡归因日志：close code/错误 + 年龄/空闲时长 + 是否有在途请求。
+		// 空闲期的对端正常关闭(close 1000/1001)是取连冷握手成本的直接来源，
+		// 这里是唯一能看到"谁、何时、为何"关掉连接的地方。
+		state.mu.Lock()
+		readerErr := state.readerErr
+		state.mu.Unlock()
+		idle := time.Duration(0)
+		if ts := wc.lastUsed.Load(); ts > 0 {
+			idle = time.Since(time.Unix(0, ts)).Round(time.Millisecond)
+		}
+		age := time.Duration(0)
+		if wc.createdAt > 0 {
+			age = time.Since(time.Unix(0, wc.createdAt)).Round(time.Millisecond)
+		}
+		pending, accountID := 0, int64(0)
+		if wc.session != nil {
+			pending = wc.session.PendingCount()
+			accountID = wc.session.AccountID
+		}
+		log.Printf("[WS] 连接读结束 account=%d age=%s idle=%s pending=%d err=%v", accountID, age, idle, pending, readerErr)
+
 		// Make the connection non-reusable only after the real read error has
 		// been queued for an active consumer.
 		wc.state.Store(int32(StateClosing))
@@ -413,6 +495,9 @@ func (wc *WsConnection) BeginReadLease(requestID string) error {
 	}
 	if state.readerStopped {
 		return fmt.Errorf("begin websocket read lease: reader stopped: %w", state.readerErr)
+	}
+	if state.idleSniffing {
+		return fmt.Errorf("begin websocket read lease: an idle upstream frame is being arbitrated")
 	}
 	if state.activeLease != "" {
 		return fmt.Errorf("begin websocket read lease: request %q is already active", state.activeLease)
@@ -667,16 +752,65 @@ func (wc *WsConnection) waitForEarlyReadFailure(ctx context.Context, grace time.
 	}
 }
 
-// ReadMessage consumes the permanent reader's bounded ordered queue. The
-// timeout is applied to this consumer wait, never to Gorilla's permanent read.
+// ReadMessage consumes the permanent reader's bounded ordered queue. Business
+// frame silence is only a liveness checkpoint: a recently active connection or
+// one that answers a correlated Ping remains readable for long-running turns.
 func (wc *WsConnection) ReadMessage() (int, []byte, error) {
+	return wc.readMessageWithLiveness(
+		ReadLivenessCheckInterval,
+		ActiveReadRecentInboundWindow,
+		ActiveReadProbeTimeout,
+		activeReadMaxTurnSilence(),
+	)
+}
+
+// activeReadMaxTurnSilence 单轮响应业务帧静默上限。存活复核只证明传输层活着,
+// 证明不了上游还在处理本请求;env CODEX_WS_MAX_TURN_SILENCE 可调
+// (Go duration 格式,如 "30m";设 "0" 关闭上限,恢复只看传输存活的行为)。
+func activeReadMaxTurnSilence() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CODEX_WS_MAX_TURN_SILENCE"))
+	if raw == "" {
+		return ActiveReadMaxTurnSilence
+	}
+	parsed, err := time.ParseDuration(raw)
+	if err != nil || parsed < 0 {
+		return ActiveReadMaxTurnSilence
+	}
+	return parsed
+}
+
+func (wc *WsConnection) sessionAccountID() int64 {
+	if wc.session != nil {
+		return wc.session.AccountID
+	}
+	return 0
+}
+
+// readMessageWithLiveness accepts explicit timings so the liveness state
+// machine can be covered by fast deterministic tests. The permanent read pump
+// remains the connection's sole Gorilla reader; probes only write control
+// frames and matching Pongs are dispatched by the installed Pong handler.
+// maxTurnSilence caps total business-frame silence within this call regardless
+// of transport liveness; <= 0 disables the cap.
+func (wc *WsConnection) readMessageWithLiveness(checkInterval, recentInboundWindow, probeTimeout, maxTurnSilence time.Duration) (int, []byte, error) {
 	if wc == nil {
 		return 0, nil, fmt.Errorf("websocket connection is nil")
+	}
+	if checkInterval <= 0 {
+		return 0, nil, fmt.Errorf("websocket liveness check interval must be positive")
+	}
+	if recentInboundWindow <= 0 {
+		return 0, nil, fmt.Errorf("websocket recent inbound window must be positive")
+	}
+	if probeTimeout <= 0 {
+		return 0, nil, fmt.Errorf("websocket liveness probe timeout must be positive")
 	}
 	state := wc.ensureReadState()
 	wc.StartReadPump()
 
-	timer := time.NewTimer(ReadTimeout)
+	started := time.Now()
+	rescuedCheckpoints := 0
+	timer := time.NewTimer(checkInterval)
 	defer timer.Stop()
 	for {
 		state.mu.Lock()
@@ -713,7 +847,67 @@ func (wc *WsConnection) ReadMessage() (int, []byte, error) {
 		case <-state.notify:
 		case <-state.readerDone:
 		case <-timer.C:
-			return 0, nil, fmt.Errorf("websocket read timeout after %s", ReadTimeout)
+			state.mu.Lock()
+			hasQueuedItem := len(state.queue) != 0
+			readerStopped = state.readerStopped
+			queueSequence := state.queueSequence
+			recentInbound := wc.recentInboundWithin(recentInboundWindow)
+			state.mu.Unlock()
+			if hasQueuedItem || readerStopped {
+				continue
+			}
+
+			// 静默上限:存活复核只证明传输层活着,证明不了上游还在处理本请求。
+			// 上游 worker 卡死而 LB/心跳仍答 Ping 时,若无此上限,请求、租约与
+			// 连接会被无限钉死(PendingRequest.Ctx 无消费者,应用层唯一的时长
+			// 约束就在这里)。文案含 "timed out" 供故障归因识别为超时。
+			silence := time.Since(started)
+			if maxTurnSilence > 0 && silence >= maxTurnSilence {
+				log.Printf("[WS] 读路径静默超限 account=%d 静默=%s 上限=%s 已续命%d次", wc.sessionAccountID(), silence.Round(time.Second), maxTurnSilence, rescuedCheckpoints)
+				return 0, nil, fmt.Errorf(
+					"websocket read timed out: no business frame within %s (%d liveness checkpoint(s) rescued)",
+					maxTurnSilence,
+					rescuedCheckpoints,
+				)
+			}
+
+			// Ping/Pong/Data activity proves the transport is alive even when a
+			// long reasoning turn has not emitted a business frame recently.
+			if recentInbound {
+				rescuedCheckpoints++
+				timer.Reset(checkInterval)
+				continue
+			}
+
+			probeAlive := probeConnectionWithTimeoutAfterQueueSequence(wc, probeTimeout, queueSequence)
+
+			// A data or terminal frame can arrive while the correlated probe is
+			// waiting. Re-check under the queue lock so an already-started frame
+			// (touchInbound happens before enqueue) or an enqueued terminal wins
+			// over probe failure at this boundary.
+			state.mu.Lock()
+			hasQueuedItem = len(state.queue) != 0
+			readerStopped = state.readerStopped
+			recentInbound = wc.recentInboundWithin(recentInboundWindow)
+			if !probeAlive && !hasQueuedItem && !readerStopped && !recentInbound {
+				state.mu.Unlock()
+				return 0, nil, fmt.Errorf(
+					"websocket liveness check timed out after %s: no inbound activity within %s and no matching pong within %s",
+					checkInterval,
+					recentInboundWindow,
+					probeTimeout,
+				)
+			}
+			state.mu.Unlock()
+
+			if hasQueuedItem || readerStopped {
+				continue
+			}
+			rescuedCheckpoints++
+			// 探针续命是罕见路径(近期无任何入站、但对端仍答复了带唯一 payload
+			// 的 Ping),留一行归因日志,供事后诊断"流看似卡住"类报告。
+			log.Printf("[WS] 读路径探活续命 account=%d 静默=%s 第%d次复核", wc.sessionAccountID(), silence.Round(time.Second), rescuedCheckpoints)
+			timer.Reset(checkInterval)
 		}
 	}
 }
@@ -750,6 +944,14 @@ func (wc *WsConnection) acquireProbeGate(state *wsReadState, deadline time.Time)
 }
 
 func probeConnectionWithTimeout(wc *WsConnection, timeout time.Duration) bool {
+	return probeConnectionWithTimeoutInternal(wc, timeout, 0, false)
+}
+
+func probeConnectionWithTimeoutAfterQueueSequence(wc *WsConnection, timeout time.Duration, queueSequence uint64) bool {
+	return probeConnectionWithTimeoutInternal(wc, timeout, queueSequence, true)
+}
+
+func probeConnectionWithTimeoutInternal(wc *WsConnection, timeout time.Duration, queueSequence uint64, acceptQueueActivity bool) bool {
 	if wc == nil || timeout <= 0 || !wc.IsConnected() || wc.conn == nil {
 		return false
 	}
@@ -763,6 +965,20 @@ func probeConnectionWithTimeout(wc *WsConnection, timeout time.Duration) bool {
 	defer func() { <-wc.probeGate }()
 	if !wc.IsConnected() {
 		return false
+	}
+	var queueNotify <-chan struct{}
+	if acceptQueueActivity {
+		state.mu.Lock()
+		queueAdvanced := state.queueSequence > queueSequence
+		state.mu.Unlock()
+		if queueAdvanced {
+			return true
+		}
+		// 不变量:notify 是容量 1 的信号通道,由 ReadMessage 的主 select 与本
+		// 探针共享。仅因探针同步运行在 ReadMessage 自身 goroutine 内(消费者
+		// 此刻不可能同时挂在 select 上),这里取走 token 才是安全的;若未来把
+		// 探针挪到独立 goroutine 或新增 notify 消费者,必须重新设计唤醒通道。
+		queueNotify = state.notify
 	}
 
 	payload := fmt.Sprintf("probe-%d-%d", time.Now().UnixNano(), probeSequence.Add(1))
@@ -791,12 +1007,25 @@ func probeConnectionWithTimeout(wc *WsConnection, timeout time.Duration) bool {
 	}
 	timer := time.NewTimer(remaining)
 	defer timer.Stop()
-	select {
-	case <-result:
-		return wc.IsConnected()
-	case <-state.readerDone:
-		return false
-	case <-timer.C:
-		return false
+	for {
+		select {
+		case <-result:
+			return wc.IsConnected()
+		case <-queueNotify:
+			// A business frame can arrive while the Ping probe is waiting. It
+			// proves the transport is alive and must be delivered without adding
+			// the full probe timeout to downstream latency. Ignore stale buffered
+			// notifications by requiring a newer queue sequence.
+			state.mu.Lock()
+			queueAdvanced := state.queueSequence > queueSequence
+			state.mu.Unlock()
+			if queueAdvanced {
+				return wc.IsConnected()
+			}
+		case <-state.readerDone:
+			return false
+		case <-timer.C:
+			return false
+		}
 	}
 }

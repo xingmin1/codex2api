@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { createPortal } from 'react-dom'
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip as RechartsTooltip } from 'recharts'
@@ -6,14 +6,18 @@ import { api } from '../api'
 import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
+import ChannelFilter, { useUsageChannel } from '../components/ChannelFilter'
+import ChannelLogo from '../components/ChannelLogo'
+import CompactionBadges from '../components/CompactionBadges'
+import ModelLogo from '../components/ModelLogo'
 import Modal from '../components/Modal'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { DEFAULT_PAGE_SIZE_OPTIONS, usePersistedPageSize } from '../hooks/usePersistedPageSize'
-import type { APIKeyRow, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog } from '../types'
-import { formatCompactEmail } from '../lib/utils'
+import type { APIKeyRow, SystemSettings, UsageAPIKeyStat, UsageEndpointStat, UsageFeatureStats, UsageLog, UsageModelStat, UsageStats, PromptFilterLog, PromptPolicyIncidentDetailResponse } from '../types'
+import { cn, formatCompactEmail } from '../lib/utils'
 import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -28,7 +32,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert, RefreshCw } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -72,6 +76,30 @@ function ReasoningEffortBadge({ effort }: { effort: string }) {
   )
 }
 
+function InternalRequestBadge({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const reason = log.internal_reason?.trim()
+  if (!reason) return null
+
+  const label = reason === 'overflow_compact_summary'
+    ? t('usage.internalOverflowSummary')
+    : t('usage.internalRequest')
+  const title = log.parent_request_id?.trim()
+    ? t('usage.internalRequestParentTooltip', { parentRequestId: log.parent_request_id.trim() })
+    : t('usage.internalRequestTooltip')
+
+  return (
+    <Badge
+      variant="outline"
+      className="gap-0.5 whitespace-nowrap border-transparent bg-fuchsia-500/12 text-[11px] font-semibold text-fuchsia-700 dark:bg-fuchsia-500/20 dark:text-fuchsia-300"
+      title={title}
+    >
+      <Brain className="size-3" />
+      {label}
+    </Badge>
+  )
+}
+
 function getStatusBadgeClassName(statusCode: number): string {
   if (statusCode === 200) {
     return 'border-transparent bg-emerald-500/14 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-300'
@@ -93,6 +121,7 @@ function getStatusBadgeClassName(statusCode: number): string {
 
 type UsagePresetRangeKey = 'today' | TimeRangeKey
 const USAGE_TIME_RANGE_OPTIONS: UsagePresetRangeKey[] = ['today', '1h', '6h', '24h', '7d', '30d']
+type UsageTypeFilter = '' | 'stream' | 'sync' | 'compact' | 'history'
 
 // 本页面局部的"自定义"区间标记。不污染全局 TimeRangeKey 类型 (Dashboard 等仍只识别预设档)。
 type UsageTimeRangeKey = UsagePresetRangeKey | 'custom'
@@ -568,10 +597,13 @@ function ModelStatsPanel({
                 <div key={item.model} className="space-y-1.5">
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <div className="truncate font-geist-mono text-[13px] font-semibold leading-tight text-foreground" title={item.model}>
-                        {item.model}
+                      <div className="flex min-w-0 items-center gap-2">
+                        <ModelLogo model={item.model} variant="soft" size={22} className="shrink-0" />
+                        <div className="truncate text-sm font-semibold leading-tight tracking-tight text-foreground" title={item.model}>
+                          {item.model}
+                        </div>
                       </div>
-                      <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-xs text-muted-foreground">
+                      <div className="mt-1 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 pl-[30px] text-xs text-muted-foreground">
                         <span className="tabular-nums">{t('usage.modelStatsRequests')} {formatTokens(item.requests, showFullUsageNumbers)}</span>
                         <span aria-hidden="true" className="text-border">·</span>
                         <span className="tabular-nums">{t('usage.modelStatsTokens')} {formatTokens(item.tokens, showFullUsageNumbers)}</span>
@@ -708,6 +740,8 @@ function EndpointStatsPanel({
       items={stats.map((item) => ({
         key: item.endpoint,
         label: item.endpoint,
+        // 端点是 URL 路径，用等宽字体更清晰
+        mono: true,
         requests: item.requests,
         tokens: item.tokens,
         errors: item.error_count,
@@ -765,7 +799,7 @@ function DistributionPanel({
   description: string
   emptyText: string
   icon: ReactNode
-  items: Array<{ key: string; label: string; requests: number; tokens: number; errors: number }>
+  items: Array<{ key: string; label: string; mono?: boolean; requests: number; tokens: number; errors: number }>
   limit?: number
   totalRequests: number
   showFullUsageNumbers: boolean
@@ -788,7 +822,14 @@ function DistributionPanel({
                 <div className="flex min-w-0 items-start gap-2.5">
                   <RankBadge accent={accent} rank={index + 1} />
                   <div className="min-w-0">
-                    <div className="truncate font-geist-mono text-[13px] font-semibold leading-tight text-foreground" title={item.label}>
+                    <div
+                      className={cn(
+                        "truncate text-sm font-semibold leading-tight tracking-tight text-foreground",
+                        // 端点是路径（代码性质）保留等宽；密钥名等宽显糙，用常规字体
+                        item.mono && "font-geist-mono text-[13px]",
+                      )}
+                      title={item.label}
+                    >
                       {item.label}
                     </div>
                     <div className="mt-0.5 flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-[11px] text-muted-foreground">
@@ -897,13 +938,83 @@ function StatusCodeBadge({ log }: { log: UsageLog }) {
   )
 }
 
-// CyberPolicyDetailButton: 对 cyber_policy 报错的请求，点击关联到提示词过滤日志，
-// 展示触发拦截的完整请求内容（为什么 & 是什么）。
+function UserAgentCell({ log, mobile = false }: { log: UsageLog; mobile?: boolean }) {
+  const { t } = useTranslation()
+  const clientUserAgent = log.client_user_agent?.trim() || ''
+  const upstreamUserAgent = log.upstream_user_agent?.trim() || ''
+  const hasAudit = Boolean(clientUserAgent || upstreamUserAgent || log.user_agent_overridden)
+  const upstreamLabel = upstreamUserAgent || (hasAudit ? t('usage.userAgentNotSent') : '-')
+  const statusLabel = !hasAudit
+    ? t('usage.userAgentNotRecorded')
+    : log.user_agent_overridden
+      ? t('usage.userAgentOverridden')
+      : t('usage.userAgentPreserved')
+
+  const content = (
+    <div className={`${mobile ? 'w-full' : 'w-[260px] max-w-[28vw]'} space-y-1 font-mono text-[11px] leading-relaxed`}>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="w-4 shrink-0 font-sans font-semibold text-muted-foreground">C</span>
+        <span className="min-w-0 truncate text-foreground/80">{clientUserAgent || '-'}</span>
+      </div>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="w-4 shrink-0 font-sans font-semibold text-muted-foreground">U</span>
+        <span className="min-w-0 truncate text-foreground/80">{upstreamLabel}</span>
+        {hasAudit ? (
+          <Badge
+            variant="outline"
+            className={`ml-auto shrink-0 border-transparent px-1.5 py-0 text-[10px] font-semibold ${
+              log.user_agent_overridden
+                ? 'bg-amber-500/12 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300'
+                : 'bg-emerald-500/12 text-emerald-700 dark:bg-emerald-500/20 dark:text-emerald-300'
+            }`}
+          >
+            {statusLabel}
+          </Badge>
+        ) : null}
+      </div>
+    </div>
+  )
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div
+          tabIndex={0}
+          aria-label={`${t('usage.clientUserAgent')}: ${clientUserAgent || '-'}; ${t('usage.upstreamUserAgent')}: ${upstreamLabel}; ${statusLabel}`}
+          className="cursor-help focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {content}
+        </div>
+      </TooltipTrigger>
+      <TooltipContent side="top" sideOffset={6} className="max-w-[440px] p-3">
+        <div className="space-y-2 text-xs">
+          <div>
+            <div className="font-semibold text-background/70">{t('usage.clientUserAgent')}</div>
+            <div className="mt-0.5 break-all font-mono leading-relaxed">{clientUserAgent || '-'}</div>
+          </div>
+          <div>
+            <div className="font-semibold text-background/70">{t('usage.upstreamUserAgent')}</div>
+            <div className="mt-0.5 break-all font-mono leading-relaxed">{upstreamLabel}</div>
+          </div>
+          <div className="font-semibold">{statusLabel}</div>
+          {log.via_websocket ? (
+            <div className="leading-relaxed text-background/70">{t('usage.userAgentWebSocketHint')}</div>
+          ) : null}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+// New usage rows resolve by immutable incident ID. Only historical rows without
+// an ID fall back to the legacy nearest-timestamp inference endpoint.
 function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
   const { t } = useTranslation()
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
-  const [detail, setDetail] = useState<PromptFilterLog | null>(null)
+  const [detail, setDetail] = useState<PromptPolicyIncidentDetailResponse | null>(null)
+  const [legacyDetail, setLegacyDetail] = useState<PromptFilterLog | null>(null)
+  const [legacyInferred, setLegacyInferred] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [loaded, setLoaded] = useState(false)
 
@@ -913,12 +1024,17 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
     setLoading(true)
     setError(null)
     try {
-      const res = await api.matchPromptFilterLog({
-        at: log.created_at,
-        endpoint: log.endpoint,
-        apiKeyId: log.api_key_id || undefined,
-      })
-      setDetail(res.log)
+      if (log.prompt_policy_incident_id) {
+        setDetail(await api.getPromptPolicyIncident(log.prompt_policy_incident_id))
+      } else {
+        const res = await api.matchPromptFilterLog({
+          at: log.created_at,
+          endpoint: log.endpoint,
+          apiKeyId: log.api_key_id || undefined,
+        })
+        setLegacyDetail(res.log)
+        setLegacyInferred(res.legacy_inferred)
+      }
       setLoaded(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -927,7 +1043,9 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
     }
   }
 
-  const content = (detail?.full_text || detail?.text_preview || '').trim()
+  const incident = detail?.incident
+  const content = (incident?.prompt_text || incident?.prompt_preview || legacyDetail?.full_text || legacyDetail?.text_preview || '').trim()
+  const score = (value: number | null | undefined) => value === null || value === undefined ? t('usage.cyberPolicyUnscored') : String(value)
 
   return (
     <>
@@ -956,8 +1074,49 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
             <div className="py-6 text-center text-sm text-muted-foreground">{t('common.loading')}</div>
           ) : error ? (
             <div className="py-4 text-sm text-red-500">{error}</div>
+          ) : incident ? (
+            <div className="space-y-3">
+              <div className="grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-3">
+                <CyberPolicyField label={t('usage.cyberPolicyUpstreamResult')} value={`${incident.status_code || '-'} · ${incident.upstream_error_code || 'cyber_policy'}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyLocalResult')} value={`${t(`usage.cyberPolicyState.${incident.local_evaluation_state}`)} · ${t(`usage.cyberPolicyOutcome.${incident.local_outcome}`)}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyLocalMiss')} value={incident.local_miss ? t('promptFilter.testResultYes') : t('promptFilter.testResultNo')} danger={incident.local_miss} />
+                <CyberPolicyField label={t('usage.cyberPolicyExecutionScore')} value={score(incident.local_score)} />
+                <CyberPolicyField label={t('usage.cyberPolicyAuditScore')} value={score(incident.local_audit_score)} />
+                <CyberPolicyField label={t('usage.cyberPolicyTransport')} value={`${incident.protocol || '-'} · ${incident.transport || '-'}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyAccountAttempt')} value={`${incident.account_id || '-'} · #${incident.attempt_index || '-'}`} />
+                <CyberPolicyField label={t('usage.cyberPolicyReview')} value={incident.local_review_model ? `${incident.local_review_model} · ${incident.local_review_flagged ? t('promptFilter.testReviewFlagged') : t('promptFilter.testReviewCleared')}` : t('promptFilter.testReviewSkipped')} />
+                <CyberPolicyField label={t('usage.cyberPolicyCandidate')} value={detail.candidate ? `${detail.candidate.status} · #${detail.candidate.id}` : '-'} />
+              </div>
+              {incident.local_evaluation_state === 'legacy_unknown' ? (
+                <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">{t('usage.cyberPolicyLegacyUnknown')}</div>
+              ) : null}
+              {(incident.local_reason || incident.local_reason_code) ? (
+                <div className="rounded-md border border-border bg-muted/20 px-3 py-2 text-xs">
+                  <div className="font-semibold text-muted-foreground">{t('usage.cyberPolicyReason')}</div>
+                  <div className="mt-1 break-words">{incident.local_reason || incident.local_reason_code}</div>
+                </div>
+              ) : null}
+              {detail.matches.length > 0 ? (
+                <div>
+                  <div className="mb-1.5 text-xs font-semibold text-muted-foreground">{t('usage.cyberPolicyMatches')}</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {detail.matches.map((match, index) => <Badge key={`${match.name}-${index}`} variant="secondary">{match.name} · {match.weight}</Badge>)}
+                  </div>
+                </div>
+              ) : null}
+              {content ? (
+                <div>
+                  <div className="mb-1.5 flex items-center justify-between">
+                    <span className="text-xs font-semibold text-muted-foreground">{t('usage.cyberPolicyRequestContent')}</span>
+                    <button type="button" onClick={() => void navigator.clipboard?.writeText(content)} className="text-xs font-medium text-primary hover:underline">{t('common.copy')}</button>
+                  </div>
+                  <pre className="max-h-[50vh] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 text-xs leading-relaxed text-foreground">{content}</pre>
+                </div>
+              ) : null}
+            </div>
           ) : content ? (
-            <div>
+            <div className="space-y-2">
+              {legacyInferred ? <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">{t('usage.cyberPolicyLegacyInferred')}</div> : null}
               <div className="mb-1.5 flex items-center justify-between">
                 <span className="text-xs font-semibold text-muted-foreground">{t('usage.cyberPolicyRequestContent')}</span>
                 <button type="button" onClick={() => void navigator.clipboard?.writeText(content)} className="text-xs font-medium text-primary hover:underline">{t('common.copy')}</button>
@@ -970,6 +1129,15 @@ function CyberPolicyDetailButton({ log }: { log: UsageLog }) {
         </div>
       </Modal>
     </>
+  )
+}
+
+function CyberPolicyField({ label, value, danger = false }: { label: string; value: string; danger?: boolean }) {
+  return (
+    <div className="rounded-md border border-border bg-muted/20 px-2.5 py-2">
+      <div className="font-semibold text-muted-foreground">{label}</div>
+      <div className={cn('mt-1 break-words font-mono text-foreground', danger && 'text-red-600 dark:text-red-300')}>{value}</div>
+    </div>
   )
 }
 
@@ -1146,7 +1314,7 @@ function EmptyPanel({ accent, icon, text }: { accent: PanelAccentKey; icon: Reac
   )
 }
 
-type UsageTableColumn = 'status' | 'model' | 'account' | 'username' | 'priceMultiplier' | 'apiKey' | 'clientIp' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'firstToken' | 'tokensPerSec' | 'duration' | 'time'
+type UsageTableColumn = 'status' | 'model' | 'account' | 'username' | 'priceMultiplier' | 'apiKey' | 'clientIp' | 'userAgent' | 'endpoint' | 'type' | 'token' | 'cost' | 'cached' | 'wsAcquire' | 'firstToken' | 'tokensPerSec' | 'timing' | 'time'
 type UsageLogSortKey = 'status' | 'model' | 'account' | 'username' | 'price_multiplier' | 'api_key' | 'client_ip' | 'endpoint' | 'tokens' | 'cost' | 'cached' | 'first_token' | 'duration' | 'time'
 type UsageLogSortDir = 'asc' | 'desc'
 
@@ -1158,14 +1326,16 @@ const USAGE_COLUMN_DEFINITIONS: Array<{ key: UsageTableColumn; labelKey: string 
   { key: 'priceMultiplier', labelKey: 'usage.tablePriceMultiplier' },
   { key: 'apiKey', labelKey: 'usage.tableApiKey' },
   { key: 'clientIp', labelKey: 'usage.tableClientIP' },
+  { key: 'userAgent', labelKey: 'usage.tableUserAgent' },
   { key: 'endpoint', labelKey: 'usage.tableEndpoint' },
   { key: 'type', labelKey: 'usage.tableType' },
   { key: 'token', labelKey: 'usage.tableToken' },
-  { key: 'cost', labelKey: 'usage.tableCost' },
   { key: 'cached', labelKey: 'usage.tableCached' },
+  { key: 'wsAcquire', labelKey: 'usage.tableWsAcquire' },
   { key: 'firstToken', labelKey: 'usage.tableFirstToken' },
+  { key: 'timing', labelKey: 'usage.tableTiming' },
   { key: 'tokensPerSec', labelKey: 'usage.tableTokensPerSec' },
-  { key: 'duration', labelKey: 'usage.tableDuration' },
+  { key: 'cost', labelKey: 'usage.tableCost' },
   { key: 'time', labelKey: 'usage.tableTime' },
 ]
 
@@ -1178,14 +1348,18 @@ const DEFAULT_USAGE_VISIBLE_COLUMNS: Record<UsageTableColumn, boolean> = {
   priceMultiplier: true,
   apiKey: true,
   clientIp: true,
+  userAgent: true,
   endpoint: true,
   type: true,
   token: true,
   cost: true,
   cached: true,
+  // 取得连接耗时属于深挖排障信息，默认隐藏，需在列设置中手动开启
+  wsAcquire: false,
   firstToken: true,
   tokensPerSec: true,
-  duration: true,
+  // 首字 + 总耗时聚合为「用时」一列
+  timing: true,
   time: true,
 }
 
@@ -1238,6 +1412,127 @@ function TokensPerSecCell({ log }: { log: UsageLog }) {
   )
 }
 
+function formatLatencyMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '-'
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`
+  return `${Math.round(ms)}ms`
+}
+
+type TimingTone = 'good' | 'warn' | 'bad' | 'muted'
+
+function firstTokenTone(ms: number): TimingTone {
+  if (ms <= 0) return 'muted'
+  if (ms > 5000) return 'bad'
+  if (ms > 2000) return 'warn'
+  return 'good'
+}
+
+function durationTone(ms: number): TimingTone {
+  if (ms <= 0) return 'muted'
+  if (ms > 30000) return 'bad'
+  if (ms > 10000) return 'warn'
+  return 'good'
+}
+
+/** 数值色阶：在各自胶囊内单独表意快慢。 */
+const TIMING_VALUE_TONE: Record<TimingTone, string> = {
+  good: 'text-emerald-700 dark:text-emerald-300',
+  warn: 'text-amber-700 dark:text-amber-300',
+  bad: 'text-red-600 dark:text-red-400',
+  muted: 'text-muted-foreground',
+}
+
+/**
+ * 首字 / 耗时 用固定身份色胶囊区分（蓝 vs 紫），
+ * 扫表时即使数值色相同也能立刻分辨是哪一项。
+ */
+const TIMING_PILL_SHELL = {
+  first:
+    'bg-sky-500/12 ring-1 ring-inset ring-sky-500/25 dark:bg-sky-500/16 dark:ring-sky-400/30',
+  duration:
+    'bg-violet-500/12 ring-1 ring-inset ring-violet-500/25 dark:bg-violet-500/16 dark:ring-violet-400/30',
+  muted: 'bg-muted/60 ring-1 ring-inset ring-border',
+} as const
+
+const TIMING_PILL_LABEL = {
+  first: 'text-sky-700/85 dark:text-sky-300/90',
+  duration: 'text-violet-700/85 dark:text-violet-300/90',
+  muted: 'text-muted-foreground',
+} as const
+
+function TimingPill({
+  kind,
+  label,
+  valueMs,
+  tone,
+}: {
+  kind: 'first' | 'duration'
+  label: string
+  valueMs: number
+  tone: TimingTone
+}) {
+  const display = valueMs > 0 ? formatLatencyMs(valueMs) : '-'
+  const shell = tone === 'muted' ? TIMING_PILL_SHELL.muted : TIMING_PILL_SHELL[kind]
+  const labelClass = tone === 'muted' ? TIMING_PILL_LABEL.muted : TIMING_PILL_LABEL[kind]
+
+  return (
+    <span
+      className={cn(
+        'inline-flex h-5 items-center gap-0.5 rounded-full px-1.5 whitespace-nowrap',
+        shell,
+      )}
+    >
+      <span className={cn('text-[10px] font-semibold leading-none tracking-tight', labelClass)}>
+        {label}
+      </span>
+      <span
+        className={cn(
+          'font-mono text-[11px] font-bold tabular-nums leading-none',
+          TIMING_VALUE_TONE[tone],
+        )}
+      >
+        {display}
+      </span>
+    </span>
+  )
+}
+
+/** 首字 + 总耗时聚合列：横向双色胶囊，避免把整行撑高。 */
+function TimingCell({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const firstMs = log.first_token_ms || 0
+  const durationMs = log.duration_ms || 0
+  if (firstMs <= 0 && durationMs <= 0) {
+    return <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
+  }
+
+  const firstLabel = firstMs > 0 ? formatLatencyMs(firstMs) : '-'
+  const durationLabel = durationMs > 0 ? formatLatencyMs(durationMs) : '-'
+  const title = [
+    firstMs > 0 ? `${t('usage.timingFirst')}: ${firstLabel}` : null,
+    durationMs > 0 ? `${t('usage.timingDuration')}: ${durationLabel}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+
+  return (
+    <div className="inline-flex items-center gap-1" title={title || undefined}>
+      <TimingPill
+        kind="first"
+        label={t('usage.timingFirst')}
+        valueMs={firstMs}
+        tone={firstTokenTone(firstMs)}
+      />
+      <TimingPill
+        kind="duration"
+        label={t('usage.timingDuration')}
+        valueMs={durationMs}
+        tone={durationTone(durationMs)}
+      />
+    </div>
+  )
+}
+
 function getInitialUsageVisibleColumns(): Record<UsageTableColumn, boolean> {
   try {
     const stored = localStorage.getItem(USAGE_VISIBLE_COLUMNS_KEY)
@@ -1247,6 +1542,12 @@ function getInitialUsageVisibleColumns(): Record<UsageTableColumn, boolean> {
         const defaults: Record<UsageTableColumn, boolean> = { ...DEFAULT_USAGE_VISIBLE_COLUMNS }
         for (const key of Object.keys(defaults) as UsageTableColumn[]) {
           if (key in parsed) defaults[key] = Boolean(parsed[key])
+        }
+        // 兼容旧版独立「首字 / 总耗时」列：任一开启则聚合列开启
+        if (!('timing' in parsed)) {
+          const oldFirst = 'firstToken' in parsed ? Boolean(parsed.firstToken) : true
+          const oldDuration = 'duration' in parsed ? Boolean(parsed.duration) : true
+          defaults.timing = oldFirst || oldDuration
         }
         return defaults
       }
@@ -1334,11 +1635,12 @@ export default function Usage() {
   const [filterApiKeyId, setFilterApiKeyId] = useState('')
   const [filterAccountId, setFilterAccountId] = useState(getInitialUsageAccountID)
   const [filterFast, setFilterFast] = useState('')
-  const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
+  const [filterType, setFilterType] = useState<UsageTypeFilter>('')
   const [logSortKey, setLogSortKey] = useState<UsageLogSortKey>('time')
   const [logSortDir, setLogSortDir] = useState<UsageLogSortDir>('desc')
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [modelOptions, setModelOptions] = useState<string[]>([])
+  const [grokModelOptions, setGrokModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = true
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS
@@ -1346,6 +1648,7 @@ export default function Usage() {
   const [visibleColumns, setVisibleColumns] = useState<Record<UsageTableColumn, boolean>>(getInitialUsageVisibleColumns)
   const [columnSettingsOpen, setColumnSettingsOpen] = useState(false)
   const [showAnalysis, setShowAnalysis] = useState(getInitialAnalysisVisibility)
+  const [channel, setChannel] = useUsageChannel()
 
   // 搜索防抖：输入停止 400ms 后触发查询
   const handleSearchChange = useCallback((value: string) => {
@@ -1381,11 +1684,11 @@ export default function Usage() {
   const loadStats = useCallback(async () => {
     const { start, end } = resolveRangeISO(timeRange, customRange)
     const [stats, settings] = await Promise.all([
-      api.getUsageStats({ start, end }),
+      api.getUsageStats({ start, end, channel: channel || undefined }),
       api.getSettings().catch((): SystemSettings | null => null),
     ])
     return { stats, settings }
-  }, [timeRange, customRange])
+  }, [timeRange, customRange, channel])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     stats: UsageStats | null
@@ -1419,7 +1722,10 @@ export default function Usage() {
         apiKeyId: filterApiKeyId || undefined,
         accountId: filterAccountId || undefined,
         fast: filterFast || undefined,
-        stream: filterStream || undefined,
+        stream: filterType === 'stream' ? 'true' : filterType === 'sync' ? 'false' : undefined,
+        compact: filterType === 'compact' ? 'true' : undefined,
+        hasCompactionHistory: filterType === 'history' ? 'true' : undefined,
+        channel: channel || undefined,
         sortBy: logSortKey,
         sortDir: logSortDir,
       })
@@ -1430,7 +1736,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterStream, logSortKey, logSortDir])
+  }, [timeRange, customRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterAccountId, filterFast, filterType, channel, logSortKey, logSortDir])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -1451,8 +1757,12 @@ export default function Usage() {
           ? response.items.filter((item) => item.enabled).map((item) => item.id)
           : response.models ?? []
         setModelOptions(models)
+        setGrokModelOptions(response.grok_models ?? [])
       } catch {
-        if (active) setModelOptions([])
+        if (active) {
+          setModelOptions([])
+          setGrokModelOptions([])
+        }
       }
     }
     void loadModels()
@@ -1498,6 +1808,26 @@ export default function Usage() {
   const rangeAccountBilled = stats?.today_account_billed ?? 0
   const rangeUserBilled = stats?.today_user_billed ?? 0
   const modelStats = stats?.model_stats ?? []
+  // 下拉选项跟随渠道过滤：codex 只列 Codex manifest 目录，grok 只列 Grok 账号声明模型，
+  // 全部渠道两者都列；再并上当前范围实际用过的模型（统计已按渠道过滤），去重后目录顺序优先。
+  const modelFilterOptions = useMemo(() => {
+    const seen = new Set<string>()
+    const merged: string[] = []
+    const catalog = channel === 'grok'
+      ? grokModelOptions
+      : channel === 'codex'
+        ? modelOptions
+        : [...modelOptions, ...grokModelOptions]
+    for (const m of catalog) {
+      const key = m.trim()
+      if (key && !seen.has(key)) { seen.add(key); merged.push(key) }
+    }
+    for (const item of modelStats) {
+      const key = (item.model || '').trim()
+      if (key && key !== 'unknown' && !seen.has(key)) { seen.add(key); merged.push(key) }
+    }
+    return merged
+  }, [modelOptions, grokModelOptions, modelStats, channel])
   const featureStats = stats?.feature_stats
   const endpointStats = stats?.endpoint_stats ?? []
   const apiKeyStats = stats?.api_key_stats ?? []
@@ -1507,7 +1837,7 @@ export default function Usage() {
   const avgDurationMs = stats?.avg_duration_ms ?? 0
   const successRequests = rangeRequests - Math.round(rangeRequests * errorRate / 100)
   const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
-  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterAccountId || filterStream || filterFast)
+  const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterAccountId || filterType || filterFast)
   const apiKeyOptions = [
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
@@ -1537,6 +1867,7 @@ export default function Usage() {
           title={t('usage.title')}
           description={t('usage.description')}
           onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
+          titleAdornment={<ChannelFilter value={channel} onChange={setChannel} />}
           actions={
             <Button
               variant="outline"
@@ -1549,7 +1880,7 @@ export default function Usage() {
           }
         />
 
-        <div className="space-y-6">
+        <div key={channel || 'all'} className="space-y-6 animate-channel-switch-in">
         {/* Stat overview: 6 metrics in a single row */}
         <div className="grid grid-cols-1 gap-3 min-[560px]:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
           <Card className="min-w-0 py-0">
@@ -1722,8 +2053,22 @@ export default function Usage() {
                   />
                 )}
               </div>
-              <div className="flex shrink-0 items-center gap-3">
+              <div className="flex shrink-0 items-center gap-2">
                 <span className="whitespace-nowrap text-xs text-muted-foreground">{logsLoading ? t('common.loading') : t('usage.recordsCount', { count: logsTotal })}</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={logsLoading}
+                  title={t('common.refresh')}
+                  aria-label={t('common.refresh')}
+                  onClick={() => {
+                    void reloadSilently()
+                    void loadLogs()
+                  }}
+                >
+                  <RefreshCw className={cn('size-3.5', logsLoading && 'animate-spin')} />
+                  {t('common.refresh')}
+                </Button>
                 <Button
                   variant="destructive"
                   size="sm"
@@ -1790,7 +2135,7 @@ export default function Usage() {
                 placeholder={t('usage.allModels')}
                 options={[
                   { label: t('usage.allModels'), value: '' },
-                  ...modelOptions.map((m) => ({ label: m, value: m })),
+                  ...modelFilterOptions.map((m) => ({ label: m, value: m })),
                 ]}
               />
 
@@ -1824,15 +2169,17 @@ export default function Usage() {
 
               {/* 类型下拉 */}
               <Select
-                className="w-28 shrink-0"
+                className="w-40 shrink-0"
                 compact
-                value={filterStream}
-                onValueChange={(v) => { setFilterStream(v as '' | 'true' | 'false'); setPage(1) }}
+                value={filterType}
+                onValueChange={(v) => { setFilterType(v as UsageTypeFilter); setPage(1) }}
                 placeholder={t('usage.allTypes')}
                 options={[
                   { label: t('usage.allTypes'), value: '' },
-                  { label: 'Stream', value: 'true' },
-                  { label: 'Sync', value: 'false' },
+                  { label: 'Stream', value: 'stream' },
+                  { label: 'Sync', value: 'sync' },
+                  { label: t('usage.compactionTrigger'), value: 'compact' },
+                  { label: t('usage.compactionHistory'), value: 'history' },
                 ]}
               />
 
@@ -1860,7 +2207,7 @@ export default function Usage() {
                     setFilterModel(''); setFilterEndpoint('')
                     setFilterApiKeyId('')
                     setFilterAccountId('')
-                    setFilterStream(''); setFilterFast('')
+                    setFilterType(''); setFilterFast('')
                     setPage(1)
                   }}
                   className="h-8 shrink-0 px-2.5 rounded-lg border border-border bg-background text-[13px] text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors inline-flex items-center gap-1 whitespace-nowrap"
@@ -1890,14 +2237,6 @@ export default function Usage() {
               <TooltipProvider>
               <div className="grid gap-3 lg:hidden">
                 {logs.map((log: UsageLog) => {
-                  const durationLabel = log.duration_ms > 1000
-                    ? `${(log.duration_ms / 1000).toFixed(1)}s`
-                    : `${log.duration_ms}ms`
-                  const firstTokenLabel = log.first_token_ms > 0
-                    ? (log.first_token_ms > 1000
-                      ? `${(log.first_token_ms / 1000).toFixed(1)}s`
-                      : `${log.first_token_ms}ms`)
-                    : null
                   return (
                     <div
                       key={log.id}
@@ -1941,6 +2280,11 @@ export default function Usage() {
                           >
                             {log.stream ? 'stream' : 'sync'}
                           </Badge>
+                          <CompactionBadges
+                            compact={log.compact}
+                            hasCompactionHistory={log.has_compaction_history}
+                          />
+                          <InternalRequestBadge log={log} />
                         </div>
                         <div className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">
                           {formatBeijingTime(log.created_at)}
@@ -1955,6 +2299,9 @@ export default function Usage() {
                         <div className="truncate font-mono">
                           <span className="font-sans font-semibold text-foreground/80">{t('usage.tableEndpoint')}: </span>
                           {log.inbound_endpoint || log.endpoint || '-'}
+                        </div>
+                        <div className="border-t border-border/60 pt-2">
+                          <UserAgentCell log={log} mobile />
                         </div>
                       </div>
 
@@ -1974,29 +2321,14 @@ export default function Usage() {
                           </div>
                         </div>
                         <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableCost')}</div>
-                          <div className="mt-1">
-                            <UsageCostCell log={log} />
+                          <div
+                            className="text-[11px] font-semibold text-muted-foreground"
+                            title={t('usage.tableTimingHint')}
+                          >
+                            {t('usage.tableTiming')}
                           </div>
-                        </div>
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableDuration')}</div>
-                          <div className={`mt-1 font-mono tabular-nums ${log.duration_ms > 30000 ? 'text-red-500' : log.duration_ms > 10000 ? 'text-amber-500' : 'text-foreground'}`}>
-                            {durationLabel}
-                          </div>
-                        </div>
-                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
-                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableFirstToken')}</div>
-                          <div className={`mt-1 font-mono tabular-nums ${
-                            !firstTokenLabel
-                              ? 'text-muted-foreground'
-                              : log.first_token_ms > 5000
-                                ? 'text-red-500'
-                                : log.first_token_ms > 2000
-                                  ? 'text-amber-500'
-                                  : 'text-emerald-500'
-                          }`}>
-                            {firstTokenLabel || '-'}
+                          <div className="mt-1.5">
+                            <TimingCell log={log} />
                           </div>
                         </div>
                         <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
@@ -2010,6 +2342,12 @@ export default function Usage() {
                             <TokensPerSecCell log={log} />
                           </div>
                         </div>
+                        <div className="rounded-lg border border-border/70 bg-card/60 px-2.5 py-2">
+                          <div className="text-[11px] font-semibold text-muted-foreground">{t('usage.tableCost')}</div>
+                          <div className="mt-1">
+                            <UsageCostCell log={log} />
+                          </div>
+                        </div>
                       </div>
                     </div>
                   )
@@ -2017,8 +2355,8 @@ export default function Usage() {
               </div>
               </TooltipProvider>
 
-              {/* Desktop table */}
-              <div className="data-table-shell hidden lg:block">
+              {/* Desktop table — denser py so multi-badge columns don't leave empty vertical air */}
+              <div className="data-table-shell usage-logs-table hidden lg:block">
                 <TooltipProvider>
                 <Table>
                   <TableHeader>
@@ -2030,12 +2368,23 @@ export default function Usage() {
                       {visibleColumns.priceMultiplier && renderSortableUsageHead('price_multiplier', t('usage.tablePriceMultiplier'))}
                       {visibleColumns.apiKey && renderSortableUsageHead('api_key', t('usage.tableApiKey'))}
                       {visibleColumns.clientIp && renderSortableUsageHead('client_ip', t('usage.tableClientIP'))}
+                      {visibleColumns.userAgent && <TableHead className={usageTableHeadClass}>{t('usage.tableUserAgent')}</TableHead>}
                       {visibleColumns.endpoint && renderSortableUsageHead('endpoint', t('usage.tableEndpoint'))}
                       {visibleColumns.type && <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>}
                       {visibleColumns.token && renderSortableUsageHead('tokens', t('usage.tableToken'))}
-                      {visibleColumns.cost && renderSortableUsageHead('cost', t('usage.tableCost'))}
                       {visibleColumns.cached && renderSortableUsageHead('cached', t('usage.tableCached'))}
+                      {visibleColumns.wsAcquire && <TableHead className={usageTableHeadClass}><span title={t('usage.wsAcquireTooltip')} className="cursor-help underline decoration-dotted underline-offset-2">{t('usage.tableWsAcquire')}</span></TableHead>}
                       {visibleColumns.firstToken && renderSortableUsageHead('first_token', t('usage.tableFirstToken'), t('usage.tableFirstTokenHint'))}
+                      {visibleColumns.timing && (
+                        <TableHead className={usageTableHeadClass}>
+                          <span
+                            title={t('usage.tableTimingHint')}
+                            className="cursor-help underline decoration-dotted underline-offset-2"
+                          >
+                            {t('usage.tableTiming')}
+                          </span>
+                        </TableHead>
+                      )}
                       {visibleColumns.tokensPerSec && (
                         <TableHead className={usageTableHeadClass}>
                           <span
@@ -2046,7 +2395,7 @@ export default function Usage() {
                           </span>
                         </TableHead>
                       )}
-                      {visibleColumns.duration && renderSortableUsageHead('duration', t('usage.tableDuration'))}
+                      {visibleColumns.cost && renderSortableUsageHead('cost', t('usage.tableCost'))}
                       {visibleColumns.time && renderSortableUsageHead('time', t('usage.tableTime'))}
                     </TableRow>
                   </TableHeader>
@@ -2072,6 +2421,14 @@ export default function Usage() {
                               </Badge>
                             )}
                             <Badge variant="outline" className={usageTableBadgeClass}>
+                              {(log.channel === 'codex' || log.channel === 'grok') && (
+                                <ChannelLogo
+                                  channel={log.channel}
+                                  size={13}
+                                  className="mr-1"
+                                  title={log.channel === 'grok' ? 'Grok' : 'Codex'}
+                                />
+                              )}
                               {log.model || '-'}
                             </Badge>
                             {log.effective_model && log.effective_model !== log.model && (
@@ -2120,14 +2477,22 @@ export default function Usage() {
                             {log.client_ip || '-'}
                           </span>
                         </TableCell>}
+                        {visibleColumns.userAgent && <TableCell>
+                          <UserAgentCell log={log} />
+                        </TableCell>}
                         {visibleColumns.endpoint && <TableCell>
-                          <div className={`${usageTableMonoClass} leading-relaxed`}>
+                          <div
+                            className={`${usageTableMonoClass} leading-relaxed`}
+                            // 中转/Grok 账号的完整上游 URL 收进 tooltip，列内只显示入站端点
+                            title={
+                              log.upstream_endpoint && log.upstream_endpoint !== log.inbound_endpoint
+                                ? `→ ${log.upstream_endpoint}`
+                                : undefined
+                            }
+                          >
                             <span className="text-muted-foreground">
                               {log.inbound_endpoint || log.endpoint || '-'}
                             </span>
-                            {log.upstream_endpoint && log.upstream_endpoint !== log.inbound_endpoint && (
-                              <span className="text-muted-foreground"> → {log.upstream_endpoint}</span>
-                            )}
                           </div>
                         </TableCell>}
                         {visibleColumns.type && <TableCell>
@@ -2143,16 +2508,11 @@ export default function Usage() {
                             >
                               {log.stream ? 'stream' : 'sync'}
                             </Badge>
-                            {log.compact && (
-                              <Badge
-                                variant="outline"
-                                className="text-[11px] font-semibold gap-0.5 border-transparent bg-teal-500/12 text-teal-700 dark:bg-teal-500/20 dark:text-teal-300"
-                                title={t('usage.compactRequestTooltip')}
-                              >
-                                <Box className="size-3" />
-                                {t('usage.compactRequest')}
-                              </Badge>
-                            )}
+                            <CompactionBadges
+                              compact={log.compact}
+                              hasCompactionHistory={log.has_compaction_history}
+                            />
+                            <InternalRequestBadge log={log} />
                           </div>
                         </TableCell>}
                         {visibleColumns.token && <TableCell>
@@ -2172,9 +2532,6 @@ export default function Usage() {
                             <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}
                         </TableCell>}
-                        {visibleColumns.cost && <TableCell>
-                          <UsageCostCell log={log} />
-                        </TableCell>}
                         {visibleColumns.cached && <TableCell>
                           {log.cached_tokens > 0 ? (
                             <Badge variant="outline" className={`${usageTableBadgeClass} gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400`}>
@@ -2185,22 +2542,33 @@ export default function Usage() {
                             <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}
                         </TableCell>}
-                        {visibleColumns.firstToken && <TableCell>
-                          {log.first_token_ms > 0 ? (
-                            <span className={`${usageTableMonoClass} ${log.first_token_ms > 5000 ? 'text-red-500' : log.first_token_ms > 2000 ? 'text-amber-500' : 'text-emerald-500'}`}>
-                              {log.first_token_ms > 1000 ? `${(log.first_token_ms / 1000).toFixed(1)}s` : `${log.first_token_ms}ms`}
+                        {visibleColumns.wsAcquire && <TableCell>
+                          {(log.ws_acquire_ms ?? 0) > 0 ? (
+                            <span
+                              className={`${usageTableMonoClass} ${(log.ws_acquire_ms as number) > 5000 ? 'text-red-500' : (log.ws_acquire_ms as number) > 1000 ? 'text-amber-500' : 'text-muted-foreground'}`}
+                              title={t('usage.wsAcquireTooltip')}
+                            >
+                              {(log.ws_acquire_ms as number) > 1000 ? `${((log.ws_acquire_ms as number) / 1000).toFixed(1)}s` : `${log.ws_acquire_ms}ms`}
                             </span>
                           ) : <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>}
                         </TableCell>}
+                        {visibleColumns.firstToken && <TableCell>
+                          <span className={`${usageTableMonoClass} text-muted-foreground`}>
+                            {log.first_token_ms > 0 ? formatLatencyMs(log.first_token_ms) : '-'}
+                          </span>
+                        </TableCell>}
+                        {visibleColumns.timing && (
+                          <TableCell>
+                            <TimingCell log={log} />
+                          </TableCell>
+                        )}
                         {visibleColumns.tokensPerSec && (
                           <TableCell>
                             <TokensPerSecCell log={log} />
                           </TableCell>
                         )}
-                        {visibleColumns.duration && <TableCell>
-                          <span className={`${usageTableMonoClass} ${log.duration_ms > 30000 ? 'text-red-500' : log.duration_ms > 10000 ? 'text-amber-500' : 'text-muted-foreground'}`}>
-                            {log.duration_ms > 1000 ? `${(log.duration_ms / 1000).toFixed(1)}s` : `${log.duration_ms}ms`}
-                          </span>
+                        {visibleColumns.cost && <TableCell>
+                          <UsageCostCell log={log} />
                         </TableCell>}
                         {visibleColumns.time && <TableCell className={`${usageTableMonoClass} text-muted-foreground whitespace-nowrap`}>
                           {formatBeijingTime(log.created_at)}

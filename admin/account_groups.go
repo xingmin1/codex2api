@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -87,7 +88,8 @@ func parseAccountGroupBaseConcurrencyOverride(raw json.RawMessage) (database.Opt
 	if strings.HasPrefix(trimmed, `"`) {
 		return database.OptionalNullInt64{}, errors.New("base_concurrency_override 必须是整数或 null")
 	}
-	return parseOptionalIntegerField(raw, "base_concurrency_override", 1, 50)
+	// 最小 1，无上限（与全局 max_concurrency / 账号级覆盖一致）
+	return parseOptionalIntegerField(raw, "base_concurrency_override", 1, math.MaxInt64)
 }
 
 func (h *Handler) CreateAccountGroup(c *gin.Context) {
@@ -154,6 +156,9 @@ func (h *Handler) CreateAccountGroup(c *gin.Context) {
 	if h.store != nil && baseConcurrencyOverride.Value.Valid {
 		value := baseConcurrencyOverride.Value.Int64
 		h.store.SetGroupBaseConcurrencyOverride(id, &value)
+	}
+	if h.store != nil {
+		h.store.SetGroupName(id, name)
 	}
 	c.JSON(http.StatusOK, gin.H{"id": id, "message": "分组已创建"})
 }
@@ -255,6 +260,9 @@ func (h *Handler) UpdateAccountGroup(c *gin.Context) {
 	if baseConcurrencyOverride.Set && h.store != nil {
 		h.store.SetGroupBaseConcurrencyOverride(id, nullableInt64Pointer(baseConcurrencyOverride.Value))
 	}
+	if req.Name != nil && h.store != nil {
+		h.store.SetGroupName(id, *req.Name)
+	}
 	writeMessage(c, http.StatusOK, "分组已更新")
 }
 
@@ -282,6 +290,7 @@ func (h *Handler) DeleteAccountGroup(c *gin.Context) {
 	if h.store != nil {
 		h.store.DeleteGroupAutoPauseThresholds(id)
 		h.store.DeleteGroupBaseConcurrencyOverride(id)
+		h.store.DeleteGroupName(id)
 		for _, acc := range h.store.Accounts() {
 			acc.Mu().RLock()
 			groups := removeInt64(acc.GroupIDs, id)

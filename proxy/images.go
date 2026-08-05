@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -49,11 +50,14 @@ const (
 
 	maxGPTImage2Pixels = 8294400
 
-	// maxImageAttempts 限制生图请求的初次尝试与换号尝试总数；同号重试使用独立预算。
+	// maxImageAttempts caps the total number of upstream attempts for image
+	// generation requests, including retries across different accounts.
 	maxImageAttempts = 5
 
 	// MaxImageEditInputCount caps the number of input images for edit requests.
-	MaxImageEditInputCount = 10
+	// 与官方 Images API 对 gpt-image 系列的上限一致（16 张）；上游 responses
+	// 通道已实测可接受 16 张 input_image（issue #275）。
+	MaxImageEditInputCount = 16
 
 	imageStreamConnectedComment = ": connected\n\n"
 	imageStreamKeepaliveComment = ": keepalive\n\n"
@@ -786,19 +790,47 @@ var imageIntentPositivePhrases = []string{
 // 两者都未表达真实生图意图（真实意图已被 rawResponsesBodyShouldForceHTTPForImageGeneration
 // 判定为强制 HTTP，不会走到这里）。移除后可防止模型自主调用图片工具产生大体积数据导致
 // WS 流卡死（issue #220）。
+//
+// 它是 stripResponsesImageGenerationCapabilities 的别名（后者是能力剥离的完整实现，
+// 额外覆盖 namespace image_gen 与 Responses Lite 内嵌声明）；WS 路径沿用此名保持语义。
 func stripResponsesImageGenerationTool(body []byte) []byte {
-	tools := gjson.GetBytes(body, "tools")
-	if tools.Exists() && tools.IsArray() {
-		kept := make([]interface{}, 0, len(tools.Array()))
-		removed := false
-		for _, tool := range tools.Array() {
-			if strings.TrimSpace(tool.Get("type").String()) == "image_generation" {
-				removed = true
-				continue
-			}
-			kept = append(kept, tool.Value())
+	return stripResponsesImageGenerationCapabilities(body)
+}
+
+// stripImageGenerationToolsFromArray 从工具数组里剔除图片能力声明：扁平的
+// {"type":"image_generation"} 与 namespace 形式 {"type":"namespace","name":"image_gen"}。
+// 返回保留下来的工具及是否发生过移除。
+func stripImageGenerationToolsFromArray(tools []gjson.Result) ([]interface{}, bool) {
+	kept := make([]interface{}, 0, len(tools))
+	removed := false
+	for _, tool := range tools {
+		toolType := strings.TrimSpace(tool.Get("type").String())
+		if toolType == "image_generation" {
+			removed = true
+			continue
 		}
-		if removed {
+		if toolType == "namespace" && strings.TrimSpace(tool.Get("name").String()) == "image_gen" {
+			removed = true
+			continue
+		}
+		kept = append(kept, tool.Value())
+	}
+	return kept, removed
+}
+
+// stripResponsesImageGenerationCapabilities 剥离请求体里的 Codex 图片工具能力声明，
+// 保留 shell/function/apply_patch/MCP/web search 等其他工具，把请求当作普通文本请求
+// 继续转发（issue #411 的 strip 策略；同时也是 WS 防大体积卡死路径的实现）。覆盖：
+//  1. 顶层 tools[] 移除 {"type":"image_generation"} 与 namespace {"name":"image_gen"}。
+//  2. Responses Lite 的 input[].additional_tools.tools[] 做同样过滤；若过滤后该载体
+//     工具列表为空则移除整个 additional_tools 项。
+//  3. 仅当 tool_choice 明确指向 image_generation / image_gen 时删除它；"auto" 及其他
+//     工具选择保持不变。
+//  4. 清理网关自己追加的图片桥接 instructions，保留用户自带的 instructions 内容。
+func stripResponsesImageGenerationCapabilities(body []byte) []byte {
+	// 1. 顶层 tools[]
+	if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
+		if kept, removed := stripImageGenerationToolsFromArray(tools.Array()); removed {
 			if len(kept) == 0 {
 				body, _ = sjson.DeleteBytes(body, "tools")
 			} else {
@@ -806,20 +838,62 @@ func stripResponsesImageGenerationTool(body []byte) []byte {
 			}
 		}
 	}
-	choice := gjson.GetBytes(body, "tool_choice")
-	if choice.Exists() {
-		isImageChoice := false
-		if choice.Type == gjson.String {
-			isImageChoice = strings.EqualFold(strings.TrimSpace(choice.String()), "image_generation")
-		} else {
-			isImageChoice = strings.EqualFold(strings.TrimSpace(choice.Get("type").String()), "image_generation")
+
+	// 2. Responses Lite: input[].additional_tools.tools[]
+	if input := gjson.GetBytes(body, "input"); input.Exists() && input.IsArray() {
+		items := input.Array()
+		keptItems := make([]interface{}, 0, len(items))
+		mutated := false
+		for _, item := range items {
+			if strings.TrimSpace(item.Get("type").String()) != "additional_tools" {
+				keptItems = append(keptItems, item.Value())
+				continue
+			}
+			nested := item.Get("tools")
+			if !nested.Exists() || !nested.IsArray() {
+				keptItems = append(keptItems, item.Value())
+				continue
+			}
+			keptTools, removed := stripImageGenerationToolsFromArray(nested.Array())
+			if !removed {
+				keptItems = append(keptItems, item.Value())
+				continue
+			}
+			mutated = true
+			if len(keptTools) == 0 {
+				// 载体工具全被剥离：移除整个 additional_tools 项。
+				continue
+			}
+			rebuilt, _ := sjson.SetBytes([]byte(item.Raw), "tools", keptTools)
+			var rebuiltVal interface{}
+			if err := json.Unmarshal(rebuilt, &rebuiltVal); err == nil {
+				keptItems = append(keptItems, rebuiltVal)
+			} else {
+				keptItems = append(keptItems, item.Value())
+			}
 		}
-		if isImageChoice {
+		if mutated {
+			body, _ = sjson.SetBytes(body, "input", keptItems)
+		}
+	}
+
+	// 3. tool_choice：仅删显式指向图片工具的选择
+	if choice := gjson.GetBytes(body, "tool_choice"); choice.Exists() {
+		var target string
+		if choice.Type == gjson.String {
+			target = strings.TrimSpace(choice.String())
+		} else {
+			target = strings.TrimSpace(choice.Get("type").String())
+			if target == "namespace" {
+				target = strings.TrimSpace(choice.Get("name").String())
+			}
+		}
+		if strings.EqualFold(target, "image_generation") || strings.EqualFold(target, "image_gen") {
 			body, _ = sjson.DeleteBytes(body, "tool_choice")
 		}
 	}
-	// 移除与图片工具配套注入的桥接 instructions（引导模型调用 image_generation
-	// 工具）；保留用户自带的 instructions 内容。
+
+	// 4. 桥接 instructions（网关注入的引导文案）
 	if instructions := gjson.GetBytes(body, "instructions").String(); strings.Contains(instructions, codexImageGenerationBridgeMarker) {
 		cleaned := strings.ReplaceAll(instructions, "\n\n"+codexImageGenerationBridgeText, "")
 		cleaned = strings.ReplaceAll(cleaned, codexImageGenerationBridgeText, "")
@@ -934,6 +1008,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	if !json.Valid(rawBody) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: body must be valid JSON", "type": "invalid_request_error"}})
 		return
@@ -970,7 +1045,7 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
-	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/generations", imageModel) {
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/images/generations", imageModel) {
 		return
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
@@ -1019,11 +1094,16 @@ func (h *Handler) ImagesEdits(c *gin.Context) {
 }
 
 func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
+	if err := h.captureSignedMultipartIngress(c); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+		return
+	}
 	form, err := c.MultipartForm()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	defer func() { _ = form.RemoveAll() }()
 
 	prompt := strings.TrimSpace(c.PostForm("prompt"))
 	if prompt == "" {
@@ -1044,26 +1124,6 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if len(imageFiles) > MaxImageEditInputCount {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": fmt.Sprintf("Invalid request: too many input images (%d, max %d)", len(imageFiles), MaxImageEditInputCount), "type": "invalid_request_error"}})
 		return
-	}
-
-	images := make([]string, 0, len(imageFiles))
-	for _, fileHeader := range imageFiles {
-		dataURL, err := multipartFileToDataURL(fileHeader)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
-			return
-		}
-		images = append(images, dataURL)
-	}
-
-	var maskDataURL string
-	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
-		dataURL, err := multipartFileToDataURL(maskFiles[0])
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
-			return
-		}
-		maskDataURL = dataURL
 	}
 
 	imageModel := strings.TrimSpace(c.PostForm("model"))
@@ -1097,6 +1157,29 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
 		return
 	}
+
+	// Multipart parsing may have used bounded temporary storage before the
+	// prompt field was known, but image bytes must not be decoded or expanded to
+	// Base64 until the current-user prompt has passed the guard.
+	images := make([]string, 0, len(imageFiles))
+	for _, fileHeader := range imageFiles {
+		dataURL, err := multipartFileToDataURL(fileHeader)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+		images = append(images, dataURL)
+	}
+
+	var maskDataURL string
+	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
+		dataURL, err := multipartFileToDataURL(maskFiles[0])
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+			return
+		}
+		maskDataURL = dataURL
+	}
 	releaseAPIKeyConcurrency, ok := h.acquireAPIKeyConcurrency(c)
 	if !ok {
 		return
@@ -1107,6 +1190,28 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, requestModel, logEffectiveModel, responsesBody, responseFormat, "image_edit", stream)
+}
+
+// captureSignedMultipartIngress preserves the exact wire body for NewAPI HMAC
+// verification, then restores it for net/http multipart parsing. It is only
+// enabled when signed NewAPI audit forwarding is configured, avoiding an
+// extra full-body copy for ordinary image uploads.
+func (h *Handler) captureSignedMultipartIngress(c *gin.Context) error {
+	if h == nil || h.store == nil || c == nil || c.Request == nil {
+		return nil
+	}
+	cfg := h.promptFilterConfigForRequest(c)
+	if !cfg.Advanced.NewAPI.Enabled || strings.TrimSpace(c.GetHeader("X-NewAPI-Signature")) == "" {
+		return nil
+	}
+	body, err := readRawRequestBody(c)
+	if err != nil {
+		return err
+	}
+	setIngressRequestBodyIfAbsent(c, body)
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	c.Request.ContentLength = int64(len(body))
+	return nil
 }
 
 func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string) []byte {
@@ -1136,6 +1241,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
+	h.capturePromptRequestIngress(c, rawBody)
 	if !json.Valid(rawBody) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: body must be valid JSON", "type": "invalid_request_error"}})
 		return
@@ -1203,7 +1309,7 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
-	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+	if h.inspectPromptFilterOpenAI(c, rawBody, "/v1/images/edits", imageModel) {
 		return
 	}
 	if h.enforceAPIKeyLimitsAndReply(c, imageModel) {
@@ -1274,7 +1380,7 @@ func resolveImageAccountModel(account *auth.Account, model string) (string, bool
 	if account == nil {
 		return "", false
 	}
-	if !account.IsOpenAIResponsesAPI() {
+	if !account.IsRelayStyle() {
 		return model, true
 	}
 	toolModel, _ := normalizeImageToolModelForPrompt(model, "")
@@ -1286,7 +1392,7 @@ func resolveImageAccountModel(account *auth.Account, model string) (string, bool
 		if mappedModel, ok := resolveAccountModelMapping(account, candidate); ok {
 			return mappedModel, true
 		}
-		if account.SupportsOpenAIResponsesModel(candidate) {
+		if relayAccountSupportsModel(account, candidate) {
 			return candidate, true
 		}
 	}
@@ -1298,18 +1404,45 @@ func imageAccountSupportsModel(account *auth.Account, model string) bool {
 	return ok
 }
 
-func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool, model string) (*auth.Account, string) {
+// nextImageAccount 先在 plus 及以上套餐的账号里挑，挑不到再放开到全部账号。
+// 模型资格、affinity 与 scope 在每一层取交集，避免任何回退路径绕过限制。
+func (h *Handler) nextImageAccount(args ...any) (*auth.Account, string) {
+	var (
+		c        *gin.Context
+		apiKeyID int64
+		exclude  map[int64]bool
+		model    string
+		identity requestSessionIdentity
+	)
+	switch len(args) {
+	case 3:
+		apiKeyID, _ = args[0].(int64)
+		exclude, _ = args[1].(map[int64]bool)
+		model, _ = args[2].(string)
+	case 5:
+		c, _ = args[0].(*gin.Context)
+		apiKeyID, _ = args[1].(int64)
+		exclude, _ = args[2].(map[int64]bool)
+		model, _ = args[3].(string)
+		identity, _ = args[4].(requestSessionIdentity)
+	default:
+		return nil, ""
+	}
+
 	eligibleFilter := func(account *auth.Account) bool {
 		return imageAccountSupportsModel(account, model)
 	}
-	preferredFilter := h.withModelCooldownFilter(model, func(account *auth.Account) bool {
-		return eligibleFilter(account) && (account.IsOpenAIResponsesAPI() || imagePreferredAccountFilter(account))
-	})
+	preferredFilter := func(account *auth.Account) bool {
+		return eligibleFilter(account) && (account.IsRelayStyle() || imagePreferredAccountFilter(account))
+	}
+	preferredFilter = applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, preferredFilter))
+	preferredFilter = h.applyScopeBudgetFilter(c, preferredFilter)
 	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, preferredFilter)
 	if account != nil {
 		return account, stickyProxyURL
 	}
-	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, eligibleFilter))
+	fallbackFilter := applyAffinityGroupRouting(c, identity, h.withModelCooldownFilter(model, eligibleFilter))
+	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.applyScopeBudgetFilter(c, fallbackFilter))
 }
 
 func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel, logModel, logEffectiveModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
@@ -1322,6 +1455,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	}
 
 	apiKeyID := requestAPIKeyID(c)
+	sessionIdentity := resolveRequestSessionIdentity(c.Request.Header, responsesBody)
+	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
+	defer h.ReleaseAPIKeyScopeConcurrency(c)
 	maxRetries := h.getMaxRetries()
 	maxRateLimitRetries := h.getMaxRateLimitRetries()
 	generalRetries := 0
@@ -1332,8 +1468,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	excludeAccounts := make(map[int64]bool)
 	transportRetries := newTransportRetryTracker()
 	sameAccountAttempts := 0
-	var retryAccountID int64
-	var retryProxyURL string
+	sameAccountTarget := sameAccountRetryTarget{}
 
 	// 仅在 response_format=url 且配置了云存储时启用：上传图片到对象存储、
 	// 登记进图库并返回预签名直链。否则 urlFor 为 nil，沿用 base64/data URL。
@@ -1347,26 +1482,18 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		if err := c.Request.Context().Err(); err != nil {
 			return
 		}
-		var account *auth.Account
-		var stickyProxyURL string
-		if retryAccountID != 0 {
-			account = h.store.TakeAccountForRetryWithFilter(retryAccountID, apiKeyID, func(candidate *auth.Account) bool {
-				return imageAccountSupportsModel(candidate, requestModel)
-			})
-			stickyProxyURL = retryProxyURL
-			retryAccountID = 0
-			retryProxyURL = ""
+		eligibleFilter := func(candidate *auth.Account) bool {
+			return imageAccountSupportsModel(candidate, requestModel)
+		}
+		account, stickyProxyURL := sameAccountTarget.take(h.store, apiKeyID, eligibleFilter)
+		if account == nil {
+			account, stickyProxyURL = h.nextImageAccount(c, apiKeyID, excludeAccounts, requestModel, sessionIdentity)
 		}
 		if account == nil {
-			account, stickyProxyURL = h.nextImageAccount(apiKeyID, excludeAccounts, requestModel)
-		}
-		if account == nil {
-			eligibleFilter := func(candidate *auth.Account) bool {
-				return imageAccountSupportsModel(candidate, requestModel)
-			}
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.withModelCooldownFilter(requestModel, eligibleFilter))
+			waitFilter := applyAffinityGroupRouting(c, sessionIdentity, h.withModelCooldownFilter(requestModel, eligibleFilter))
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.applyScopeBudgetFilter(c, waitFilter))
 			if account == nil {
-				if lastStatusCode > 0 && len(lastBody) > 0 {
+				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
@@ -1374,11 +1501,16 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 					ErrorToGinResponse(c, lastRequestErr)
 					return
 				}
+				if msg := scopeBudgetExhaustedMessage(c); msg != "" {
+					SendAPIKeyLimitError(c, http.StatusTooManyRequests, msg)
+					return
+				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
 				return
 			}
 		}
 
+		h.AcquireAPIKeyScopeConcurrency(c, account)
 		start := time.Now()
 		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
@@ -1392,9 +1524,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		upstreamEndpoint := "/v1/responses"
 		var resp *http.Response
 		var reqErr error
-		if account.IsOpenAIResponsesAPI() {
-			baseURL, _ := account.OpenAIResponsesCredentials()
-			upstreamEndpoint = auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses")
+		if account.IsRelayStyle() {
+			upstreamEndpoint = relayUpstreamEndpointForAccount(account)
 			upstreamBody := PrepareOpenAIResponsesBody(responsesBody)
 			if relayModel, ok := resolveImageAccountModel(account, requestModel); ok {
 				if mappedBody, err := sjson.SetBytes(upstreamBody, "model", relayModel); err == nil {
@@ -1402,36 +1533,31 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 					attemptLogEffectiveModel = usageEffectiveModelForMapping(logModel, relayModel, !strings.EqualFold(logModel, relayModel))
 				}
 			}
-			resp, reqErr = ExecuteOpenAIResponsesRequest(c.Request.Context(), account, upstreamBody, proxyURL, downstreamHeaders)
+			upstreamBody, _ = applyAccountFastTierPolicy(upstreamBody, account)
+			resp, reqErr = ExecuteRelayStyleRequest(c.Request.Context(), account, upstreamBody, proxyURL, downstreamHeaders)
 		} else {
-			resp, reqErr = ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, downstreamHeaders, false)
+			upstreamBody, _ := applyAccountFastTierPolicy(responsesBody, account)
+			resp, reqErr = ExecuteRequest(c.Request.Context(), account, upstreamBody, "", proxyURL, apiKey, deviceCfg, downstreamHeaders, false)
 		}
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
 			lastRequestErr = reqErr
-			log.Printf("图像请求上游连接失败: endpoint=%s model=%s account=%d relay=%t error=%v", inboundEndpoint, logModel, account.ID(), account.IsOpenAIResponsesAPI(), reqErr)
 			kind := classifyTransportFailure(reqErr)
 			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, true, false, kind)
 			if sameAccountRetry {
 				h.logSameAccountRetryRequestError(c, &database.UsageLogInput{
-					AccountID:        account.ID(),
-					Endpoint:         inboundEndpoint,
-					Model:            logModel,
-					EffectiveModel:   attemptLogEffectiveModel,
-					DurationMs:       durationMs,
-					InboundEndpoint:  inboundEndpoint,
-					UpstreamEndpoint: upstreamEndpoint,
-					Stream:           stream,
+					AccountID: account.ID(), Endpoint: inboundEndpoint, Model: logModel,
+					EffectiveModel: attemptLogEffectiveModel, DurationMs: durationMs,
+					InboundEndpoint: inboundEndpoint, UpstreamEndpoint: upstreamEndpoint, Stream: stream,
 				}, attempt, kind, reqErr)
 			}
-			if kind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
-				h.reportUpstreamAttemptFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if shouldPenalizeTransportKind(kind) && !sameAccountRetry {
+				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			if sameAccountRetry {
 				sameAccountAttempts++
-				retryAccountID = account.ID()
-				retryProxyURL = proxyURL
+				sameAccountTarget.remember(account, proxyURL)
 				logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, inboundEndpoint)
 				continue
 			}
@@ -1454,20 +1580,21 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			cyberPolicy := markUpstreamCyberPolicy(c, errBody)
 			failureKind := upstreamErrorKindForAccount(account, resp.StatusCode, errBody, codex429Decision{})
 			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, !cyberPolicy, false, failureKind)
-			if failureKind != "" && (account.IsOpenAIResponsesAPI() || !sameAccountRetry) {
-				h.reportUpstreamAttemptFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
+			if failureKind != "" && !sameAccountRetry && !cyberPolicy {
+				h.store.ReportRequestFailure(account, failureKind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if !sameAccountRetry && !cyberPolicy && !ShouldIgnoreFailureCooldown(account) {
-				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-					h.store.PersistUsageSnapshot(account, usagePct)
-				}
+			if !sameAccountRetry && !cyberPolicy {
+				SyncCodexUsageState(h.store, account, resp)
 			}
 			h.store.Release(account)
 			if !sameAccountRetry && !cyberPolicy {
 				excludeAccounts[account.ID()] = true
 			}
 			logUpstreamError(inboundEndpoint, resp.StatusCode, logModel, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody)
+			promptPolicyIncidentID := acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, errBody, upstreamCyberPolicyAttempt{
+				Transport: upstreamPromptPolicyTransport(stream, false), StatusCode: resp.StatusCode,
+				AccountID: account.ID(), AttemptIndex: attempt + 1,
+			}))
 			decision := codex429Decision{}
 			shouldRetry := sameAccountRetry
 			if !sameAccountRetry && !cyberPolicy {
@@ -1475,27 +1602,27 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				shouldRetry = shouldRetryHTTPStatusForAccount(account, resp.StatusCode, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			}
 			h.logUsageForRequest(c, &database.UsageLogInput{
-				AccountID:         account.ID(),
-				Endpoint:          inboundEndpoint,
-				Model:             logModel,
-				EffectiveModel:    attemptLogEffectiveModel,
-				StatusCode:        resp.StatusCode,
-				DurationMs:        durationMs,
-				InboundEndpoint:   inboundEndpoint,
-				UpstreamEndpoint:  upstreamEndpoint,
-				Stream:            stream,
-				IsRetryAttempt:    shouldRetry,
-				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
-				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+				AccountID:              account.ID(),
+				Endpoint:               inboundEndpoint,
+				Model:                  logModel,
+				EffectiveModel:         attemptLogEffectiveModel,
+				StatusCode:             resp.StatusCode,
+				DurationMs:             durationMs,
+				InboundEndpoint:        inboundEndpoint,
+				UpstreamEndpoint:       upstreamEndpoint,
+				Stream:                 stream,
+				IsRetryAttempt:         shouldRetry,
+				AttemptIndex:           attempt + 1,
+				UpstreamErrorKind:      upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
+				ErrorMessage:           usageLogErrorMessage(resp.StatusCode, errBody),
+				PromptPolicyIncidentID: promptPolicyIncidentID,
 			})
 			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				if sameAccountRetry {
 					sameAccountAttempts++
-					retryAccountID = account.ID()
-					retryProxyURL = proxyURL
+					sameAccountTarget.remember(account, proxyURL)
 					logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, inboundEndpoint)
 				}
 				continue
@@ -1515,11 +1642,22 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		var imageCount int
 		var imageLogInfo imageUsageLogInfo
 		var readErr error
+		promptPolicyIncidentID := ""
 		if stream {
 			usage, imageCount, firstTokenMs, imageLogInfo, readErr = h.streamImagesResponse(c, resp.Body, responseFormat, streamPrefix, requestModel, start)
+			if payload := imageResponseFailedPayload(readErr); len(payload) > 0 {
+				promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, responseFailedErrorBody(payload), upstreamCyberPolicyAttempt{
+					Transport: "sse", StatusCode: http.StatusBadGateway, AccountID: account.ID(), AttemptIndex: attempt + 1,
+				}))
+			}
 		} else {
 			var out []byte
 			out, usage, imageCount, imageLogInfo, readErr = collectImagesResponse(c.Request.Context(), resp.Body, responseFormat, requestModel, urlFor)
+			if payload := imageResponseFailedPayload(readErr); len(payload) > 0 {
+				promptPolicyIncidentID = acceptedPromptPolicyIncidentID(h.logUpstreamCyberPolicy(c, inboundEndpoint, logModel, responseFailedErrorBody(payload), upstreamCyberPolicyAttempt{
+					Transport: "http", StatusCode: http.StatusBadGateway, AccountID: account.ID(), AttemptIndex: attempt + 1,
+				}))
+			}
 			if readErr == nil {
 				persister.finalize(c.Request.Context())
 				c.Data(http.StatusOK, "application/json", out)
@@ -1527,25 +1665,17 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				// Check retryability BEFORE writing error response to avoid
 				// double-write when the error is transient.
 				resp.Body.Close()
-				kind := classifyTransportFailure(readErr)
-				sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, true, false, kind)
 				h.store.Release(account)
-				if !sameAccountRetry {
-					excludeAccounts[account.ID()] = true
-				}
-				willRetry := sameAccountRetry || shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts)
+				excludeAccounts[account.ID()] = true
+				willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts)
 				// Always record the failed attempt so it appears in usage stats,
 				// matching the chat completions error path.
-				h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, attemptLogEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
+				failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo)
+				failedLog.PromptPolicyIncidentID = promptPolicyIncidentID
+				h.logUsageForRequest(c, failedLog)
 				if willRetry {
 					lastStatusCode = http.StatusBadGateway
 					lastBody = []byte(readErr.Error())
-					if sameAccountRetry {
-						sameAccountAttempts++
-						retryAccountID = account.ID()
-						retryProxyURL = proxyURL
-						logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, inboundEndpoint)
-					}
 					continue
 				}
 				c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": readErr.Error(), "type": "upstream_error"}})
@@ -1560,25 +1690,17 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			// Stream disconnects and upstream image generation failures can be
 			// transient (e.g. upstream model overload, network hiccup).
 			resp.Body.Close()
-			kind := classifyTransportFailure(readErr)
-			sameAccountRetry, sameAccountFailures, sameAccountLimit := transportRetries.shouldRetrySameAccount(h, account, !c.Writer.Written(), false, kind)
 			h.store.Release(account)
-			if !sameAccountRetry {
-				excludeAccounts[account.ID()] = true
-			}
+			excludeAccounts[account.ID()] = true
 			// Only retry when nothing has been written to the client yet.
-			willRetry := sameAccountRetry || (shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) && !c.Writer.Written())
+			willRetry := shouldRetryImageStreamError(readErr, &generalRetries, maxRetries, attempt, maxImageAttempts) && !c.Writer.Written()
 			// Always record the failed attempt so it appears in usage stats.
-			h.logUsageForRequest(c, buildImageErrorUsageLog(account, inboundEndpoint, logModel, attemptLogEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo))
+			failedLog := buildImageErrorUsageLog(account, inboundEndpoint, logModel, logEffectiveModel, stream, int(time.Since(start).Milliseconds()), attempt, willRetry, readErr, usage, imageLogInfo)
+			failedLog.PromptPolicyIncidentID = promptPolicyIncidentID
+			h.logUsageForRequest(c, failedLog)
 			if willRetry {
 				lastStatusCode = statusCode
 				lastBody = []byte(readErr.Error())
-				if sameAccountRetry {
-					sameAccountAttempts++
-					retryAccountID = account.ID()
-					retryProxyURL = proxyURL
-					logTransportSameAccountRetry(account.ID(), attempt+1, sameAccountFailures, sameAccountLimit, inboundEndpoint)
-				}
 				continue
 			}
 			// Non-retryable -- deliver error response if nothing written yet.
@@ -1591,12 +1713,12 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			AccountID:        account.ID(),
 			Endpoint:         inboundEndpoint,
 			Model:            logModel,
-			EffectiveModel:   attemptLogEffectiveModel,
+			EffectiveModel:   logEffectiveModel,
 			StatusCode:       statusCode,
 			DurationMs:       int(time.Since(start).Milliseconds()),
 			FirstTokenMs:     firstTokenMs,
 			InboundEndpoint:  inboundEndpoint,
-			UpstreamEndpoint: upstreamEndpoint,
+			UpstreamEndpoint: "/v1/responses",
 			Stream:           stream,
 		}
 		if usage != nil {
@@ -1626,10 +1748,6 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	// Exhausted all attempts.
 	if lastStatusCode > 0 && len(lastBody) > 0 {
 		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
-		return
-	}
-	if lastRequestErr != nil {
-		ErrorToGinResponse(c, lastRequestErr)
 		return
 	}
 	c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
@@ -1746,7 +1864,7 @@ func collectImagesResponse(ctx context.Context, body io.Reader, responseFormat, 
 			readErr = imageGenerationFailureError(data)
 			return false
 		case "response.failed":
-			readErr = imageGenerationFailureError(data)
+			readErr = newImageResponseFailedError(data)
 			return false
 		}
 		return true
@@ -1795,7 +1913,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		imageLogInfo   imageUsageLogInfo
 		readErr        error
 	)
-	streamWriter := newStreamFlushWriter(c.Writer, flusher)
+	streamWriter := h.newStreamFlushWriter(c, c.Writer, flusher)
 	var (
 		writeMu   sync.Mutex
 		closeOnce sync.Once
@@ -1929,7 +2047,7 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 			setReadErr(err)
 			return false
 		case "response.failed":
-			err := imageGenerationFailureError(data)
+			err := newImageResponseFailedError(data)
 			writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
 			setReadErr(err)
 			return false
@@ -1937,6 +2055,11 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		return true
 	})
 	stopKeepalive()
+	writeMu.Lock()
+	if finalizeErr := streamWriter.Finalize(); finalizeErr != nil && readErr == nil {
+		readErr = finalizeErr
+	}
+	writeMu.Unlock()
 	if err != nil {
 		if streamErr := getReadErr(); streamErr != nil {
 			return usage, imageCount, firstTokenMs, imageLogInfo, streamErr
@@ -1960,6 +2083,11 @@ func (h *Handler) streamImagesResponse(c *gin.Context, body io.Reader, responseF
 		writeEvent("error", buildImagesStreamErrorPayload(err.Error()))
 		setReadErr(err)
 	}
+	writeMu.Lock()
+	if finalizeErr := streamWriter.Finalize(); finalizeErr != nil && readErr == nil {
+		readErr = finalizeErr
+	}
+	writeMu.Unlock()
 	return usage, imageCount, firstTokenMs, imageLogInfo, getReadErr()
 }
 
@@ -2014,6 +2142,37 @@ func imageGenerationFailureError(payload []byte) error {
 		return fmt.Errorf("upstream image generation failed (%s): %s", code, message)
 	}
 	return fmt.Errorf("upstream image generation failed: %s", message)
+}
+
+type imageResponseFailedError struct {
+	cause   error
+	payload []byte
+}
+
+func newImageResponseFailedError(payload []byte) error {
+	return &imageResponseFailedError{cause: imageGenerationFailureError(payload), payload: append([]byte(nil), payload...)}
+}
+
+func (e *imageResponseFailedError) Error() string {
+	if e == nil || e.cause == nil {
+		return "upstream image generation failed"
+	}
+	return e.cause.Error()
+}
+
+func (e *imageResponseFailedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func imageResponseFailedPayload(err error) []byte {
+	var failed *imageResponseFailedError
+	if !errors.As(err, &failed) || failed == nil {
+		return nil
+	}
+	return append([]byte(nil), failed.payload...)
 }
 
 func firstNonEmptyImageErrorField(values ...string) string {

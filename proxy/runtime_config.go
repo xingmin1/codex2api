@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"log"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -31,20 +33,24 @@ const (
 	RequestIsolationModeIsolated  = "isolated"
 	RequestIsolationModePerAPIKey = "per-api-key"
 
-	defaultClientCompatMode      = ClientCompatModePreserve
-	defaultCodexMinCLIVersion    = "0.118.0"
-	defaultStreamFlushPolicy     = StreamFlushPolicyImmediate
-	defaultStreamFlushIntervalMS = 20
-	minStreamFlushIntervalMS     = 1
-	maxStreamFlushIntervalMS     = 1000
-	defaultFirstTokenMode        = FirstTokenModeStrict
-	defaultFirstTokenTimeoutSec  = 0
-	maxFirstTokenTimeoutSec      = 600
-	defaultBillingTierPolicy     = BillingTierPolicyActual
-	defaultCodexWSHideErrors     = true
-	defaultCodexWSSilentRetry    = true
-	defaultCodexWSSilentRetries  = 2
-	maxCodexWSSilentRetries      = 10
+	defaultClientCompatMode       = ClientCompatModePreserve
+	defaultCodexMinCLIVersion     = "0.144.1"
+	defaultStreamFlushPolicy      = StreamFlushPolicyImmediate
+	defaultStreamFlushIntervalMS  = 20
+	minStreamFlushIntervalMS      = 1
+	maxStreamFlushIntervalMS      = 1000
+	defaultFirstTokenMode         = FirstTokenModeStrict
+	defaultFirstTokenTimeoutSec   = 0
+	maxFirstTokenTimeoutSec       = 600
+	defaultBillingTierPolicy      = BillingTierPolicyActual
+	defaultCodexWSHideErrors      = true
+	defaultCodexWSSilentRetry     = true
+	defaultCodexWSSilentRetries   = 2
+	defaultCodexWSSizeRouter      = true
+	maxCodexWSSilentRetries       = 10
+	defaultCodexWSBusyMaxWaitSec  = 30
+	defaultCodexWSBusyPatienceSec = 2
+	maxCodexWSBusyWaitSec         = 300
 
 	defaultCodexContinueMaxRounds = 8
 	minCodexContinueMaxRounds     = 1
@@ -61,9 +67,28 @@ type RuntimeSettings struct {
 	FirstTokenTimeoutSec  int
 	BillingTierPolicy     string
 	CodexForceWebsocket   bool // 强制 Codex 上游走 WebSocket（默认 false）
-	CodexWSHideErrors     bool // 隐藏 Codex WS 上游原始错误（默认 true）
-	CodexWSSilentRetry    bool // 首包前 Codex WS 上游错误静默换号重试（默认 true）
-	CodexWSSilentRetries  int  // Codex WS 静默换号最大重试次数（默认 2）
+	// CodexWSWeakNetworkMode 对 VPN/住宅代理等不稳定链路采用保守复用：
+	// 缩短空闲/最大寿命、每次复用都做真实 Ping/Pong，并暂停空闲保活（默认 false）。
+	CodexWSWeakNetworkMode bool
+	CodexWSHideErrors      bool // 隐藏 Codex WS 上游原始错误（默认 true）
+	CodexWSSilentRetry     bool // 首包前 Codex WS 上游错误静默换号重试（默认 true）
+	CodexWSSilentRetries   int  // Codex WS 静默换号最大重试次数（默认 2）
+	CodexWSSizeRouter      bool // 1009 自学习体积路由：超大请求直接首发 HTTP（默认 true）
+	CodexWSBusyMaxWaitSec  int  // busy session/容量等待的累计上限秒数（默认 30，issue #413）
+	CodexWSBusyOverflow    bool // busy session 溢出到同账号兄弟连接（默认 false）
+	CodexWSBusyPatienceSec int  // 触发溢出前的短等待秒数（默认 2）
+	// OverflowAutoCompact 上下文超窗时自动摘要旧轮次并重试一次（实验性，默认 false，issue #415）。
+	// 全局开关与 per-key limits.auto_compact_overflow 为「或」关系。
+	OverflowAutoCompact bool
+	// CodexPreflightSSEPassthrough 将前置元数据事件（codex.rate_limits /
+	// codex.response.metadata / response.metadata）立即透传下游而不缓冲到首个内容
+	// 事件（旧版兼容，默认 false，issue #425）。开启后首内容前会提前提交 200，
+	// 该窗口内的 response.failed 只能以 SSE failed 帧下发，真实错误码/静默换号/
+	// 超窗压缩重试均不可用。
+	CodexPreflightSSEPassthrough bool
+	// FirstTokenExcludesWsAcquire 落库的 first_token_ms 是否扣除本次 attempt 的
+	// WS 取连耗时（默认 false，保持含取连的原口径；原始值 = first_token_ms + ws_acquire_ms）。
+	FirstTokenExcludesWsAcquire bool
 	// CodexContinueThinking 检测到上游按 518n-2 指纹截断思考时自动续想并折叠成单响应（默认 false）。
 	CodexContinueThinking  bool
 	CodexContinueMaxRounds int // 单次请求最大续想轮数，含首轮（默认 8，范围 1-32）
@@ -76,6 +101,19 @@ type RuntimeSettings struct {
 	CodexCLIVersionSyncEnabled bool
 	// CodexCLIVersionSyncIntervalHours 定时同步间隔（小时，默认 12，范围 1-720）。
 	CodexCLIVersionSyncIntervalHours int
+	// AutoResetCreditsEnabled 控制 Plus/Pro 主动重置次数的临期自动消费（默认 false）。
+	AutoResetCreditsEnabled bool
+	// AutoResetCreditsBeforeExpiryMin 是进入自动消费窗口的提前分钟数（默认 60）。
+	AutoResetCreditsBeforeExpiryMin int
+	// UTLSShutdownTimeoutMin 是 uTLS（CODEX_TRANSPORT_MODE=utls_chrome）连接被摘出
+	// 连接池后，等待其上在途 stream 收尾的上限（分钟，默认 30，范围 1-240）。
+	// 超时则强制关闭，保证异常挂死的 stream 不会把连接永久留住（issue #446）。
+	UTLSShutdownTimeoutMin int
+}
+
+// UTLSShutdownTimeout 返回 uTLS 连接优雅关闭的等待上限。
+func (s RuntimeSettings) UTLSShutdownTimeout() time.Duration {
+	return time.Duration(database.NormalizeUTLSShutdownTimeoutMinutes(s.UTLSShutdownTimeoutMin)) * time.Minute
 }
 
 // IsolateRequestsByDefault 返回是否对无显式会话的请求默认按每请求隔离上游身份。
@@ -84,7 +122,10 @@ func (s RuntimeSettings) IsolateRequestsByDefault() bool {
 	return NormalizeRequestIsolationMode(s.RequestIsolationMode) != RequestIsolationModePerAPIKey
 }
 
-var runtimeSettings atomic.Value // stores RuntimeSettings
+var (
+	runtimeSettings         atomic.Value // stores RuntimeSettings
+	runtimeSettingsUpdateMu sync.Mutex
+)
 
 func init() {
 	runtimeSettings.Store(DefaultRuntimeSettings())
@@ -92,21 +133,26 @@ func init() {
 
 func DefaultRuntimeSettings() RuntimeSettings {
 	return RuntimeSettings{
-		ClientCompatMode:       defaultClientCompatMode,
-		CodexMinCLIVersion:     defaultCodexMinCLIVersion,
-		CodexUserAgentConfig:   DefaultCodexUserAgentConfigJSON(),
-		StreamFlushPolicy:      defaultStreamFlushPolicy,
-		StreamFlushIntervalMS:  defaultStreamFlushIntervalMS,
-		FirstTokenMode:         defaultFirstTokenMode,
-		FirstTokenTimeoutSec:   defaultFirstTokenTimeoutSec,
-		BillingTierPolicy:      defaultBillingTierPolicy,
-		CodexWSHideErrors:      defaultCodexWSHideErrors,
-		CodexWSSilentRetry:     defaultCodexWSSilentRetry,
-		CodexWSSilentRetries:   defaultCodexWSSilentRetries,
-		CodexContinueMaxRounds: defaultCodexContinueMaxRounds,
-		RequestIsolationMode:   defaultRequestIsolationMode(),
+		ClientCompatMode:                 defaultClientCompatMode,
+		CodexMinCLIVersion:               defaultCodexMinCLIVersion,
+		CodexUserAgentConfig:             DefaultCodexUserAgentConfigJSON(),
+		StreamFlushPolicy:                defaultStreamFlushPolicy,
+		StreamFlushIntervalMS:            defaultStreamFlushIntervalMS,
+		FirstTokenMode:                   defaultFirstTokenMode,
+		FirstTokenTimeoutSec:             defaultFirstTokenTimeoutSec,
+		BillingTierPolicy:                defaultBillingTierPolicy,
+		CodexWSHideErrors:                defaultCodexWSHideErrors,
+		CodexWSSilentRetry:               defaultCodexWSSilentRetry,
+		CodexWSSilentRetries:             defaultCodexWSSilentRetries,
+		CodexWSSizeRouter:                defaultCodexWSSizeRouter,
+		CodexWSBusyMaxWaitSec:            defaultCodexWSBusyMaxWaitSec,
+		CodexWSBusyPatienceSec:           defaultCodexWSBusyPatienceSec,
+		CodexContinueMaxRounds:           defaultCodexContinueMaxRounds,
+		RequestIsolationMode:             defaultRequestIsolationMode(),
 		CodexCLIVersionSyncEnabled:       true,
 		CodexCLIVersionSyncIntervalHours: 12,
+		AutoResetCreditsBeforeExpiryMin:  60,
+		UTLSShutdownTimeoutMin:           database.NormalizeUTLSShutdownTimeoutMinutes(0),
 	}
 }
 
@@ -208,16 +254,33 @@ func NormalizeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
 	if settings.CodexWSSilentRetries > maxCodexWSSilentRetries {
 		settings.CodexWSSilentRetries = maxCodexWSSilentRetries
 	}
+	if settings.CodexWSBusyMaxWaitSec <= 0 {
+		settings.CodexWSBusyMaxWaitSec = defaultCodexWSBusyMaxWaitSec
+	}
+	if settings.CodexWSBusyMaxWaitSec > maxCodexWSBusyWaitSec {
+		settings.CodexWSBusyMaxWaitSec = maxCodexWSBusyWaitSec
+	}
+	if settings.CodexWSBusyPatienceSec < 0 {
+		settings.CodexWSBusyPatienceSec = defaultCodexWSBusyPatienceSec
+	}
+	if settings.CodexWSBusyPatienceSec > maxCodexWSBusyWaitSec {
+		settings.CodexWSBusyPatienceSec = maxCodexWSBusyWaitSec
+	}
 	if settings.CodexContinueMaxRounds < minCodexContinueMaxRounds {
 		settings.CodexContinueMaxRounds = defaults.CodexContinueMaxRounds
 	}
 	if settings.CodexContinueMaxRounds > maxCodexContinueMaxRounds {
 		settings.CodexContinueMaxRounds = maxCodexContinueMaxRounds
 	}
+	settings.AutoResetCreditsBeforeExpiryMin = database.NormalizeAutoResetCreditsBeforeExpiryMinutes(settings.AutoResetCreditsBeforeExpiryMin)
+	settings.UTLSShutdownTimeoutMin = database.NormalizeUTLSShutdownTimeoutMinutes(settings.UTLSShutdownTimeoutMin)
 	return settings
 }
 
 func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSettings {
+	runtimeSettingsUpdateMu.Lock()
+	defer runtimeSettingsUpdateMu.Unlock()
+
 	next := DefaultRuntimeSettings()
 	if settings != nil {
 		next.ClientCompatMode = settings.ClientCompatMode
@@ -229,31 +292,67 @@ func ApplyRuntimeSettingsFromSystem(settings *database.SystemSettings) RuntimeSe
 		next.FirstTokenTimeoutSec = settings.FirstTokenTimeoutSeconds
 		next.BillingTierPolicy = settings.BillingTierPolicy
 		next.CodexForceWebsocket = settings.CodexForceWebsocket
+		next.CodexWSWeakNetworkMode = settings.CodexWSWeakNetworkMode
 		next.CodexWSHideErrors = settings.CodexWSHideUpstreamErrors
 		next.CodexWSSilentRetry = settings.CodexWSSilentRetryEnabled
 		next.CodexWSSilentRetries = settings.CodexWSSilentMaxRetries
+		next.CodexWSSizeRouter = settings.CodexWSSizeRouterEnabled
+		next.CodexWSBusyMaxWaitSec = settings.CodexWSBusyAcquireMaxWaitSec
+		next.CodexWSBusyOverflow = settings.CodexWSBusyOverflowEnabled
+		next.CodexWSBusyPatienceSec = settings.CodexWSBusyPatienceSec
+		next.OverflowAutoCompact = settings.OverflowAutoCompactEnabled
+		next.CodexPreflightSSEPassthrough = settings.CodexPreflightSSEPassthroughEnabled
+		next.FirstTokenExcludesWsAcquire = settings.FirstTokenExcludesWsAcquire
 		next.CodexContinueThinking = settings.CodexContinueThinkingEnabled
 		next.CodexContinueMaxRounds = settings.CodexContinueMaxRounds
 		next.CodexSyncedCLIVersion = settings.CodexSyncedCLIVersion
 		next.CodexCLIVersionSyncEnabled = settings.CodexCLIVersionSyncEnabled
 		next.CodexCLIVersionSyncIntervalHours = settings.CodexCLIVersionSyncIntervalHours
+		next.AutoResetCreditsEnabled = settings.AutoResetCreditsEnabled
+		next.AutoResetCreditsBeforeExpiryMin = settings.AutoResetCreditsBeforeExpiryMin
+		next.UTLSShutdownTimeoutMin = settings.UTLSShutdownTimeoutMinutes
+		// Payload 重写规则不进 RuntimeSettings（编译后独立存放），此处顺带完成启动种子。
+		if err := SetPayloadRulesJSON(settings.PayloadRules); err != nil {
+			log.Printf("payload_rules 配置解析失败，已忽略: %v", err)
+		}
 	}
-	next = NormalizeRuntimeSettings(next)
-	runtimeSettings.Store(next)
-	return next
+	return storeRuntimeSettings(next)
 }
 
 func ApplyRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
-	settings = NormalizeRuntimeSettings(settings)
-	runtimeSettings.Store(settings)
-	return settings
+	runtimeSettingsUpdateMu.Lock()
+	defer runtimeSettingsUpdateMu.Unlock()
+	return storeRuntimeSettings(settings)
+}
+
+// UpdateRuntimeSettings 在与完整设置写入共享的临界区内更新运行时配置。
+// 后台任务应使用这个函数只修改自己拥有的字段，避免旧快照覆盖管理员刚保存的设置。
+func UpdateRuntimeSettings(update func(RuntimeSettings) RuntimeSettings) RuntimeSettings {
+	runtimeSettingsUpdateMu.Lock()
+	defer runtimeSettingsUpdateMu.Unlock()
+
+	next := currentRuntimeSettings()
+	if update != nil {
+		next = update(next)
+	}
+	return storeRuntimeSettings(next)
 }
 
 func CurrentRuntimeSettings() RuntimeSettings {
+	return currentRuntimeSettings()
+}
+
+func currentRuntimeSettings() RuntimeSettings {
 	if v, ok := runtimeSettings.Load().(RuntimeSettings); ok {
 		return NormalizeRuntimeSettings(v)
 	}
 	return DefaultRuntimeSettings()
+}
+
+func storeRuntimeSettings(settings RuntimeSettings) RuntimeSettings {
+	settings = NormalizeRuntimeSettings(settings)
+	runtimeSettings.Store(settings)
+	return settings
 }
 
 func currentStreamFlushInterval() time.Duration {

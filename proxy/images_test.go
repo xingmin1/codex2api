@@ -14,8 +14,10 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
 )
@@ -114,7 +116,7 @@ func TestImageGalleryPersisterRecordsAssetAndJob(t *testing.T) {
 	p.finalize(ctx)
 
 	// 应登记一条 asset，且 storage_path 为 s3:// ref。
-	assets, err := db.ListImageAssets(ctx, 1, 10)
+	assets, err := db.ListImageAssets(ctx, 1, 10, 0)
 	if err != nil {
 		t.Fatalf("ListImageAssets: %v", err)
 	}
@@ -170,6 +172,31 @@ func TestBuildImagesResponsesRequestMatchesReferenceChain(t *testing.T) {
 	}
 	if got := gjson.GetBytes(body, "input.0.content.0.text").String(); got != "draw a cat" {
 		t.Fatalf("prompt = %q, want draw a cat", got)
+	}
+}
+
+func TestBuildImagesResponsesRequestCarriesMaxEditImages(t *testing.T) {
+	if MaxImageEditInputCount != 16 {
+		t.Fatalf("MaxImageEditInputCount = %d, want 16（对齐官方 gpt-image 编辑上限）", MaxImageEditInputCount)
+	}
+
+	images := make([]string, MaxImageEditInputCount)
+	for i := range images {
+		images[i] = fmt.Sprintf("data:image/png;base64,IMG%d", i)
+	}
+	body := buildImagesResponsesRequest("edit these", images, nil)
+
+	parts := gjson.GetBytes(body, "input.0.content").Array()
+	if len(parts) != MaxImageEditInputCount+1 {
+		t.Fatalf("content parts = %d, want %d（1 条文本 + %d 张图）", len(parts), MaxImageEditInputCount+1, MaxImageEditInputCount)
+	}
+	for i, part := range parts[1:] {
+		if got := part.Get("type").String(); got != "input_image" {
+			t.Fatalf("content[%d].type = %q, want input_image", i+1, got)
+		}
+		if got := part.Get("image_url").String(); got != images[i] {
+			t.Fatalf("content[%d].image_url = %q, want %q", i+1, got, images[i])
+		}
 	}
 }
 
@@ -377,7 +404,7 @@ func TestNextImageAccountPrefersPlusOrHigherPlan(t *testing.T) {
 	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "plus-token", PlanType: "plus"})
 	handler := &Handler{store: store}
 
-	account, _ := handler.nextImageAccount(0, nil, "")
+	account, _ := handler.nextImageAccount(nil, 0, nil, "", requestSessionIdentity{})
 	if account == nil {
 		t.Fatal("nextImageAccount returned nil")
 	}
@@ -393,7 +420,7 @@ func TestNextImageAccountFallsBackToFreeWhenNoPaidAccountAvailable(t *testing.T)
 	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "free-token", PlanType: "free"})
 	handler := &Handler{store: store}
 
-	account, _ := handler.nextImageAccount(0, nil, "")
+	account, _ := handler.nextImageAccount(nil, 0, nil, "", requestSessionIdentity{})
 	if account == nil {
 		t.Fatal("nextImageAccount returned nil")
 	}
@@ -738,6 +765,56 @@ func TestCollectImagesResponseUsesUpstreamFailureMessage(t *testing.T) {
 	}
 }
 
+func TestForwardImagesResponseFailedCyberPolicyEntersUnifiedAuditAndCandidateQueue(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.failed","response":{"error":{"code":"cyber_policy","message":"cyber security risk detected"}}}`+"\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "image-cyber-test"})
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "images-cyber.db"))
+	if err != nil {
+		t.Fatalf("database.New(sqlite): %v", err)
+	}
+	defer db.Close()
+	settings := &database.SystemSettings{
+		MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", MaxRetries: 0,
+		PromptFilterEnabled: true, PromptFilterMode: promptfilter.ModeBlock, PromptFilterThreshold: 50,
+		PromptFilterMaxTextLength: promptfilter.DefaultMaxTextLength, PromptFilterCustomPatterns: "[]", PromptFilterDisabledPatterns: "[]",
+	}
+	store := auth.NewStore(nil, nil, settings)
+	t.Cleanup(store.Stop)
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "at-image", PlanType: "plus", AccountID: "acct-image"})
+	handler := NewHandler(store, db, &config.Config{AllowAnonymousV1: true}, nil)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"prompt":"draw a harmless landscape"}`))
+	evaluation := promptGuardEvaluation{
+		Envelope: promptfilter.RequestEnvelope{
+			Endpoint: "/v1/images/generations", Protocol: promptfilter.ProtocolResponses, ModelFamily: promptfilter.ModelFamilyOpenAI,
+			Segments: []promptfilter.Segment{{Origin: promptfilter.OriginCurrentUser, Role: "user", Text: "draw a harmless landscape"}},
+		},
+		Decision: promptfilter.Decision{Action: promptfilter.ActionAllow},
+		Verdict:  promptfilter.Verdict{Enabled: true, Action: promptfilter.ActionAllow},
+	}
+	handler.capturePromptRuleLearningEvidence(c, "/v1/images/generations", "gpt-image-2", evaluation)
+	responsesBody := []byte(`{"model":"gpt-5.4","input":"draw a harmless landscape","tools":[{"type":"image_generation","model":"gpt-image-2","size":"1024x1024"}],"stream":true}`)
+	handler.forwardImagesRequest(c, "/v1/images/generations", "gpt-image-2", "gpt-image-2", "gpt-image-2", responsesBody, "b64_json", "image_generation", false)
+	waitPromptFilterAuditIdle(t, db)
+	incidents, incidentTotal, err := db.ListPromptPolicyIncidentsPage(context.Background(), database.PromptPolicyIncidentQuery{Page: 1, PageSize: 20})
+	if err != nil || incidentTotal != 1 || len(incidents) != 1 || incidents[0].Endpoint != "/v1/images/generations" || incidents[0].Transport != "http" {
+		t.Fatalf("image cyber_policy incident total=%d items=%#v err=%v", incidentTotal, incidents, err)
+	}
+	assertCyberUsageIncidentLinks(t, db, "/v1/images/generations")
+	candidates, total, err := db.ListPromptRuleCandidates(context.Background(), database.PromptRuleCandidateQuery{Status: database.PromptRuleCandidateStatusPending})
+	if err != nil || total != 1 || len(candidates) != 1 || candidates[0].Kind != database.PromptRuleCandidateKindEvidence {
+		t.Fatalf("image candidate total=%d items=%#v err=%v", total, candidates, err)
+	}
+}
+
 func TestBuildImageErrorUsageLogRecordsFailure(t *testing.T) {
 	account := &auth.Account{DBID: 42, AccessToken: "token", PlanType: "plus"}
 	readErr := fmt.Errorf("upstream image generation failed: server_error")
@@ -833,5 +910,40 @@ func TestStreamImagesResponseSendsConnectedComment(t *testing.T) {
 	}
 	if !strings.Contains(body, "event: image_generation.completed\n") {
 		t.Fatalf("stream body missing completed event: %q", body)
+	}
+}
+
+// TestNextImageAccountHonorsNoAffinitySplit 生图也要守分流：无指纹的生图请求只能落到
+// 分流组，带指纹的必须避开分流组——否则 store 层放宽了授权，生图流量会两个方向都走反。
+func TestNextImageAccountHonorsNoAffinitySplit(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4"})
+	store.AddAccount(&auth.Account{DBID: 1, AccessToken: "primary-token", PlanType: "plus", GroupIDs: []int64{10}})
+	store.AddAccount(&auth.Account{DBID: 2, AccessToken: "split-token", PlanType: "plus", GroupIDs: []int64{20}})
+	handler := &Handler{store: store}
+
+	newContext := func() *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Set(contextAPIKeyRow, &database.APIKeyRow{
+			Limits: database.APIKeyLimits{NoAffinityGroupIDs: []int64{20}},
+		})
+		return c
+	}
+
+	noFingerprint, _ := handler.nextImageAccount(newContext(), 0, nil, "", requestSessionIdentity{})
+	if noFingerprint == nil {
+		t.Fatal("nextImageAccount returned nil for a request without a fingerprint")
+	}
+	defer store.Release(noFingerprint)
+	if noFingerprint.DBID != 2 {
+		t.Fatalf("request without a fingerprint picked account %d, want the split account 2", noFingerprint.DBID)
+	}
+
+	fingerprinted, _ := handler.nextImageAccount(newContext(), 0, nil, "", requestSessionIdentity{hasRequestFingerprint: true})
+	if fingerprinted == nil {
+		t.Fatal("nextImageAccount returned nil for a fingerprinted request")
+	}
+	defer store.Release(fingerprinted)
+	if fingerprinted.DBID != 1 {
+		t.Fatalf("fingerprinted request picked account %d, want the non-split account 1", fingerprinted.DBID)
 	}
 }

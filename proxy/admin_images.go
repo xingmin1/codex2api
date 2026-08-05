@@ -16,7 +16,7 @@ import (
 
 // GenerateImageOnceForAdmin executes the existing Images API handler in-process.
 // It keeps model aliasing, account dispatch, usage logging, and image parsing in one code path.
-func (h *Handler) GenerateImageOnceForAdmin(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow) ([]byte, int, error) {
+func (h *Handler) GenerateImageOnceForAdmin(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow, sharedAPIKeyConcurrency bool) ([]byte, int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -30,11 +30,22 @@ func (h *Handler) GenerateImageOnceForAdmin(ctx context.Context, rawBody []byte,
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != nil && strings.TrimSpace(apiKey.Key) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey.Key)
+		ginCtx.Set(contextAPIKeyRow, apiKey)
 		ginCtx.Set(contextAPIKeyID, apiKey.ID)
 		ginCtx.Set(contextAPIKeyName, strings.TrimSpace(apiKey.Name))
 		ginCtx.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKey.Key))
 	}
 	ginCtx.Request = req
+
+	// 每个批量输出都是一次真实上游请求，因此复用标准 Images handler 的
+	// API Key 限额。并发槽由调用方决定：入队时已经为整个任务占过槽的路径
+	// 传 true，否则这里会为同一个 Key 再占一次，把上限打对折。
+	if sharedAPIKeyConcurrency {
+		ginCtx.Set(contextAPIKeyConcurrencyInherited, true)
+	}
+	if status, msg := h.applyAdminScopeBudget(ctx, ginCtx, apiKey); status != 0 {
+		return nil, status, fmt.Errorf("%s", msg)
+	}
 
 	h.ImagesGenerations(ginCtx)
 
@@ -66,7 +77,7 @@ func extractAdminImageErrorMessage(body []byte) string {
 
 // GenerateImageEditForAdmin executes the ImagesEdits handler in-process for
 // image-to-image (edit) jobs from the admin image studio.
-func (h *Handler) GenerateImageEditForAdmin(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow) ([]byte, int, error) {
+func (h *Handler) GenerateImageEditForAdmin(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow, sharedAPIKeyConcurrency bool) ([]byte, int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -80,11 +91,19 @@ func (h *Handler) GenerateImageEditForAdmin(ctx context.Context, rawBody []byte,
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != nil && strings.TrimSpace(apiKey.Key) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey.Key)
+		ginCtx.Set(contextAPIKeyRow, apiKey)
 		ginCtx.Set(contextAPIKeyID, apiKey.ID)
 		ginCtx.Set(contextAPIKeyName, strings.TrimSpace(apiKey.Name))
 		ginCtx.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKey.Key))
 	}
 	ginCtx.Request = req
+
+	if sharedAPIKeyConcurrency {
+		ginCtx.Set(contextAPIKeyConcurrencyInherited, true)
+	}
+	if status, msg := h.applyAdminScopeBudget(ctx, ginCtx, apiKey); status != 0 {
+		return nil, status, fmt.Errorf("%s", msg)
+	}
 
 	h.ImagesEdits(ginCtx)
 
@@ -101,4 +120,20 @@ func (h *Handler) GenerateImageEditForAdmin(ctx context.Context, rawBody []byte,
 
 func gjsonGetString(body []byte, path string) string {
 	return gjson.GetBytes(body, path).String()
+}
+
+// applyAdminScopeBudget 为 in-process 的管理端生图任务计算 scope 预算闸门：
+// reject 类超额直接返回 429，skip 类挂到该 gin context 上供账号过滤链剔除候选。
+func (h *Handler) applyAdminScopeBudget(ctx context.Context, ginCtx *gin.Context, apiKey *database.APIKeyRow) (int, string) {
+	if apiKey == nil || len(apiKey.Limits.ScopeLimits) == 0 {
+		return 0, ""
+	}
+	gate, rejectMsg := h.evaluateAPIKeyScopeBudgets(ctx, apiKey)
+	if rejectMsg != "" {
+		return http.StatusTooManyRequests, rejectMsg
+	}
+	if gate != nil {
+		ginCtx.Set(contextScopeBudgetGate, gate)
+	}
+	return 0, ""
 }

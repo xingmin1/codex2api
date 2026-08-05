@@ -1,8 +1,16 @@
 import type { ChangeEvent, DragEvent, ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, useMemo } from "react";
 import { createPortal } from "react-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { api, getAdminKey, resetAdminAuthState } from "../api";
+import type { ProxyRow } from "../api";
+import { ProxyPoolSelect } from "../components/ProxyPoolSelect";
 import Modal from "../components/Modal";
+import ChannelLogo from "../components/ChannelLogo";
+import ModelLogo from "../components/ModelLogo";
+import OperationResultsModal from "../components/OperationResultsModal";
+import { cn } from "@/lib/utils";
+import GrokAccounts from "./GrokAccounts";
 import PageHeader from "../components/PageHeader";
 import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
@@ -35,11 +43,26 @@ import type {
   QualityEvalKind,
   QualityEvalSample,
   RunQualityEvalRequest,
+  AgentIdentityImportItem,
 } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
-import { formatLongUsageWindowLabel } from "../lib/usageFormat";
+import {
+  collectAccountOperationResult,
+  resolveChannelBatchTestAccountIDs,
+  snapshotAccountOperationResults,
+  type AccountOperationResult,
+  type AccountOperationResultsState,
+} from "../lib/accountOperationResults";
+import {
+  readOperationResultsVisibility,
+  writeOperationResultsVisibility,
+} from "../lib/operationResultsPreference";
+import {
+  formatLongUsageWindowLabel,
+  needsUsageReload,
+} from "../lib/usageFormat";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -76,12 +99,16 @@ import {
   Search,
   Fingerprint,
   FolderOpen,
+  Layers,
   Cloud,
   Lock,
   Unlock,
   RotateCcw,
   Pencil,
   Check,
+  CheckCircle,
+  XCircle,
+  Loader2,
   ChevronDown,
   Copy,
   Cookie,
@@ -100,6 +127,7 @@ import {
   ToggleLeft,
   ToggleRight,
   MoreHorizontal,
+  Sparkles,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
@@ -113,6 +141,7 @@ import Sub2APIImportModal from "../components/Sub2APIImportModal";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
+import { useImportGroupIds } from "../hooks/useImportGroupIds";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
   accountMatchesGroupFilter,
@@ -189,6 +218,7 @@ type AccountSortKey =
   | "lastUsed"
   | "importTime"
   | "schedulerPriority"
+  | "group"
   | "updatedAt";
 type SortDirection = "asc" | "desc";
 type AccountSortPreference = {
@@ -276,12 +306,15 @@ const ACCOUNT_SORT_KEYS = new Set<AccountSortKey>([
   "billed",
   "lastUsed",
   "importTime",
+  "schedulerPriority",
+  "group",
   "updatedAt",
 ]);
 
 function defaultAccountSortDirection(key: AccountSortKey | null): SortDirection {
   switch (key) {
     case "name":
+    case "group":
     case "priceMultiplier":
       return "asc";
     default:
@@ -388,6 +421,14 @@ function formatAccountListEmail(account: AccountRow): string {
 
 function formatAccessTokenBadge(account: AccountRow): string {
   return account.access_token_type === "codex_at" ? "codex_at" : "AT";
+}
+
+// getCreditBalanceDisplay 返回 credits 积分余额徽标应显示的文本；无余额（或未探测）返回 null。
+function getCreditBalanceDisplay(account: AccountRow): string | null {
+  if (!account.credits_has_credits) return null;
+  if (account.credits_unlimited) return "∞";
+  const balance = (account.credits_balance ?? "").trim();
+  return balance ? balance : null;
 }
 
 function getInitialAnalysisVisibility(): boolean {
@@ -595,7 +636,7 @@ function mergeModelLists(current: string[], incoming: string[]): string[] {
 }
 
 function formatAccountName(account: AccountRow): string {
-  if (account.openai_responses_api) {
+  if (account.openai_responses_api || account.grok_api) {
     return account.name?.trim() || `ID ${account.id}`;
   }
   return account.email || account.name || `ID ${account.id}`;
@@ -797,6 +838,8 @@ function accountSortValue(
       return accountSortTime(account.created_at, direction);
     case "schedulerPriority":
       return getSchedulerPriority(account);
+    case "group":
+      return "";
     case "updatedAt":
       return accountSortTime(account.updated_at, direction);
   }
@@ -807,7 +850,17 @@ function compareAccountsBySort(
   right: AccountRow,
   key: AccountSortKey,
   direction: SortDirection,
+  groups: AccountGroup[],
 ): number {
+  if (key === "group") {
+    const leftGroup = getAccountGroupSortMeta(left, groups);
+    const rightGroup = getAccountGroupSortMeta(right, groups);
+    let diff = leftGroup.order - rightGroup.order;
+    if (diff === 0) diff = leftGroup.key.localeCompare(rightGroup.key, "zh");
+    if (diff === 0) diff = left.id - right.id;
+    return direction === "asc" ? diff : -diff;
+  }
+
   const leftValue = accountSortValue(left, key, direction);
   const rightValue = accountSortValue(right, key, direction);
   let diff = 0;
@@ -873,6 +926,8 @@ type BatchOperationAction = "batch_test" | "batch_delete" | "batch_refresh";
 interface BatchOperationEvent {
   type: "start" | "progress" | "complete";
   action: BatchOperationAction;
+  status?: string;
+  http_status?: number;
   current?: number;
   total?: number;
   success?: number;
@@ -961,6 +1016,29 @@ export default function Accounts() {
   const { t, i18n } = useTranslation();
   const pageSizeOptions = DEFAULT_PAGE_SIZE_OPTIONS;
   const [showAdd, setShowAdd] = useState(false);
+  // providerView 决定账号管理页顶部展示哪一套上游：codex(现有页) 或 grok(独立黑白视图)。
+  // 由路由驱动（/accounts vs /accounts/grok），刷新浏览器后停留在当前视图。
+  const location = useLocation();
+  const navigate = useNavigate();
+  const normalizedPath = location.pathname.replace(/\/+$/, "");
+  const providerView: "codex" | "grok" = normalizedPath.endsWith("/accounts/grok")
+    ? "grok"
+    : "codex";
+  const setProviderView = useCallback(
+    (view: "codex" | "grok") => {
+      navigate(view === "grok" ? "/accounts/grok" : "/accounts");
+    },
+    [navigate],
+  );
+  // Codex 邀请视图同样由路由驱动（/accounts/invite），与 Grok 视图一致：
+  // 可直接分享链接、刷新浏览器停在原处、浏览器返回键能退回账号列表。
+  const showInvite = normalizedPath.endsWith("/accounts/invite");
+  const setShowInvite = useCallback(
+    (open: boolean) => {
+      navigate(open ? "/accounts/invite" : "/accounts");
+    },
+    [navigate],
+  );
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = usePersistedPageSize(
     "accounts",
@@ -1011,6 +1089,15 @@ export default function Accounts() {
   const [batchTesting, setBatchTesting] = useState(false);
   const [operationProgress, setOperationProgress] =
     useState<OperationProgressState | null>(null);
+  const [operationResults, setOperationResults] =
+    useState<AccountOperationResultsState | null>(null);
+  const [showOperationResults, setShowOperationResults] = useState(
+    readOperationResultsVisibility,
+  );
+  const showOperationResultsRef = useRef(showOperationResults);
+  const operationResultMap = useRef<Map<number, AccountOperationResult>>(
+    new Map(),
+  );
   const operationProgressHideTimer = useRef<number | null>(null);
   const operationProgressFrame = useRef<number | null>(null);
   const operationProgressFlushTimer = useRef<number | null>(null);
@@ -1092,6 +1179,23 @@ export default function Accounts() {
   const [editProxyUrl, setEditProxyUrl] = useState("");
   const [editCustomHeadersText, setEditCustomHeadersText] = useState("");
   const [testingProxyKey, setTestingProxyKey] = useState<string | null>(null);
+  // 代理池条目：账号表单里"从代理池选择"下拉的数据源。加载失败静默留空
+  // （选择器为空时自动隐藏，不影响手动填代理）。
+  const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void api
+      .listProxies()
+      .then((res) => {
+        if (!cancelled) setProxyPool(res.proxies ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setProxyPool([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [editOpenAIForm, setEditOpenAIForm] =
     useState<UpdateOpenAIResponsesAccountRequest>({
       name: "",
@@ -1126,7 +1230,6 @@ export default function Accounts() {
     getInitialAnalysisVisibility,
   );
   const [showRecycleBin, setShowRecycleBin] = useState(false);
-  const [showInvite, setShowInvite] = useState(false);
   const [showEmailDomainTags, setShowEmailDomainTags] = useState(
     getInitialEmailDomainVisibility,
   );
@@ -1153,8 +1256,19 @@ export default function Accounts() {
     done: false,
   });
   const [addMethod, setAddMethod] = useState<
-    "rt" | "st" | "at" | "session" | "openai" | "oauth"
+    "rt" | "st" | "at" | "session" | "openai" | "oauth" | "agentIdentity"
   >("oauth");
+  const [agentIdentityJson, setAgentIdentityJson] = useState("");
+  const [agentIdentityProxyUrl, setAgentIdentityProxyUrl] = useState("");
+  const agentIdentityFileInputRef = useRef<HTMLInputElement | null>(null);
+  const [agentIdentityFilesImporting, setAgentIdentityFilesImporting] =
+    useState(false);
+  const [agentIdentityFilesResult, setAgentIdentityFilesResult] = useState<{
+    total: number;
+    imported: number;
+    failed: number;
+    items: AgentIdentityImportItem[];
+  } | null>(null);
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: "",
     proxy_url: "",
@@ -1208,12 +1322,27 @@ export default function Accounts() {
   );
   const [quickGroupIds, setQuickGroupIds] = useState<number[]>([]);
   const [quickGroupSubmitting, setQuickGroupSubmitting] = useState(false);
+  // OAuth 账号“支持模型”白名单编辑器状态;空白名单表示该账号可调度所有模型。
+  const [modelsAccount, setModelsAccount] = useState<AccountRow | null>(null);
+  const [modelsDraft, setModelsDraft] = useState<string[]>([]);
+  const [modelsInputDraft, setModelsInputDraft] = useState("");
+  const [modelsSyncing, setModelsSyncing] = useState(false);
+  const [modelsProbing, setModelsProbing] = useState(false);
+  const [modelsSaving, setModelsSaving] = useState(false);
+  // 探测看板：逐模型的实时测试状态（pending→testing→结果）。
+  const [probeBoard, setProbeBoard] = useState<ModelProbeItem[]>([]);
   const [tagFilter, setTagFilter] = useState<string>("");
   const [domainFilter, setDomainFilter] = useState<string>("");
   const [groupFilter, setGroupFilter] = useState<AccountGroupFilterValue>(
     EMPTY_ACCOUNT_GROUP_FILTER,
   );
   const [allGroups, setAllGroups] = useState<AccountGroup[]>([]);
+  // 导入/添加账号时直接绑定的分组（记住上次选择，添加弹窗与导入弹窗共用，与 allowDuplicate 同风格）。
+  const {
+    groupIds: importGroupIds,
+    setGroupIds: setImportGroupIds,
+    prune: pruneImportGroupIds,
+  } = useImportGroupIds();
   const [showGroupManager, setShowGroupManager] = useState(false);
   const [groupDraft, setGroupDraft] = useState<AccountGroupDraft>({
     id: null,
@@ -1231,6 +1360,16 @@ export default function Accounts() {
   const [batchTags, setBatchTags] = useState<string[]>([]);
   const [batchUpdateGroups, setBatchUpdateGroups] = useState(false);
   const [batchGroupIds, setBatchGroupIds] = useState<number[]>([]);
+  const [batchUpdateScoreBias, setBatchUpdateScoreBias] = useState(false);
+  const [batchScoreBiasInput, setBatchScoreBiasInput] = useState("");
+  const [batchUpdateBaseConcurrency, setBatchUpdateBaseConcurrency] =
+    useState(false);
+  const [batchBaseConcurrencyInput, setBatchBaseConcurrencyInput] =
+    useState("");
+  const [batchUpdateSchedulerPriority, setBatchUpdateSchedulerPriority] =
+    useState(false);
+  const [batchSchedulerPriorityInput, setBatchSchedulerPriorityInput] =
+    useState("");
   const [batchMetaSubmitting, setBatchMetaSubmitting] = useState(false);
   const [showBatchQuotaAutoPauseEditor, setShowBatchQuotaAutoPauseEditor] =
     useState(false);
@@ -1329,13 +1468,15 @@ export default function Accounts() {
   }) => {
     const isTesting = testingProxyKey === testKey;
     const testDisabled = disabled || !value.trim() || testingProxyKey !== null;
+    const hasProxyPool = proxyPool.length > 0;
 
     return (
-      <div>
-        <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+      <div className="space-y-2.5">
+        <label className="block text-sm font-semibold text-muted-foreground">
           {label}
         </label>
-        <div className="flex flex-col gap-2 sm:flex-row">
+        {/* 第一行：手动填写代理 URL + 测试 */}
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-stretch">
           <Input
             className="min-w-0 flex-1"
             placeholder={placeholder}
@@ -1356,6 +1497,15 @@ export default function Accounts() {
             {isTesting ? t("accounts.testingProxy") : t("accounts.testProxy")}
           </Button>
         </div>
+        {/* 第二行：从代理池选择（有池条目时单独占一行，与上方 URL 输入左对齐） */}
+        {hasProxyPool ? (
+          <ProxyPoolSelect
+            className="w-full"
+            proxies={proxyPool}
+            disabled={disabled}
+            onSelect={onChange}
+          />
+        ) : null}
       </div>
     );
   };
@@ -1580,6 +1730,7 @@ export default function Accounts() {
         window.clearTimeout(operationProgressFlushTimer.current);
       }
       pendingOperationProgress.current = null;
+      operationResultMap.current.clear();
     };
   }, []);
 
@@ -1590,6 +1741,18 @@ export default function Accounts() {
     }
     setOperationProgress(null);
   }, []);
+
+  const handleOperationResultsVisibilityChange = useCallback(
+    (visible: boolean) => {
+      showOperationResultsRef.current = visible;
+      setShowOperationResults(visible);
+      writeOperationResultsVisibility(visible);
+      if (!visible) {
+        setOperationResults(null);
+      }
+    },
+    [],
+  );
 
   const scheduleOperationProgressClose = useCallback(() => {
     if (operationProgressHideTimer.current !== null) {
@@ -1603,6 +1766,9 @@ export default function Accounts() {
 
   const commitOperationProgressEvent = useCallback(
     (title: string, event: BatchOperationEvent) => {
+      const results = snapshotAccountOperationResults(
+        operationResultMap.current,
+      );
       setOperationProgress((prev) => ({
         show: true,
         action: event.action,
@@ -1618,6 +1784,16 @@ export default function Accounts() {
         message: event.error || event.message || prev?.message,
       }));
       if (event.type === "complete") {
+        if (
+          showOperationResultsRef.current &&
+          (event.action === "batch_test" ||
+            event.action === "batch_refresh")
+        ) {
+          setOperationResults({
+            action: event.action,
+            results,
+          });
+        }
         scheduleOperationProgressClose();
       }
     },
@@ -1635,6 +1811,10 @@ export default function Accounts() {
 
   const applyOperationProgressEvent = useCallback(
     (title: string, event: BatchOperationEvent) => {
+      collectAccountOperationResult(operationResultMap.current, event);
+      if (event.type === "start") {
+        setOperationResults(null);
+      }
       if (operationProgressHideTimer.current !== null) {
         window.clearTimeout(operationProgressHideTimer.current);
         operationProgressHideTimer.current = null;
@@ -1713,7 +1893,8 @@ export default function Accounts() {
       healthBars,
     ] =
       await Promise.all([
-        api.getAccounts(),
+        // Codex 页只拉非 Grok 账号，与 Grok 页 channel=grok 对称，减少大号池传输。
+        api.getAccounts({ channel: "codex" }),
         api.getAPIKeys(),
         api.getOpsOverview().catch((): OpsOverviewResponse | null => null),
         api.listAccountGroups().catch(() => ({ groups: [] })),
@@ -1753,7 +1934,13 @@ export default function Accounts() {
     },
     load: loadAccounts,
   });
-  const accounts = data.accounts;
+  // Codex 视图的统计卡/额度分布/列表/批量操作一律排除 Grok 账号
+  // （Grok 账号由顶部切换后的 Grok 页单独统计与管理）。
+  const allAccounts = data.accounts;
+  const accounts = useMemo(
+    () => allAccounts.filter((account) => !account.grok_api),
+    [allAccounts],
+  );
   const apiKeys = data.apiKeys;
   const opsOverview = data.opsOverview;
   const lazyMode = data.lazyMode;
@@ -1800,32 +1987,10 @@ export default function Accounts() {
 
   useEffect(() => {
     setGroupFilter((current) => pruneAccountGroupFilter(current, allGroups));
-  }, [allGroups]);
+    pruneImportGroupIds(allGroups);
+  }, [allGroups, pruneImportGroupIds]);
 
   useEffect(() => {
-    const needsUsageReload = (account: AccountRow) => {
-      if (account.status !== "active" && account.status !== "ready") {
-        return false;
-      }
-
-      const plan = normalizePlanType(account.plan_type);
-      const has7d =
-        account.usage_percent_7d !== null &&
-        account.usage_percent_7d !== undefined;
-      const has5h =
-        account.usage_percent_5h !== null &&
-        account.usage_percent_5h !== undefined;
-      // 与 UsageCell 的显示判定保持一致:plan_type 可能滞后于真实订阅状态,
-      // 看到 5h 重置时间就当订阅账号处理,触发拉取 5h 数据。
-      const looksLikeSubscription =
-        isPremiumUsagePlan(plan) || !!account.reset_5h_at;
-
-      if (looksLikeSubscription) {
-        return !has5h || !has7d;
-      }
-      return !has7d;
-    };
-
     const missingUsageIds = accounts
       .filter(needsUsageReload)
       .map((account) => account.id);
@@ -2032,9 +2197,9 @@ export default function Accounts() {
   const sortedAccounts = useMemo(() => {
     if (!sortKey) return filteredAccounts;
     return [...filteredAccounts].sort((a, b) =>
-      compareAccountsBySort(a, b, sortKey, sortDir),
+      compareAccountsBySort(a, b, sortKey, sortDir, allGroups),
     );
-  }, [filteredAccounts, sortDir, sortKey]);
+  }, [allGroups, filteredAccounts, sortDir, sortKey]);
 
   const accountSortOptions = useMemo(
     () => [
@@ -2047,6 +2212,7 @@ export default function Accounts() {
       { label: t("accounts.sortBilled"), value: "billed" },
       { label: t("accounts.sortLastUsed"), value: "lastUsed" },
       { label: t("accounts.sortImportTime"), value: "importTime" },
+      { label: t("accounts.groupSort"), value: "group" },
       { label: t("accounts.schedulerPriorityColumn"), value: "schedulerPriority" },
       { label: t("accounts.sortUpdatedAt"), value: "updatedAt" },
     ],
@@ -2348,12 +2514,14 @@ export default function Accounts() {
             refresh_token: "",
             allow_duplicate: allowDuplicate,
             custom_headers: parsedCustomHeaders.value,
+            group_ids: importGroupIds,
           }
         : {
             ...addForm,
             session_token: "",
             allow_duplicate: allowDuplicate,
             custom_headers: parsedCustomHeaders.value,
+            group_ids: importGroupIds,
           };
     if (
       !payload.refresh_token?.trim() &&
@@ -2411,6 +2579,7 @@ export default function Accounts() {
         ...atForm,
         allow_duplicate: allowDuplicate,
         custom_headers: parsedCustomHeaders.value,
+        group_ids: importGroupIds,
       });
       setShowAdd(false);
       await readImportSSE(res);
@@ -2444,6 +2613,10 @@ export default function Accounts() {
     }));
   }, []);
 
+  const clearOpenAIModels = useCallback(() => {
+    setOpenAIForm((form) => ({ ...form, models: [] }));
+  }, []);
+
   const addEditOpenAIModelValues = useCallback((raw: string) => {
     const nextModels = parseModelTokens(raw);
     if (nextModels.length === 0) return;
@@ -2459,6 +2632,10 @@ export default function Accounts() {
       ...form,
       models: form.models.filter((item) => item !== model),
     }));
+  }, []);
+
+  const clearEditOpenAIModels = useCallback(() => {
+    setEditOpenAIForm((form) => ({ ...form, models: [] }));
   }, []);
 
   const handleFetchOpenAIModels = async () => {
@@ -2519,6 +2696,67 @@ export default function Accounts() {
       setSubmitting(false);
     }
   };
+  const handleAddAgentIdentity = async () => {
+    if (!agentIdentityJson.trim() || submitting) return;
+    setSubmitting(true);
+    try {
+      const res = await api.importCodexAgentIdentity({
+        auth_json: agentIdentityJson,
+        proxy_url: agentIdentityProxyUrl.trim() || undefined,
+      });
+      showToast(
+        res.email
+          ? t("accounts.agentIdentitySuccess", { email: res.email })
+          : t("accounts.addSuccess"),
+      );
+      setShowAdd(false);
+      setAgentIdentityJson("");
+      setAgentIdentityProxyUrl("");
+      void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.addFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleImportAgentIdentityFiles = async (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    setAgentIdentityFilesImporting(true);
+    setAgentIdentityFilesResult(null);
+    try {
+      const files = await Promise.all(
+        Array.from(fileList).map((file) => file.text()),
+      );
+      const res = await api.batchImportCodexAgentIdentity({
+        files,
+        proxy_url: agentIdentityProxyUrl.trim() || undefined,
+      });
+      setAgentIdentityFilesResult(res);
+      if (res.imported > 0) {
+        showToast(
+          t("accounts.agentIdentityFileImportDone", {
+            imported: res.imported,
+            total: res.total,
+          }),
+        );
+        void reload();
+      }
+    } catch (error) {
+      showToast(
+        t("accounts.addFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    } finally {
+      setAgentIdentityFilesImporting(false);
+      if (agentIdentityFileInputRef.current)
+        agentIdentityFileInputRef.current.value = "";
+    }
+  };
+
   const handleAddOpenAIResponses = async () => {
     const models = openAIForm.models;
     if (!openAIForm.api_key.trim() || models.length === 0) return;
@@ -2909,6 +3147,9 @@ export default function Accounts() {
         );
       }
       if (allowDuplicate) formData.append("allow_duplicate", "true");
+      if (importGroupIds.length > 0) {
+        formData.append("group_ids", JSON.stringify(importGroupIds));
+      }
       for (const f of files) formData.append("file", f);
       const res = await fetch("/api/admin/accounts/import", {
         method: "POST",
@@ -3218,11 +3459,11 @@ export default function Accounts() {
         const blob = new Blob([JSON.stringify(data, null, 2)], {
           type: "application/json",
         });
-        downloadBlob(blob, `codex2api-${ts}-${data.length}.json`);
+        downloadBlob(blob, `codex2api-codex-${ts}-${data.length}.json`);
       } else {
         const text = data.map((e) => e.refresh_token).join("\n");
         const blob = new Blob([text], { type: "text/plain" });
-        downloadBlob(blob, `codex2api-rt-${ts}-${data.length}.txt`);
+        downloadBlob(blob, `codex2api-codex-rt-${ts}-${data.length}.txt`);
       }
       showToast(t("accounts.exportSuccess", { count: data.length }));
     } catch (error) {
@@ -3466,6 +3707,51 @@ export default function Accounts() {
     }
   };
 
+  // 通过审核:启用自助提交的账号(enabled=true)。
+  const handleApprovePending = async (account: AccountRow) => {
+    try {
+      await api.toggleAccountEnabled(account.id, true);
+      showToast(t("accounts.pendingReview.approved"));
+      void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.enableFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    }
+  };
+
+  // 拒绝:删除自助提交的账号。
+  const handleRejectPending = async (account: AccountRow) => {
+    const confirmed = await confirm({
+      title: t("accounts.pendingReview.rejectTitle"),
+      description: t("accounts.pendingReview.rejectDesc", {
+        account: account.email || `ID ${account.id}`,
+      }),
+      confirmText: t("accounts.pendingReview.rejectConfirm"),
+      tone: "destructive",
+      confirmVariant: "destructive",
+    });
+    if (!confirmed) return;
+    try {
+      await api.deleteAccount(account.id);
+      showToast(t("accounts.pendingReview.rejected"));
+      void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.deleteFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    }
+  };
+
+  // 保存账号备注(PATCH /accounts/:id/note)。
+  const handleSaveNote = async (account: AccountRow, note: string) => {
+    await api.updateAccountNote(account.id, note);
+    showToast(t("accounts.pendingReview.noteSaved"));
+    void reloadSilently();
+  };
+
   const handleBatchDelete = async () => {
     const ids = Array.from(selected);
     if (ids.length === 0) return;
@@ -3634,6 +3920,12 @@ export default function Accounts() {
     setBatchTags([]);
     setBatchUpdateGroups(false);
     setBatchGroupIds([]);
+    setBatchUpdateScoreBias(false);
+    setBatchScoreBiasInput("");
+    setBatchUpdateBaseConcurrency(false);
+    setBatchBaseConcurrencyInput("");
+    setBatchUpdateSchedulerPriority(false);
+    setBatchSchedulerPriorityInput("");
     setShowBatchMetaEditor(true);
   };
 
@@ -3643,6 +3935,12 @@ export default function Accounts() {
     setBatchTags([]);
     setBatchUpdateGroups(true);
     setBatchGroupIds([]);
+    setBatchUpdateScoreBias(false);
+    setBatchScoreBiasInput("");
+    setBatchUpdateBaseConcurrency(false);
+    setBatchBaseConcurrencyInput("");
+    setBatchUpdateSchedulerPriority(false);
+    setBatchSchedulerPriorityInput("");
     setShowBatchMetaEditor(true);
   };
 
@@ -3672,9 +3970,210 @@ export default function Accounts() {
     }
   };
 
+  const openModelsEditor = (account: AccountRow) => {
+    setModelsAccount(account);
+    setModelsDraft([...(account.models ?? [])]);
+    setModelsInputDraft("");
+    setProbeBoard([]);
+  };
+
+  const closeModelsEditor = () => {
+    if (modelsSaving || modelsSyncing || modelsProbing) return;
+    setModelsAccount(null);
+    setModelsDraft([]);
+    setModelsInputDraft("");
+    setProbeBoard([]);
+  };
+
+  const addModelsDraftValues = (raw: string) => {
+    const next = parseModelTokens(raw);
+    if (next.length === 0) return;
+    setModelsDraft((current) => mergeModelLists(current, next));
+    setModelsInputDraft("");
+  };
+
+  const removeModelsDraftValue = (model: string) => {
+    setModelsDraft((current) => current.filter((item) => item !== model));
+  };
+
+  const clearModelsDraft = () => {
+    setModelsDraft([]);
+  };
+
+  const handleSyncModelsUpstream = async () => {
+    if (!modelsAccount) return;
+    setModelsSyncing(true);
+    try {
+      const result = await api.syncAccountModelsUpstream(modelsAccount.id);
+      const fetched = result.models ?? [];
+      setModelsDraft((current) => mergeModelLists(current, fetched));
+      showToast(
+        t("accounts.supportedModelsSyncDone", { count: fetched.length }),
+      );
+    } catch (error) {
+      showToast(
+        t("accounts.supportedModelsSyncFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setModelsSyncing(false);
+    }
+  };
+
+  const handleProbeModels = async () => {
+    if (!modelsAccount) return;
+    setModelsProbing(true);
+    setProbeBoard([]);
+    let available: string[] = [];
+    try {
+      const res = await fetch(
+        `/api/admin/accounts/${modelsAccount.id}/models/probe?stream=true`,
+        {
+          method: "POST",
+          headers: getAdminKey() ? { "X-Admin-Key": getAdminKey() } : {},
+        },
+      );
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        throw new Error(data?.error || `HTTP ${res.status}`);
+      }
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error("no stream");
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const ev = JSON.parse(line.slice(6)) as {
+              type: string;
+              models?: string[];
+              model?: string;
+              outcome?: string;
+              detail?: string;
+              available?: string[];
+            };
+            if (ev.type === "start") {
+              setProbeBoard(
+                (ev.models ?? []).map((m) => ({
+                  model: m,
+                  status: "pending" as ModelProbeStatus,
+                })),
+              );
+            } else if (ev.type === "testing") {
+              setProbeBoard((board) =>
+                board.map((it) =>
+                  it.model === ev.model ? { ...it, status: "testing" } : it,
+                ),
+              );
+            } else if (ev.type === "result") {
+              setProbeBoard((board) =>
+                board.map((it) =>
+                  it.model === ev.model
+                    ? {
+                        ...it,
+                        status: (ev.outcome as ModelProbeStatus) ?? "error",
+                        detail: ev.detail,
+                      }
+                    : it,
+                ),
+              );
+            } else if (ev.type === "done") {
+              available = ev.available ?? [];
+            }
+          } catch {
+            /* 忽略解析异常 */
+          }
+        }
+      }
+      if (available.length === 0) {
+        showToast(t("accounts.supportedModelsProbeNone"), "error");
+      } else {
+        setModelsDraft((current) => mergeModelLists(current, available));
+        showToast(
+          t("accounts.supportedModelsProbeDone", { count: available.length }),
+        );
+      }
+    } catch (error) {
+      showToast(
+        t("accounts.supportedModelsProbeFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setModelsProbing(false);
+    }
+  };
+
+  const handleSaveModels = async () => {
+    if (!modelsAccount) return;
+    setModelsSaving(true);
+    try {
+      await api.updateAccountModels(modelsAccount.id, modelsDraft);
+      showToast(t("accounts.supportedModelsSaveDone"));
+      void reloadSilently();
+      setModelsAccount(null);
+      setModelsDraft([]);
+      setModelsInputDraft("");
+    } catch (error) {
+      showToast(
+        t("accounts.supportedModelsSaveFailed", {
+          error: getErrorMessage(error),
+        }),
+        "error",
+      );
+    } finally {
+      setModelsSaving(false);
+    }
+  };
+
+  const batchScoreBiasTrimmed = batchScoreBiasInput.trim();
+  const batchScoreBiasValue = batchScoreBiasTrimmed
+    ? parseIntegerInput(batchScoreBiasTrimmed)
+    : null;
+  const batchScoreBiasInvalid =
+    batchUpdateScoreBias &&
+    batchScoreBiasTrimmed !== "" &&
+    (batchScoreBiasValue === null ||
+      batchScoreBiasValue < -200 ||
+      batchScoreBiasValue > 200);
+  const batchBaseConcurrencyTrimmed = batchBaseConcurrencyInput.trim();
+  const batchBaseConcurrencyValue = batchBaseConcurrencyTrimmed
+    ? parseIntegerInput(batchBaseConcurrencyTrimmed)
+    : null;
+  const batchBaseConcurrencyInvalid =
+    batchUpdateBaseConcurrency &&
+    batchBaseConcurrencyTrimmed !== "" &&
+    (batchBaseConcurrencyValue === null || batchBaseConcurrencyValue < 1);
+  const batchSchedulerPriorityInvalid =
+    batchUpdateSchedulerPriority &&
+    isSchedulerPriorityInputInvalid(batchSchedulerPriorityInput);
+  const batchMetaHasUpdates =
+    batchUpdateTags ||
+    batchUpdateGroups ||
+    batchUpdateScoreBias ||
+    batchUpdateBaseConcurrency ||
+    batchUpdateSchedulerPriority;
+  const batchMetaInvalid =
+    batchScoreBiasInvalid ||
+    batchBaseConcurrencyInvalid ||
+    batchSchedulerPriorityInvalid;
+
   const handleBatchSaveMeta = async () => {
     const ids = Array.from(selected);
-    if (ids.length === 0 || (!batchUpdateTags && !batchUpdateGroups)) return;
+    if (ids.length === 0 || !batchMetaHasUpdates) return;
+    if (batchMetaInvalid) {
+      showToast(t("accounts.schedulerInvalidInput"), "error");
+      return;
+    }
     setBatchMetaSubmitting(true);
     try {
       const result = await api.batchUpdateAccounts(
@@ -3684,6 +4183,14 @@ export default function Accounts() {
           tags: batchTags,
           updateGroups: batchUpdateGroups,
           groupIds: batchGroupIds,
+          updateScoreBias: batchUpdateScoreBias,
+          scoreBias: batchScoreBiasValue,
+          updateBaseConcurrency: batchUpdateBaseConcurrency,
+          baseConcurrency: batchBaseConcurrencyValue,
+          updateSchedulerPriority: batchUpdateSchedulerPriority,
+          schedulerPriority: schedulerPriorityInputToValue(
+            batchSchedulerPriorityInput,
+          ),
         }),
       );
       showToast(
@@ -3754,12 +4261,17 @@ export default function Accounts() {
   };
 
   const handleBatchTest = async (ids?: number[]) => {
-    if (ids && ids.length === 0) return;
+    const scopedIDs = resolveChannelBatchTestAccountIDs(
+      accounts,
+      "codex",
+      ids,
+    );
+    if (scopedIDs.length === 0) return;
     setBatchTesting(true);
     try {
       const result = await runStreamingAccountOperation(
         "/accounts/batch-test?stream=true",
-        ids ? { ids } : undefined,
+        { ids: scopedIDs },
         t("accounts.batchTestProgressTitle"),
       );
       showToast(
@@ -4024,9 +4536,7 @@ export default function Accounts() {
       parsedScoreBias > 200);
   const concurrencyInputInvalid =
     concurrencyMode === "custom" &&
-    (parsedBaseConcurrency === null ||
-      parsedBaseConcurrency < 1 ||
-      parsedBaseConcurrency > 50);
+    (parsedBaseConcurrency === null || parsedBaseConcurrency < 1);
   const editAutoPause5hThresholdInvalid = isPercentThresholdInputInvalid(
     editAutoPause5hThresholdInput,
   );
@@ -4227,14 +4737,35 @@ export default function Accounts() {
     setAllGroups(res.groups ?? []);
   };
 
+  /** Inline create from multi-select (batch / quick / account editor). Returns new group id. */
+  const handleCreateGroupInline = async (
+    name: string,
+  ): Promise<number | null> => {
+    const trimmed = name.trim();
+    if (!trimmed) {
+      showToast(t("accounts.groupNameRequired"), "error");
+      return null;
+    }
+    try {
+      const res = await api.createAccountGroup({
+        name: trimmed,
+        color: ACCOUNT_GROUP_COLORS[allGroups.length % ACCOUNT_GROUP_COLORS.length],
+      });
+      await reloadGroups();
+      showToast(t("accounts.groupCreated"));
+      return res.id;
+    } catch (error) {
+      showToast(getErrorMessage(error), "error");
+      return null;
+    }
+  };
+
   const parsedGroupBaseConcurrency = parseIntegerInput(
     groupDraft.baseConcurrencyInput,
   );
   const groupBaseConcurrencyInvalid =
     groupDraft.baseConcurrencyInput.trim() !== "" &&
-    (parsedGroupBaseConcurrency === null ||
-      parsedGroupBaseConcurrency < 1 ||
-      parsedGroupBaseConcurrency > 50);
+    (parsedGroupBaseConcurrency === null || parsedGroupBaseConcurrency < 1);
 
   const resetGroupDraft = () => {
     setGroupDraft({
@@ -4336,9 +4867,60 @@ export default function Accounts() {
     }
   };
 
+  // Codex/Grok 顶部段控切换：两套账号视图共用同一切换器（Grok 通过 headerSlot 注入）。
+  // 滑块动画 + 品牌 logo，与仪表盘渠道过滤器视觉一致。
+  // 不复用 Codex 侧的导入/导出/邀请/回收站等入口，Grok 页只保留账号本身的增删启停。
+  const providerSwitcher = (
+    <div className="relative grid grid-cols-2 items-center rounded-lg border border-border bg-muted/40 p-0.5">
+      <span
+        aria-hidden
+        className="absolute inset-y-0.5 left-0.5 w-[calc((100%-4px)/2)] rounded-md bg-background shadow-sm transition-transform duration-300 ease-out"
+        style={{ transform: `translateX(${providerView === "grok" ? 100 : 0}%)` }}
+      />
+      {(
+        [
+          ["codex", t("accounts.providerViewCodex")],
+          ["grok", t("accounts.providerViewGrok")],
+        ] as const
+      ).map(([key, label]) => (
+        <button
+          key={key}
+          type="button"
+          onClick={() => setProviderView(key)}
+          aria-pressed={providerView === key}
+          className={cn(
+            "relative z-10 inline-flex items-center justify-center gap-2 rounded-md px-5 py-2 text-base font-semibold transition-all duration-200 active:scale-[0.97]",
+            providerView === key
+              ? "text-foreground"
+              : "text-muted-foreground opacity-75 grayscale hover:opacity-100 hover:grayscale-0 hover:text-foreground",
+          )}
+        >
+          <ChannelLogo channel={key} size={20} />
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (providerView === "grok") {
+    // key 触发渠道切换时整块内容淡入过渡，切换器由 headerSlot 常驻不闪。
+    return (
+      <div key="provider-grok" className="animate-channel-switch-in">
+        <GrokAccounts
+          headerSlot={providerSwitcher}
+          showOperationResults={showOperationResults}
+          onShowOperationResultsChange={
+            handleOperationResultsVisibilityChange
+          }
+        />
+      </div>
+    );
+  }
+
   return (
     <div
-      className="relative @container/accounts"
+      key="provider-codex"
+      className="relative @container/accounts animate-channel-switch-in"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -4361,6 +4943,12 @@ export default function Accounts() {
         progress={operationProgress}
         onClose={closeOperationProgress}
       />
+      <OperationResultsModal
+        state={showOperationResults ? operationResults : null}
+        accounts={accounts}
+        channel="codex"
+        onClose={() => setOperationResults(null)}
+      />
       <StateShell
         variant="page"
         loading={loading}
@@ -4382,6 +4970,7 @@ export default function Accounts() {
           {showInvite ? (
             <CodexInviteView
               accounts={accounts}
+              loading={loading}
               onClose={() => setShowInvite(false)}
             />
           ) : null}
@@ -4390,23 +4979,27 @@ export default function Accounts() {
             title={t("accounts.title")}
             description={t("accounts.description")}
             onRefresh={() => void reload()}
+            hideTitle
             titleAdornment={
-              <Select
-                className="w-32"
-                compact
-                value={pageMode}
-                onValueChange={(value) => {
-                  const mode = value === "personal" ? "personal" : "pool";
-                  // 用户手动选择：标记并持久化，之后一律尊重用户、不再自动判定。
-                  pageModeUserSetRef.current = true;
-                  persistAccountPageMode(mode);
-                  setPageMode(mode);
-                }}
-                options={[
-                  { value: "pool", label: t("accounts.pageModePool") },
-                  { value: "personal", label: t("accounts.pageModePersonal") },
-                ]}
-              />
+              <div className="flex items-center gap-2">
+                {providerSwitcher}
+                <Select
+                  className="w-32"
+                  compact
+                  value={pageMode}
+                  onValueChange={(value) => {
+                    const mode = value === "personal" ? "personal" : "pool";
+                    // 用户手动选择：标记并持久化，之后一律尊重用户、不再自动判定。
+                    pageModeUserSetRef.current = true;
+                    persistAccountPageMode(mode);
+                    setPageMode(mode);
+                  }}
+                  options={[
+                    { value: "pool", label: t("accounts.pageModePool") },
+                    { value: "personal", label: t("accounts.pageModePersonal") },
+                  ]}
+                />
+              </div>
             }
             actions={
               <>
@@ -4549,6 +5142,25 @@ export default function Accounts() {
                             : t("accounts.testConnection")}
                         </span>
                       </Button>
+                      <label
+                        className="inline-flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md border border-border bg-background px-2.5 text-xs font-medium text-muted-foreground"
+                        title={t(
+                          "accounts.operationResultsPreferenceHint",
+                        )}
+                      >
+                        <Switch
+                          checked={showOperationResults}
+                          onCheckedChange={
+                            handleOperationResultsVisibilityChange
+                          }
+                          aria-label={t(
+                            "accounts.operationResultsPreference",
+                          )}
+                        />
+                        <span className="hidden lg:inline">
+                          {t("accounts.operationResultsPreference")}
+                        </span>
+                      </label>
                       <Button
                         variant="outline"
                         size="sm"
@@ -4895,6 +5507,35 @@ export default function Accounts() {
                     setPage(1);
                   }}
                 />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="min-w-0"
+                  aria-pressed={sortKey === "group"}
+                  title={t("accounts.groupSortHint")}
+                  onClick={() => {
+                    if (sortKey === "group") {
+                      setSortDir((current) =>
+                        current === "desc" ? "asc" : "desc",
+                      );
+                    } else {
+                      setSortKey("group");
+                      setSortDir("asc");
+                    }
+                    setPage(1);
+                  }}
+                >
+                  <Layers className="size-3.5" />
+                  <span className="truncate">
+                    {t("accounts.groupSort")}
+                  </span>
+                  {sortKey === "group" ? (
+                    <span aria-hidden="true">
+                      {sortDir === "desc" ? "↓" : "↑"}
+                    </span>
+                  ) : null}
+                </Button>
                 <Button
                   type="button"
                   variant="outline"
@@ -5282,6 +5923,13 @@ export default function Accounts() {
             </div>
           )}
 
+          <PendingSelfServiceReviewPanel
+            accounts={accounts}
+            onApprove={handleApprovePending}
+            onReject={handleRejectPending}
+            onSaveNote={handleSaveNote}
+          />
+
           <Card>
             <CardContent className="p-3 sm:p-4">
               <StateShell
@@ -5343,6 +5991,7 @@ export default function Accounts() {
                           onResetCredits={() =>
                             void handleResetCredits(account)
                           }
+                          onEditModels={() => openModelsEditor(account)}
                           onDelete={() => void handleDelete(account)}
                           onUsageRefreshed={() => void reloadSilently()}
                         />
@@ -5385,8 +6034,26 @@ export default function Accounts() {
                           </TableHead>
                         )}
                         {visibleColumns.groups && (
-                          <TableHead className="text-[13px] font-semibold">
-                            {t("accounts.groupsLabel")}
+                          <TableHead
+                            className="cursor-pointer select-none text-[13px] font-semibold transition-colors hover:text-primary"
+                            onClick={() => {
+                              if (sortKey === "group") {
+                                setSortDir((current) =>
+                                  current === "asc" ? "desc" : "asc",
+                                );
+                              } else {
+                                setSortKey("group");
+                                setSortDir("asc");
+                              }
+                              setPage(1);
+                            }}
+                          >
+                            {t("accounts.groupsLabel")}{" "}
+                            {sortKey === "group"
+                              ? sortDir === "desc"
+                                ? "↓"
+                                : "↑"
+                              : ""}
                           </TableHead>
                         )}
                         {visibleColumns.priority && (
@@ -5564,6 +6231,14 @@ export default function Accounts() {
                             )}
                             {visibleColumns.email && (
                               <TableCell className="min-w-[220px] whitespace-normal text-[14px] text-muted-foreground">
+                                <div className="flex min-w-0 items-center gap-2.5">
+                                <span className="flex size-8 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-card ring-1 ring-border shadow-sm">
+                                  {account.openai_responses_api ? (
+                                    <ModelLogo model="openai" variant="plain" size={17} />
+                                  ) : (
+                                    <ChannelLogo channel="codex" size={32} className="rounded-lg" />
+                                  )}
+                                </span>
                                 <div className="flex min-w-0 flex-col items-start gap-1">
                                   <button
                                     type="button"
@@ -5574,7 +6249,7 @@ export default function Accounts() {
                                       openAccountDetail(account);
                                     }}
                                   >
-                                    {account.openai_responses_api
+                                    {account.openai_responses_api || account.grok_api
                                       ? formatAccountName(account)
                                       : formatAccountListEmail(account)}
                                   </button>
@@ -5595,19 +6270,35 @@ export default function Accounts() {
                                   )}
                                   {(account.at_only ||
                                     account.openai_responses_api ||
+                                    account.grok_api ||
+                                    account.agent_identity ||
                                     account.enabled === false ||
                                     account.locked ||
                                     (account.rate_limit_reset_credits ?? 0) >
-                                      0) && (
+                                      0 ||
+                                    getCreditBalanceDisplay(account) !==
+                                      null) && (
                                     <div className="flex flex-wrap gap-1">
                                       {account.at_only && (
                                         <span className="inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
                                           {formatAccessTokenBadge(account)}
                                         </span>
                                       )}
+                                      {account.agent_identity && (
+                                        <span className="inline-flex items-center gap-0.5 rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
+                                          <Fingerprint className="size-2.5" />
+                                          Agent Identity
+                                        </span>
+                                      )}
                                       {account.openai_responses_api && (
                                         <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
                                           Responses API
+                                        </span>
+                                      )}
+                                      {account.grok_api && (
+                                        <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                                          <Sparkles className="size-2.5" />
+                                          Grok
                                         </span>
                                       )}
                                       {account.enabled === false && (
@@ -5641,8 +6332,38 @@ export default function Accounts() {
                                           {account.rate_limit_reset_credits ?? 0}
                                         </button>
                                       )}
+                                      {getCreditBalanceDisplay(account) !==
+                                        null && (
+                                        <button
+                                          type="button"
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setUsageAccount(account);
+                                          }}
+                                          className="inline-flex items-center rounded-md bg-teal-50 px-1.5 py-0.5 text-[10px] font-medium text-teal-700 ring-1 ring-inset ring-teal-600/20 transition-colors hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-400 dark:ring-teal-400/20 dark:hover:bg-teal-900"
+                                          title={
+                                            account.credits_unlimited
+                                              ? t(
+                                                  "accounts.creditsBalanceUnlimited",
+                                                )
+                                              : t(
+                                                  "accounts.creditsBalanceBadge",
+                                                  {
+                                                    balance:
+                                                      getCreditBalanceDisplay(
+                                                        account,
+                                                      ),
+                                                  },
+                                                )
+                                          }
+                                        >
+                                          <Coins className="mr-0.5 size-2.5" />
+                                          {getCreditBalanceDisplay(account)}
+                                        </button>
+                                      )}
                                     </div>
                                   )}
+                                </div>
                                 </div>
                               </TableCell>
                             )}
@@ -5727,6 +6448,7 @@ export default function Accounts() {
                                       }
                                       errorMessage={account.error_message}
                                     />
+                                    <UsingCreditsBadge account={account} />
                                     <AccountStatusCountdown account={account} />
                                     {(account.manual_score_bonus ?? 0) !== 0 && (
                                       <AccountManualScoreBonusBadge
@@ -5921,6 +6643,7 @@ export default function Accounts() {
                                     onResetCredits={() =>
                                       void handleResetCredits(account)
                                     }
+                                    onEditModels={() => openModelsEditor(account)}
                                     onDelete={() => void handleDelete(account)}
                                   />
                                 </div>
@@ -6057,6 +6780,15 @@ export default function Accounts() {
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
+                ) : addMethod === "agentIdentity" ? (
+                  <Button
+                    onClick={() => void handleAddAgentIdentity()}
+                    disabled={submitting || !agentIdentityJson.trim()}
+                  >
+                    {submitting
+                      ? t("accounts.adding")
+                      : t("accounts.agentIdentityImportBtn")}
+                  </Button>
                 ) : oauthStep === "generate" ? (
                   <Button
                     onClick={() => void handleOAuthGenerate()}
@@ -6080,7 +6812,7 @@ export default function Accounts() {
             }
           >
             {/* Tab switcher */}
-            <div className="grid grid-cols-3 sm:grid-cols-6 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
               <button
                 onClick={() => {
                   setAddMethod("oauth");
@@ -6151,6 +6883,17 @@ export default function Accounts() {
               >
                 <KeyRound className="size-3.5" />
                 {t("accounts.addMethodOpenAI")}
+              </button>
+              <button
+                onClick={() => setAddMethod("agentIdentity")}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "agentIdentity"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <Fingerprint className="size-3.5" />
+                {t("accounts.addMethodAgentIdentity")}
               </button>
             </div>
 
@@ -6429,11 +7172,23 @@ export default function Accounts() {
                     onRemove={removeOpenAIModel}
                     emptyLabel={t("accounts.openaiModelsEmpty")}
                   />
-                  <p className="mt-1.5 text-xs text-muted-foreground">
-                    {t("accounts.openaiModelsHint", {
-                      count: openAIForm.models.length,
-                    })}
-                  </p>
+                  <div className="mt-1.5 flex items-center justify-between gap-2">
+                    <p className="text-xs text-muted-foreground">
+                      {t("accounts.openaiModelsHint", {
+                        count: openAIForm.models.length,
+                      })}
+                    </p>
+                    {openAIForm.models.length > 0 && (
+                      <button
+                        type="button"
+                        className="shrink-0 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+                        disabled={openAIModelsLoading || submitting}
+                        onClick={clearOpenAIModels}
+                      >
+                        {t("accounts.supportedModelsClearAll")}
+                      </button>
+                    )}
+                  </div>
                 </div>
                 {renderModelMappingEditor({
                   value: openAIModelMappingText,
@@ -6455,6 +7210,110 @@ export default function Accounts() {
                 {renderCustomHeadersTextarea({
                   value: addCustomHeadersText,
                   onChange: setAddCustomHeadersText,
+                })}
+              </div>
+            ) : addMethod === "agentIdentity" ? (
+              <div className="space-y-4">
+                <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-300">
+                  {t("accounts.agentIdentityHint")}
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.agentIdentityJsonLabel")} *
+                  </label>
+                  <textarea
+                    className="w-full min-h-[240px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
+                    placeholder={t("accounts.agentIdentityJsonPlaceholder")}
+                    value={agentIdentityJson}
+                    onChange={(event: ChangeEvent<HTMLTextAreaElement>) =>
+                      setAgentIdentityJson(event.target.value)
+                    }
+                    rows={10}
+                  />
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {t("accounts.agentIdentityNote")}
+                  </p>
+                </div>
+
+                {/* 多文件批量导入 */}
+                <div className="rounded-xl border border-dashed border-border bg-muted/20 px-4 py-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold text-foreground">
+                        {t("accounts.agentIdentityFileImportTitle")}
+                      </p>
+                      <p className="mt-0.5 text-xs text-muted-foreground">
+                        {t("accounts.agentIdentityFileImportDesc")}
+                      </p>
+                    </div>
+                    <input
+                      ref={agentIdentityFileInputRef}
+                      type="file"
+                      accept=".json,application/json"
+                      multiple
+                      className="hidden"
+                      onChange={(e) =>
+                        void handleImportAgentIdentityFiles(e.target.files)
+                      }
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={agentIdentityFilesImporting}
+                      onClick={() => agentIdentityFileInputRef.current?.click()}
+                    >
+                      {agentIdentityFilesImporting ? (
+                        <>
+                          <Loader2 className="size-3.5 animate-spin" />
+                          {t("accounts.agentIdentityFileImporting")}
+                        </>
+                      ) : (
+                        <>
+                          <Upload className="size-3.5" />
+                          {t("accounts.agentIdentityFileImportBtn")}
+                        </>
+                      )}
+                    </Button>
+                  </div>
+                  {agentIdentityFilesResult ? (
+                    <div className="mt-3 space-y-2 border-t border-border pt-3">
+                      <p className="text-sm font-semibold text-foreground">
+                        {t("accounts.agentIdentityFileImportSummary", {
+                          imported: agentIdentityFilesResult.imported,
+                          total: agentIdentityFilesResult.total,
+                        })}
+                      </p>
+                      <div className="max-h-40 space-y-1 overflow-y-auto">
+                        {agentIdentityFilesResult.items.map((item, index) => (
+                          <div
+                            key={index}
+                            className="flex items-start gap-1.5 text-xs"
+                          >
+                            {item.ok ? (
+                              <CheckCircle className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
+                            ) : (
+                              <XCircle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
+                            )}
+                            <span className="min-w-0 flex-1 break-all text-muted-foreground">
+                              {item.email || `#${index + 1}`}
+                              {item.ok
+                                ? null
+                                : item.error
+                                  ? ` — ${item.error}`
+                                  : ""}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+
+                {renderProxyInput({
+                  value: agentIdentityProxyUrl,
+                  testKey: "add-agent-identity",
+                  onChange: setAgentIdentityProxyUrl,
                 })}
               </div>
             ) : (
@@ -6552,6 +7411,35 @@ export default function Accounts() {
                     </button>
                   </>
                 )}
+              </div>
+            )}
+            {(addMethod === "rt" ||
+              addMethod === "st" ||
+              addMethod === "at") && (
+              <div className="mt-4 space-y-1.5 border-t border-border pt-4">
+                <label className="text-sm font-semibold text-muted-foreground">
+                  {t("accounts.importGroupsLabel")}
+                </label>
+                <AccountGroupMultiSelect
+                  groups={allGroups}
+                  value={importGroupIds}
+                  onChange={setImportGroupIds}
+                  allLabel={t("accounts.groupsUnbound")}
+                  selectedLabel={t("accounts.groupsSelected", {
+                    count: importGroupIds.length,
+                  })}
+                  placeholder={t("accounts.importGroupsPlaceholder")}
+                  emptyLabel={t("accounts.groupsNone")}
+                  emptyHint={t("accounts.groupsSelectHint")}
+                  onCreateGroup={handleCreateGroupInline}
+                  createLabel={t("accounts.groupCreate")}
+                  createPlaceholder={t("accounts.groupNamePlaceholder")}
+                  creatingLabel={t("accounts.groupCreating")}
+                  createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {t("accounts.importGroupsHint")}
+                </p>
               </div>
             )}
           </Modal>
@@ -6699,6 +7587,31 @@ export default function Accounts() {
                 />
                 {t("accounts.allowDuplicate")}
               </label>
+              <div className="space-y-1.5 pt-1">
+                <label className="text-xs font-medium text-foreground">
+                  {t("accounts.importGroupsLabel")}
+                </label>
+                <AccountGroupMultiSelect
+                  groups={allGroups}
+                  value={importGroupIds}
+                  onChange={setImportGroupIds}
+                  allLabel={t("accounts.groupsUnbound")}
+                  selectedLabel={t("accounts.groupsSelected", {
+                    count: importGroupIds.length,
+                  })}
+                  placeholder={t("accounts.importGroupsPlaceholder")}
+                  emptyLabel={t("accounts.groupsNone")}
+                  emptyHint={t("accounts.groupsSelectHint")}
+                  onCreateGroup={handleCreateGroupInline}
+                  createLabel={t("accounts.groupCreate")}
+                  createPlaceholder={t("accounts.groupNamePlaceholder")}
+                  creatingLabel={t("accounts.groupCreating")}
+                  createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  {t("accounts.importGroupsHint")}
+                </p>
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <button
@@ -7061,7 +7974,10 @@ export default function Accounts() {
             <AccountUsageModal
               account={usageAccount}
               onClose={() => setUsageAccount(null)}
-              onCreditsReset={() => void reload()}
+              // 必须静默重拉：reload() 会把 StateShell 切成整页 loading，
+              // 而这个弹窗就渲染在 StateShell 里 —— 一开积分开关整个界面连同弹窗
+              // 就被卸载重建（用量数据重新拉、滚动位置丢失），观感就是"闪一下全刷新"。
+              onCreditsReset={() => void reloadSilently()}
             />
           )}
 
@@ -7488,11 +8404,23 @@ export default function Accounts() {
                         onRemove={removeEditOpenAIModel}
                         emptyLabel={t("accounts.openaiModelsEmpty")}
                       />
-                      <p className="mt-1.5 text-xs text-muted-foreground">
-                        {t("accounts.openaiModelsHint", {
-                          count: editOpenAIForm.models.length,
-                        })}
-                      </p>
+                      <div className="mt-1.5 flex items-center justify-between gap-2">
+                        <p className="text-xs text-muted-foreground">
+                          {t("accounts.openaiModelsHint", {
+                            count: editOpenAIForm.models.length,
+                          })}
+                        </p>
+                        {editOpenAIForm.models.length > 0 && (
+                          <button
+                            type="button"
+                            className="shrink-0 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+                            disabled={editOpenAIModelsLoading || editSubmitting}
+                            onClick={clearEditOpenAIModels}
+                          >
+                            {t("accounts.supportedModelsClearAll")}
+                          </button>
+                        )}
+                      </div>
                     </div>
                     {renderModelMappingEditor({
                       value: editOpenAIModelMappingText,
@@ -8200,7 +9128,7 @@ export default function Accounts() {
                         </div>
                       </div>
 
-                      <div className="rounded-xl border border-border p-4">
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
                         <div className="text-sm font-semibold text-foreground">
                           {t("accounts.allowedAPIKeysLabel")}
                         </div>
@@ -8227,7 +9155,7 @@ export default function Accounts() {
                         </div>
                       </div>
 
-                      <div className="rounded-xl border border-border p-4">
+                      <div className="rounded-xl border border-border p-4 md:col-span-2">
                         {renderProxyInput({
                           value: editProxyUrl,
                           testKey: "edit-account-proxy",
@@ -8292,6 +9220,11 @@ export default function Accounts() {
                             placeholder={t("accounts.groupsPlaceholder")}
                             emptyLabel={t("accounts.groupsNone")}
                             emptyHint={t("accounts.groupsSelectHint")}
+                            onCreateGroup={handleCreateGroupInline}
+                            createLabel={t("accounts.groupCreate")}
+                            createPlaceholder={t("accounts.groupNamePlaceholder")}
+                            creatingLabel={t("accounts.groupCreating")}
+                            createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
                           />
                         </div>
                       </div>
@@ -8373,6 +9306,18 @@ export default function Accounts() {
                 </div>
                 <div className="mt-1">{t("accounts.groupQuickDesc")}</div>
               </div>
+              <div className="flex items-center justify-end">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  disabled={quickGroupSubmitting}
+                  onClick={() => setShowGroupManager(true)}
+                >
+                  <FolderOpen className="size-3" />
+                  {t("accounts.groupManage")}
+                </Button>
+              </div>
               <AccountGroupMultiSelect
                 groups={allGroups}
                 value={quickGroupIds}
@@ -8385,7 +9330,156 @@ export default function Accounts() {
                 emptyLabel={t("accounts.groupsNone")}
                 emptyHint={t("accounts.groupsSelectHint")}
                 disabled={quickGroupSubmitting}
+                onCreateGroup={handleCreateGroupInline}
+                createLabel={t("accounts.groupCreate")}
+                createPlaceholder={t("accounts.groupNamePlaceholder")}
+                creatingLabel={t("accounts.groupCreating")}
+                createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
               />
+            </div>
+          </Modal>
+
+          <Modal
+            show={Boolean(modelsAccount)}
+            title={t("accounts.supportedModelsTitle")}
+            contentClassName="sm:max-w-[560px]"
+            onClose={closeModelsEditor}
+            footer={
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={modelsSaving || modelsSyncing || modelsProbing}
+                  onClick={closeModelsEditor}
+                >
+                  {t("common.cancel")}
+                </Button>
+                <Button
+                  type="button"
+                  disabled={modelsSaving || modelsSyncing || modelsProbing}
+                  onClick={() => void handleSaveModels()}
+                >
+                  {modelsSaving
+                    ? t("common.saving")
+                    : modelsDraft.length === 0
+                      ? t("accounts.supportedModelsClearSave")
+                      : t("common.save")}
+                </Button>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <div className="rounded-lg border border-border bg-muted/20 p-3 text-sm text-muted-foreground">
+                <div className="font-semibold text-foreground">
+                  {modelsAccount ? formatAccountName(modelsAccount) : ""}
+                </div>
+                <div className="mt-1">{t("accounts.supportedModelsDesc")}</div>
+              </div>
+
+              {/* 自动获取：探测/同步按钮 + 说明，成一体 */}
+              <div className="rounded-lg border border-border bg-muted/10 p-3">
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={modelsSyncing || modelsSaving || modelsProbing}
+                    onClick={() => void handleProbeModels()}
+                  >
+                    <Zap
+                      className={`size-3.5 ${modelsProbing ? "animate-pulse" : ""}`}
+                    />
+                    {modelsProbing
+                      ? t("accounts.supportedModelsProbing")
+                      : t("accounts.supportedModelsProbe")}
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={modelsSyncing || modelsSaving || modelsProbing}
+                    onClick={() => void handleSyncModelsUpstream()}
+                  >
+                    <RefreshCw
+                      className={`size-3.5 ${modelsSyncing ? "animate-spin" : ""}`}
+                    />
+                    {modelsSyncing
+                      ? t("accounts.supportedModelsSyncing")
+                      : t("accounts.supportedModelsSync")}
+                  </Button>
+                </div>
+                <p className="mt-2 text-xs text-muted-foreground">
+                  {t("accounts.supportedModelsProbeHint")}
+                </p>
+                {probeBoard.length > 0 && (
+                  <div className="mt-3">
+                    <ModelProbeBoard items={probeBoard} t={t} />
+                  </div>
+                )}
+              </div>
+
+              {/* 手动添加 */}
+              <div className="flex gap-2">
+                <Input
+                  placeholder={t("accounts.openaiModelsPlaceholder")}
+                  value={modelsInputDraft}
+                  disabled={modelsSaving}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setModelsInputDraft(event.target.value)
+                  }
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      addModelsDraftValues(modelsInputDraft);
+                    }
+                  }}
+                  onPaste={(event) => {
+                    const pasted = event.clipboardData.getData("text");
+                    if (parseModelTokens(pasted).length > 1) {
+                      event.preventDefault();
+                      addModelsDraftValues(pasted);
+                    }
+                  }}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => addModelsDraftValues(modelsInputDraft)}
+                  disabled={!modelsInputDraft.trim() || modelsSaving}
+                >
+                  <Plus className="size-3.5" />
+                  {t("accounts.openaiModelsAdd")}
+                </Button>
+              </div>
+
+              {/* 白名单列表：计数 + 清空 在上，紧凑 pills 在下 */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">
+                    {modelsDraft.length === 0
+                      ? t("accounts.supportedModelsHintAll")
+                      : t("accounts.supportedModelsHintCount", {
+                          count: modelsDraft.length,
+                        })}
+                  </span>
+                  {modelsDraft.length > 0 && (
+                    <button
+                      type="button"
+                      className="shrink-0 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+                      disabled={modelsSaving}
+                      onClick={clearModelsDraft}
+                    >
+                      {t("accounts.supportedModelsClearAll")}
+                    </button>
+                  )}
+                </div>
+                <ModelChipGrid
+                  variant="pills"
+                  models={modelsDraft}
+                  onRemove={removeModelsDraftValue}
+                  emptyLabel={t("accounts.supportedModelsEmpty")}
+                />
+              </div>
             </div>
           </Modal>
 
@@ -8396,7 +9490,7 @@ export default function Accounts() {
                 ? "accounts.batchGroupTitle"
                 : "accounts.batchMetaTitle",
             )}
-            contentClassName="sm:max-w-[560px]"
+            contentClassName="sm:max-w-[760px]"
             onClose={() => {
               if (batchMetaSubmitting) return;
               setShowBatchMetaEditor(false);
@@ -8416,7 +9510,8 @@ export default function Accounts() {
                   onClick={() => void handleBatchSaveMeta()}
                   disabled={
                     batchMetaSubmitting ||
-                    (!batchUpdateTags && !batchUpdateGroups)
+                    !batchMetaHasUpdates ||
+                    batchMetaInvalid
                   }
                 >
                   {batchMetaSubmitting
@@ -8479,6 +9574,118 @@ export default function Accounts() {
                   />
                 </div>
               ) : null}
+              {batchMetaMode === "all" ? (
+                <div className="grid gap-4 md:grid-cols-2">
+                  <div className="rounded-xl border border-border p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.schedulerScoreLabel")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.schedulerScoreHint")}
+                        </div>
+                      </div>
+                      <Switch
+                        checked={batchUpdateScoreBias}
+                        onCheckedChange={setBatchUpdateScoreBias}
+                        aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.schedulerScoreLabel")}`}
+                      />
+                    </div>
+                    <Input
+                      className="mt-3"
+                      inputMode="numeric"
+                      value={batchScoreBiasInput}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setBatchScoreBiasInput(event.target.value)
+                      }
+                      placeholder={t("accounts.schedulerScorePlaceholder")}
+                      disabled={!batchUpdateScoreBias}
+                    />
+                    <div
+                      className={`mt-1.5 text-xs ${batchScoreBiasInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                    >
+                      {batchScoreBiasInvalid
+                        ? t("accounts.schedulerScoreRange")
+                        : t("accounts.batchMetaResetHint")}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-border p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.schedulerConcurrencyLabel")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.schedulerConcurrencyHint")}
+                        </div>
+                      </div>
+                      <Switch
+                        checked={batchUpdateBaseConcurrency}
+                        onCheckedChange={setBatchUpdateBaseConcurrency}
+                        aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.schedulerConcurrencyLabel")}`}
+                      />
+                    </div>
+                    <Input
+                      className="mt-3"
+                      inputMode="numeric"
+                      value={batchBaseConcurrencyInput}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setBatchBaseConcurrencyInput(event.target.value)
+                      }
+                      placeholder={t(
+                        "accounts.schedulerConcurrencyPlaceholder",
+                      )}
+                      disabled={!batchUpdateBaseConcurrency}
+                    />
+                    <div
+                      className={`mt-1.5 text-xs ${batchBaseConcurrencyInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                    >
+                      {batchBaseConcurrencyInvalid
+                        ? t("accounts.schedulerConcurrencyRange")
+                        : t("accounts.batchMetaResetHint")}
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-border p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="text-sm font-semibold text-foreground">
+                          {t("accounts.schedulerPriorityTitle")}
+                        </div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {t("accounts.schedulerPriorityHint")}
+                        </div>
+                      </div>
+                      <Switch
+                        checked={batchUpdateSchedulerPriority}
+                        onCheckedChange={setBatchUpdateSchedulerPriority}
+                        aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.schedulerPriorityTitle")}`}
+                      />
+                    </div>
+                    <Input
+                      className="mt-3"
+                      inputMode="numeric"
+                      value={batchSchedulerPriorityInput}
+                      onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                        setBatchSchedulerPriorityInput(event.target.value)
+                      }
+                      placeholder={t(
+                        "accounts.schedulerPriorityPlaceholder",
+                      )}
+                      disabled={!batchUpdateSchedulerPriority}
+                    />
+                    <div
+                      className={`mt-1.5 text-xs ${batchSchedulerPriorityInvalid ? "text-red-500" : "text-muted-foreground"}`}
+                    >
+                      {batchSchedulerPriorityInvalid
+                        ? t("accounts.schedulerPriorityRange")
+                        : t("accounts.batchMetaResetHint")}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
               <div className="rounded-xl border border-border p-4">
                 <div className="flex items-start justify-between gap-4">
                   <div className="min-w-0">
@@ -8493,22 +9700,35 @@ export default function Accounts() {
                       )}
                     </div>
                   </div>
-                  {batchMetaMode === "all" ? (
-                    <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
-                      <span>
-                        {t(
-                          batchUpdateGroups
-                            ? "common.enabled"
-                            : "common.disabled",
-                        )}
-                      </span>
-                      <Switch
-                        checked={batchUpdateGroups}
-                        onCheckedChange={setBatchUpdateGroups}
-                        aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.groupsLabel")}`}
-                      />
-                    </label>
-                  ) : null}
+                  <div className="flex shrink-0 items-center gap-2">
+                    {batchUpdateGroups ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        onClick={() => setShowGroupManager(true)}
+                      >
+                        <FolderOpen className="size-3" />
+                        {t("accounts.groupManage")}
+                      </Button>
+                    ) : null}
+                    {batchMetaMode === "all" ? (
+                      <label className="flex shrink-0 items-center gap-2 text-xs font-medium text-muted-foreground">
+                        <span>
+                          {t(
+                            batchUpdateGroups
+                              ? "common.enabled"
+                              : "common.disabled",
+                          )}
+                        </span>
+                        <Switch
+                          checked={batchUpdateGroups}
+                          onCheckedChange={setBatchUpdateGroups}
+                          aria-label={`${t("accounts.batchMetaTitle")}: ${t("accounts.groupsLabel")}`}
+                        />
+                      </label>
+                    ) : null}
+                  </div>
                 </div>
                 <div className="mt-3">
                   <AccountGroupMultiSelect
@@ -8535,6 +9755,13 @@ export default function Accounts() {
                         : "accounts.batchMetaFieldHint",
                     )}
                     disabled={!batchUpdateGroups}
+                    onCreateGroup={
+                      batchUpdateGroups ? handleCreateGroupInline : undefined
+                    }
+                    createLabel={t("accounts.groupCreate")}
+                    createPlaceholder={t("accounts.groupNamePlaceholder")}
+                    creatingLabel={t("accounts.groupCreating")}
+                    createEmptyHint={t("accounts.groupCreateInlineEmptyHint")}
                   />
                 </div>
               </div>
@@ -8849,7 +10076,6 @@ export default function Accounts() {
                     <Input
                       type="number"
                       min={1}
-                      max={50}
                       step={1}
                       inputMode="numeric"
                       value={groupDraft.baseConcurrencyInput}
@@ -10088,19 +11314,153 @@ function APIKeyMultiSelect({
   );
 }
 
+type ModelProbeStatus =
+  | "pending"
+  | "testing"
+  | "available"
+  | "unsupported"
+  | "throttled"
+  | "error";
+
+type ModelProbeItem = {
+  model: string;
+  status: ModelProbeStatus;
+  detail?: string;
+};
+
+// ModelProbeBoard 逐模型实时探测看板：每个模型显示 等待/测试中/结果 的动画状态。
+function ModelProbeBoard({
+  items,
+  t,
+}: {
+  items: ModelProbeItem[];
+  t: ReturnType<typeof useTranslation>["t"];
+}) {
+  const tested = items.filter(
+    (it) => it.status !== "pending" && it.status !== "testing",
+  ).length;
+  const availableCount = items.filter(
+    (it) => it.status === "available",
+  ).length;
+
+  const statusMeta: Record<
+    ModelProbeStatus,
+    { icon: ReactNode; ring: string; text: string; label: string }
+  > = {
+    pending: {
+      icon: <Hourglass className="size-3.5" />,
+      ring: "border-border bg-muted/20",
+      text: "text-muted-foreground/70",
+      label: t("accounts.probeStatePending"),
+    },
+    testing: {
+      icon: <RefreshCw className="size-3.5 animate-spin" />,
+      ring: "border-primary/40 bg-primary/5",
+      text: "text-primary",
+      label: t("accounts.probeStateTesting"),
+    },
+    available: {
+      icon: <Check className="size-3.5" />,
+      ring: "border-emerald-500/30 bg-emerald-500/5",
+      text: "text-emerald-600 dark:text-emerald-400",
+      label: t("accounts.probeStateAvailable"),
+    },
+    unsupported: {
+      icon: <Ban className="size-3.5" />,
+      ring: "border-rose-500/30 bg-rose-500/5",
+      text: "text-rose-600 dark:text-rose-400",
+      label: t("accounts.probeStateUnsupported"),
+    },
+    throttled: {
+      icon: <Timer className="size-3.5" />,
+      ring: "border-amber-500/30 bg-amber-500/5",
+      text: "text-amber-600 dark:text-amber-400",
+      label: t("accounts.probeStateThrottled"),
+    },
+    error: {
+      icon: <AlertTriangle className="size-3.5" />,
+      ring: "border-border bg-muted/30",
+      text: "text-muted-foreground",
+      label: t("accounts.probeStateError"),
+    },
+  };
+
+  return (
+    <div className="space-y-2 rounded-lg border border-border bg-card p-3">
+      <div className="flex items-center justify-between text-xs">
+        <span className="font-medium text-foreground">
+          {t("accounts.probeBoardTitle")}
+        </span>
+        <span className="tabular-nums text-muted-foreground">
+          {t("accounts.probeBoardProgress", {
+            tested,
+            total: items.length,
+            available: availableCount,
+          })}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+        {items.map((it) => {
+          const meta = statusMeta[it.status];
+          return (
+            <div
+              key={it.model}
+              className={`flex items-center gap-2 rounded-md border px-2.5 py-1.5 transition-colors duration-300 ${meta.ring}`}
+              title={it.detail || meta.label}
+            >
+              <span className={`shrink-0 ${meta.text}`}>{meta.icon}</span>
+              <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">
+                {it.model}
+              </span>
+              <span className={`shrink-0 text-[11px] ${meta.text}`}>
+                {meta.label}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ModelChipGrid({
   models,
   onRemove,
   emptyLabel,
+  variant = "grid",
 }: {
   models: string[];
   onRemove: (model: string) => void;
   emptyLabel: string;
+  variant?: "grid" | "pills";
 }) {
   if (models.length === 0) {
     return (
       <div className="rounded-lg border border-dashed border-border bg-muted/20 px-3 py-3 text-sm text-muted-foreground">
         {emptyLabel}
+      </div>
+    );
+  }
+  if (variant === "pills") {
+    return (
+      <div className="flex flex-wrap gap-1.5 rounded-lg border border-border bg-muted/10 p-2.5">
+        {models.map((model) => (
+          <span
+            key={model}
+            className="inline-flex items-center gap-1 rounded-md border border-border bg-background py-1 pl-2 pr-1 text-[12px]"
+            title={model}
+          >
+            <span className="font-mono text-foreground">{model}</span>
+            <button
+              type="button"
+              className="inline-flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+              onClick={() => onRemove(model)}
+              aria-label={`Remove ${model}`}
+            >
+              <X className="size-3" />
+            </button>
+          </span>
+        ))}
       </div>
     );
   }
@@ -10260,6 +11620,26 @@ function getSchedulerPriority(account: AccountRow): number {
     : 0;
 }
 
+// UsingCreditsBadge 紧跟在限流徽章后面：账号显示仍是「限流」（用量窗口客观上确实打满了），
+// 这个积分徽章表示"正在用积分顶替限流，因此仍在参与调度"。
+// 后端 using_credits 已经算过全部前提（两个开关 + 当下确有余额 + 窗口真打满），
+// 这里只负责显示，不重算，避免两边判定漂移。
+function UsingCreditsBadge({ account }: { account: AccountRow }) {
+  const { t } = useTranslation();
+  if (!account.using_credits) return null;
+  // 纯图标：余额已经在邮箱下方的徽章里显示过，这里再写一遍是重复信息，
+  // 而且会把「限流 | 7d」和倒计时之间撑开。语义靠 title / aria-label 承载。
+  return (
+    <span
+      className="inline-flex size-5 shrink-0 items-center justify-center rounded-md border border-teal-500/30 bg-teal-500/10 text-teal-700 dark:text-teal-300"
+      title={t("accounts.usingCreditsBadgeTooltip")}
+      aria-label={t("accounts.usingCreditsBadge")}
+    >
+      <Coins className="size-3" />
+    </span>
+  );
+}
+
 function SchedulerPriorityBadge({ account }: { account: AccountRow }) {
   const { t } = useTranslation();
   const priority = getSchedulerPriority(account);
@@ -10344,12 +11724,16 @@ function isPremiumUsagePlan(planType?: string): boolean {
 type RateLimitWindow = "5h" | "7d";
 
 function isRateLimitedAccount(account: AccountRow): boolean {
+  // 积分顶替限流的账号：状态徽章仍写「限流」（用量窗口客观上确实打满了），但调度侧
+  // 照常放行。健康分类与筛选按"可用"计，否则一个正在正常干活的账号会被算进限流数、
+  // 被「限流」筛选捞出来，与旁边的积分徽章互相矛盾。
+  if (account.using_credits) return false;
   return getAccountRateLimitWindow(account) !== null;
 }
 
 function isUnsampledQuotaAccount(account: AccountRow): boolean {
   const status = (account.status || "").toLowerCase();
-  if (status === "unauthorized" || account.openai_responses_api) {
+  if (status === "unauthorized" || account.openai_responses_api || account.grok_api) {
     return false;
   }
   // k12 等 team 型工作区可能只返回 5h 窗口：任一窗口有数据即算已采样，
@@ -10433,7 +11817,11 @@ function getRateLimitedWindowStats(accounts: AccountRow[]): {
 } {
   const stats = accounts.reduce(
     (stats, account) => {
-      const window = getAccountRateLimitWindow(account);
+      // 走 isRateLimitedAccount 而不是直接取窗口：积分顶替限流的账号按可用计，
+      // 这样 5h + 7d 仍然等于总限流数，不会比汇总里的「限流」多出几个。
+      const window = isRateLimitedAccount(account)
+        ? getAccountRateLimitWindow(account)
+        : null;
       if (!window) {
         return stats;
       }
@@ -11189,6 +12577,7 @@ function AccountRowActionsMenu({
   onToggleLock,
   onResetStatus,
   onResetCredits,
+  onEditModels,
   onDelete,
 }: {
   t: ReturnType<typeof useTranslation>["t"];
@@ -11206,12 +12595,17 @@ function AccountRowActionsMenu({
   onToggleLock: () => void;
   onResetStatus: () => void;
   onResetCredits: () => void;
+  onEditModels?: () => void;
   onDelete: () => void;
 }) {
   const refreshDisabled =
     refreshing || account.at_only || account.openai_responses_api;
   const authJsonDisabled =
-    authJsonExporting || account.at_only || account.openai_responses_api;
+    authJsonExporting ||
+    account.at_only ||
+    account.openai_responses_api ||
+    account.grok_api ||
+    account.agent_identity;
   const resetCredits = account.rate_limit_reset_credits ?? 0;
 
   const items: HeaderActionMenuItem[] = [
@@ -11253,7 +12647,10 @@ function AccountRowActionsMenu({
       icon: <FileJson className="size-3.5" />,
       disabled: authJsonDisabled,
       title:
-        account.at_only || account.openai_responses_api
+        account.at_only ||
+        account.openai_responses_api ||
+        account.grok_api ||
+        account.agent_identity
           ? t("accounts.authJsonDisabled")
           : undefined,
       onSelect: onGenerateAuthJson,
@@ -11297,6 +12694,17 @@ function AccountRowActionsMenu({
       disabled: resetCredits <= 0,
       onSelect: onResetCredits,
     },
+    // 支持模型白名单仅适用于 OAuth(ChatGPT)账号,relay/Grok 账号不显示。
+    ...(onEditModels && !account.openai_responses_api && !account.grok_api
+      ? [
+          {
+            key: "edit-models",
+            label: t("accounts.supportedModelsAction"),
+            icon: <SlidersHorizontal className="size-3.5" />,
+            onSelect: onEditModels,
+          },
+        ]
+      : []),
     ...(includeDelete
       ? [
           {
@@ -11388,6 +12796,26 @@ function resolveAccountGroups(
   if (ids.length === 0 || groups.length === 0) return [];
   const byID = new Map(groups.map((group) => [group.id, group]));
   return ids.map((id) => byID.get(id)).filter(Boolean) as AccountGroup[];
+}
+
+/** Sort key for clustering accounts that share the same group membership. */
+function getAccountGroupSortMeta(
+  account: { group_ids?: number[] | null },
+  groups: AccountGroup[],
+): { order: number; key: string } {
+  const resolved = resolveAccountGroups(account.group_ids ?? [], groups);
+  if (resolved.length === 0) {
+    // Ungrouped accounts sort after every named group in ascending order.
+    return { order: Number.MAX_SAFE_INTEGER, key: "" };
+  }
+  const sorted = [...resolved].sort((a, b) => {
+    if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
+    return a.name.localeCompare(b.name, "zh");
+  });
+  return {
+    order: sorted[0].sort_order,
+    key: sorted.map((group) => group.name).join("\0"),
+  };
 }
 
 function GroupChipList({
@@ -11557,6 +12985,7 @@ function AccountMobileCard({
   onToggleLock,
   onResetStatus,
   onResetCredits,
+  onEditModels,
   onDelete,
   onUsageRefreshed,
 }: {
@@ -11587,6 +13016,7 @@ function AccountMobileCard({
   onToggleLock: () => void;
   onResetStatus: () => void;
   onResetCredits: () => void;
+  onEditModels?: () => void;
   onDelete: () => void;
   onUsageRefreshed?: () => void;
 }) {
@@ -11603,6 +13033,7 @@ function AccountMobileCard({
   const hasStateBadges =
     account.at_only ||
     account.openai_responses_api ||
+    account.grok_api ||
     account.enabled === false ||
     account.locked;
   const modelCooldownCount = account.model_cooldowns?.length ?? 0;
@@ -11648,6 +13079,26 @@ function AccountMobileCard({
                 {resetCredits}
               </button>
             )}
+            {getCreditBalanceDisplay(account) !== null && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onUsage();
+                }}
+                className="inline-flex items-center gap-1 rounded-md bg-teal-50 px-1.5 py-0.5 text-[10px] font-medium text-teal-700 ring-1 ring-inset ring-teal-600/20 transition-colors hover:bg-teal-100 dark:bg-teal-950 dark:text-teal-300 dark:ring-teal-400/20 dark:hover:bg-teal-900"
+                title={
+                  account.credits_unlimited
+                    ? t("accounts.creditsBalanceUnlimited")
+                    : t("accounts.creditsBalanceBadge", {
+                        balance: getCreditBalanceDisplay(account),
+                      })
+                }
+              >
+                <Coins className="size-2.5" />
+                {getCreditBalanceDisplay(account)}
+              </button>
+            )}
           </div>
 
           <div className="min-w-0 flex-1">
@@ -11657,6 +13108,7 @@ function AccountMobileCard({
               </span>
               <PlanBadge planType={account.plan_type} />
               <SchedulerPriorityBadge account={account} />
+              <UsingCreditsBadge account={account} />
               <AccountStatusCountdown account={account} />
               <ExpiryBadge
                 expiresAt={account.subscription_expires_at}
@@ -11716,6 +13168,13 @@ function AccountMobileCard({
                 {account.openai_responses_api && (
                   <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
                     Responses API
+                  </span>
+                )}
+                {account.grok_api && (
+                  <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                    <Sparkles className="size-2.5" />
+                    Grok
+                    {account.grok_auth_kind === "api_key" ? " · API Key" : " · OAuth"}
                   </span>
                 )}
                 {account.enabled === false && (
@@ -11910,6 +13369,7 @@ function AccountMobileCard({
               onToggleLock={onToggleLock}
               onResetStatus={onResetStatus}
               onResetCredits={onResetCredits}
+              onEditModels={onEditModels}
               onDelete={onDelete}
             />
           </div>
@@ -11977,7 +13437,8 @@ function AccountMobileCard({
                   detail={getAccountRateLimitWindow(account) ?? undefined}
                   errorMessage={account.error_message}
                 />
-                <div className="mt-1 flex min-h-6 items-center justify-end">
+                <div className="mt-1 flex min-h-6 flex-wrap items-center justify-end gap-1.5">
+                  <UsingCreditsBadge account={account} />
                   <AccountStatusCountdown account={account} />
                 </div>
               </div>
@@ -11996,6 +13457,13 @@ function AccountMobileCard({
             {account.openai_responses_api && (
               <span className="inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
                 Responses API
+              </span>
+            )}
+            {account.grok_api && (
+              <span className="inline-flex items-center gap-0.5 rounded-md bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-white ring-1 ring-inset ring-zinc-700 dark:bg-white dark:text-zinc-900 dark:ring-zinc-300">
+                <Sparkles className="size-2.5" />
+                Grok
+                {account.grok_auth_kind === "api_key" ? " · API Key" : " · OAuth"}
               </span>
             )}
             {account.enabled === false && (
@@ -12149,6 +13617,7 @@ function AccountMobileCard({
           onToggleLock={onToggleLock}
           onResetStatus={onResetStatus}
           onResetCredits={onResetCredits}
+          onEditModels={onEditModels}
           onDelete={onDelete}
         />
       </div>
@@ -12422,7 +13891,11 @@ function TestConnectionModal({
     onSettledRef.current();
   }, []);
 
-  const isOpenAIResponsesAccount = Boolean(account.openai_responses_api);
+  // Grok 与 openai_responses 同属"账号自带模型清单"的 relay 风格账号，
+  // 测试模型选择逻辑一致（用 account.models 而非上游 /v1/models 全量）。
+  const isOpenAIResponsesAccount = Boolean(
+    account.openai_responses_api || account.grok_api,
+  );
 
   const modelSelectOptions = useMemo(
     () =>
@@ -12665,12 +14138,19 @@ function TestConnectionModal({
     outputEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [output]);
 
-  const statusLabel = {
-    connecting: `⏳ ${t("accounts.connecting")}`,
-    streaming: `🔄 ${t("accounts.receivingResponse")}`,
-    success: `✅ ${t("accounts.testSuccess")}`,
-    error: `❌ ${t("accounts.testFailed")}`,
+  const statusText = {
+    connecting: t("accounts.connecting"),
+    streaming: t("accounts.receivingResponse"),
+    success: t("accounts.testSuccess"),
+    error: t("accounts.testFailed"),
   }[status];
+  const StatusIcon = {
+    connecting: Loader2,
+    streaming: Loader2,
+    success: CheckCircle,
+    error: XCircle,
+  }[status];
+  const statusIconSpin = status === "connecting" || status === "streaming";
 
   const statusColor = {
     connecting: "text-muted-foreground",
@@ -12708,7 +14188,10 @@ function TestConnectionModal({
           <span
             className={`flex items-center gap-1.5 text-sm font-semibold ${statusColor}`}
           >
-            {statusLabel}
+            <StatusIcon
+              className={cn("size-4", statusIconSpin && "animate-spin")}
+            />
+            {statusText}
           </span>
           <Select
             className="w-52 max-w-full"
@@ -12903,8 +14386,7 @@ function UsageWindowStat({
 // 显示策略不再单独依赖 plan_type:
 // 当 plan_type 还停留在按 RT 刷新出来的旧值(例如 "free")、但账号实际已订阅、
 // 后端已经返回 5h 窗口数据时,只看 plan_type 会把 5h 吞掉。
-// 因此这里以"是否真的存在 5h / 7d 数据(含 reset 时间)"作为主判据,
-// plan_type 仅作为 5h 数据缺位时的辅助提示。
+// 因此这里以"是否真的存在 5h / 7d 数据(含 reset 时间)"作为主判据。
 function UsageCell({
   account,
   wide = false,
@@ -12947,26 +14429,23 @@ function UsageCell({
     </button>
   );
 
-  const plan = normalizePlanType(account.plan_type);
   const has7d =
     account.usage_percent_7d !== null && account.usage_percent_7d !== undefined;
   const has5h =
     account.usage_percent_5h !== null && account.usage_percent_5h !== undefined;
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail);
-  const has5hDetail = hasUsageWindowDetail(account.usage_5h_detail);
   const has5hReset = !!account.reset_5h_at;
   const has7dReset = !!account.reset_7d_at;
 
-  const fiveHourPresent = has5h || has5hDetail || has5hReset;
+  const fiveHourPresent = has5h || has5hReset;
   const sevenDayPresent = has7d || has7dDetail || has7dReset;
   // 长窗口标签:free/team plan 实为月窗(约 30 天),按真实周期显示 30d 而非误标 7d (issue #324)
   const longWindowLabel = formatLongUsageWindowLabel(account);
-  // plan 表明是订阅型时,即使数据暂未拉到也按订阅布局占位,避免抖动
-  const planSuggestsPremium = isPremiumUsagePlan(plan);
-  const showFiveHour = fiveHourPresent || planSuggestsPremium;
+  // 5h 是上游可选窗口：仅数据存在时展示，不再因 premium plan 强制占位（issue #382）
+  const showFiveHour = fiveHourPresent;
 
   if (showFiveHour) {
-    if (!has5h && !has7d && !has5hDetail && !has7dDetail && !has5hReset && !has7dReset)
+    if (!has5h && !has7d && !has7dDetail && !has5hReset && !has7dReset)
       return <span className="text-[12px] text-muted-foreground">-</span>;
     return (
       <div className={`${wide ? "w-full" : "w-52"} flex items-start gap-1`}>
@@ -13023,12 +14502,16 @@ function UsageCell({
 function BilledCell({ account }: { account: AccountRow }) {
   const h5 = typeof account.billed_5h === "number" ? account.billed_5h.toFixed(2) : null;
   const d7 = typeof account.billed_7d === "number" ? account.billed_7d.toFixed(2) : null;
-  if (h5 === null && d7 === null) return <span className="text-[12px] text-muted-foreground">-</span>;
+  const has5hWindow =
+    (account.usage_percent_5h !== null && account.usage_percent_5h !== undefined) ||
+    !!account.reset_5h_at;
+  const visibleH5 = has5hWindow ? h5 : null;
+  if (visibleH5 === null && d7 === null) return <span className="text-[12px] text-muted-foreground">-</span>;
   const longLabel = formatLongUsageWindowLabel(account);
   return (
     <span className="text-[12px] text-muted-foreground">
-      {h5 !== null ? `5h: $${h5}` : "5h: -"}
-      {" / "}
+      {visibleH5 !== null && `5h: $${visibleH5}`}
+      {visibleH5 !== null && " / "}
       {d7 !== null ? `${longLabel}: $${d7}` : `${longLabel}: -`}
     </span>
   );
@@ -13038,13 +14521,20 @@ function getAccountStatusCountdownUntil(
   account: AccountRow,
 ): string | undefined {
   const status = account.status;
+  const rateLimited =
+    status === "rate_limited" ||
+    status === "rate_limited_5h" ||
+    status === "rate_limited_7d";
   if (
     account.cooldown_until &&
-    (status === "rate_limited" || status === "error" || status === "cooldown")
+    (rateLimited || status === "error" || status === "cooldown")
   ) {
     return account.cooldown_until;
   }
-  if (status === "quota_paused") {
+  // 限流态但没有 cooldown：积分顶替限流会主动释放本地用量判罚（cooldown_until 被清空），
+  // premium 5h 打满也是直接由用量窗口判定、从不落 cooldown。这两种情况下倒计时改用窗口
+  // 重置时间——徽章上写着「限流 | 7d」，右边就该显示它多久恢复，而不是整个消失。
+  if (rateLimited || status === "quota_paused") {
     const window = getAccountRateLimitWindow(account);
     if (window === "7d") {
       return account.reset_7d_at;
@@ -13107,5 +14597,176 @@ function CooldownTimer({ until }: { until: string }) {
       <Hourglass className="size-3 shrink-0" aria-hidden="true" />
       {remaining}
     </span>
+  );
+}
+
+// 自助提交待审核面板:列出 enabled=false 且带 self-service 标签的账号,
+// 支持查看/编辑备注、通过(启用)与拒绝(删除)。
+const SELF_SERVICE_TAG = "self-service";
+
+function PendingSelfServiceReviewPanel({
+  accounts,
+  onApprove,
+  onReject,
+  onSaveNote,
+}: {
+  accounts: AccountRow[];
+  onApprove: (account: AccountRow) => void;
+  onReject: (account: AccountRow) => void;
+  onSaveNote: (account: AccountRow, note: string) => Promise<void>;
+}) {
+  const { t } = useTranslation();
+  const pending = useMemo(
+    () =>
+      accounts.filter(
+        (account) =>
+          account.enabled === false &&
+          (account.tags ?? []).includes(SELF_SERVICE_TAG),
+      ),
+    [accounts],
+  );
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [draftNote, setDraftNote] = useState("");
+  const [savingId, setSavingId] = useState<number | null>(null);
+
+  if (pending.length === 0) return null;
+
+  const startEdit = (account: AccountRow) => {
+    setEditingId(account.id);
+    setDraftNote(account.note ?? "");
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setDraftNote("");
+  };
+
+  const saveNote = async (account: AccountRow) => {
+    setSavingId(account.id);
+    try {
+      await onSaveNote(account, draftNote.trim());
+      setEditingId(null);
+      setDraftNote("");
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  return (
+    <Card className="border-amber-500/40 bg-amber-500/[0.04] shadow-sm">
+      <CardContent className="p-3 sm:p-4">
+        <div className="mb-3 flex items-center gap-2.5">
+          <div className="flex size-9 items-center justify-center rounded-xl bg-amber-500/15 text-amber-600 dark:text-amber-300">
+            <Hourglass className="size-4" />
+          </div>
+          <div className="min-w-0">
+            <div className="text-sm font-semibold tracking-tight">
+              {t("accounts.pendingReview.title")}
+            </div>
+            <div className="text-[11px] text-muted-foreground">
+              {t("accounts.pendingReview.count", { count: pending.length })} ·{" "}
+              {t("accounts.pendingReview.desc")}
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          {pending.map((account) => {
+            const editing = editingId === account.id;
+            const saving = savingId === account.id;
+            return (
+              <div
+                key={account.id}
+                className="flex flex-col gap-3 rounded-xl border border-border/70 bg-card p-3 sm:flex-row sm:items-start sm:justify-between"
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center gap-1.5 text-sm font-semibold text-foreground">
+                      <Mail className="size-3.5 text-muted-foreground" />
+                      {account.email || `ID ${account.id}`}
+                    </span>
+                    <Badge className="border-transparent bg-amber-500/14 text-amber-700 dark:bg-amber-500/20 dark:text-amber-300">
+                      {SELF_SERVICE_TAG}
+                    </Badge>
+                    {account.plan_type ? (
+                      <span className="text-[11px] text-muted-foreground">
+                        {account.plan_type}
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {editing ? (
+                    <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
+                      <Input
+                        value={draftNote}
+                        onChange={(e) => setDraftNote(e.target.value)}
+                        placeholder={t("accounts.pendingReview.notePlaceholder")}
+                        className="h-9"
+                      />
+                      <div className="flex shrink-0 gap-1.5">
+                        <Button
+                          size="sm"
+                          className="h-9"
+                          disabled={saving}
+                          onClick={() => void saveNote(account)}
+                        >
+                          {saving ? (
+                            <RotateCcw className="size-3.5 animate-spin" />
+                          ) : (
+                            <Check className="size-3.5" />
+                          )}
+                          {t("common.save")}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-9"
+                          disabled={saving}
+                          onClick={cancelEdit}
+                        >
+                          <X className="size-3.5" />
+                        </Button>
+                      </div>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => startEdit(account)}
+                      className="mt-1.5 flex w-full items-start gap-1.5 rounded-md text-left text-xs leading-relaxed text-muted-foreground transition-colors hover:text-foreground"
+                      title={t("accounts.pendingReview.editNote")}
+                    >
+                      <Pencil className="mt-0.5 size-3 shrink-0" />
+                      <span className="min-w-0 break-words">
+                        {account.note || t("accounts.pendingReview.noNote")}
+                      </span>
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex shrink-0 gap-1.5">
+                  <Button
+                    size="sm"
+                    className="h-9"
+                    onClick={() => onApprove(account)}
+                  >
+                    <Check className="size-3.5" />
+                    {t("accounts.pendingReview.approve")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-9"
+                    onClick={() => onReject(account)}
+                  >
+                    <Trash2 className="size-3.5" />
+                    {t("accounts.pendingReview.reject")}
+                  </Button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </CardContent>
+    </Card>
   );
 }

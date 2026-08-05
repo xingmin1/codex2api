@@ -62,6 +62,18 @@ func TestDrainableUpstreamContextStaysAliveWhileClientAlive(t *testing.T) {
 	}
 }
 
+func TestDrainableUpstreamContextPreservesRequestValues(t *testing.T) {
+	type contextKey struct{}
+	clientCtx := context.WithValue(context.Background(), contextKey{}, "audit-value")
+
+	upstreamCtx, cancelUpstream := newDrainableUpstreamContext(clientCtx, time.Second)
+	defer cancelUpstream()
+
+	if got := upstreamCtx.Value(contextKey{}); got != "audit-value" {
+		t.Fatalf("upstream context value = %v, want audit-value", got)
+	}
+}
+
 func TestDrainableUpstreamContextAlreadyCanceledDoesNotStayAlive(t *testing.T) {
 	clientCtx, cancelClient := context.WithCancel(context.Background())
 	cancelClient()
